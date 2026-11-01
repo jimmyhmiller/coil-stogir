@@ -16,6 +16,85 @@
 (defn require [(result (Result i32 (slice u8)))] (-> i32)
   (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
 
+(defn constant-case [(ty i32) (opcode i32) (bits u64) (constant-first bool)]
+  (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        arg (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        literal
+          (require (b/scalar-constant! (mut graph)
+                                       ty
+                                       (if (or (= ty 4) (= ty 10))
+                                           (& bits (: 4294967295 u64))
+                                           bits)
+                                       8))
+        v
+          (require (b/emit! (mut graph)
+                            opcode
+                            ty
+                            (if constant-first [literal arg] [arg literal])))
+        result
+          (if (or (= ty 4) (= ty 10))
+              (require (b/conversion! (mut graph) 34 5 8 v))
+              (require (b/conversion! (mut graph) 36 5 8 v)))
+        ret (require (b/emit! (mut graph) 120 5 [start result (: 0 i32)]))
+        (mut failures) 0]
+    (match (compile/text graph start [ret] a)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [text]
+          (let [(mut text) text]
+            (match (jit/map-text (slice text))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [mapped]
+                  (let [(mut mapped) mapped
+                        f
+                          (primitive/cast (fnptr (cc/C) [u64] u64)
+                                          (.base mapped))
+                        width (if (or (= ty 4) (= ty 10)) 32 64)
+                        mask
+                          (if (= width 32)
+                              (: 4294967295 u64)
+                              (: 18446744073709551615 u64))
+                        shift (& bits (cast u64 (- width 1)))]
+                    (for x [(: 0 u64)
+                            1
+                            2
+                            3
+                            127
+                            128
+                            255
+                            256
+                            2147483647
+                            2147483648
+                            4294967295
+                            4294967296
+                            9223372036854775808
+                            18446744073709551615]
+                      (let [input (& x mask)
+                            expected
+                              (& mask
+                                 (cond (= opcode 28) (primitive/imul input bits)
+                                       (= opcode 49)
+                                         (primitive/ishl input shift)
+                                       (= opcode 50)
+                                         (primitive/ishr input shift)
+                                       :else
+                                         (cast u64
+                                               (primitive/ishr (if (= width 32)
+                                                                   (cast i64
+                                                                         (cast i32
+                                                                               input))
+                                                                   (cast i64
+                                                                         input))
+                                                               (cast i64 shift)))))]
+                        (when (!= (call-ptr f x) expected)
+                          (set! failures (+ failures 1)))))
+                    (jit/release! (mut mapped)))))
+            (free! (mut text)))))
+    (g/release! (mut graph))
+    failures))
+
 (defn main [] (-> i64)
   (let [(mut text) (ArrayList::new [u8] (malloc-allocator))
         (mut failures) 0]
@@ -55,6 +134,28 @@
               (set! failures (+ failures 1)))
             (when (not (jit/release! (mut owned)))
               (set! failures (+ failures 1))))))
+    (for ty [(: 4 i32) 10 5 11]
+      (for op [(: 49 i32) 50 51]
+        (for bits [(: 0 u64)
+                   1
+                   7
+                   8
+                   15
+                   16
+                   31
+                   32
+                   33
+                   63
+                   64
+                   65
+                   127
+                   18446744073709551615]
+          (set! failures (+ failures (constant-case ty op bits false)))))
+      (for bits [(: 1 u64) 2 4 8 2147483648]
+        (set! failures
+              (+ failures
+                 (constant-case ty 28 bits false)
+                 (constant-case ty 28 bits true)))))
     (free! (mut text))
     (println "compiled shift checks: {} failures" failures)
     (if (= failures 0) 0 1)))
