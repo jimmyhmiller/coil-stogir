@@ -1,0 +1,545 @@
+(module stogir.tests.jit-vector-arithmetic)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "stogir.types" :as types)
+
+(defn pattern [(base i32) (lane i64) (seed i64) (right? bool)] (-> u64)
+  (let [i (% (+ lane seed (if right? (: 3 i64) 0)) 11)
+        fp? (types/floating? base)
+        wide? (= base 12)]
+    (if fp?
+        (if wide?
+            (match i
+              (0 (: 0 u64))
+              (1 0x8000000000000000)
+              (2 0x3FF0000000000000)
+              (3 0xBFF0000000000000)
+              (4 1)
+              (5 0x000FFFFFFFFFFFFF)
+              (6 0x7FEFFFFFFFFFFFFF)
+              (7 0x7FF0000000000000)
+              (8 0xFFF0000000000000)
+              (9 0x7FF8123456789ABC)
+              (_ 0x7FF0123456789ABC))
+            (match i
+              (0 (: 0 u64))
+              (1 0x80000000)
+              (2 0x3F800000)
+              (3 0xBF800000)
+              (4 1)
+              (5 0x007FFFFF)
+              (6 0x7F7FFFFF)
+              (7 0x7F800000)
+              (8 0xFF800000)
+              (9 0x7FC12345)
+              (_ 0x7F812345)))
+        (match i
+          (0 (: 0 u64))
+          (1 1)
+          (2 0xFFFFFFFFFFFFFFFF)
+          (3 0x8000000000000000)
+          (4 0x7FFFFFFFFFFFFFFF)
+          (5 0x8080808080808080)
+          (6 0x7F7F7F7F7F7F7F7F)
+          (7 0xFFFF0000FFFF0000)
+          (8 0x123456789ABCDEF0)
+          (9 0xFFFFFFFFFFFFFFFE)
+          (_ 0x0102030405060708)))))
+
+(defn input-byte [(base i32) (index i64) (seed i64) (right? bool)] (-> u8)
+  (let [width (cast i64 (types/scalar-size base 8))]
+    (cast u8
+          (>> (pattern base (/ index width) seed right?)
+              (cast u64 (* (% index width) 8))))))
+
+(defn nan? [(base i32) (bits u64)] (-> bool)
+  (let [exponent (if (= base 12) (: 0x7FF0000000000000 u64) 0x7F800000)
+        fraction (if (= base 12) (: 0x000FFFFFFFFFFFFF u64) 0x007FFFFF)]
+    (and (= (& bits exponent) exponent) (!= (& bits fraction) 0))))
+
+(defn expected [(opcode i32) (base i32) (a u64) (b u64)] (-> u64)
+  (if (types/floating? base)
+      (if (= base 12)
+          (let [(mut x) (: 0.0 f64)
+                (mut y) (: 0.0 f64)]
+            (p/store! (p/cast (ptr u64) (mut x)) a)
+            (p/store! (p/cast (ptr u64) (mut y)) b)
+            (let [(mut result)
+                    (match opcode
+                      (26 (+ x y))
+                      (27 (- x y))
+                      (28 (* x y))
+                      (_ (/ x y)))]
+              (p/load (p/cast (ptr u64) (mut result)))))
+          (let [(mut x) (: 0.0 f32)
+                (mut y) (: 0.0 f32)]
+            (p/store! (p/cast (ptr u32) (mut x)) (cast u32 a))
+            (p/store! (p/cast (ptr u32) (mut y)) (cast u32 b))
+            (let [(mut result)
+                    (match opcode
+                      (26 (+ x y))
+                      (27 (- x y))
+                      (28 (* x y))
+                      (_ (/ x y)))]
+              (cast u64 (p/load (p/cast (ptr u32) (mut result)))))))
+      (let [width (* 8 (types/scalar-size base 8))
+            mask (- (<< (: 1 u128) (cast u128 width)) 1)
+            x (& (cast u128 a) mask)
+            y (& (cast u128 b) mask)]
+        (cast u64
+              (& mask
+                 (match opcode
+                   (26 (+ x y))
+                   (27 (- (+ x (+ mask 1)) y))
+                   (46 (| x y))
+                   (47 (& x y))
+                   (_ (^ x y))))))))
+
+(defn exercise [(ty i32) (opcode i32) (mode i32) (address (ptr u8))] (-> i64)
+  (let [allocator (malloc-allocator)
+        base (types/base-type ty)
+        width (types/size ty 8)
+        lane-width (types/scalar-size base 8)
+        lanes (/ width lane-width)
+        f (p/cast (fnptr (cc/C) [u64 u64 u64] void) address)
+        (mut a) (ArrayList::new [u8] allocator)
+        (mut b) (ArrayList::new [u8] allocator)
+        (mut output) (ArrayList::new [u8] allocator)
+        (mut failures) 0
+        (mut seed) (: 0 i64)]
+    (while (< seed 11)
+      (clear! (mut a))
+      (clear! (mut b))
+      (clear! (mut output))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 32)
+          (push! (mut a) (input-byte base i seed false))
+          (push! (mut b) (input-byte base i seed true))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 80) (push! (mut output) 165) (set! i (+ i 1))))
+      (call-ptr f
+                (p/cast u64 (.data output))
+                (p/cast u64 (.data a))
+                (p/cast u64 (.data b)))
+      (let [(mut lane) (: 0 i32)]
+        (while (< lane lanes)
+          (let [left-seed (if (or (= mode 1) (= mode 3)) (: 0 i64) seed)
+                right-seed (if (or (= mode 2) (= mode 3)) (: 0 i64) seed)
+                x (pattern base (cast i64 lane) left-seed false)
+                y
+                  (if (= mode 4)
+                      x
+                      (pattern base (cast i64 lane) right-seed true))
+                result (expected opcode base x y)
+                (mut got) (: 0 u64)
+                (mut byte) (: 0 i32)]
+            (while (< byte lane-width)
+              (set! got
+                    (| got
+                       (<< (cast u64
+                                 (get output
+                                      (cast i64 (+ (* lane lane-width) byte))))
+                           (cast u64 (* byte 8)))))
+              (set! byte (+ byte 1)))
+            (when (if (and (types/floating? base) (nan? base result))
+                      (not (nan? base got))
+                      (!= got result))
+              (println "vector binary ty{} op{} mode{} seed{} lane{} got{} expected{}"
+                       ty
+                       opcode
+                       mode
+                       seed
+                       lane
+                       got
+                       result)
+              (set! failures (+ failures 1))))
+          (set! lane (+ lane 1))))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 80)
+          (when (>= i (cast i64 width))
+            (let [left?
+                    (and (!= mode 4) (>= i 24) (< i (+ 24 (cast i64 width))))
+                  right?
+                    (and (!= mode 4) (>= i 48) (< i (+ 48 (cast i64 width))))
+                  wanted
+                    (if left?
+                        (input-byte base
+                                    (- i 24)
+                                    (if (or (= mode 1) (= mode 3))
+                                        (: 0 i64)
+                                        seed)
+                                    false)
+                        (if right?
+                            (input-byte base
+                                        (- i 48)
+                                        (if (or (= mode 2) (= mode 3))
+                                            (: 0 i64)
+                                            seed)
+                                        true)
+                            (: 165 u8)))]
+              (when (!= (get output i) wanted) (set! failures (+ failures 1)))))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 32)
+          (when (or (!= (get a i) (input-byte base i seed false))
+                    (!= (get b i) (input-byte base i seed true)))
+            (set! failures (+ failures 1)))
+          (set! i (+ i 1))))
+      (set! seed (+ seed 1)))
+    (free! (mut a))
+    (free! (mut b))
+    (free! (mut output))
+    failures))
+
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.vector-arithmetic" :as va)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn address! [(graph (mut g/Graph)) (base i32) (offset i32)] (-> i32)
+  (require (b/emit! (mut graph)
+                    26
+                    6
+                    [base
+                     (require (b/scalar-constant! (mut graph)
+                                                  5
+                                                  (cast u64 offset)
+                                                  8))])))
+
+(defn fixture-id [(ty i32) (opcode i32) (mode i32)] (-> i32)
+  (match (+ (* ty 1000) (* opcode 10) mode)
+    (66260 0)
+    (66270 1)
+    (66460 2)
+    (66470 3)
+    (66480 4)
+    (82260 5)
+    (82270 6)
+    (82460 7)
+    (82470 8)
+    (82480 9)
+    (51260 10)
+    (51270 11)
+    (51460 12)
+    (51470 13)
+    (51480 14)
+    (67260 15)
+    (67270 16)
+    (67460 17)
+    (67470 18)
+    (67480 19)
+    (36260 20)
+    (36270 21)
+    (36460 22)
+    (36470 23)
+    (36480 24)
+    (52260 25)
+    (52270 26)
+    (52460 27)
+    (52470 28)
+    (52480 29)
+    (21260 30)
+    (21270 31)
+    (21460 32)
+    (21470 33)
+    (21480 34)
+    (37260 35)
+    (37270 36)
+    (37460 37)
+    (37470 38)
+    (37480 39)
+    (45260 40)
+    (45270 41)
+    (45280 42)
+    (45290 43)
+    (61260 44)
+    (61270 45)
+    (61280 46)
+    (61290 47)
+    (28260 48)
+    (28270 49)
+    (28280 50)
+    (28290 51)
+    (44260 52)
+    (44270 53)
+    (44280 54)
+    (44290 55)
+    (37263 56)
+    (37273 57)
+    (37463 58)
+    (37473 59)
+    (37483 60)
+    (61263 61)
+    (61273 62)
+    (61283 63)
+    (61293 64)
+    (_ (: -1 i32))))
+
+(defn fixture-name [(id i32)] (-> (slice u8))
+  (match id
+    (0 "_stogir_vector_arithmetic_0")
+    (1 "_stogir_vector_arithmetic_1")
+    (2 "_stogir_vector_arithmetic_2")
+    (3 "_stogir_vector_arithmetic_3")
+    (4 "_stogir_vector_arithmetic_4")
+    (5 "_stogir_vector_arithmetic_5")
+    (6 "_stogir_vector_arithmetic_6")
+    (7 "_stogir_vector_arithmetic_7")
+    (8 "_stogir_vector_arithmetic_8")
+    (9 "_stogir_vector_arithmetic_9")
+    (10 "_stogir_vector_arithmetic_10")
+    (11 "_stogir_vector_arithmetic_11")
+    (12 "_stogir_vector_arithmetic_12")
+    (13 "_stogir_vector_arithmetic_13")
+    (14 "_stogir_vector_arithmetic_14")
+    (15 "_stogir_vector_arithmetic_15")
+    (16 "_stogir_vector_arithmetic_16")
+    (17 "_stogir_vector_arithmetic_17")
+    (18 "_stogir_vector_arithmetic_18")
+    (19 "_stogir_vector_arithmetic_19")
+    (20 "_stogir_vector_arithmetic_20")
+    (21 "_stogir_vector_arithmetic_21")
+    (22 "_stogir_vector_arithmetic_22")
+    (23 "_stogir_vector_arithmetic_23")
+    (24 "_stogir_vector_arithmetic_24")
+    (25 "_stogir_vector_arithmetic_25")
+    (26 "_stogir_vector_arithmetic_26")
+    (27 "_stogir_vector_arithmetic_27")
+    (28 "_stogir_vector_arithmetic_28")
+    (29 "_stogir_vector_arithmetic_29")
+    (30 "_stogir_vector_arithmetic_30")
+    (31 "_stogir_vector_arithmetic_31")
+    (32 "_stogir_vector_arithmetic_32")
+    (33 "_stogir_vector_arithmetic_33")
+    (34 "_stogir_vector_arithmetic_34")
+    (35 "_stogir_vector_arithmetic_35")
+    (36 "_stogir_vector_arithmetic_36")
+    (37 "_stogir_vector_arithmetic_37")
+    (38 "_stogir_vector_arithmetic_38")
+    (39 "_stogir_vector_arithmetic_39")
+    (40 "_stogir_vector_arithmetic_40")
+    (41 "_stogir_vector_arithmetic_41")
+    (42 "_stogir_vector_arithmetic_42")
+    (43 "_stogir_vector_arithmetic_43")
+    (44 "_stogir_vector_arithmetic_44")
+    (45 "_stogir_vector_arithmetic_45")
+    (46 "_stogir_vector_arithmetic_46")
+    (47 "_stogir_vector_arithmetic_47")
+    (48 "_stogir_vector_arithmetic_48")
+    (49 "_stogir_vector_arithmetic_49")
+    (50 "_stogir_vector_arithmetic_50")
+    (51 "_stogir_vector_arithmetic_51")
+    (52 "_stogir_vector_arithmetic_52")
+    (53 "_stogir_vector_arithmetic_53")
+    (54 "_stogir_vector_arithmetic_54")
+    (55 "_stogir_vector_arithmetic_55")
+    (56 "_stogir_vector_arithmetic_56")
+    (57 "_stogir_vector_arithmetic_57")
+    (58 "_stogir_vector_arithmetic_58")
+    (59 "_stogir_vector_arithmetic_59")
+    (60 "_stogir_vector_arithmetic_60")
+    (61 "_stogir_vector_arithmetic_61")
+    (62 "_stogir_vector_arithmetic_62")
+    (63 "_stogir_vector_arithmetic_63")
+    (64 "_stogir_vector_arithmetic_64")
+    (_ "invalid")))
+
+(defn fixture-path [(id i32)] (-> (slice u8))
+  (match id
+    (0 "/tmp/coil-stogir-vector-arithmetic-0.o")
+    (1 "/tmp/coil-stogir-vector-arithmetic-1.o")
+    (2 "/tmp/coil-stogir-vector-arithmetic-2.o")
+    (3 "/tmp/coil-stogir-vector-arithmetic-3.o")
+    (4 "/tmp/coil-stogir-vector-arithmetic-4.o")
+    (5 "/tmp/coil-stogir-vector-arithmetic-5.o")
+    (6 "/tmp/coil-stogir-vector-arithmetic-6.o")
+    (7 "/tmp/coil-stogir-vector-arithmetic-7.o")
+    (8 "/tmp/coil-stogir-vector-arithmetic-8.o")
+    (9 "/tmp/coil-stogir-vector-arithmetic-9.o")
+    (10 "/tmp/coil-stogir-vector-arithmetic-10.o")
+    (11 "/tmp/coil-stogir-vector-arithmetic-11.o")
+    (12 "/tmp/coil-stogir-vector-arithmetic-12.o")
+    (13 "/tmp/coil-stogir-vector-arithmetic-13.o")
+    (14 "/tmp/coil-stogir-vector-arithmetic-14.o")
+    (15 "/tmp/coil-stogir-vector-arithmetic-15.o")
+    (16 "/tmp/coil-stogir-vector-arithmetic-16.o")
+    (17 "/tmp/coil-stogir-vector-arithmetic-17.o")
+    (18 "/tmp/coil-stogir-vector-arithmetic-18.o")
+    (19 "/tmp/coil-stogir-vector-arithmetic-19.o")
+    (20 "/tmp/coil-stogir-vector-arithmetic-20.o")
+    (21 "/tmp/coil-stogir-vector-arithmetic-21.o")
+    (22 "/tmp/coil-stogir-vector-arithmetic-22.o")
+    (23 "/tmp/coil-stogir-vector-arithmetic-23.o")
+    (24 "/tmp/coil-stogir-vector-arithmetic-24.o")
+    (25 "/tmp/coil-stogir-vector-arithmetic-25.o")
+    (26 "/tmp/coil-stogir-vector-arithmetic-26.o")
+    (27 "/tmp/coil-stogir-vector-arithmetic-27.o")
+    (28 "/tmp/coil-stogir-vector-arithmetic-28.o")
+    (29 "/tmp/coil-stogir-vector-arithmetic-29.o")
+    (30 "/tmp/coil-stogir-vector-arithmetic-30.o")
+    (31 "/tmp/coil-stogir-vector-arithmetic-31.o")
+    (32 "/tmp/coil-stogir-vector-arithmetic-32.o")
+    (33 "/tmp/coil-stogir-vector-arithmetic-33.o")
+    (34 "/tmp/coil-stogir-vector-arithmetic-34.o")
+    (35 "/tmp/coil-stogir-vector-arithmetic-35.o")
+    (36 "/tmp/coil-stogir-vector-arithmetic-36.o")
+    (37 "/tmp/coil-stogir-vector-arithmetic-37.o")
+    (38 "/tmp/coil-stogir-vector-arithmetic-38.o")
+    (39 "/tmp/coil-stogir-vector-arithmetic-39.o")
+    (40 "/tmp/coil-stogir-vector-arithmetic-40.o")
+    (41 "/tmp/coil-stogir-vector-arithmetic-41.o")
+    (42 "/tmp/coil-stogir-vector-arithmetic-42.o")
+    (43 "/tmp/coil-stogir-vector-arithmetic-43.o")
+    (44 "/tmp/coil-stogir-vector-arithmetic-44.o")
+    (45 "/tmp/coil-stogir-vector-arithmetic-45.o")
+    (46 "/tmp/coil-stogir-vector-arithmetic-46.o")
+    (47 "/tmp/coil-stogir-vector-arithmetic-47.o")
+    (48 "/tmp/coil-stogir-vector-arithmetic-48.o")
+    (49 "/tmp/coil-stogir-vector-arithmetic-49.o")
+    (50 "/tmp/coil-stogir-vector-arithmetic-50.o")
+    (51 "/tmp/coil-stogir-vector-arithmetic-51.o")
+    (52 "/tmp/coil-stogir-vector-arithmetic-52.o")
+    (53 "/tmp/coil-stogir-vector-arithmetic-53.o")
+    (54 "/tmp/coil-stogir-vector-arithmetic-54.o")
+    (55 "/tmp/coil-stogir-vector-arithmetic-55.o")
+    (56 "/tmp/coil-stogir-vector-arithmetic-56.o")
+    (57 "/tmp/coil-stogir-vector-arithmetic-57.o")
+    (58 "/tmp/coil-stogir-vector-arithmetic-58.o")
+    (59 "/tmp/coil-stogir-vector-arithmetic-59.o")
+    (60 "/tmp/coil-stogir-vector-arithmetic-60.o")
+    (61 "/tmp/coil-stogir-vector-arithmetic-61.o")
+    (62 "/tmp/coil-stogir-vector-arithmetic-62.o")
+    (63 "/tmp/coil-stogir-vector-arithmetic-63.o")
+    (64 "/tmp/coil-stogir-vector-arithmetic-64.o")
+    (_ "invalid")))
+
+(defn generate [(ty i32) (opcode i32) (mode i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        output (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        a (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        b (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        p (require (b/vector-load! (mut graph) ty 8 start a true))
+        q (require (b/vector-load! (mut graph) ty 8 p b true))
+        (mut left-bytes) (ArrayList::new [u8] allocator)
+        (mut right-bytes) (ArrayList::new [u8] allocator)
+        (mut i) (: 0 i32)
+        (mut failures) 0
+        width (types/size ty 8)
+        base (types/base-type ty)]
+    (while (< i width)
+      (push! (mut left-bytes) (input-byte base (cast i64 i) 0 false))
+      (push! (mut right-bytes) (input-byte base (cast i64 i) 0 true))
+      (set! i (+ i 1)))
+    (let [left
+            (if (or (= mode 1) (= mode 3))
+                (require (b/vector-constant! (mut graph)
+                                             ty
+                                             8
+                                             (slice left-bytes)))
+                p)
+          right
+            (if (= mode 4)
+                left
+                (if (or (= mode 2) (= mode 3))
+                    (require (b/vector-constant! (mut graph)
+                                                 ty
+                                                 8
+                                                 (slice right-bytes)))
+                    q))
+          result
+            (require (b/vector-binary! (mut graph)
+                                       opcode
+                                       ty
+                                       left
+                                       right
+                                       (if (= opcode 29) start (: 0 i32))))
+          (mut control)
+            (require (b/vector-store! (mut graph) 8 q output result true))]
+      (when (!= mode 4)
+        (set! control
+              (require (b/vector-store! (mut graph)
+                                        8
+                                        control
+                                        (address! (mut graph) output 24)
+                                        left
+                                        true)))
+        (set! control
+              (require (b/vector-store! (mut graph)
+                                        8
+                                        control
+                                        (address! (mut graph) output 48)
+                                        right
+                                        true))))
+      (let [ret (require (b/emit! (mut graph) 120 0 [control (: 0 i32) 0]))
+            id (fixture-id ty opcode mode)]
+        (when (>= id 0)
+          (match (compile/object graph start [ret] (fixture-name id) allocator)
+            (Err [message]
+                 (println "{}" message)
+                 (set! failures (+ failures 1)))
+            (Ok [object]
+                (let [(mut object) object]
+                  (match (fs/write-file allocator
+                                        (fixture-path id)
+                                        (slice object))
+                    (Err [_] (set! failures (+ failures 1)))
+                    (Ok [_] 0))
+                  (free! (mut object))))))
+        (match (compile/image graph
+                              start
+                              [ret]
+                              "_vector_arithmetic_jit"
+                              allocator)
+          (Err [message]
+               (println "ty{} op{} mode{}: {}" ty opcode mode message)
+               (set! failures (+ failures 1)))
+          (Ok [source]
+              (let [(mut source) source]
+                (match (jit/map-image source allocator)
+                  (Err [message]
+                       (println "{}" message)
+                       (set! failures (+ failures 1)))
+                  (Ok [loaded]
+                      (let [(mut loaded) loaded]
+                        (set! failures
+                              (+ failures
+                                 (exercise ty
+                                           opcode
+                                           mode
+                                           (.base (.memory loaded)))))
+                        (jit/release-image! (mut loaded)))))
+                (image/release! (mut source)))))))
+    (free! (mut left-bytes))
+    (free! (mut right-bytes))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0
+        (mut cases) 0]
+    (for base [(: 1 i32) 2 3 4 5 6 7 8 9 10 11 12 13]
+      (for lanes [(: 1 i32) 2 4 8 16]
+        (let [ty (types/vector-type base lanes)]
+          (when (types/short-vector? ty 8)
+            (for opcode [(: 26 i32) 27 28 29 46 47 48]
+              (when (va/valid-type? opcode ty)
+                (for mode [(: 0 i32) 1 2 3 4]
+                  (set! failures (+ failures (generate ty opcode mode)))
+                  (set! cases (+ cases 1)))))))))
+    (when (!= cases 610) (set! failures (+ failures 1)))
+    (println "native vector binary arithmetic and logical matrix: {} graphs, {} failures"
+             cases
+             failures)
+    (if (= failures 0) 0 1)))

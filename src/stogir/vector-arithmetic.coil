@@ -1,0 +1,83 @@
+;;; Typed vector binary operations over the shared scalar/vector opcode space.
+(module stogir.vector-arithmetic)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.opcode" :as op)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn operation? [(opcode i32)] (-> bool)
+  (or (= opcode 26)
+      (= opcode 27)
+      (= opcode 28)
+      (= opcode 29)
+      (= opcode 46)
+      (= opcode 47)
+      (= opcode 48)))
+
+(defn valid-type? [(opcode i32) (ty i32)] (-> bool)
+  (let [base (types/base-type ty)]
+    (and (types/vector? ty)
+         (operation? opcode)
+         (if (or (= opcode 46) (= opcode 47) (= opcode 48))
+             (types/integer? base)
+             (if (types/floating? base)
+                 true
+                 (and (types/integer? base)
+                      (!= base 1)
+                      (or (= opcode 26) (= opcode 27))))))))
+
+(defn node? [(graph g/Graph) (reference i32)] (-> bool)
+  (match (g/lookup graph reference)
+    (None [] false)
+    (Some [node]
+          (and (operation? (cast i32 (n/opcode node)))
+               (types/vector? (cast i32 (n/type-id node)))))))
+
+(defn operands [(graph g/Graph)
+                (opcode i32)
+                (ty i32)
+                (left i32)
+                (right i32)
+                (guard i32)]
+  (-> (Result i32 (slice u8)))
+  (let [(mut error) ""]
+    (when (not (valid-type? opcode ty))
+      (set! error "unsupported vector binary operation or element type"))
+    (for input [left right]
+      (match (g/lookup graph input)
+        (None [] (set! error "vector binary operand missing"))
+        (Some [node]
+              (when (or (!= (cast i32 (n/type-id node)) ty)
+                        (= (n/opcode node) 72))
+                (set! error "vector binary operand type or storage mismatch")))))
+    (when (!= guard 0)
+      (if (!= opcode 29)
+          (set! error "only vector DIV accepts a guard")
+          (match (g/lookup graph guard)
+            (None [] (set! error "vector division guard missing"))
+            (Some [node]
+                  (when (or (<= guard 0)
+                            (not (or (op/block-start? (cast i32 (n/opcode node)))
+                                     (= (n/opcode node) 101)
+                                     (= (n/opcode node) 102))))
+                    (set! error
+                          "vector division guard must be a block start or guard"))))))
+    (if (= error "") (Ok ty) (Err error))))
+
+(defn validate [(graph g/Graph) (reference i32)] (-> (Result i32 (slice u8)))
+  (match (g/lookup graph reference)
+    (None [] (Err "vector binary instruction missing"))
+    (Some [node]
+          (let [opcode (cast i32 (n/opcode node))]
+            (if (or (<= reference 0)
+                    (not (node? graph reference))
+                    (!= (get (.arities graph) (cast i64 reference))
+                        (if (= opcode 29) 3 2)))
+                (Err "invalid vector binary instruction shape")
+                (operands graph
+                          opcode
+                          (cast i32 (n/type-id node))
+                          (.op1 node)
+                          (.op2 node)
+                          (if (= opcode 29) (.op3 node) 0)))))))

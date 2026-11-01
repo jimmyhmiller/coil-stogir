@@ -1,0 +1,118 @@
+;;; Complete D/Q binary emission, with independent widths on both operands.
+(module stogir.a64.vector-arithmetic)
+(import "stogir.vector-arithmetic" :as vector)
+(import "stogir.types" :as types)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.allocation" :as allocation)
+(import "stogir.locations" :as loc)
+(import "stogir.a64.code" :as code)
+(import "stogir.a64.value" :as value)
+(import "stogir.a64.registers" :as registers)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err])
+
+(defn instruction [(opcode i32) (ty i32) (rd i32) (rn i32) (rm i32)]
+  (-> (Result u32 (slice u8)))
+  (if (or (not (vector/valid-type? opcode ty))
+          (not (types/short-vector? ty 8))
+          (< rd 0)
+          (> rd 31)
+          (< rn 0)
+          (> rn 31)
+          (< rm 0)
+          (> rm 31))
+      (Err "unsupported AArch64 vector binary shape or registers")
+      (let [base (types/base-type ty)
+            width (types/size ty 8)
+            element (types/scalar-size base 8)
+            q (if (= width 16) (: 0x40000000 u32) (: 0 u32))
+            size
+              (if (= element 1)
+                  (: 0 u32)
+                  (if (= element 2) 1 (if (= element 4) 2 3)))
+            fields (| (cast u32 rd) (<< (cast u32 rn) 5) (<< (cast u32 rm) 16))]
+        (if (and (types/floating? base) (= width 8) (= element 8))
+            (encode/floating-binary true opcode rd rn rm)
+            (Ok (| fields
+                   (if (or (= opcode 46) (= opcode 47) (= opcode 48))
+                       (| q
+                          (if (= opcode 46)
+                              (: 0x0EA01C00 u32)
+                              (if (= opcode 47)
+                                  (: 0x0E201C00 u32)
+                                  (: 0x2E201C00 u32))))
+                       (if (types/floating? base)
+                           (| q
+                              (if (= element 8) (: 0x00400000 u32) (: 0 u32))
+                              (match opcode
+                                (26 (: 0x0E20D400 u32))
+                                (27 (: 0x0EA0D400 u32))
+                                (28 (: 0x2E20DC00 u32))
+                                (_ (: 0x2E20FC00 u32))))
+                           (if (and (= width 8) (= element 8))
+                               (if (= opcode 26)
+                                   (: 0x5EE08400 u32)
+                                   (: 0x7EE08400 u32))
+                               (| q
+                                  (<< size 22)
+                                  (if (= opcode 26)
+                                      (: 0x0E208400 u32)
+                                      (: 0x2E208400 u32))))))))))))
+
+(defn emit! [(output (mut code/Buffer))
+             (graph g/Graph)
+             (parts (ArrayList allocation/Part))
+             (reference i32)
+             (position i64)]
+  (-> (Result i32 (slice u8)))
+  (match (vector/validate graph reference)
+    (Err [message] (Err message))
+    (Ok [ty]
+        (let [node (get (.instructions graph) (cast i64 reference))
+              (mut temporary) (code/create (.alc (.text output)))
+              (mut error) ""
+              (mut destination) (: -1 i32)
+              (mut left) (: -1 i32)
+              (mut right) (: -1 i32)]
+          (match (loc/lookup parts reference (+ position 1))
+            (Err [message] (set! error message))
+            (Ok [location]
+                (if (and (= (.kind location) 0)
+                         (registers/allocatable? ty
+                                                 (cast i32 (.value location))))
+                    (set! destination (- (cast i32 (.value location)) 32))
+                    (set! error "vector result requires a SIMD register"))))
+          (match (value/register! (mut temporary)
+                                  graph
+                                  parts
+                                  (.op1 node)
+                                  position
+                                  16
+                                  62)
+            (Err [message] (set! error message))
+            (Ok [reg] (set! left (- reg 32))))
+          (match (value/register! (mut temporary)
+                                  graph
+                                  parts
+                                  (.op2 node)
+                                  position
+                                  17
+                                  63)
+            (Err [message] (set! error message))
+            (Ok [reg] (set! right (- reg 32))))
+          (when (= error "")
+            (match (instruction (cast i32 (n/opcode node))
+                                ty
+                                destination
+                                left
+                                right)
+              (Err [message] (set! error message))
+              (Ok [word] (bytes/append32! (mut (.text temporary)) word))))
+          (let [count (cast i32 (len (.text temporary)))]
+            (when (and (= error "") (not (code/append! (mut output) temporary)))
+              (set! error "invalid vector binary code references"))
+            (code/release! (mut temporary))
+            (if (= error "") (Ok count) (Err error)))))))
