@@ -1256,3 +1256,42 @@ The final unchanged-source regression passes all 199 standalone checks and all
 before linked validation; exact file/consumer pass sets match, and linked output
 has no warnings. All 362 implementation/test files are Coil. Formatting and diff
 checks pass. Current evidence is indexed in the coil-stogir project pad.
+
+
+### Vector comparison checkpoint
+
+The independent vector predicate module validates equal operand types, explicit
+integer result masks with matching lane count/element width, and 4/8-byte target
+pointer layouts. `builder.vector-compare!` takes graph, opcode, result mask type,
+pointer bytes and the two operands. `vector-comparison.mask-type` computes a
+canonical unsigned mask type for an operand type and pointer width; matching
+signed, Boolean-byte and address mask types are also accepted.
+
+Integer EQ/NE, signed LT/GE/LE/GT and unsigned ULT/UGE/ULE/UGT use lane bit-width
+semantics independently of the declared integer signedness. Floating comparisons
+implement all twelve scalar-library predicates, including unordered U-prefixed
+relations and ORDERED/UNORDERED. True lanes are all ones, false lanes zero.
+Scalar floating classification now excludes vector predicates so valid masks do
+not enter scalar Boolean validation. The generic vector verifier, SIMD constraints
+and native dispatch consume the separately typed input/result roles.
+
+D/Q emission uses one SIMD comparison for basic relations, inversion for NE and
+unordered-inclusive predicates, and paired self-comparisons/AND for orderedness.
+An aliased input is saved before the two comparisons; v30 is reused only after
+its input is consumed. Literal inputs may occupy either reserved SIMD register.
+All emission is transactional and needs no helper calls or per-lane loops.
+
+Pinned upstream AArch64 vector U-prefixed floating paths use ordered FCMGT/FCMGE,
+whereas scalar paths include unordered inputs. Its vector ORDERED/UNORDERED route
+has no matching emission case and reaches NIY in assertion builds. This library
+uses consistent scalar predicate semantics; source capability differences are
+recorded in the project pad and do not imply full exceptional-input equivalence.
+
+Focused checks cover 3,484 register cases / 4,346 independent LLVM MC words, all
+91 abstract vector type codes and matching integer mask representations, target
+pointer-width geometry, 1,340 native graph variants with 121 pattern pairs each,
+3,484 forced physical-register JIT harnesses, 56 clobbering-call/spill/dynamic-frame
+pressure graphs and 860 linked Mach-O objects. Remaining lane/shuffle/conversion
+families, broader independent-library coverage/optimization/scaling/targets, the
+actual Coil compiler backend and equivalent LLVM/TPDE runtime/compile-time
+benchmarks remain required.

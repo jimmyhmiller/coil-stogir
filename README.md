@@ -60,6 +60,8 @@ scalar counts, plus ROL/ROR with protected source aliases, have native and linke
 coverage. Lane-wise integer and floating MIN/MAX also have native and linked
 coverage. Floating extrema select the left operand on an ordered tie and the
 right operand for unordered inputs, preserving exact payloads and zero signs.
+Integer and floating vector comparisons return checked full-lane integer masks;
+floating U-prefixed predicates include unordered inputs, matching scalar rules.
 Remaining vector operations and broader ABI coverage are unfinished.
 
 Native copy, overlap-safe move and zero builders expand into existing memory

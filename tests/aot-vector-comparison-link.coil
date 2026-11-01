@@ -1,0 +1,2242 @@
+(module stogir.tests.aot-vector-comparison-link)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "stogir.types" :as types)
+
+(defn pattern [(base i32) (lane i64) (seed i64) (right? bool)] (-> u64)
+  (let [i (% (+ lane (if right? (/ seed 11) (% seed 11))) 11)
+        fp? (types/floating? base)
+        wide? (= base 12)]
+    (if fp?
+        (if wide?
+            (match i
+              (0 (: 0 u64))
+              (1 0x8000000000000000)
+              (2 0x3FF0000000000000)
+              (3 0xBFF0000000000000)
+              (4 1)
+              (5 0x000FFFFFFFFFFFFF)
+              (6 0x7FEFFFFFFFFFFFFF)
+              (7 0x7FF0000000000000)
+              (8 0xFFF0000000000000)
+              (9 0x7FF8123456789ABC)
+              (_ 0x7FF0123456789ABC))
+            (match i
+              (0 (: 0 u64))
+              (1 0x80000000)
+              (2 0x3F800000)
+              (3 0xBF800000)
+              (4 1)
+              (5 0x007FFFFF)
+              (6 0x7F7FFFFF)
+              (7 0x7F800000)
+              (8 0xFF800000)
+              (9 0x7FC12345)
+              (_ 0x7F812345)))
+        (match i
+          (0 (: 0 u64))
+          (1 1)
+          (2 0xFFFFFFFFFFFFFFFF)
+          (3 (<< (: 1 u64) (cast u64 (- (* 8 (types/scalar-size base 8)) 1))))
+          (4 (- (<< (: 1 u64) (cast u64 (- (* 8 (types/scalar-size base 8)) 1)))
+                1))
+          (5 0x8080808080808080)
+          (6 0x7F7F7F7F7F7F7F7F)
+          (7 0xFFFF0000FFFF0000)
+          (8 0x123456789ABCDEF0)
+          (9 0xFFFFFFFFFFFFFFFE)
+          (_ 0x0102030405060708)))))
+
+(defn input-byte [(base i32) (index i64) (seed i64) (right? bool)] (-> u8)
+  (let [width (cast i64 (types/scalar-size base 8))]
+    (cast u8
+          (>> (pattern base (/ index width) seed right?)
+              (cast u64 (* (% index width) 8))))))
+
+(defn literal-word [(base i32) (lane i64) (right? bool) (mode i32)] (-> u64)
+  (let [bits (* 8 (types/scalar-size base 8))
+        mask (cast u64 (- (<< (: 1 u128) (cast u128 bits)) 1))]
+    (if (= mode 5)
+        (if right? mask (cast u64 (<< (: 1 u128) (cast u128 (- bits 1)))))
+        (if (and (= mode 6) right?)
+            (: 0 u64)
+            (pattern base lane (if right? 99 10) right?)))))
+
+(defn literal-byte [(base i32) (index i64) (right? bool) (mode i32)] (-> u8)
+  (let [width (cast i64 (types/scalar-size base 8))]
+    (cast u8
+          (>> (literal-word base (/ index width) right? mode)
+              (cast u64 (* (% index width) 8))))))
+
+(defn nan? [(base i32) (bits u64)] (-> bool)
+  (let [exponent (if (= base 12) (: 0x7FF0000000000000 u64) 0x7F800000)
+        fraction (if (= base 12) (: 0x000FFFFFFFFFFFFF u64) 0x007FFFFF)]
+    (and (= (& bits exponent) exponent) (!= (& bits fraction) 0))))
+
+(defn predicate32 [(op i32) (a f32) (b f32)] (-> bool)
+  (match op
+    (14 (= a b))
+    (15 (!= a b))
+    (16 (< a b))
+    (17 (>= a b))
+    (18 (<= a b))
+    (19 (> a b))
+    (20 (not (>= a b)))
+    (21 (not (< a b)))
+    (22 (not (> a b)))
+    (23 (not (<= a b)))
+    (24 true)
+    (_ false)))
+
+(defn predicate64 [(op i32) (a f64) (b f64)] (-> bool)
+  (match op
+    (14 (= a b))
+    (15 (!= a b))
+    (16 (< a b))
+    (17 (>= a b))
+    (18 (<= a b))
+    (19 (> a b))
+    (20 (not (>= a b)))
+    (21 (not (< a b)))
+    (22 (not (> a b)))
+    (23 (not (<= a b)))
+    (24 true)
+    (_ false)))
+
+(defn expected [(opcode i32) (base i32) (a u64) (b u64)] (-> u64)
+  (let [bits (* 8 (types/scalar-size base 8))
+        range (<< (: 1 u128) (cast u128 bits))
+        mask (- range 1)
+        x (& (cast u128 a) mask)
+        y (& (cast u128 b) mask)
+        yes?
+          (if (types/floating? base)
+              (if (or (nan? base a) (nan? base b))
+                  (or (= opcode 15)
+                      (and (>= opcode 20) (<= opcode 23))
+                      (= opcode 25))
+                  (if (= base 12)
+                      (let [(mut l) (: 0.0 f64)
+                            (mut r) (: 0.0 f64)]
+                        (p/store! (p/cast (ptr u64) (mut l)) a)
+                        (p/store! (p/cast (ptr u64) (mut r)) b)
+                        (predicate64 opcode l r))
+                      (let [(mut l) (: 0.0 f32)
+                            (mut r) (: 0.0 f32)]
+                        (p/store! (p/cast (ptr u32) (mut l)) (cast u32 a))
+                        (p/store! (p/cast (ptr u32) (mut r)) (cast u32 b))
+                        (predicate32 opcode l r))))
+              (let [sign (>> range 1)
+                    l
+                      (if (>= x sign)
+                          (- (cast i128 x) (cast i128 range))
+                          (cast i128 x))
+                    r
+                      (if (>= y sign)
+                          (- (cast i128 y) (cast i128 range))
+                          (cast i128 y))]
+                (match opcode
+                  (14 (= x y))
+                  (15 (!= x y))
+                  (16 (< l r))
+                  (17 (>= l r))
+                  (18 (<= l r))
+                  (19 (> l r))
+                  (20 (< x y))
+                  (21 (>= x y))
+                  (22 (<= x y))
+                  (_ (> x y)))))]
+    (if yes? (cast u64 mask) (: 0 u64))))
+
+(defn exercise [(ty i32) (opcode i32) (mode i32) (address (ptr u8))] (-> i64)
+  (let [allocator (malloc-allocator)
+        base (types/base-type ty)
+        width (types/size ty 8)
+        lane-width (types/scalar-size base 8)
+        lanes (/ width lane-width)
+        f (p/cast (fnptr (cc/C) [u64 u64 u64] void) address)
+        (mut a) (ArrayList::new [u8] allocator)
+        (mut b) (ArrayList::new [u8] allocator)
+        (mut output) (ArrayList::new [u8] allocator)
+        (mut failures) 0
+        (mut seed) (: 0 i64)]
+    (while (< seed 121)
+      (clear! (mut a))
+      (clear! (mut b))
+      (clear! (mut output))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 32)
+          (push! (mut a) (input-byte base i seed false))
+          (push! (mut b) (input-byte base i seed true))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 80) (push! (mut output) 165) (set! i (+ i 1))))
+      (call-ptr f
+                (p/cast u64 (.data output))
+                (p/cast u64 (.data a))
+                (p/cast u64 (.data b)))
+      (let [(mut lane) (: 0 i32)]
+        (while (< lane lanes)
+          (let [x
+                  (if (or (= mode 1) (= mode 3) (>= mode 5))
+                      (literal-word base (cast i64 lane) false mode)
+                      (pattern base (cast i64 lane) seed false))
+                y
+                  (if (= mode 4)
+                      x
+                      (if (or (= mode 2) (= mode 3) (>= mode 5))
+                          (literal-word base (cast i64 lane) true mode)
+                          (pattern base (cast i64 lane) seed true)))
+                result (expected opcode base x y)
+                (mut got) (: 0 u64)
+                (mut byte) (: 0 i32)]
+            (while (< byte lane-width)
+              (set! got
+                    (| got
+                       (<< (cast u64
+                                 (get output
+                                      (cast i64 (+ (* lane lane-width) byte))))
+                           (cast u64 (* byte 8)))))
+              (set! byte (+ byte 1)))
+            (when (!= got result)
+              (println "vector binary ty{} op{} mode{} seed{} lane{} got{} expected{}"
+                       ty
+                       opcode
+                       mode
+                       seed
+                       lane
+                       got
+                       result)
+              (set! failures (+ failures 1))))
+          (set! lane (+ lane 1))))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 80)
+          (when (>= i (cast i64 width))
+            (let [left?
+                    (and (>= mode 0)
+                         (!= mode 4)
+                         (>= i 24)
+                         (< i (+ 24 (cast i64 width))))
+                  right?
+                    (and (>= mode 0)
+                         (!= mode 4)
+                         (>= i 48)
+                         (< i (+ 48 (cast i64 width))))
+                  wanted
+                    (if left?
+                        (if (or (= mode 1) (= mode 3) (>= mode 5))
+                            (literal-byte base (- i 24) false mode)
+                            (input-byte base (- i 24) seed false))
+                        (if right?
+                            (if (or (= mode 2) (= mode 3) (>= mode 5))
+                                (literal-byte base (- i 48) true mode)
+                                (input-byte base (- i 48) seed true))
+                            (: 165 u8)))]
+              (when (!= (get output i) wanted) (set! failures (+ failures 1)))))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 32)
+          (when (or (!= (get a i) (input-byte base i seed false))
+                    (!= (get b i) (input-byte base i seed true)))
+            (set! failures (+ failures 1)))
+          (set! i (+ i 1))))
+      (set! seed (+ seed 1)))
+    (free! (mut a))
+    (free! (mut b))
+    (free! (mut output))
+    failures))
+
+(defn probe :cc (cc/C) [(input (ptr u8))] (-> u64)
+  (p/machine-code (Aarch64)
+                  0xf1
+                  0x03
+                  0x00
+                  0xaa
+                  0x20
+                  0x02
+                  0xc0
+                  0x3d
+                  0x21
+                  0x02
+                  0xc0
+                  0x3d
+                  0x22
+                  0x02
+                  0xc0
+                  0x3d
+                  0x23
+                  0x02
+                  0xc0
+                  0x3d
+                  0x24
+                  0x02
+                  0xc0
+                  0x3d
+                  0x25
+                  0x02
+                  0xc0
+                  0x3d
+                  0x26
+                  0x02
+                  0xc0
+                  0x3d
+                  0x27
+                  0x02
+                  0xc0
+                  0x3d
+                  0x30
+                  0x02
+                  0xc0
+                  0x3d
+                  0x31
+                  0x02
+                  0xc0
+                  0x3d
+                  0x32
+                  0x02
+                  0xc0
+                  0x3d
+                  0x33
+                  0x02
+                  0xc0
+                  0x3d
+                  0x34
+                  0x02
+                  0xc0
+                  0x3d
+                  0x35
+                  0x02
+                  0xc0
+                  0x3d
+                  0x36
+                  0x02
+                  0xc0
+                  0x3d
+                  0x37
+                  0x02
+                  0xc0
+                  0x3d
+                  0x38
+                  0x02
+                  0xc0
+                  0x3d
+                  0x39
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3a
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3b
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3c
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3d
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3e
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3f
+                  0x02
+                  0xc0
+                  0x3d
+                  0xa0
+                  0x15
+                  0x80
+                  0xd2
+                  0xc1
+                  0x15
+                  0x80
+                  0xd2
+                  0xe2
+                  0x15
+                  0x80
+                  0xd2
+                  0x03
+                  0x16
+                  0x80
+                  0xd2
+                  0x24
+                  0x16
+                  0x80
+                  0xd2
+                  0x45
+                  0x16
+                  0x80
+                  0xd2
+                  0x66
+                  0x16
+                  0x80
+                  0xd2
+                  0x87
+                  0x16
+                  0x80
+                  0xd2
+                  0xa8
+                  0x16
+                  0x80
+                  0xd2
+                  0xc9
+                  0x16
+                  0x80
+                  0xd2
+                  0xea
+                  0x16
+                  0x80
+                  0xd2
+                  0x0b
+                  0x17
+                  0x80
+                  0xd2
+                  0x2c
+                  0x17
+                  0x80
+                  0xd2
+                  0x4d
+                  0x17
+                  0x80
+                  0xd2
+                  0x6e
+                  0x17
+                  0x80
+                  0xd2
+                  0x8f
+                  0x17
+                  0x80
+                  0xd2
+                  0xc0
+                  0x03
+                  0x5f
+                  0xd6))
+
+(defn read-word [(buffer (slice u8)) (offset i64) (width i32)] (-> u64)
+  (let [(mut result) (: 0 u64)
+        (mut i) (: 0 i32)]
+    (while (< i width)
+      (set! result
+            (| result
+               (<< (cast u64 (get buffer (+ offset (cast i64 i))))
+                   (cast u64 (* i 8)))))
+      (set! i (+ i 1)))
+    result))
+
+(defn pressure-exercise [(ty i32) (opcode i32) (address (ptr u8))] (-> i64)
+  (let [allocator (malloc-allocator)
+        base (types/base-type ty)
+        width (types/size ty 8)
+        element (types/scalar-size base 8)
+        lanes (/ width element)
+        f (p/cast (fnptr (cc/C) [u64 u64 u64] u64) address)
+        target
+          (p/cast u64
+                  (p/cast (ptr u8)
+                          (: (fnptr-of probe) (fnptr (cc/C) [(ptr u8)] u64))))
+        (mut input) (ArrayList::new [u8] allocator)
+        (mut output) (ArrayList::new [u8] allocator)
+        (mut failures) 0
+        (mut seed) (: 0 i64)]
+    (while (< seed 11)
+      (clear! (mut input))
+      (clear! (mut output))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 2048)
+          (push! (mut input) (input-byte base i seed false))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 2064) (push! (mut output) 165) (set! i (+ i 1))))
+      (when (!= (call-ptr f
+                          (p/cast u64 (p/index (.data output) 3))
+                          (p/cast u64 (.data input))
+                          target)
+                811)
+        (println "vector pressure guard/result ty{} op{} seed{}" ty opcode seed)
+        (set! failures (+ failures 1)))
+      (let [(mut lane) (: 0 i32)]
+        (while (< lane (* 40 lanes))
+          (let [a (pattern base (cast i64 lane) seed false)
+                b (pattern base (cast i64 lane) 0 true)
+                wanted (expected opcode base a b)
+                got
+                  (read-word (slice output)
+                             (+ 3 (* (cast i64 lane) (cast i64 element)))
+                             element)]
+            (when (!= wanted got)
+              (println "vector pressure ty{} op{} seed{} lane{} got{} expected{}"
+                       ty
+                       opcode
+                       seed
+                       lane
+                       got
+                       wanted)
+              (set! failures (+ failures 1))))
+          (set! lane (+ lane 1))))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 2064)
+          (let [pos (- i 3)]
+            (when (not (and (>= pos 0) (< pos (* 40 (cast i64 width)))))
+              (let [wanted
+                      (if (and (>= pos 1024)
+                               (< pos (+ 1024 (* 40 (cast i64 width)))))
+                          (input-byte base (- pos 1024) seed false)
+                          (: 165 u8))]
+                (when (!= (get output i) wanted) (set! failures (+ failures 1))))))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 2048)
+          (when (!= (get input i) (input-byte base i seed false))
+            (set! failures (+ failures 1)))
+          (set! i (+ i 1))))
+      (set! seed (+ seed 1)))
+    (free! (mut input))
+    (free! (mut output))
+    failures))
+
+(import "coil.os" :as os)
+
+(defn linked-exercise [(ty i32) (opcode i32) (mode i32) (name (ptr i8))]
+  (-> i64)
+  (let [address (os/dlsym (p/cast (ptr i8) (: -2 i64)) name)]
+    (if (= (p/cast u64 address) 0)
+        (do (println "missing linked vector extrema symbol") 1)
+        (exercise ty opcode mode (p/cast (ptr u8) address)))))
+
+(defn linked-pressure [(ty i32) (opcode i32) (name (ptr i8))] (-> i64)
+  (let [address (os/dlsym (p/cast (ptr i8) (: -2 i64)) name)]
+    (if (= (p/cast u64 address) 0)
+        (do (println "missing linked vector extrema pressure symbol") 1)
+        (pressure-exercise ty opcode (p/cast (ptr u8) address)))))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (set! failures
+          (+ failures (linked-exercise 65 14 0 c"stogir_vector_comparison_0")))
+    (set! failures
+          (+ failures (linked-exercise 65 14 3 c"stogir_vector_comparison_1")))
+    (set! failures
+          (+ failures (linked-exercise 65 14 4 c"stogir_vector_comparison_2")))
+    (set! failures
+          (+ failures (linked-exercise 65 15 0 c"stogir_vector_comparison_3")))
+    (set! failures
+          (+ failures (linked-exercise 65 15 3 c"stogir_vector_comparison_4")))
+    (set! failures
+          (+ failures (linked-exercise 65 15 4 c"stogir_vector_comparison_5")))
+    (set! failures
+          (+ failures (linked-exercise 65 16 0 c"stogir_vector_comparison_6")))
+    (set! failures
+          (+ failures (linked-exercise 65 16 3 c"stogir_vector_comparison_7")))
+    (set! failures
+          (+ failures (linked-exercise 65 16 4 c"stogir_vector_comparison_8")))
+    (set! failures
+          (+ failures (linked-exercise 65 17 0 c"stogir_vector_comparison_9")))
+    (set! failures
+          (+ failures (linked-exercise 65 17 3 c"stogir_vector_comparison_10")))
+    (set! failures
+          (+ failures (linked-exercise 65 17 4 c"stogir_vector_comparison_11")))
+    (set! failures
+          (+ failures (linked-exercise 65 18 0 c"stogir_vector_comparison_12")))
+    (set! failures
+          (+ failures (linked-exercise 65 18 3 c"stogir_vector_comparison_13")))
+    (set! failures
+          (+ failures (linked-exercise 65 18 4 c"stogir_vector_comparison_14")))
+    (set! failures
+          (+ failures (linked-exercise 65 19 0 c"stogir_vector_comparison_15")))
+    (set! failures
+          (+ failures (linked-exercise 65 19 3 c"stogir_vector_comparison_16")))
+    (set! failures
+          (+ failures (linked-exercise 65 19 4 c"stogir_vector_comparison_17")))
+    (set! failures
+          (+ failures (linked-exercise 65 20 0 c"stogir_vector_comparison_18")))
+    (set! failures
+          (+ failures (linked-exercise 65 20 3 c"stogir_vector_comparison_19")))
+    (set! failures
+          (+ failures (linked-exercise 65 20 4 c"stogir_vector_comparison_20")))
+    (set! failures
+          (+ failures (linked-exercise 65 21 0 c"stogir_vector_comparison_21")))
+    (set! failures
+          (+ failures (linked-exercise 65 21 3 c"stogir_vector_comparison_22")))
+    (set! failures
+          (+ failures (linked-exercise 65 21 4 c"stogir_vector_comparison_23")))
+    (set! failures
+          (+ failures (linked-exercise 65 22 0 c"stogir_vector_comparison_24")))
+    (set! failures
+          (+ failures (linked-exercise 65 22 3 c"stogir_vector_comparison_25")))
+    (set! failures
+          (+ failures (linked-exercise 65 22 4 c"stogir_vector_comparison_26")))
+    (set! failures
+          (+ failures (linked-exercise 65 23 0 c"stogir_vector_comparison_27")))
+    (set! failures
+          (+ failures (linked-exercise 65 23 3 c"stogir_vector_comparison_28")))
+    (set! failures
+          (+ failures (linked-exercise 65 23 4 c"stogir_vector_comparison_29")))
+    (set! failures
+          (+ failures (linked-exercise 81 14 0 c"stogir_vector_comparison_30")))
+    (set! failures
+          (+ failures (linked-exercise 81 14 3 c"stogir_vector_comparison_31")))
+    (set! failures
+          (+ failures (linked-exercise 81 14 4 c"stogir_vector_comparison_32")))
+    (set! failures
+          (+ failures (linked-exercise 81 15 0 c"stogir_vector_comparison_33")))
+    (set! failures
+          (+ failures (linked-exercise 81 15 3 c"stogir_vector_comparison_34")))
+    (set! failures
+          (+ failures (linked-exercise 81 15 4 c"stogir_vector_comparison_35")))
+    (set! failures
+          (+ failures (linked-exercise 81 16 0 c"stogir_vector_comparison_36")))
+    (set! failures
+          (+ failures (linked-exercise 81 16 3 c"stogir_vector_comparison_37")))
+    (set! failures
+          (+ failures (linked-exercise 81 16 4 c"stogir_vector_comparison_38")))
+    (set! failures
+          (+ failures (linked-exercise 81 17 0 c"stogir_vector_comparison_39")))
+    (set! failures
+          (+ failures (linked-exercise 81 17 3 c"stogir_vector_comparison_40")))
+    (set! failures
+          (+ failures (linked-exercise 81 17 4 c"stogir_vector_comparison_41")))
+    (set! failures
+          (+ failures (linked-exercise 81 18 0 c"stogir_vector_comparison_42")))
+    (set! failures
+          (+ failures (linked-exercise 81 18 3 c"stogir_vector_comparison_43")))
+    (set! failures
+          (+ failures (linked-exercise 81 18 4 c"stogir_vector_comparison_44")))
+    (set! failures
+          (+ failures (linked-exercise 81 19 0 c"stogir_vector_comparison_45")))
+    (set! failures
+          (+ failures (linked-exercise 81 19 3 c"stogir_vector_comparison_46")))
+    (set! failures
+          (+ failures (linked-exercise 81 19 4 c"stogir_vector_comparison_47")))
+    (set! failures
+          (+ failures (linked-exercise 81 20 0 c"stogir_vector_comparison_48")))
+    (set! failures
+          (+ failures (linked-exercise 81 20 3 c"stogir_vector_comparison_49")))
+    (set! failures
+          (+ failures (linked-exercise 81 20 4 c"stogir_vector_comparison_50")))
+    (set! failures
+          (+ failures (linked-exercise 81 21 0 c"stogir_vector_comparison_51")))
+    (set! failures
+          (+ failures (linked-exercise 81 21 3 c"stogir_vector_comparison_52")))
+    (set! failures
+          (+ failures (linked-exercise 81 21 4 c"stogir_vector_comparison_53")))
+    (set! failures
+          (+ failures (linked-exercise 81 22 0 c"stogir_vector_comparison_54")))
+    (set! failures
+          (+ failures (linked-exercise 81 22 3 c"stogir_vector_comparison_55")))
+    (set! failures
+          (+ failures (linked-exercise 81 22 4 c"stogir_vector_comparison_56")))
+    (set! failures
+          (+ failures (linked-exercise 81 23 0 c"stogir_vector_comparison_57")))
+    (set! failures
+          (+ failures (linked-exercise 81 23 3 c"stogir_vector_comparison_58")))
+    (set! failures
+          (+ failures (linked-exercise 81 23 4 c"stogir_vector_comparison_59")))
+    (set! failures
+          (+ failures (linked-exercise 66 14 0 c"stogir_vector_comparison_60")))
+    (set! failures
+          (+ failures (linked-exercise 66 14 3 c"stogir_vector_comparison_61")))
+    (set! failures
+          (+ failures (linked-exercise 66 14 4 c"stogir_vector_comparison_62")))
+    (set! failures
+          (+ failures (linked-exercise 66 15 0 c"stogir_vector_comparison_63")))
+    (set! failures
+          (+ failures (linked-exercise 66 15 3 c"stogir_vector_comparison_64")))
+    (set! failures
+          (+ failures (linked-exercise 66 15 4 c"stogir_vector_comparison_65")))
+    (set! failures
+          (+ failures (linked-exercise 66 16 0 c"stogir_vector_comparison_66")))
+    (set! failures
+          (+ failures (linked-exercise 66 16 3 c"stogir_vector_comparison_67")))
+    (set! failures
+          (+ failures (linked-exercise 66 16 4 c"stogir_vector_comparison_68")))
+    (set! failures
+          (+ failures (linked-exercise 66 17 0 c"stogir_vector_comparison_69")))
+    (set! failures
+          (+ failures (linked-exercise 66 17 3 c"stogir_vector_comparison_70")))
+    (set! failures
+          (+ failures (linked-exercise 66 17 4 c"stogir_vector_comparison_71")))
+    (set! failures
+          (+ failures (linked-exercise 66 18 0 c"stogir_vector_comparison_72")))
+    (set! failures
+          (+ failures (linked-exercise 66 18 3 c"stogir_vector_comparison_73")))
+    (set! failures
+          (+ failures (linked-exercise 66 18 4 c"stogir_vector_comparison_74")))
+    (set! failures
+          (+ failures (linked-exercise 66 19 0 c"stogir_vector_comparison_75")))
+    (set! failures
+          (+ failures (linked-exercise 66 19 3 c"stogir_vector_comparison_76")))
+    (set! failures
+          (+ failures (linked-exercise 66 19 4 c"stogir_vector_comparison_77")))
+    (set! failures
+          (+ failures (linked-exercise 66 20 0 c"stogir_vector_comparison_78")))
+    (set! failures
+          (+ failures (linked-exercise 66 20 3 c"stogir_vector_comparison_79")))
+    (set! failures
+          (+ failures (linked-exercise 66 20 4 c"stogir_vector_comparison_80")))
+    (set! failures
+          (+ failures (linked-exercise 66 21 0 c"stogir_vector_comparison_81")))
+    (set! failures
+          (+ failures (linked-exercise 66 21 3 c"stogir_vector_comparison_82")))
+    (set! failures
+          (+ failures (linked-exercise 66 21 4 c"stogir_vector_comparison_83")))
+    (set! failures
+          (+ failures (linked-exercise 66 22 0 c"stogir_vector_comparison_84")))
+    (set! failures
+          (+ failures (linked-exercise 66 22 3 c"stogir_vector_comparison_85")))
+    (set! failures
+          (+ failures (linked-exercise 66 22 4 c"stogir_vector_comparison_86")))
+    (set! failures
+          (+ failures (linked-exercise 66 23 0 c"stogir_vector_comparison_87")))
+    (set! failures
+          (+ failures (linked-exercise 66 23 3 c"stogir_vector_comparison_88")))
+    (set! failures
+          (+ failures (linked-exercise 66 23 4 c"stogir_vector_comparison_89")))
+    (set! failures
+          (+ failures (linked-exercise 82 14 0 c"stogir_vector_comparison_90")))
+    (set! failures
+          (+ failures (linked-exercise 82 14 3 c"stogir_vector_comparison_91")))
+    (set! failures
+          (+ failures (linked-exercise 82 14 4 c"stogir_vector_comparison_92")))
+    (set! failures
+          (+ failures (linked-exercise 82 15 0 c"stogir_vector_comparison_93")))
+    (set! failures
+          (+ failures (linked-exercise 82 15 3 c"stogir_vector_comparison_94")))
+    (set! failures
+          (+ failures (linked-exercise 82 15 4 c"stogir_vector_comparison_95")))
+    (set! failures
+          (+ failures (linked-exercise 82 16 0 c"stogir_vector_comparison_96")))
+    (set! failures
+          (+ failures (linked-exercise 82 16 3 c"stogir_vector_comparison_97")))
+    (set! failures
+          (+ failures (linked-exercise 82 16 4 c"stogir_vector_comparison_98")))
+    (set! failures
+          (+ failures (linked-exercise 82 17 0 c"stogir_vector_comparison_99")))
+    (set! failures
+          (+ failures (linked-exercise 82 17 3 c"stogir_vector_comparison_100")))
+    (set! failures
+          (+ failures (linked-exercise 82 17 4 c"stogir_vector_comparison_101")))
+    (set! failures
+          (+ failures (linked-exercise 82 18 0 c"stogir_vector_comparison_102")))
+    (set! failures
+          (+ failures (linked-exercise 82 18 3 c"stogir_vector_comparison_103")))
+    (set! failures
+          (+ failures (linked-exercise 82 18 4 c"stogir_vector_comparison_104")))
+    (set! failures
+          (+ failures (linked-exercise 82 19 0 c"stogir_vector_comparison_105")))
+    (set! failures
+          (+ failures (linked-exercise 82 19 3 c"stogir_vector_comparison_106")))
+    (set! failures
+          (+ failures (linked-exercise 82 19 4 c"stogir_vector_comparison_107")))
+    (set! failures
+          (+ failures (linked-exercise 82 20 0 c"stogir_vector_comparison_108")))
+    (set! failures
+          (+ failures (linked-exercise 82 20 3 c"stogir_vector_comparison_109")))
+    (set! failures
+          (+ failures (linked-exercise 82 20 4 c"stogir_vector_comparison_110")))
+    (set! failures
+          (+ failures (linked-exercise 82 21 0 c"stogir_vector_comparison_111")))
+    (set! failures
+          (+ failures (linked-exercise 82 21 3 c"stogir_vector_comparison_112")))
+    (set! failures
+          (+ failures (linked-exercise 82 21 4 c"stogir_vector_comparison_113")))
+    (set! failures
+          (+ failures (linked-exercise 82 22 0 c"stogir_vector_comparison_114")))
+    (set! failures
+          (+ failures (linked-exercise 82 22 3 c"stogir_vector_comparison_115")))
+    (set! failures
+          (+ failures (linked-exercise 82 22 4 c"stogir_vector_comparison_116")))
+    (set! failures
+          (+ failures (linked-exercise 82 23 0 c"stogir_vector_comparison_117")))
+    (set! failures
+          (+ failures (linked-exercise 82 23 3 c"stogir_vector_comparison_118")))
+    (set! failures
+          (+ failures (linked-exercise 82 23 4 c"stogir_vector_comparison_119")))
+    (set! failures
+          (+ failures (linked-exercise 51 14 0 c"stogir_vector_comparison_120")))
+    (set! failures
+          (+ failures (linked-exercise 51 14 3 c"stogir_vector_comparison_121")))
+    (set! failures
+          (+ failures (linked-exercise 51 14 4 c"stogir_vector_comparison_122")))
+    (set! failures
+          (+ failures (linked-exercise 51 15 0 c"stogir_vector_comparison_123")))
+    (set! failures
+          (+ failures (linked-exercise 51 15 3 c"stogir_vector_comparison_124")))
+    (set! failures
+          (+ failures (linked-exercise 51 15 4 c"stogir_vector_comparison_125")))
+    (set! failures
+          (+ failures (linked-exercise 51 16 0 c"stogir_vector_comparison_126")))
+    (set! failures
+          (+ failures (linked-exercise 51 16 3 c"stogir_vector_comparison_127")))
+    (set! failures
+          (+ failures (linked-exercise 51 16 4 c"stogir_vector_comparison_128")))
+    (set! failures
+          (+ failures (linked-exercise 51 17 0 c"stogir_vector_comparison_129")))
+    (set! failures
+          (+ failures (linked-exercise 51 17 3 c"stogir_vector_comparison_130")))
+    (set! failures
+          (+ failures (linked-exercise 51 17 4 c"stogir_vector_comparison_131")))
+    (set! failures
+          (+ failures (linked-exercise 51 18 0 c"stogir_vector_comparison_132")))
+    (set! failures
+          (+ failures (linked-exercise 51 18 3 c"stogir_vector_comparison_133")))
+    (set! failures
+          (+ failures (linked-exercise 51 18 4 c"stogir_vector_comparison_134")))
+    (set! failures
+          (+ failures (linked-exercise 51 19 0 c"stogir_vector_comparison_135")))
+    (set! failures
+          (+ failures (linked-exercise 51 19 3 c"stogir_vector_comparison_136")))
+    (set! failures
+          (+ failures (linked-exercise 51 19 4 c"stogir_vector_comparison_137")))
+    (set! failures
+          (+ failures (linked-exercise 51 20 0 c"stogir_vector_comparison_138")))
+    (set! failures
+          (+ failures (linked-exercise 51 20 3 c"stogir_vector_comparison_139")))
+    (set! failures
+          (+ failures (linked-exercise 51 20 4 c"stogir_vector_comparison_140")))
+    (set! failures
+          (+ failures (linked-exercise 51 21 0 c"stogir_vector_comparison_141")))
+    (set! failures
+          (+ failures (linked-exercise 51 21 3 c"stogir_vector_comparison_142")))
+    (set! failures
+          (+ failures (linked-exercise 51 21 4 c"stogir_vector_comparison_143")))
+    (set! failures
+          (+ failures (linked-exercise 51 22 0 c"stogir_vector_comparison_144")))
+    (set! failures
+          (+ failures (linked-exercise 51 22 3 c"stogir_vector_comparison_145")))
+    (set! failures
+          (+ failures (linked-exercise 51 22 4 c"stogir_vector_comparison_146")))
+    (set! failures
+          (+ failures (linked-exercise 51 23 0 c"stogir_vector_comparison_147")))
+    (set! failures
+          (+ failures (linked-exercise 51 23 3 c"stogir_vector_comparison_148")))
+    (set! failures
+          (+ failures (linked-exercise 51 23 4 c"stogir_vector_comparison_149")))
+    (set! failures
+          (+ failures (linked-exercise 67 14 0 c"stogir_vector_comparison_150")))
+    (set! failures
+          (+ failures (linked-exercise 67 14 3 c"stogir_vector_comparison_151")))
+    (set! failures
+          (+ failures (linked-exercise 67 14 4 c"stogir_vector_comparison_152")))
+    (set! failures
+          (+ failures (linked-exercise 67 15 0 c"stogir_vector_comparison_153")))
+    (set! failures
+          (+ failures (linked-exercise 67 15 3 c"stogir_vector_comparison_154")))
+    (set! failures
+          (+ failures (linked-exercise 67 15 4 c"stogir_vector_comparison_155")))
+    (set! failures
+          (+ failures (linked-exercise 67 16 0 c"stogir_vector_comparison_156")))
+    (set! failures
+          (+ failures (linked-exercise 67 16 3 c"stogir_vector_comparison_157")))
+    (set! failures
+          (+ failures (linked-exercise 67 16 4 c"stogir_vector_comparison_158")))
+    (set! failures
+          (+ failures (linked-exercise 67 17 0 c"stogir_vector_comparison_159")))
+    (set! failures
+          (+ failures (linked-exercise 67 17 3 c"stogir_vector_comparison_160")))
+    (set! failures
+          (+ failures (linked-exercise 67 17 4 c"stogir_vector_comparison_161")))
+    (set! failures
+          (+ failures (linked-exercise 67 18 0 c"stogir_vector_comparison_162")))
+    (set! failures
+          (+ failures (linked-exercise 67 18 3 c"stogir_vector_comparison_163")))
+    (set! failures
+          (+ failures (linked-exercise 67 18 4 c"stogir_vector_comparison_164")))
+    (set! failures
+          (+ failures (linked-exercise 67 19 0 c"stogir_vector_comparison_165")))
+    (set! failures
+          (+ failures (linked-exercise 67 19 3 c"stogir_vector_comparison_166")))
+    (set! failures
+          (+ failures (linked-exercise 67 19 4 c"stogir_vector_comparison_167")))
+    (set! failures
+          (+ failures (linked-exercise 67 20 0 c"stogir_vector_comparison_168")))
+    (set! failures
+          (+ failures (linked-exercise 67 20 3 c"stogir_vector_comparison_169")))
+    (set! failures
+          (+ failures (linked-exercise 67 20 4 c"stogir_vector_comparison_170")))
+    (set! failures
+          (+ failures (linked-exercise 67 21 0 c"stogir_vector_comparison_171")))
+    (set! failures
+          (+ failures (linked-exercise 67 21 3 c"stogir_vector_comparison_172")))
+    (set! failures
+          (+ failures (linked-exercise 67 21 4 c"stogir_vector_comparison_173")))
+    (set! failures
+          (+ failures (linked-exercise 67 22 0 c"stogir_vector_comparison_174")))
+    (set! failures
+          (+ failures (linked-exercise 67 22 3 c"stogir_vector_comparison_175")))
+    (set! failures
+          (+ failures (linked-exercise 67 22 4 c"stogir_vector_comparison_176")))
+    (set! failures
+          (+ failures (linked-exercise 67 23 0 c"stogir_vector_comparison_177")))
+    (set! failures
+          (+ failures (linked-exercise 67 23 3 c"stogir_vector_comparison_178")))
+    (set! failures
+          (+ failures (linked-exercise 67 23 4 c"stogir_vector_comparison_179")))
+    (set! failures
+          (+ failures (linked-exercise 36 14 0 c"stogir_vector_comparison_180")))
+    (set! failures
+          (+ failures (linked-exercise 36 14 3 c"stogir_vector_comparison_181")))
+    (set! failures
+          (+ failures (linked-exercise 36 14 4 c"stogir_vector_comparison_182")))
+    (set! failures
+          (+ failures (linked-exercise 36 15 0 c"stogir_vector_comparison_183")))
+    (set! failures
+          (+ failures (linked-exercise 36 15 3 c"stogir_vector_comparison_184")))
+    (set! failures
+          (+ failures (linked-exercise 36 15 4 c"stogir_vector_comparison_185")))
+    (set! failures
+          (+ failures (linked-exercise 36 16 0 c"stogir_vector_comparison_186")))
+    (set! failures
+          (+ failures (linked-exercise 36 16 3 c"stogir_vector_comparison_187")))
+    (set! failures
+          (+ failures (linked-exercise 36 16 4 c"stogir_vector_comparison_188")))
+    (set! failures
+          (+ failures (linked-exercise 36 17 0 c"stogir_vector_comparison_189")))
+    (set! failures
+          (+ failures (linked-exercise 36 17 3 c"stogir_vector_comparison_190")))
+    (set! failures
+          (+ failures (linked-exercise 36 17 4 c"stogir_vector_comparison_191")))
+    (set! failures
+          (+ failures (linked-exercise 36 18 0 c"stogir_vector_comparison_192")))
+    (set! failures
+          (+ failures (linked-exercise 36 18 3 c"stogir_vector_comparison_193")))
+    (set! failures
+          (+ failures (linked-exercise 36 18 4 c"stogir_vector_comparison_194")))
+    (set! failures
+          (+ failures (linked-exercise 36 19 0 c"stogir_vector_comparison_195")))
+    (set! failures
+          (+ failures (linked-exercise 36 19 3 c"stogir_vector_comparison_196")))
+    (set! failures
+          (+ failures (linked-exercise 36 19 4 c"stogir_vector_comparison_197")))
+    (set! failures
+          (+ failures (linked-exercise 36 20 0 c"stogir_vector_comparison_198")))
+    (set! failures
+          (+ failures (linked-exercise 36 20 3 c"stogir_vector_comparison_199")))
+    (set! failures
+          (+ failures (linked-exercise 36 20 4 c"stogir_vector_comparison_200")))
+    (set! failures
+          (+ failures (linked-exercise 36 21 0 c"stogir_vector_comparison_201")))
+    (set! failures
+          (+ failures (linked-exercise 36 21 3 c"stogir_vector_comparison_202")))
+    (set! failures
+          (+ failures (linked-exercise 36 21 4 c"stogir_vector_comparison_203")))
+    (set! failures
+          (+ failures (linked-exercise 36 22 0 c"stogir_vector_comparison_204")))
+    (set! failures
+          (+ failures (linked-exercise 36 22 3 c"stogir_vector_comparison_205")))
+    (set! failures
+          (+ failures (linked-exercise 36 22 4 c"stogir_vector_comparison_206")))
+    (set! failures
+          (+ failures (linked-exercise 36 23 0 c"stogir_vector_comparison_207")))
+    (set! failures
+          (+ failures (linked-exercise 36 23 3 c"stogir_vector_comparison_208")))
+    (set! failures
+          (+ failures (linked-exercise 36 23 4 c"stogir_vector_comparison_209")))
+    (set! failures
+          (+ failures (linked-exercise 52 14 0 c"stogir_vector_comparison_210")))
+    (set! failures
+          (+ failures (linked-exercise 52 14 3 c"stogir_vector_comparison_211")))
+    (set! failures
+          (+ failures (linked-exercise 52 14 4 c"stogir_vector_comparison_212")))
+    (set! failures
+          (+ failures (linked-exercise 52 15 0 c"stogir_vector_comparison_213")))
+    (set! failures
+          (+ failures (linked-exercise 52 15 3 c"stogir_vector_comparison_214")))
+    (set! failures
+          (+ failures (linked-exercise 52 15 4 c"stogir_vector_comparison_215")))
+    (set! failures
+          (+ failures (linked-exercise 52 16 0 c"stogir_vector_comparison_216")))
+    (set! failures
+          (+ failures (linked-exercise 52 16 3 c"stogir_vector_comparison_217")))
+    (set! failures
+          (+ failures (linked-exercise 52 16 4 c"stogir_vector_comparison_218")))
+    (set! failures
+          (+ failures (linked-exercise 52 17 0 c"stogir_vector_comparison_219")))
+    (set! failures
+          (+ failures (linked-exercise 52 17 3 c"stogir_vector_comparison_220")))
+    (set! failures
+          (+ failures (linked-exercise 52 17 4 c"stogir_vector_comparison_221")))
+    (set! failures
+          (+ failures (linked-exercise 52 18 0 c"stogir_vector_comparison_222")))
+    (set! failures
+          (+ failures (linked-exercise 52 18 3 c"stogir_vector_comparison_223")))
+    (set! failures
+          (+ failures (linked-exercise 52 18 4 c"stogir_vector_comparison_224")))
+    (set! failures
+          (+ failures (linked-exercise 52 19 0 c"stogir_vector_comparison_225")))
+    (set! failures
+          (+ failures (linked-exercise 52 19 3 c"stogir_vector_comparison_226")))
+    (set! failures
+          (+ failures (linked-exercise 52 19 4 c"stogir_vector_comparison_227")))
+    (set! failures
+          (+ failures (linked-exercise 52 20 0 c"stogir_vector_comparison_228")))
+    (set! failures
+          (+ failures (linked-exercise 52 20 3 c"stogir_vector_comparison_229")))
+    (set! failures
+          (+ failures (linked-exercise 52 20 4 c"stogir_vector_comparison_230")))
+    (set! failures
+          (+ failures (linked-exercise 52 21 0 c"stogir_vector_comparison_231")))
+    (set! failures
+          (+ failures (linked-exercise 52 21 3 c"stogir_vector_comparison_232")))
+    (set! failures
+          (+ failures (linked-exercise 52 21 4 c"stogir_vector_comparison_233")))
+    (set! failures
+          (+ failures (linked-exercise 52 22 0 c"stogir_vector_comparison_234")))
+    (set! failures
+          (+ failures (linked-exercise 52 22 3 c"stogir_vector_comparison_235")))
+    (set! failures
+          (+ failures (linked-exercise 52 22 4 c"stogir_vector_comparison_236")))
+    (set! failures
+          (+ failures (linked-exercise 52 23 0 c"stogir_vector_comparison_237")))
+    (set! failures
+          (+ failures (linked-exercise 52 23 3 c"stogir_vector_comparison_238")))
+    (set! failures
+          (+ failures (linked-exercise 52 23 4 c"stogir_vector_comparison_239")))
+    (set! failures
+          (+ failures (linked-exercise 21 14 0 c"stogir_vector_comparison_240")))
+    (set! failures
+          (+ failures (linked-exercise 21 14 3 c"stogir_vector_comparison_241")))
+    (set! failures
+          (+ failures (linked-exercise 21 14 4 c"stogir_vector_comparison_242")))
+    (set! failures
+          (+ failures (linked-exercise 21 15 0 c"stogir_vector_comparison_243")))
+    (set! failures
+          (+ failures (linked-exercise 21 15 3 c"stogir_vector_comparison_244")))
+    (set! failures
+          (+ failures (linked-exercise 21 15 4 c"stogir_vector_comparison_245")))
+    (set! failures
+          (+ failures (linked-exercise 21 16 0 c"stogir_vector_comparison_246")))
+    (set! failures
+          (+ failures (linked-exercise 21 16 3 c"stogir_vector_comparison_247")))
+    (set! failures
+          (+ failures (linked-exercise 21 16 4 c"stogir_vector_comparison_248")))
+    (set! failures
+          (+ failures (linked-exercise 21 17 0 c"stogir_vector_comparison_249")))
+    (set! failures
+          (+ failures (linked-exercise 21 17 3 c"stogir_vector_comparison_250")))
+    (set! failures
+          (+ failures (linked-exercise 21 17 4 c"stogir_vector_comparison_251")))
+    (set! failures
+          (+ failures (linked-exercise 21 18 0 c"stogir_vector_comparison_252")))
+    (set! failures
+          (+ failures (linked-exercise 21 18 3 c"stogir_vector_comparison_253")))
+    (set! failures
+          (+ failures (linked-exercise 21 18 4 c"stogir_vector_comparison_254")))
+    (set! failures
+          (+ failures (linked-exercise 21 19 0 c"stogir_vector_comparison_255")))
+    (set! failures
+          (+ failures (linked-exercise 21 19 3 c"stogir_vector_comparison_256")))
+    (set! failures
+          (+ failures (linked-exercise 21 19 4 c"stogir_vector_comparison_257")))
+    (set! failures
+          (+ failures (linked-exercise 21 20 0 c"stogir_vector_comparison_258")))
+    (set! failures
+          (+ failures (linked-exercise 21 20 3 c"stogir_vector_comparison_259")))
+    (set! failures
+          (+ failures (linked-exercise 21 20 4 c"stogir_vector_comparison_260")))
+    (set! failures
+          (+ failures (linked-exercise 21 21 0 c"stogir_vector_comparison_261")))
+    (set! failures
+          (+ failures (linked-exercise 21 21 3 c"stogir_vector_comparison_262")))
+    (set! failures
+          (+ failures (linked-exercise 21 21 4 c"stogir_vector_comparison_263")))
+    (set! failures
+          (+ failures (linked-exercise 21 22 0 c"stogir_vector_comparison_264")))
+    (set! failures
+          (+ failures (linked-exercise 21 22 3 c"stogir_vector_comparison_265")))
+    (set! failures
+          (+ failures (linked-exercise 21 22 4 c"stogir_vector_comparison_266")))
+    (set! failures
+          (+ failures (linked-exercise 21 23 0 c"stogir_vector_comparison_267")))
+    (set! failures
+          (+ failures (linked-exercise 21 23 3 c"stogir_vector_comparison_268")))
+    (set! failures
+          (+ failures (linked-exercise 21 23 4 c"stogir_vector_comparison_269")))
+    (set! failures
+          (+ failures (linked-exercise 37 14 0 c"stogir_vector_comparison_270")))
+    (set! failures
+          (+ failures (linked-exercise 37 14 3 c"stogir_vector_comparison_271")))
+    (set! failures
+          (+ failures (linked-exercise 37 14 4 c"stogir_vector_comparison_272")))
+    (set! failures
+          (+ failures (linked-exercise 37 15 0 c"stogir_vector_comparison_273")))
+    (set! failures
+          (+ failures (linked-exercise 37 15 3 c"stogir_vector_comparison_274")))
+    (set! failures
+          (+ failures (linked-exercise 37 15 4 c"stogir_vector_comparison_275")))
+    (set! failures
+          (+ failures (linked-exercise 37 16 0 c"stogir_vector_comparison_276")))
+    (set! failures
+          (+ failures (linked-exercise 37 16 3 c"stogir_vector_comparison_277")))
+    (set! failures
+          (+ failures (linked-exercise 37 16 4 c"stogir_vector_comparison_278")))
+    (set! failures
+          (+ failures (linked-exercise 37 17 0 c"stogir_vector_comparison_279")))
+    (set! failures
+          (+ failures (linked-exercise 37 17 3 c"stogir_vector_comparison_280")))
+    (set! failures
+          (+ failures (linked-exercise 37 17 4 c"stogir_vector_comparison_281")))
+    (set! failures
+          (+ failures (linked-exercise 37 18 0 c"stogir_vector_comparison_282")))
+    (set! failures
+          (+ failures (linked-exercise 37 18 3 c"stogir_vector_comparison_283")))
+    (set! failures
+          (+ failures (linked-exercise 37 18 4 c"stogir_vector_comparison_284")))
+    (set! failures
+          (+ failures (linked-exercise 37 19 0 c"stogir_vector_comparison_285")))
+    (set! failures
+          (+ failures (linked-exercise 37 19 3 c"stogir_vector_comparison_286")))
+    (set! failures
+          (+ failures (linked-exercise 37 19 4 c"stogir_vector_comparison_287")))
+    (set! failures
+          (+ failures (linked-exercise 37 20 0 c"stogir_vector_comparison_288")))
+    (set! failures
+          (+ failures (linked-exercise 37 20 3 c"stogir_vector_comparison_289")))
+    (set! failures
+          (+ failures (linked-exercise 37 20 4 c"stogir_vector_comparison_290")))
+    (set! failures
+          (+ failures (linked-exercise 37 21 0 c"stogir_vector_comparison_291")))
+    (set! failures
+          (+ failures (linked-exercise 37 21 3 c"stogir_vector_comparison_292")))
+    (set! failures
+          (+ failures (linked-exercise 37 21 4 c"stogir_vector_comparison_293")))
+    (set! failures
+          (+ failures (linked-exercise 37 22 0 c"stogir_vector_comparison_294")))
+    (set! failures
+          (+ failures (linked-exercise 37 22 3 c"stogir_vector_comparison_295")))
+    (set! failures
+          (+ failures (linked-exercise 37 22 4 c"stogir_vector_comparison_296")))
+    (set! failures
+          (+ failures (linked-exercise 37 23 0 c"stogir_vector_comparison_297")))
+    (set! failures
+          (+ failures (linked-exercise 37 23 3 c"stogir_vector_comparison_298")))
+    (set! failures
+          (+ failures (linked-exercise 37 23 4 c"stogir_vector_comparison_299")))
+    (set! failures
+          (+ failures (linked-exercise 22 14 0 c"stogir_vector_comparison_300")))
+    (set! failures
+          (+ failures (linked-exercise 22 14 3 c"stogir_vector_comparison_301")))
+    (set! failures
+          (+ failures (linked-exercise 22 14 4 c"stogir_vector_comparison_302")))
+    (set! failures
+          (+ failures (linked-exercise 22 15 0 c"stogir_vector_comparison_303")))
+    (set! failures
+          (+ failures (linked-exercise 22 15 3 c"stogir_vector_comparison_304")))
+    (set! failures
+          (+ failures (linked-exercise 22 15 4 c"stogir_vector_comparison_305")))
+    (set! failures
+          (+ failures (linked-exercise 22 16 0 c"stogir_vector_comparison_306")))
+    (set! failures
+          (+ failures (linked-exercise 22 16 3 c"stogir_vector_comparison_307")))
+    (set! failures
+          (+ failures (linked-exercise 22 16 4 c"stogir_vector_comparison_308")))
+    (set! failures
+          (+ failures (linked-exercise 22 17 0 c"stogir_vector_comparison_309")))
+    (set! failures
+          (+ failures (linked-exercise 22 17 3 c"stogir_vector_comparison_310")))
+    (set! failures
+          (+ failures (linked-exercise 22 17 4 c"stogir_vector_comparison_311")))
+    (set! failures
+          (+ failures (linked-exercise 22 18 0 c"stogir_vector_comparison_312")))
+    (set! failures
+          (+ failures (linked-exercise 22 18 3 c"stogir_vector_comparison_313")))
+    (set! failures
+          (+ failures (linked-exercise 22 18 4 c"stogir_vector_comparison_314")))
+    (set! failures
+          (+ failures (linked-exercise 22 19 0 c"stogir_vector_comparison_315")))
+    (set! failures
+          (+ failures (linked-exercise 22 19 3 c"stogir_vector_comparison_316")))
+    (set! failures
+          (+ failures (linked-exercise 22 19 4 c"stogir_vector_comparison_317")))
+    (set! failures
+          (+ failures (linked-exercise 22 20 0 c"stogir_vector_comparison_318")))
+    (set! failures
+          (+ failures (linked-exercise 22 20 3 c"stogir_vector_comparison_319")))
+    (set! failures
+          (+ failures (linked-exercise 22 20 4 c"stogir_vector_comparison_320")))
+    (set! failures
+          (+ failures (linked-exercise 22 21 0 c"stogir_vector_comparison_321")))
+    (set! failures
+          (+ failures (linked-exercise 22 21 3 c"stogir_vector_comparison_322")))
+    (set! failures
+          (+ failures (linked-exercise 22 21 4 c"stogir_vector_comparison_323")))
+    (set! failures
+          (+ failures (linked-exercise 22 22 0 c"stogir_vector_comparison_324")))
+    (set! failures
+          (+ failures (linked-exercise 22 22 3 c"stogir_vector_comparison_325")))
+    (set! failures
+          (+ failures (linked-exercise 22 22 4 c"stogir_vector_comparison_326")))
+    (set! failures
+          (+ failures (linked-exercise 22 23 0 c"stogir_vector_comparison_327")))
+    (set! failures
+          (+ failures (linked-exercise 22 23 3 c"stogir_vector_comparison_328")))
+    (set! failures
+          (+ failures (linked-exercise 22 23 4 c"stogir_vector_comparison_329")))
+    (set! failures
+          (+ failures (linked-exercise 38 14 0 c"stogir_vector_comparison_330")))
+    (set! failures
+          (+ failures (linked-exercise 38 14 3 c"stogir_vector_comparison_331")))
+    (set! failures
+          (+ failures (linked-exercise 38 14 4 c"stogir_vector_comparison_332")))
+    (set! failures
+          (+ failures (linked-exercise 38 15 0 c"stogir_vector_comparison_333")))
+    (set! failures
+          (+ failures (linked-exercise 38 15 3 c"stogir_vector_comparison_334")))
+    (set! failures
+          (+ failures (linked-exercise 38 15 4 c"stogir_vector_comparison_335")))
+    (set! failures
+          (+ failures (linked-exercise 38 16 0 c"stogir_vector_comparison_336")))
+    (set! failures
+          (+ failures (linked-exercise 38 16 3 c"stogir_vector_comparison_337")))
+    (set! failures
+          (+ failures (linked-exercise 38 16 4 c"stogir_vector_comparison_338")))
+    (set! failures
+          (+ failures (linked-exercise 38 17 0 c"stogir_vector_comparison_339")))
+    (set! failures
+          (+ failures (linked-exercise 38 17 3 c"stogir_vector_comparison_340")))
+    (set! failures
+          (+ failures (linked-exercise 38 17 4 c"stogir_vector_comparison_341")))
+    (set! failures
+          (+ failures (linked-exercise 38 18 0 c"stogir_vector_comparison_342")))
+    (set! failures
+          (+ failures (linked-exercise 38 18 3 c"stogir_vector_comparison_343")))
+    (set! failures
+          (+ failures (linked-exercise 38 18 4 c"stogir_vector_comparison_344")))
+    (set! failures
+          (+ failures (linked-exercise 38 19 0 c"stogir_vector_comparison_345")))
+    (set! failures
+          (+ failures (linked-exercise 38 19 3 c"stogir_vector_comparison_346")))
+    (set! failures
+          (+ failures (linked-exercise 38 19 4 c"stogir_vector_comparison_347")))
+    (set! failures
+          (+ failures (linked-exercise 38 20 0 c"stogir_vector_comparison_348")))
+    (set! failures
+          (+ failures (linked-exercise 38 20 3 c"stogir_vector_comparison_349")))
+    (set! failures
+          (+ failures (linked-exercise 38 20 4 c"stogir_vector_comparison_350")))
+    (set! failures
+          (+ failures (linked-exercise 38 21 0 c"stogir_vector_comparison_351")))
+    (set! failures
+          (+ failures (linked-exercise 38 21 3 c"stogir_vector_comparison_352")))
+    (set! failures
+          (+ failures (linked-exercise 38 21 4 c"stogir_vector_comparison_353")))
+    (set! failures
+          (+ failures (linked-exercise 38 22 0 c"stogir_vector_comparison_354")))
+    (set! failures
+          (+ failures (linked-exercise 38 22 3 c"stogir_vector_comparison_355")))
+    (set! failures
+          (+ failures (linked-exercise 38 22 4 c"stogir_vector_comparison_356")))
+    (set! failures
+          (+ failures (linked-exercise 38 23 0 c"stogir_vector_comparison_357")))
+    (set! failures
+          (+ failures (linked-exercise 38 23 3 c"stogir_vector_comparison_358")))
+    (set! failures
+          (+ failures (linked-exercise 38 23 4 c"stogir_vector_comparison_359")))
+    (set! failures
+          (+ failures (linked-exercise 71 14 0 c"stogir_vector_comparison_360")))
+    (set! failures
+          (+ failures (linked-exercise 71 14 3 c"stogir_vector_comparison_361")))
+    (set! failures
+          (+ failures (linked-exercise 71 14 4 c"stogir_vector_comparison_362")))
+    (set! failures
+          (+ failures (linked-exercise 71 15 0 c"stogir_vector_comparison_363")))
+    (set! failures
+          (+ failures (linked-exercise 71 15 3 c"stogir_vector_comparison_364")))
+    (set! failures
+          (+ failures (linked-exercise 71 15 4 c"stogir_vector_comparison_365")))
+    (set! failures
+          (+ failures (linked-exercise 71 16 0 c"stogir_vector_comparison_366")))
+    (set! failures
+          (+ failures (linked-exercise 71 16 3 c"stogir_vector_comparison_367")))
+    (set! failures
+          (+ failures (linked-exercise 71 16 4 c"stogir_vector_comparison_368")))
+    (set! failures
+          (+ failures (linked-exercise 71 17 0 c"stogir_vector_comparison_369")))
+    (set! failures
+          (+ failures (linked-exercise 71 17 3 c"stogir_vector_comparison_370")))
+    (set! failures
+          (+ failures (linked-exercise 71 17 4 c"stogir_vector_comparison_371")))
+    (set! failures
+          (+ failures (linked-exercise 71 18 0 c"stogir_vector_comparison_372")))
+    (set! failures
+          (+ failures (linked-exercise 71 18 3 c"stogir_vector_comparison_373")))
+    (set! failures
+          (+ failures (linked-exercise 71 18 4 c"stogir_vector_comparison_374")))
+    (set! failures
+          (+ failures (linked-exercise 71 19 0 c"stogir_vector_comparison_375")))
+    (set! failures
+          (+ failures (linked-exercise 71 19 3 c"stogir_vector_comparison_376")))
+    (set! failures
+          (+ failures (linked-exercise 71 19 4 c"stogir_vector_comparison_377")))
+    (set! failures
+          (+ failures (linked-exercise 71 20 0 c"stogir_vector_comparison_378")))
+    (set! failures
+          (+ failures (linked-exercise 71 20 3 c"stogir_vector_comparison_379")))
+    (set! failures
+          (+ failures (linked-exercise 71 20 4 c"stogir_vector_comparison_380")))
+    (set! failures
+          (+ failures (linked-exercise 71 21 0 c"stogir_vector_comparison_381")))
+    (set! failures
+          (+ failures (linked-exercise 71 21 3 c"stogir_vector_comparison_382")))
+    (set! failures
+          (+ failures (linked-exercise 71 21 4 c"stogir_vector_comparison_383")))
+    (set! failures
+          (+ failures (linked-exercise 71 22 0 c"stogir_vector_comparison_384")))
+    (set! failures
+          (+ failures (linked-exercise 71 22 3 c"stogir_vector_comparison_385")))
+    (set! failures
+          (+ failures (linked-exercise 71 22 4 c"stogir_vector_comparison_386")))
+    (set! failures
+          (+ failures (linked-exercise 71 23 0 c"stogir_vector_comparison_387")))
+    (set! failures
+          (+ failures (linked-exercise 71 23 3 c"stogir_vector_comparison_388")))
+    (set! failures
+          (+ failures (linked-exercise 71 23 4 c"stogir_vector_comparison_389")))
+    (set! failures
+          (+ failures (linked-exercise 87 14 0 c"stogir_vector_comparison_390")))
+    (set! failures
+          (+ failures (linked-exercise 87 14 3 c"stogir_vector_comparison_391")))
+    (set! failures
+          (+ failures (linked-exercise 87 14 4 c"stogir_vector_comparison_392")))
+    (set! failures
+          (+ failures (linked-exercise 87 15 0 c"stogir_vector_comparison_393")))
+    (set! failures
+          (+ failures (linked-exercise 87 15 3 c"stogir_vector_comparison_394")))
+    (set! failures
+          (+ failures (linked-exercise 87 15 4 c"stogir_vector_comparison_395")))
+    (set! failures
+          (+ failures (linked-exercise 87 16 0 c"stogir_vector_comparison_396")))
+    (set! failures
+          (+ failures (linked-exercise 87 16 3 c"stogir_vector_comparison_397")))
+    (set! failures
+          (+ failures (linked-exercise 87 16 4 c"stogir_vector_comparison_398")))
+    (set! failures
+          (+ failures (linked-exercise 87 17 0 c"stogir_vector_comparison_399")))
+    (set! failures
+          (+ failures (linked-exercise 87 17 3 c"stogir_vector_comparison_400")))
+    (set! failures
+          (+ failures (linked-exercise 87 17 4 c"stogir_vector_comparison_401")))
+    (set! failures
+          (+ failures (linked-exercise 87 18 0 c"stogir_vector_comparison_402")))
+    (set! failures
+          (+ failures (linked-exercise 87 18 3 c"stogir_vector_comparison_403")))
+    (set! failures
+          (+ failures (linked-exercise 87 18 4 c"stogir_vector_comparison_404")))
+    (set! failures
+          (+ failures (linked-exercise 87 19 0 c"stogir_vector_comparison_405")))
+    (set! failures
+          (+ failures (linked-exercise 87 19 3 c"stogir_vector_comparison_406")))
+    (set! failures
+          (+ failures (linked-exercise 87 19 4 c"stogir_vector_comparison_407")))
+    (set! failures
+          (+ failures (linked-exercise 87 20 0 c"stogir_vector_comparison_408")))
+    (set! failures
+          (+ failures (linked-exercise 87 20 3 c"stogir_vector_comparison_409")))
+    (set! failures
+          (+ failures (linked-exercise 87 20 4 c"stogir_vector_comparison_410")))
+    (set! failures
+          (+ failures (linked-exercise 87 21 0 c"stogir_vector_comparison_411")))
+    (set! failures
+          (+ failures (linked-exercise 87 21 3 c"stogir_vector_comparison_412")))
+    (set! failures
+          (+ failures (linked-exercise 87 21 4 c"stogir_vector_comparison_413")))
+    (set! failures
+          (+ failures (linked-exercise 87 22 0 c"stogir_vector_comparison_414")))
+    (set! failures
+          (+ failures (linked-exercise 87 22 3 c"stogir_vector_comparison_415")))
+    (set! failures
+          (+ failures (linked-exercise 87 22 4 c"stogir_vector_comparison_416")))
+    (set! failures
+          (+ failures (linked-exercise 87 23 0 c"stogir_vector_comparison_417")))
+    (set! failures
+          (+ failures (linked-exercise 87 23 3 c"stogir_vector_comparison_418")))
+    (set! failures
+          (+ failures (linked-exercise 87 23 4 c"stogir_vector_comparison_419")))
+    (set! failures
+          (+ failures (linked-exercise 72 14 0 c"stogir_vector_comparison_420")))
+    (set! failures
+          (+ failures (linked-exercise 72 14 3 c"stogir_vector_comparison_421")))
+    (set! failures
+          (+ failures (linked-exercise 72 14 4 c"stogir_vector_comparison_422")))
+    (set! failures
+          (+ failures (linked-exercise 72 15 0 c"stogir_vector_comparison_423")))
+    (set! failures
+          (+ failures (linked-exercise 72 15 3 c"stogir_vector_comparison_424")))
+    (set! failures
+          (+ failures (linked-exercise 72 15 4 c"stogir_vector_comparison_425")))
+    (set! failures
+          (+ failures (linked-exercise 72 16 0 c"stogir_vector_comparison_426")))
+    (set! failures
+          (+ failures (linked-exercise 72 16 3 c"stogir_vector_comparison_427")))
+    (set! failures
+          (+ failures (linked-exercise 72 16 4 c"stogir_vector_comparison_428")))
+    (set! failures
+          (+ failures (linked-exercise 72 17 0 c"stogir_vector_comparison_429")))
+    (set! failures
+          (+ failures (linked-exercise 72 17 3 c"stogir_vector_comparison_430")))
+    (set! failures
+          (+ failures (linked-exercise 72 17 4 c"stogir_vector_comparison_431")))
+    (set! failures
+          (+ failures (linked-exercise 72 18 0 c"stogir_vector_comparison_432")))
+    (set! failures
+          (+ failures (linked-exercise 72 18 3 c"stogir_vector_comparison_433")))
+    (set! failures
+          (+ failures (linked-exercise 72 18 4 c"stogir_vector_comparison_434")))
+    (set! failures
+          (+ failures (linked-exercise 72 19 0 c"stogir_vector_comparison_435")))
+    (set! failures
+          (+ failures (linked-exercise 72 19 3 c"stogir_vector_comparison_436")))
+    (set! failures
+          (+ failures (linked-exercise 72 19 4 c"stogir_vector_comparison_437")))
+    (set! failures
+          (+ failures (linked-exercise 72 20 0 c"stogir_vector_comparison_438")))
+    (set! failures
+          (+ failures (linked-exercise 72 20 3 c"stogir_vector_comparison_439")))
+    (set! failures
+          (+ failures (linked-exercise 72 20 4 c"stogir_vector_comparison_440")))
+    (set! failures
+          (+ failures (linked-exercise 72 21 0 c"stogir_vector_comparison_441")))
+    (set! failures
+          (+ failures (linked-exercise 72 21 3 c"stogir_vector_comparison_442")))
+    (set! failures
+          (+ failures (linked-exercise 72 21 4 c"stogir_vector_comparison_443")))
+    (set! failures
+          (+ failures (linked-exercise 72 22 0 c"stogir_vector_comparison_444")))
+    (set! failures
+          (+ failures (linked-exercise 72 22 3 c"stogir_vector_comparison_445")))
+    (set! failures
+          (+ failures (linked-exercise 72 22 4 c"stogir_vector_comparison_446")))
+    (set! failures
+          (+ failures (linked-exercise 72 23 0 c"stogir_vector_comparison_447")))
+    (set! failures
+          (+ failures (linked-exercise 72 23 3 c"stogir_vector_comparison_448")))
+    (set! failures
+          (+ failures (linked-exercise 72 23 4 c"stogir_vector_comparison_449")))
+    (set! failures
+          (+ failures (linked-exercise 88 14 0 c"stogir_vector_comparison_450")))
+    (set! failures
+          (+ failures (linked-exercise 88 14 3 c"stogir_vector_comparison_451")))
+    (set! failures
+          (+ failures (linked-exercise 88 14 4 c"stogir_vector_comparison_452")))
+    (set! failures
+          (+ failures (linked-exercise 88 15 0 c"stogir_vector_comparison_453")))
+    (set! failures
+          (+ failures (linked-exercise 88 15 3 c"stogir_vector_comparison_454")))
+    (set! failures
+          (+ failures (linked-exercise 88 15 4 c"stogir_vector_comparison_455")))
+    (set! failures
+          (+ failures (linked-exercise 88 16 0 c"stogir_vector_comparison_456")))
+    (set! failures
+          (+ failures (linked-exercise 88 16 3 c"stogir_vector_comparison_457")))
+    (set! failures
+          (+ failures (linked-exercise 88 16 4 c"stogir_vector_comparison_458")))
+    (set! failures
+          (+ failures (linked-exercise 88 17 0 c"stogir_vector_comparison_459")))
+    (set! failures
+          (+ failures (linked-exercise 88 17 3 c"stogir_vector_comparison_460")))
+    (set! failures
+          (+ failures (linked-exercise 88 17 4 c"stogir_vector_comparison_461")))
+    (set! failures
+          (+ failures (linked-exercise 88 18 0 c"stogir_vector_comparison_462")))
+    (set! failures
+          (+ failures (linked-exercise 88 18 3 c"stogir_vector_comparison_463")))
+    (set! failures
+          (+ failures (linked-exercise 88 18 4 c"stogir_vector_comparison_464")))
+    (set! failures
+          (+ failures (linked-exercise 88 19 0 c"stogir_vector_comparison_465")))
+    (set! failures
+          (+ failures (linked-exercise 88 19 3 c"stogir_vector_comparison_466")))
+    (set! failures
+          (+ failures (linked-exercise 88 19 4 c"stogir_vector_comparison_467")))
+    (set! failures
+          (+ failures (linked-exercise 88 20 0 c"stogir_vector_comparison_468")))
+    (set! failures
+          (+ failures (linked-exercise 88 20 3 c"stogir_vector_comparison_469")))
+    (set! failures
+          (+ failures (linked-exercise 88 20 4 c"stogir_vector_comparison_470")))
+    (set! failures
+          (+ failures (linked-exercise 88 21 0 c"stogir_vector_comparison_471")))
+    (set! failures
+          (+ failures (linked-exercise 88 21 3 c"stogir_vector_comparison_472")))
+    (set! failures
+          (+ failures (linked-exercise 88 21 4 c"stogir_vector_comparison_473")))
+    (set! failures
+          (+ failures (linked-exercise 88 22 0 c"stogir_vector_comparison_474")))
+    (set! failures
+          (+ failures (linked-exercise 88 22 3 c"stogir_vector_comparison_475")))
+    (set! failures
+          (+ failures (linked-exercise 88 22 4 c"stogir_vector_comparison_476")))
+    (set! failures
+          (+ failures (linked-exercise 88 23 0 c"stogir_vector_comparison_477")))
+    (set! failures
+          (+ failures (linked-exercise 88 23 3 c"stogir_vector_comparison_478")))
+    (set! failures
+          (+ failures (linked-exercise 88 23 4 c"stogir_vector_comparison_479")))
+    (set! failures
+          (+ failures (linked-exercise 57 14 0 c"stogir_vector_comparison_480")))
+    (set! failures
+          (+ failures (linked-exercise 57 14 3 c"stogir_vector_comparison_481")))
+    (set! failures
+          (+ failures (linked-exercise 57 14 4 c"stogir_vector_comparison_482")))
+    (set! failures
+          (+ failures (linked-exercise 57 15 0 c"stogir_vector_comparison_483")))
+    (set! failures
+          (+ failures (linked-exercise 57 15 3 c"stogir_vector_comparison_484")))
+    (set! failures
+          (+ failures (linked-exercise 57 15 4 c"stogir_vector_comparison_485")))
+    (set! failures
+          (+ failures (linked-exercise 57 16 0 c"stogir_vector_comparison_486")))
+    (set! failures
+          (+ failures (linked-exercise 57 16 3 c"stogir_vector_comparison_487")))
+    (set! failures
+          (+ failures (linked-exercise 57 16 4 c"stogir_vector_comparison_488")))
+    (set! failures
+          (+ failures (linked-exercise 57 17 0 c"stogir_vector_comparison_489")))
+    (set! failures
+          (+ failures (linked-exercise 57 17 3 c"stogir_vector_comparison_490")))
+    (set! failures
+          (+ failures (linked-exercise 57 17 4 c"stogir_vector_comparison_491")))
+    (set! failures
+          (+ failures (linked-exercise 57 18 0 c"stogir_vector_comparison_492")))
+    (set! failures
+          (+ failures (linked-exercise 57 18 3 c"stogir_vector_comparison_493")))
+    (set! failures
+          (+ failures (linked-exercise 57 18 4 c"stogir_vector_comparison_494")))
+    (set! failures
+          (+ failures (linked-exercise 57 19 0 c"stogir_vector_comparison_495")))
+    (set! failures
+          (+ failures (linked-exercise 57 19 3 c"stogir_vector_comparison_496")))
+    (set! failures
+          (+ failures (linked-exercise 57 19 4 c"stogir_vector_comparison_497")))
+    (set! failures
+          (+ failures (linked-exercise 57 20 0 c"stogir_vector_comparison_498")))
+    (set! failures
+          (+ failures (linked-exercise 57 20 3 c"stogir_vector_comparison_499")))
+    (set! failures
+          (+ failures (linked-exercise 57 20 4 c"stogir_vector_comparison_500")))
+    (set! failures
+          (+ failures (linked-exercise 57 21 0 c"stogir_vector_comparison_501")))
+    (set! failures
+          (+ failures (linked-exercise 57 21 3 c"stogir_vector_comparison_502")))
+    (set! failures
+          (+ failures (linked-exercise 57 21 4 c"stogir_vector_comparison_503")))
+    (set! failures
+          (+ failures (linked-exercise 57 22 0 c"stogir_vector_comparison_504")))
+    (set! failures
+          (+ failures (linked-exercise 57 22 3 c"stogir_vector_comparison_505")))
+    (set! failures
+          (+ failures (linked-exercise 57 22 4 c"stogir_vector_comparison_506")))
+    (set! failures
+          (+ failures (linked-exercise 57 23 0 c"stogir_vector_comparison_507")))
+    (set! failures
+          (+ failures (linked-exercise 57 23 3 c"stogir_vector_comparison_508")))
+    (set! failures
+          (+ failures (linked-exercise 57 23 4 c"stogir_vector_comparison_509")))
+    (set! failures
+          (+ failures (linked-exercise 73 14 0 c"stogir_vector_comparison_510")))
+    (set! failures
+          (+ failures (linked-exercise 73 14 3 c"stogir_vector_comparison_511")))
+    (set! failures
+          (+ failures (linked-exercise 73 14 4 c"stogir_vector_comparison_512")))
+    (set! failures
+          (+ failures (linked-exercise 73 15 0 c"stogir_vector_comparison_513")))
+    (set! failures
+          (+ failures (linked-exercise 73 15 3 c"stogir_vector_comparison_514")))
+    (set! failures
+          (+ failures (linked-exercise 73 15 4 c"stogir_vector_comparison_515")))
+    (set! failures
+          (+ failures (linked-exercise 73 16 0 c"stogir_vector_comparison_516")))
+    (set! failures
+          (+ failures (linked-exercise 73 16 3 c"stogir_vector_comparison_517")))
+    (set! failures
+          (+ failures (linked-exercise 73 16 4 c"stogir_vector_comparison_518")))
+    (set! failures
+          (+ failures (linked-exercise 73 17 0 c"stogir_vector_comparison_519")))
+    (set! failures
+          (+ failures (linked-exercise 73 17 3 c"stogir_vector_comparison_520")))
+    (set! failures
+          (+ failures (linked-exercise 73 17 4 c"stogir_vector_comparison_521")))
+    (set! failures
+          (+ failures (linked-exercise 73 18 0 c"stogir_vector_comparison_522")))
+    (set! failures
+          (+ failures (linked-exercise 73 18 3 c"stogir_vector_comparison_523")))
+    (set! failures
+          (+ failures (linked-exercise 73 18 4 c"stogir_vector_comparison_524")))
+    (set! failures
+          (+ failures (linked-exercise 73 19 0 c"stogir_vector_comparison_525")))
+    (set! failures
+          (+ failures (linked-exercise 73 19 3 c"stogir_vector_comparison_526")))
+    (set! failures
+          (+ failures (linked-exercise 73 19 4 c"stogir_vector_comparison_527")))
+    (set! failures
+          (+ failures (linked-exercise 73 20 0 c"stogir_vector_comparison_528")))
+    (set! failures
+          (+ failures (linked-exercise 73 20 3 c"stogir_vector_comparison_529")))
+    (set! failures
+          (+ failures (linked-exercise 73 20 4 c"stogir_vector_comparison_530")))
+    (set! failures
+          (+ failures (linked-exercise 73 21 0 c"stogir_vector_comparison_531")))
+    (set! failures
+          (+ failures (linked-exercise 73 21 3 c"stogir_vector_comparison_532")))
+    (set! failures
+          (+ failures (linked-exercise 73 21 4 c"stogir_vector_comparison_533")))
+    (set! failures
+          (+ failures (linked-exercise 73 22 0 c"stogir_vector_comparison_534")))
+    (set! failures
+          (+ failures (linked-exercise 73 22 3 c"stogir_vector_comparison_535")))
+    (set! failures
+          (+ failures (linked-exercise 73 22 4 c"stogir_vector_comparison_536")))
+    (set! failures
+          (+ failures (linked-exercise 73 23 0 c"stogir_vector_comparison_537")))
+    (set! failures
+          (+ failures (linked-exercise 73 23 3 c"stogir_vector_comparison_538")))
+    (set! failures
+          (+ failures (linked-exercise 73 23 4 c"stogir_vector_comparison_539")))
+    (set! failures
+          (+ failures (linked-exercise 42 14 0 c"stogir_vector_comparison_540")))
+    (set! failures
+          (+ failures (linked-exercise 42 14 3 c"stogir_vector_comparison_541")))
+    (set! failures
+          (+ failures (linked-exercise 42 14 4 c"stogir_vector_comparison_542")))
+    (set! failures
+          (+ failures (linked-exercise 42 15 0 c"stogir_vector_comparison_543")))
+    (set! failures
+          (+ failures (linked-exercise 42 15 3 c"stogir_vector_comparison_544")))
+    (set! failures
+          (+ failures (linked-exercise 42 15 4 c"stogir_vector_comparison_545")))
+    (set! failures
+          (+ failures (linked-exercise 42 16 0 c"stogir_vector_comparison_546")))
+    (set! failures
+          (+ failures (linked-exercise 42 16 3 c"stogir_vector_comparison_547")))
+    (set! failures
+          (+ failures (linked-exercise 42 16 4 c"stogir_vector_comparison_548")))
+    (set! failures
+          (+ failures (linked-exercise 42 17 0 c"stogir_vector_comparison_549")))
+    (set! failures
+          (+ failures (linked-exercise 42 17 3 c"stogir_vector_comparison_550")))
+    (set! failures
+          (+ failures (linked-exercise 42 17 4 c"stogir_vector_comparison_551")))
+    (set! failures
+          (+ failures (linked-exercise 42 18 0 c"stogir_vector_comparison_552")))
+    (set! failures
+          (+ failures (linked-exercise 42 18 3 c"stogir_vector_comparison_553")))
+    (set! failures
+          (+ failures (linked-exercise 42 18 4 c"stogir_vector_comparison_554")))
+    (set! failures
+          (+ failures (linked-exercise 42 19 0 c"stogir_vector_comparison_555")))
+    (set! failures
+          (+ failures (linked-exercise 42 19 3 c"stogir_vector_comparison_556")))
+    (set! failures
+          (+ failures (linked-exercise 42 19 4 c"stogir_vector_comparison_557")))
+    (set! failures
+          (+ failures (linked-exercise 42 20 0 c"stogir_vector_comparison_558")))
+    (set! failures
+          (+ failures (linked-exercise 42 20 3 c"stogir_vector_comparison_559")))
+    (set! failures
+          (+ failures (linked-exercise 42 20 4 c"stogir_vector_comparison_560")))
+    (set! failures
+          (+ failures (linked-exercise 42 21 0 c"stogir_vector_comparison_561")))
+    (set! failures
+          (+ failures (linked-exercise 42 21 3 c"stogir_vector_comparison_562")))
+    (set! failures
+          (+ failures (linked-exercise 42 21 4 c"stogir_vector_comparison_563")))
+    (set! failures
+          (+ failures (linked-exercise 42 22 0 c"stogir_vector_comparison_564")))
+    (set! failures
+          (+ failures (linked-exercise 42 22 3 c"stogir_vector_comparison_565")))
+    (set! failures
+          (+ failures (linked-exercise 42 22 4 c"stogir_vector_comparison_566")))
+    (set! failures
+          (+ failures (linked-exercise 42 23 0 c"stogir_vector_comparison_567")))
+    (set! failures
+          (+ failures (linked-exercise 42 23 3 c"stogir_vector_comparison_568")))
+    (set! failures
+          (+ failures (linked-exercise 42 23 4 c"stogir_vector_comparison_569")))
+    (set! failures
+          (+ failures (linked-exercise 58 14 0 c"stogir_vector_comparison_570")))
+    (set! failures
+          (+ failures (linked-exercise 58 14 3 c"stogir_vector_comparison_571")))
+    (set! failures
+          (+ failures (linked-exercise 58 14 4 c"stogir_vector_comparison_572")))
+    (set! failures
+          (+ failures (linked-exercise 58 15 0 c"stogir_vector_comparison_573")))
+    (set! failures
+          (+ failures (linked-exercise 58 15 3 c"stogir_vector_comparison_574")))
+    (set! failures
+          (+ failures (linked-exercise 58 15 4 c"stogir_vector_comparison_575")))
+    (set! failures
+          (+ failures (linked-exercise 58 16 0 c"stogir_vector_comparison_576")))
+    (set! failures
+          (+ failures (linked-exercise 58 16 3 c"stogir_vector_comparison_577")))
+    (set! failures
+          (+ failures (linked-exercise 58 16 4 c"stogir_vector_comparison_578")))
+    (set! failures
+          (+ failures (linked-exercise 58 17 0 c"stogir_vector_comparison_579")))
+    (set! failures
+          (+ failures (linked-exercise 58 17 3 c"stogir_vector_comparison_580")))
+    (set! failures
+          (+ failures (linked-exercise 58 17 4 c"stogir_vector_comparison_581")))
+    (set! failures
+          (+ failures (linked-exercise 58 18 0 c"stogir_vector_comparison_582")))
+    (set! failures
+          (+ failures (linked-exercise 58 18 3 c"stogir_vector_comparison_583")))
+    (set! failures
+          (+ failures (linked-exercise 58 18 4 c"stogir_vector_comparison_584")))
+    (set! failures
+          (+ failures (linked-exercise 58 19 0 c"stogir_vector_comparison_585")))
+    (set! failures
+          (+ failures (linked-exercise 58 19 3 c"stogir_vector_comparison_586")))
+    (set! failures
+          (+ failures (linked-exercise 58 19 4 c"stogir_vector_comparison_587")))
+    (set! failures
+          (+ failures (linked-exercise 58 20 0 c"stogir_vector_comparison_588")))
+    (set! failures
+          (+ failures (linked-exercise 58 20 3 c"stogir_vector_comparison_589")))
+    (set! failures
+          (+ failures (linked-exercise 58 20 4 c"stogir_vector_comparison_590")))
+    (set! failures
+          (+ failures (linked-exercise 58 21 0 c"stogir_vector_comparison_591")))
+    (set! failures
+          (+ failures (linked-exercise 58 21 3 c"stogir_vector_comparison_592")))
+    (set! failures
+          (+ failures (linked-exercise 58 21 4 c"stogir_vector_comparison_593")))
+    (set! failures
+          (+ failures (linked-exercise 58 22 0 c"stogir_vector_comparison_594")))
+    (set! failures
+          (+ failures (linked-exercise 58 22 3 c"stogir_vector_comparison_595")))
+    (set! failures
+          (+ failures (linked-exercise 58 22 4 c"stogir_vector_comparison_596")))
+    (set! failures
+          (+ failures (linked-exercise 58 23 0 c"stogir_vector_comparison_597")))
+    (set! failures
+          (+ failures (linked-exercise 58 23 3 c"stogir_vector_comparison_598")))
+    (set! failures
+          (+ failures (linked-exercise 58 23 4 c"stogir_vector_comparison_599")))
+    (set! failures
+          (+ failures (linked-exercise 27 14 0 c"stogir_vector_comparison_600")))
+    (set! failures
+          (+ failures (linked-exercise 27 14 3 c"stogir_vector_comparison_601")))
+    (set! failures
+          (+ failures (linked-exercise 27 14 4 c"stogir_vector_comparison_602")))
+    (set! failures
+          (+ failures (linked-exercise 27 15 0 c"stogir_vector_comparison_603")))
+    (set! failures
+          (+ failures (linked-exercise 27 15 3 c"stogir_vector_comparison_604")))
+    (set! failures
+          (+ failures (linked-exercise 27 15 4 c"stogir_vector_comparison_605")))
+    (set! failures
+          (+ failures (linked-exercise 27 16 0 c"stogir_vector_comparison_606")))
+    (set! failures
+          (+ failures (linked-exercise 27 16 3 c"stogir_vector_comparison_607")))
+    (set! failures
+          (+ failures (linked-exercise 27 16 4 c"stogir_vector_comparison_608")))
+    (set! failures
+          (+ failures (linked-exercise 27 17 0 c"stogir_vector_comparison_609")))
+    (set! failures
+          (+ failures (linked-exercise 27 17 3 c"stogir_vector_comparison_610")))
+    (set! failures
+          (+ failures (linked-exercise 27 17 4 c"stogir_vector_comparison_611")))
+    (set! failures
+          (+ failures (linked-exercise 27 18 0 c"stogir_vector_comparison_612")))
+    (set! failures
+          (+ failures (linked-exercise 27 18 3 c"stogir_vector_comparison_613")))
+    (set! failures
+          (+ failures (linked-exercise 27 18 4 c"stogir_vector_comparison_614")))
+    (set! failures
+          (+ failures (linked-exercise 27 19 0 c"stogir_vector_comparison_615")))
+    (set! failures
+          (+ failures (linked-exercise 27 19 3 c"stogir_vector_comparison_616")))
+    (set! failures
+          (+ failures (linked-exercise 27 19 4 c"stogir_vector_comparison_617")))
+    (set! failures
+          (+ failures (linked-exercise 27 20 0 c"stogir_vector_comparison_618")))
+    (set! failures
+          (+ failures (linked-exercise 27 20 3 c"stogir_vector_comparison_619")))
+    (set! failures
+          (+ failures (linked-exercise 27 20 4 c"stogir_vector_comparison_620")))
+    (set! failures
+          (+ failures (linked-exercise 27 21 0 c"stogir_vector_comparison_621")))
+    (set! failures
+          (+ failures (linked-exercise 27 21 3 c"stogir_vector_comparison_622")))
+    (set! failures
+          (+ failures (linked-exercise 27 21 4 c"stogir_vector_comparison_623")))
+    (set! failures
+          (+ failures (linked-exercise 27 22 0 c"stogir_vector_comparison_624")))
+    (set! failures
+          (+ failures (linked-exercise 27 22 3 c"stogir_vector_comparison_625")))
+    (set! failures
+          (+ failures (linked-exercise 27 22 4 c"stogir_vector_comparison_626")))
+    (set! failures
+          (+ failures (linked-exercise 27 23 0 c"stogir_vector_comparison_627")))
+    (set! failures
+          (+ failures (linked-exercise 27 23 3 c"stogir_vector_comparison_628")))
+    (set! failures
+          (+ failures (linked-exercise 27 23 4 c"stogir_vector_comparison_629")))
+    (set! failures
+          (+ failures (linked-exercise 43 14 0 c"stogir_vector_comparison_630")))
+    (set! failures
+          (+ failures (linked-exercise 43 14 3 c"stogir_vector_comparison_631")))
+    (set! failures
+          (+ failures (linked-exercise 43 14 4 c"stogir_vector_comparison_632")))
+    (set! failures
+          (+ failures (linked-exercise 43 15 0 c"stogir_vector_comparison_633")))
+    (set! failures
+          (+ failures (linked-exercise 43 15 3 c"stogir_vector_comparison_634")))
+    (set! failures
+          (+ failures (linked-exercise 43 15 4 c"stogir_vector_comparison_635")))
+    (set! failures
+          (+ failures (linked-exercise 43 16 0 c"stogir_vector_comparison_636")))
+    (set! failures
+          (+ failures (linked-exercise 43 16 3 c"stogir_vector_comparison_637")))
+    (set! failures
+          (+ failures (linked-exercise 43 16 4 c"stogir_vector_comparison_638")))
+    (set! failures
+          (+ failures (linked-exercise 43 17 0 c"stogir_vector_comparison_639")))
+    (set! failures
+          (+ failures (linked-exercise 43 17 3 c"stogir_vector_comparison_640")))
+    (set! failures
+          (+ failures (linked-exercise 43 17 4 c"stogir_vector_comparison_641")))
+    (set! failures
+          (+ failures (linked-exercise 43 18 0 c"stogir_vector_comparison_642")))
+    (set! failures
+          (+ failures (linked-exercise 43 18 3 c"stogir_vector_comparison_643")))
+    (set! failures
+          (+ failures (linked-exercise 43 18 4 c"stogir_vector_comparison_644")))
+    (set! failures
+          (+ failures (linked-exercise 43 19 0 c"stogir_vector_comparison_645")))
+    (set! failures
+          (+ failures (linked-exercise 43 19 3 c"stogir_vector_comparison_646")))
+    (set! failures
+          (+ failures (linked-exercise 43 19 4 c"stogir_vector_comparison_647")))
+    (set! failures
+          (+ failures (linked-exercise 43 20 0 c"stogir_vector_comparison_648")))
+    (set! failures
+          (+ failures (linked-exercise 43 20 3 c"stogir_vector_comparison_649")))
+    (set! failures
+          (+ failures (linked-exercise 43 20 4 c"stogir_vector_comparison_650")))
+    (set! failures
+          (+ failures (linked-exercise 43 21 0 c"stogir_vector_comparison_651")))
+    (set! failures
+          (+ failures (linked-exercise 43 21 3 c"stogir_vector_comparison_652")))
+    (set! failures
+          (+ failures (linked-exercise 43 21 4 c"stogir_vector_comparison_653")))
+    (set! failures
+          (+ failures (linked-exercise 43 22 0 c"stogir_vector_comparison_654")))
+    (set! failures
+          (+ failures (linked-exercise 43 22 3 c"stogir_vector_comparison_655")))
+    (set! failures
+          (+ failures (linked-exercise 43 22 4 c"stogir_vector_comparison_656")))
+    (set! failures
+          (+ failures (linked-exercise 43 23 0 c"stogir_vector_comparison_657")))
+    (set! failures
+          (+ failures (linked-exercise 43 23 3 c"stogir_vector_comparison_658")))
+    (set! failures
+          (+ failures (linked-exercise 43 23 4 c"stogir_vector_comparison_659")))
+    (set! failures
+          (+ failures (linked-exercise 28 14 0 c"stogir_vector_comparison_660")))
+    (set! failures
+          (+ failures (linked-exercise 28 14 3 c"stogir_vector_comparison_661")))
+    (set! failures
+          (+ failures (linked-exercise 28 14 4 c"stogir_vector_comparison_662")))
+    (set! failures
+          (+ failures (linked-exercise 28 15 0 c"stogir_vector_comparison_663")))
+    (set! failures
+          (+ failures (linked-exercise 28 15 3 c"stogir_vector_comparison_664")))
+    (set! failures
+          (+ failures (linked-exercise 28 15 4 c"stogir_vector_comparison_665")))
+    (set! failures
+          (+ failures (linked-exercise 28 16 0 c"stogir_vector_comparison_666")))
+    (set! failures
+          (+ failures (linked-exercise 28 16 3 c"stogir_vector_comparison_667")))
+    (set! failures
+          (+ failures (linked-exercise 28 16 4 c"stogir_vector_comparison_668")))
+    (set! failures
+          (+ failures (linked-exercise 28 17 0 c"stogir_vector_comparison_669")))
+    (set! failures
+          (+ failures (linked-exercise 28 17 3 c"stogir_vector_comparison_670")))
+    (set! failures
+          (+ failures (linked-exercise 28 17 4 c"stogir_vector_comparison_671")))
+    (set! failures
+          (+ failures (linked-exercise 28 18 0 c"stogir_vector_comparison_672")))
+    (set! failures
+          (+ failures (linked-exercise 28 18 3 c"stogir_vector_comparison_673")))
+    (set! failures
+          (+ failures (linked-exercise 28 18 4 c"stogir_vector_comparison_674")))
+    (set! failures
+          (+ failures (linked-exercise 28 19 0 c"stogir_vector_comparison_675")))
+    (set! failures
+          (+ failures (linked-exercise 28 19 3 c"stogir_vector_comparison_676")))
+    (set! failures
+          (+ failures (linked-exercise 28 19 4 c"stogir_vector_comparison_677")))
+    (set! failures
+          (+ failures (linked-exercise 28 20 0 c"stogir_vector_comparison_678")))
+    (set! failures
+          (+ failures (linked-exercise 28 20 3 c"stogir_vector_comparison_679")))
+    (set! failures
+          (+ failures (linked-exercise 28 20 4 c"stogir_vector_comparison_680")))
+    (set! failures
+          (+ failures (linked-exercise 28 21 0 c"stogir_vector_comparison_681")))
+    (set! failures
+          (+ failures (linked-exercise 28 21 3 c"stogir_vector_comparison_682")))
+    (set! failures
+          (+ failures (linked-exercise 28 21 4 c"stogir_vector_comparison_683")))
+    (set! failures
+          (+ failures (linked-exercise 28 22 0 c"stogir_vector_comparison_684")))
+    (set! failures
+          (+ failures (linked-exercise 28 22 3 c"stogir_vector_comparison_685")))
+    (set! failures
+          (+ failures (linked-exercise 28 22 4 c"stogir_vector_comparison_686")))
+    (set! failures
+          (+ failures (linked-exercise 28 23 0 c"stogir_vector_comparison_687")))
+    (set! failures
+          (+ failures (linked-exercise 28 23 3 c"stogir_vector_comparison_688")))
+    (set! failures
+          (+ failures (linked-exercise 28 23 4 c"stogir_vector_comparison_689")))
+    (set! failures
+          (+ failures (linked-exercise 28 24 0 c"stogir_vector_comparison_690")))
+    (set! failures
+          (+ failures (linked-exercise 28 24 3 c"stogir_vector_comparison_691")))
+    (set! failures
+          (+ failures (linked-exercise 28 24 4 c"stogir_vector_comparison_692")))
+    (set! failures
+          (+ failures (linked-exercise 28 25 0 c"stogir_vector_comparison_693")))
+    (set! failures
+          (+ failures (linked-exercise 28 25 3 c"stogir_vector_comparison_694")))
+    (set! failures
+          (+ failures (linked-exercise 28 25 4 c"stogir_vector_comparison_695")))
+    (set! failures
+          (+ failures (linked-exercise 44 14 0 c"stogir_vector_comparison_696")))
+    (set! failures
+          (+ failures (linked-exercise 44 14 3 c"stogir_vector_comparison_697")))
+    (set! failures
+          (+ failures (linked-exercise 44 14 4 c"stogir_vector_comparison_698")))
+    (set! failures
+          (+ failures (linked-exercise 44 15 0 c"stogir_vector_comparison_699")))
+    (set! failures
+          (+ failures (linked-exercise 44 15 3 c"stogir_vector_comparison_700")))
+    (set! failures
+          (+ failures (linked-exercise 44 15 4 c"stogir_vector_comparison_701")))
+    (set! failures
+          (+ failures (linked-exercise 44 16 0 c"stogir_vector_comparison_702")))
+    (set! failures
+          (+ failures (linked-exercise 44 16 3 c"stogir_vector_comparison_703")))
+    (set! failures
+          (+ failures (linked-exercise 44 16 4 c"stogir_vector_comparison_704")))
+    (set! failures
+          (+ failures (linked-exercise 44 17 0 c"stogir_vector_comparison_705")))
+    (set! failures
+          (+ failures (linked-exercise 44 17 3 c"stogir_vector_comparison_706")))
+    (set! failures
+          (+ failures (linked-exercise 44 17 4 c"stogir_vector_comparison_707")))
+    (set! failures
+          (+ failures (linked-exercise 44 18 0 c"stogir_vector_comparison_708")))
+    (set! failures
+          (+ failures (linked-exercise 44 18 3 c"stogir_vector_comparison_709")))
+    (set! failures
+          (+ failures (linked-exercise 44 18 4 c"stogir_vector_comparison_710")))
+    (set! failures
+          (+ failures (linked-exercise 44 19 0 c"stogir_vector_comparison_711")))
+    (set! failures
+          (+ failures (linked-exercise 44 19 3 c"stogir_vector_comparison_712")))
+    (set! failures
+          (+ failures (linked-exercise 44 19 4 c"stogir_vector_comparison_713")))
+    (set! failures
+          (+ failures (linked-exercise 44 20 0 c"stogir_vector_comparison_714")))
+    (set! failures
+          (+ failures (linked-exercise 44 20 3 c"stogir_vector_comparison_715")))
+    (set! failures
+          (+ failures (linked-exercise 44 20 4 c"stogir_vector_comparison_716")))
+    (set! failures
+          (+ failures (linked-exercise 44 21 0 c"stogir_vector_comparison_717")))
+    (set! failures
+          (+ failures (linked-exercise 44 21 3 c"stogir_vector_comparison_718")))
+    (set! failures
+          (+ failures (linked-exercise 44 21 4 c"stogir_vector_comparison_719")))
+    (set! failures
+          (+ failures (linked-exercise 44 22 0 c"stogir_vector_comparison_720")))
+    (set! failures
+          (+ failures (linked-exercise 44 22 3 c"stogir_vector_comparison_721")))
+    (set! failures
+          (+ failures (linked-exercise 44 22 4 c"stogir_vector_comparison_722")))
+    (set! failures
+          (+ failures (linked-exercise 44 23 0 c"stogir_vector_comparison_723")))
+    (set! failures
+          (+ failures (linked-exercise 44 23 3 c"stogir_vector_comparison_724")))
+    (set! failures
+          (+ failures (linked-exercise 44 23 4 c"stogir_vector_comparison_725")))
+    (set! failures
+          (+ failures (linked-exercise 44 24 0 c"stogir_vector_comparison_726")))
+    (set! failures
+          (+ failures (linked-exercise 44 24 3 c"stogir_vector_comparison_727")))
+    (set! failures
+          (+ failures (linked-exercise 44 24 4 c"stogir_vector_comparison_728")))
+    (set! failures
+          (+ failures (linked-exercise 44 25 0 c"stogir_vector_comparison_729")))
+    (set! failures
+          (+ failures (linked-exercise 44 25 3 c"stogir_vector_comparison_730")))
+    (set! failures
+          (+ failures (linked-exercise 44 25 4 c"stogir_vector_comparison_731")))
+    (set! failures
+          (+ failures (linked-exercise 45 14 0 c"stogir_vector_comparison_732")))
+    (set! failures
+          (+ failures (linked-exercise 45 14 3 c"stogir_vector_comparison_733")))
+    (set! failures
+          (+ failures (linked-exercise 45 14 4 c"stogir_vector_comparison_734")))
+    (set! failures
+          (+ failures (linked-exercise 45 15 0 c"stogir_vector_comparison_735")))
+    (set! failures
+          (+ failures (linked-exercise 45 15 3 c"stogir_vector_comparison_736")))
+    (set! failures
+          (+ failures (linked-exercise 45 15 4 c"stogir_vector_comparison_737")))
+    (set! failures
+          (+ failures (linked-exercise 45 16 0 c"stogir_vector_comparison_738")))
+    (set! failures
+          (+ failures (linked-exercise 45 16 3 c"stogir_vector_comparison_739")))
+    (set! failures
+          (+ failures (linked-exercise 45 16 4 c"stogir_vector_comparison_740")))
+    (set! failures
+          (+ failures (linked-exercise 45 17 0 c"stogir_vector_comparison_741")))
+    (set! failures
+          (+ failures (linked-exercise 45 17 3 c"stogir_vector_comparison_742")))
+    (set! failures
+          (+ failures (linked-exercise 45 17 4 c"stogir_vector_comparison_743")))
+    (set! failures
+          (+ failures (linked-exercise 45 18 0 c"stogir_vector_comparison_744")))
+    (set! failures
+          (+ failures (linked-exercise 45 18 3 c"stogir_vector_comparison_745")))
+    (set! failures
+          (+ failures (linked-exercise 45 18 4 c"stogir_vector_comparison_746")))
+    (set! failures
+          (+ failures (linked-exercise 45 19 0 c"stogir_vector_comparison_747")))
+    (set! failures
+          (+ failures (linked-exercise 45 19 3 c"stogir_vector_comparison_748")))
+    (set! failures
+          (+ failures (linked-exercise 45 19 4 c"stogir_vector_comparison_749")))
+    (set! failures
+          (+ failures (linked-exercise 45 20 0 c"stogir_vector_comparison_750")))
+    (set! failures
+          (+ failures (linked-exercise 45 20 3 c"stogir_vector_comparison_751")))
+    (set! failures
+          (+ failures (linked-exercise 45 20 4 c"stogir_vector_comparison_752")))
+    (set! failures
+          (+ failures (linked-exercise 45 21 0 c"stogir_vector_comparison_753")))
+    (set! failures
+          (+ failures (linked-exercise 45 21 3 c"stogir_vector_comparison_754")))
+    (set! failures
+          (+ failures (linked-exercise 45 21 4 c"stogir_vector_comparison_755")))
+    (set! failures
+          (+ failures (linked-exercise 45 22 0 c"stogir_vector_comparison_756")))
+    (set! failures
+          (+ failures (linked-exercise 45 22 3 c"stogir_vector_comparison_757")))
+    (set! failures
+          (+ failures (linked-exercise 45 22 4 c"stogir_vector_comparison_758")))
+    (set! failures
+          (+ failures (linked-exercise 45 23 0 c"stogir_vector_comparison_759")))
+    (set! failures
+          (+ failures (linked-exercise 45 23 3 c"stogir_vector_comparison_760")))
+    (set! failures
+          (+ failures (linked-exercise 45 23 4 c"stogir_vector_comparison_761")))
+    (set! failures
+          (+ failures (linked-exercise 45 24 0 c"stogir_vector_comparison_762")))
+    (set! failures
+          (+ failures (linked-exercise 45 24 3 c"stogir_vector_comparison_763")))
+    (set! failures
+          (+ failures (linked-exercise 45 24 4 c"stogir_vector_comparison_764")))
+    (set! failures
+          (+ failures (linked-exercise 45 25 0 c"stogir_vector_comparison_765")))
+    (set! failures
+          (+ failures (linked-exercise 45 25 3 c"stogir_vector_comparison_766")))
+    (set! failures
+          (+ failures (linked-exercise 45 25 4 c"stogir_vector_comparison_767")))
+    (set! failures
+          (+ failures (linked-exercise 61 14 0 c"stogir_vector_comparison_768")))
+    (set! failures
+          (+ failures (linked-exercise 61 14 3 c"stogir_vector_comparison_769")))
+    (set! failures
+          (+ failures (linked-exercise 61 14 4 c"stogir_vector_comparison_770")))
+    (set! failures
+          (+ failures (linked-exercise 61 15 0 c"stogir_vector_comparison_771")))
+    (set! failures
+          (+ failures (linked-exercise 61 15 3 c"stogir_vector_comparison_772")))
+    (set! failures
+          (+ failures (linked-exercise 61 15 4 c"stogir_vector_comparison_773")))
+    (set! failures
+          (+ failures (linked-exercise 61 16 0 c"stogir_vector_comparison_774")))
+    (set! failures
+          (+ failures (linked-exercise 61 16 3 c"stogir_vector_comparison_775")))
+    (set! failures
+          (+ failures (linked-exercise 61 16 4 c"stogir_vector_comparison_776")))
+    (set! failures
+          (+ failures (linked-exercise 61 17 0 c"stogir_vector_comparison_777")))
+    (set! failures
+          (+ failures (linked-exercise 61 17 3 c"stogir_vector_comparison_778")))
+    (set! failures
+          (+ failures (linked-exercise 61 17 4 c"stogir_vector_comparison_779")))
+    (set! failures
+          (+ failures (linked-exercise 61 18 0 c"stogir_vector_comparison_780")))
+    (set! failures
+          (+ failures (linked-exercise 61 18 3 c"stogir_vector_comparison_781")))
+    (set! failures
+          (+ failures (linked-exercise 61 18 4 c"stogir_vector_comparison_782")))
+    (set! failures
+          (+ failures (linked-exercise 61 19 0 c"stogir_vector_comparison_783")))
+    (set! failures
+          (+ failures (linked-exercise 61 19 3 c"stogir_vector_comparison_784")))
+    (set! failures
+          (+ failures (linked-exercise 61 19 4 c"stogir_vector_comparison_785")))
+    (set! failures
+          (+ failures (linked-exercise 61 20 0 c"stogir_vector_comparison_786")))
+    (set! failures
+          (+ failures (linked-exercise 61 20 3 c"stogir_vector_comparison_787")))
+    (set! failures
+          (+ failures (linked-exercise 61 20 4 c"stogir_vector_comparison_788")))
+    (set! failures
+          (+ failures (linked-exercise 61 21 0 c"stogir_vector_comparison_789")))
+    (set! failures
+          (+ failures (linked-exercise 61 21 3 c"stogir_vector_comparison_790")))
+    (set! failures
+          (+ failures (linked-exercise 61 21 4 c"stogir_vector_comparison_791")))
+    (set! failures
+          (+ failures (linked-exercise 61 22 0 c"stogir_vector_comparison_792")))
+    (set! failures
+          (+ failures (linked-exercise 61 22 3 c"stogir_vector_comparison_793")))
+    (set! failures
+          (+ failures (linked-exercise 61 22 4 c"stogir_vector_comparison_794")))
+    (set! failures
+          (+ failures (linked-exercise 61 23 0 c"stogir_vector_comparison_795")))
+    (set! failures
+          (+ failures (linked-exercise 61 23 3 c"stogir_vector_comparison_796")))
+    (set! failures
+          (+ failures (linked-exercise 61 23 4 c"stogir_vector_comparison_797")))
+    (set! failures
+          (+ failures (linked-exercise 61 24 0 c"stogir_vector_comparison_798")))
+    (set! failures
+          (+ failures (linked-exercise 61 24 3 c"stogir_vector_comparison_799")))
+    (set! failures
+          (+ failures (linked-exercise 61 24 4 c"stogir_vector_comparison_800")))
+    (set! failures
+          (+ failures (linked-exercise 61 25 0 c"stogir_vector_comparison_801")))
+    (set! failures
+          (+ failures (linked-exercise 61 25 3 c"stogir_vector_comparison_802")))
+    (set! failures
+          (+ failures (linked-exercise 61 25 4 c"stogir_vector_comparison_803")))
+    (set! failures
+          (+ failures (linked-pressure 81 14 c"stogir_vector_comparison_804")))
+    (set! failures
+          (+ failures (linked-pressure 81 14 c"stogir_vector_comparison_805")))
+    (set! failures
+          (+ failures (linked-pressure 81 16 c"stogir_vector_comparison_806")))
+    (set! failures
+          (+ failures (linked-pressure 81 16 c"stogir_vector_comparison_807")))
+    (set! failures
+          (+ failures (linked-pressure 81 20 c"stogir_vector_comparison_808")))
+    (set! failures
+          (+ failures (linked-pressure 81 20 c"stogir_vector_comparison_809")))
+    (set! failures
+          (+ failures (linked-pressure 88 14 c"stogir_vector_comparison_810")))
+    (set! failures
+          (+ failures (linked-pressure 88 14 c"stogir_vector_comparison_811")))
+    (set! failures
+          (+ failures (linked-pressure 88 16 c"stogir_vector_comparison_812")))
+    (set! failures
+          (+ failures (linked-pressure 88 16 c"stogir_vector_comparison_813")))
+    (set! failures
+          (+ failures (linked-pressure 88 20 c"stogir_vector_comparison_814")))
+    (set! failures
+          (+ failures (linked-pressure 88 20 c"stogir_vector_comparison_815")))
+    (set! failures
+          (+ failures (linked-pressure 67 14 c"stogir_vector_comparison_816")))
+    (set! failures
+          (+ failures (linked-pressure 67 14 c"stogir_vector_comparison_817")))
+    (set! failures
+          (+ failures (linked-pressure 67 16 c"stogir_vector_comparison_818")))
+    (set! failures
+          (+ failures (linked-pressure 67 16 c"stogir_vector_comparison_819")))
+    (set! failures
+          (+ failures (linked-pressure 67 20 c"stogir_vector_comparison_820")))
+    (set! failures
+          (+ failures (linked-pressure 67 20 c"stogir_vector_comparison_821")))
+    (set! failures
+          (+ failures (linked-pressure 52 14 c"stogir_vector_comparison_822")))
+    (set! failures
+          (+ failures (linked-pressure 52 14 c"stogir_vector_comparison_823")))
+    (set! failures
+          (+ failures (linked-pressure 52 16 c"stogir_vector_comparison_824")))
+    (set! failures
+          (+ failures (linked-pressure 52 16 c"stogir_vector_comparison_825")))
+    (set! failures
+          (+ failures (linked-pressure 52 20 c"stogir_vector_comparison_826")))
+    (set! failures
+          (+ failures (linked-pressure 52 20 c"stogir_vector_comparison_827")))
+    (set! failures
+          (+ failures (linked-pressure 37 14 c"stogir_vector_comparison_828")))
+    (set! failures
+          (+ failures (linked-pressure 37 14 c"stogir_vector_comparison_829")))
+    (set! failures
+          (+ failures (linked-pressure 37 16 c"stogir_vector_comparison_830")))
+    (set! failures
+          (+ failures (linked-pressure 37 16 c"stogir_vector_comparison_831")))
+    (set! failures
+          (+ failures (linked-pressure 37 20 c"stogir_vector_comparison_832")))
+    (set! failures
+          (+ failures (linked-pressure 37 20 c"stogir_vector_comparison_833")))
+    (set! failures
+          (+ failures (linked-pressure 43 14 c"stogir_vector_comparison_834")))
+    (set! failures
+          (+ failures (linked-pressure 43 14 c"stogir_vector_comparison_835")))
+    (set! failures
+          (+ failures (linked-pressure 43 16 c"stogir_vector_comparison_836")))
+    (set! failures
+          (+ failures (linked-pressure 43 16 c"stogir_vector_comparison_837")))
+    (set! failures
+          (+ failures (linked-pressure 43 20 c"stogir_vector_comparison_838")))
+    (set! failures
+          (+ failures (linked-pressure 43 20 c"stogir_vector_comparison_839")))
+    (set! failures
+          (+ failures (linked-pressure 45 14 c"stogir_vector_comparison_840")))
+    (set! failures
+          (+ failures (linked-pressure 45 14 c"stogir_vector_comparison_841")))
+    (set! failures
+          (+ failures (linked-pressure 45 16 c"stogir_vector_comparison_842")))
+    (set! failures
+          (+ failures (linked-pressure 45 16 c"stogir_vector_comparison_843")))
+    (set! failures
+          (+ failures (linked-pressure 45 20 c"stogir_vector_comparison_844")))
+    (set! failures
+          (+ failures (linked-pressure 45 20 c"stogir_vector_comparison_845")))
+    (set! failures
+          (+ failures (linked-pressure 45 24 c"stogir_vector_comparison_846")))
+    (set! failures
+          (+ failures (linked-pressure 45 24 c"stogir_vector_comparison_847")))
+    (set! failures
+          (+ failures (linked-pressure 45 25 c"stogir_vector_comparison_848")))
+    (set! failures
+          (+ failures (linked-pressure 45 25 c"stogir_vector_comparison_849")))
+    (set! failures
+          (+ failures (linked-pressure 44 14 c"stogir_vector_comparison_850")))
+    (set! failures
+          (+ failures (linked-pressure 44 14 c"stogir_vector_comparison_851")))
+    (set! failures
+          (+ failures (linked-pressure 44 16 c"stogir_vector_comparison_852")))
+    (set! failures
+          (+ failures (linked-pressure 44 16 c"stogir_vector_comparison_853")))
+    (set! failures
+          (+ failures (linked-pressure 44 20 c"stogir_vector_comparison_854")))
+    (set! failures
+          (+ failures (linked-pressure 44 20 c"stogir_vector_comparison_855")))
+    (set! failures
+          (+ failures (linked-pressure 44 24 c"stogir_vector_comparison_856")))
+    (set! failures
+          (+ failures (linked-pressure 44 24 c"stogir_vector_comparison_857")))
+    (set! failures
+          (+ failures (linked-pressure 44 25 c"stogir_vector_comparison_858")))
+    (set! failures
+          (+ failures (linked-pressure 44 25 c"stogir_vector_comparison_859")))
+    (println "linked vector comparisons: 860 objects; failures {}" failures)
+    failures))
