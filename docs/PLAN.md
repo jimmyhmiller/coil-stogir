@@ -1387,3 +1387,13 @@ short-vector C ABI entirely from Coil. An inspected Q-return object captures
 `fcmp s0, #0.0` before loading v30/v31 literals and overwriting v0 with its mask.
 Final focused coverage is 2,728 matrix graphs, 80 pressure graphs, 1,014 forced
 register cases, 24 typed returns, 988 ordinary/pressure objects and 24 return objects.
+
+
+The final unchanged-source selection regression passes all 207 standalone checks
+and 63 linked consumers with debug checks, regenerated objects, exact expected
+file/consumer pass sets and no linked warnings. All 380 implementation/test files
+remain Coil. An external compiler replacement occurred during the first pass, so
+final validation used an isolated snapshot of the installed aa64e44440df build
+(labelled dirty), its standard library, compiler SDK and units. Project/toolchain
+content hashes stayed fixed throughout both final passes. Formatting/diff checks
+pass; the project pad records the toolchain manifest and evidence logs.
