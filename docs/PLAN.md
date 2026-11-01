@@ -764,3 +764,38 @@ changes, followed by the complete linked run. Formatting and git diff checks pas
 All 297 implementation/test files are Coil. Library optimization/scaling and
 remaining semantics, actual Coil backend integration and equivalent LLVM/TPDE
 runtime and compile-time measurements remain open.
+
+### ARGVAL indirect aggregate arguments
+
+The reference's AArch64 ARGVAL is an indirect private-copy argument: metadata
+contains an address, byte size and alignment, and the consuming CALL receives a
+pointer to a fresh copy. It does not classify arbitrary small aggregates or
+aggregate results. The checked builder and CALL-only use validation now preserve
+that model. Each argument occurrence gets a distinct aligned buffer, even when
+one ARGVAL node is reused. Repeated calls refresh their copies. Incoming pointers
+continue to use ordinary ADDR parameters.
+
+Private buffers follow scalar stack arguments in the outgoing area; required
+alignment raises actual frame alignment, including with dynamic stack objects.
+Native exact-width copies use reserved x16/x17/x30/v31 before capturing an
+indirect callee and installing arguments. This avoids hidden memcpy calls and
+keeps code size bounded for large metadata sizes. Zero-sized arguments reserve
+separate aligned bytes and perform no source access. See [ABI.md](ABI.md).
+
+Committed helper checkpoint dc7258f passes 74 protected-boundary copy sizes.
+ARGVAL checkpoint fa743fd passes construction/layout/invalid-use checks, emission
+through i32::MAX sizes without unrolling, 672 whole-function fixed/variadic,
+GP/FP-pressure, frame and alignment combinations, and four linked AOT fixtures.
+The whole-function cases retain forty values through two mutating calls, pass
+ten separate private copies (two via stack), check preceding writes and original
+source preservation, and include null source pointers for zero sizes.
+
+The full standalone regression passes all 169 checks with exact source coverage.
+All 42 linked AOT consumers pass after fixture regeneration, with exact consumer
+coverage and no warnings. The final
+zero-size null-source check was rerun after its addition during the standalone
+run; all other implementation behavior remained stable. The source inventory is
+303 Coil implementation/test files. Small aggregate grouping, HFA/HVA support,
+multi-register and dedicated-x8 results remain aggregate ABI requirements, along
+with the remaining semantics, optimization/scaling, actual compiler adapter and
+LLVM/TPDE runtime/compile-time benchmarks.
