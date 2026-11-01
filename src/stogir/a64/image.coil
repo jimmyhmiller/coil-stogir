@@ -4,6 +4,7 @@
 (import "stogir.node" :as n)
 (import "stogir.strings" :as strings)
 (import "stogir.symbols" :as symbols)
+(import "stogir.long-constant" :as long)
 (import "stogir.image" :as image)
 (import "stogir.text-data" :as text-data)
 (import "stogir.bytes" :as bytes)
@@ -25,6 +26,48 @@
                 (do
                   (push! (mut (.data output)) 0)
                   (image/fresh-local! (mut output) 2 offset allocator)))))))
+
+;;; Materialize one immutable complete payload. Verify bytes/hash before
+;;; reserving data, preserve its natural extent alignment, and bind privately.
+(defn long-target! [(output (mut image/Image))
+                    (graph g/Graph)
+                    (reference i32)
+                    (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (match (g/lookup graph reference)
+    (None [] (Err "long constant missing"))
+    (Some [node]
+          (let [size (g/long-size graph reference)
+                (mut hash) (: 5381 u32)
+                (mut i) (: 0 i64)
+                (mut error) ""]
+            (when (or (not (long/valid-header? node 8)) (<= size 0))
+              (set! error "invalid long constant image target"))
+            (while (and (= error "") (< i size))
+              (match (g/long-byte graph reference i)
+                (None [] (set! error "long constant image payload missing"))
+                (Some [byte] (set! hash (long/hash-step hash byte))))
+              (set! i (+ i 1)))
+            (when (!= (n/constant-bits node) (cast u64 (^ hash (.header node))))
+              (set! error "long constant image hash mismatch"))
+            (if (!= error "")
+                (Err error)
+                (match (image/data-space! (mut output)
+                                          size
+                                          (if (< size 8) 8 size))
+                  (Err [message] (Err message))
+                  (Ok [offset]
+                      (set! i 0)
+                      (while (and (= error "") (< i size))
+                        (match (g/long-byte graph reference i)
+                          (None []
+                                (set! error
+                                      "long constant image payload missing"))
+                          (Some [byte]
+                                (set! (mut (.data output)) (+ offset i) byte)))
+                        (set! i (+ i 1)))
+                      (if (!= error "")
+                          (Err error)
+                          (image/fresh-local! (mut output) 2 offset allocator)))))))))
 
 (defn address-slot! [(output (mut image/Image))
                      (target i32)
@@ -62,16 +105,22 @@
   (match (g/lookup graph reference)
     (None [] (Err "emitted symbol constant missing"))
     (Some [node]
-          (if (or (>= reference 0)
-                  (not (symbols/validate graph node))
-                  (not (symbols/named? (n/opcode node))))
-              (Err "invalid emitted symbolic constant")
-              (if (= (n/opcode node) 77)
+          (if (= (n/opcode node) 78)
+              (if (and (< reference 0)
+                       (long/valid-header? node 8)
+                       (> (g/long-size graph reference) 0))
                   (Ok -1)
-                  (match (strings/lookup (.strings graph)
-                                         (cast i32 (n/constant-bits node)))
-                    (None [] (Err "symbol name missing"))
-                    (Some [name] (image/symbol! (mut output) name 0 0))))))))
+                  (Err "invalid emitted long constant"))
+              (if (or (>= reference 0)
+                      (not (symbols/validate graph node))
+                      (not (symbols/named? (n/opcode node))))
+                  (Err "invalid emitted symbolic constant")
+                  (if (= (n/opcode node) 77)
+                      (Ok -1)
+                      (match (strings/lookup (.strings graph)
+                                             (cast i32 (n/constant-bits node)))
+                        (None [] (Err "symbol name missing"))
+                        (Some [name] (image/symbol! (mut output) name 0 0)))))))))
 
 (defn relocation-target! [(output (mut image/Image))
                           (graph g/Graph)
@@ -97,15 +146,20 @@
                     (match (get literals (.target pending))
                       (Some [id] (Ok id))
                       (None []
-                            (match (if (= (n/opcode node) 77)
-                                       (string-target! (mut output)
-                                                       graph
-                                                       node
-                                                       allocator)
-                                       (address-slot! (mut output)
-                                                      symbol
-                                                      (mut addresses)
-                                                      allocator))
+                            (match (if (= (n/opcode node) 78)
+                                       (long-target! (mut output)
+                                                     graph
+                                                     (.target pending)
+                                                     allocator)
+                                       (if (= (n/opcode node) 77)
+                                           (string-target! (mut output)
+                                                           graph
+                                                           node
+                                                           allocator)
+                                           (address-slot! (mut output)
+                                                          symbol
+                                                          (mut addresses)
+                                                          allocator)))
                               (Err [msg] (Err msg))
                               (Ok [id]
                                   (do

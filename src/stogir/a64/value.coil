@@ -12,11 +12,11 @@
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.result" :use [Result Ok Err Some None])
 
-(defn constant! [(out (mut code/Buffer))
-                 (graph g/Graph)
-                 (reference i32)
-                 (destination i32)
-                 (gpr-scratch i32)] (-> (Result i32 (slice u8)))
+(defn scalar-constant! [(out (mut code/Buffer))
+                        (graph g/Graph)
+                        (reference i32)
+                        (destination i32)
+                        (gpr-scratch i32)] (-> (Result i32 (slice u8)))
   (match (g/lookup graph reference)
     (None [] (Err "constant operand missing"))
     (Some [node]
@@ -52,6 +52,44 @@
                                        wide
                                        destination)))))))
 
+;;; A vector constant is loaded from its complete, aligned private image data.
+(defn constant! [(out (mut code/Buffer))
+                 (graph g/Graph)
+                 (reference i32)
+                 (destination i32)
+                 (gpr-scratch i32)] (-> (Result i32 (slice u8)))
+  (match (g/lookup graph reference)
+    (None [] (Err "constant operand missing"))
+    (Some [node]
+          (let [ty (cast i32 (n/type-id node))]
+            (if (not (types/vector? ty))
+                (scalar-constant! (mut out)
+                                  graph
+                                  reference
+                                  destination
+                                  gpr-scratch)
+                (if (or (>= reference 0)
+                        (not (types/short-vector? ty 8))
+                        (not (registers/simd? destination))
+                        (< gpr-scratch 0)
+                        (> gpr-scratch 30))
+                    (Err "unsupported vector constant width or register class")
+                    (match (encode/floating-load-store true
+                                                       (types/size ty 8)
+                                                       (registers/physical destination)
+                                                       gpr-scratch
+                                                       0)
+                      (Err [message] (Err message))
+                      (Ok [load]
+                          (match (code/long-address! (mut out)
+                                                     graph
+                                                     reference
+                                                     gpr-scratch)
+                            (Err [message] (Err message))
+                            (Ok [count]
+                                (bytes/append32! (mut (.text out)) load)
+                                (Ok (+ count 4))))))))))))
+
 (defn register! [(out (mut code/Buffer))
                  (graph g/Graph)
                  (parts (ArrayList a/Part))
@@ -65,7 +103,7 @@
           (let [ty (cast i32 (n/type-id node))]
             (if (< reference 0)
                 (let [destination
-                        (if (types/floating? ty) simd-scratch gpr-scratch)]
+                        (if (registers/simd-type? ty) simd-scratch gpr-scratch)]
                   (match (constant! (mut out)
                                     graph
                                     reference
