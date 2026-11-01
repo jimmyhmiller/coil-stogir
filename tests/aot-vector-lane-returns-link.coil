@@ -1,0 +1,287 @@
+(module stogir.tests.aot-vector-lane-returns-link)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.simd" :as v)
+(import "stogir.types" :as types)
+
+(defstruct Lane8 [(bits (vec u64 1))])
+
+(defstruct Lane16 [(bits (vec u64 2))])
+
+(defn pattern [(base i32) (lane i64) (seed i64) (right? bool)] (-> u64)
+  (let [i (% (+ lane (if right? (/ seed 11) (% seed 11))) 11)
+        fp? (types/floating? base)
+        wide? (= base 12)]
+    (if fp?
+        (if wide?
+            (match i
+              (0 (: 0 u64))
+              (1 0x8000000000000000)
+              (2 0x3FF0000000000000)
+              (3 0xBFF0000000000000)
+              (4 1)
+              (5 0x000FFFFFFFFFFFFF)
+              (6 0x7FEFFFFFFFFFFFFF)
+              (7 0x7FF0000000000000)
+              (8 0xFFF0000000000000)
+              (9 0x7FF8123456789ABC)
+              (_ 0x7FF0123456789ABC))
+            (match i
+              (0 (: 0 u64))
+              (1 0x80000000)
+              (2 0x3F800000)
+              (3 0xBF800000)
+              (4 1)
+              (5 0x007FFFFF)
+              (6 0x7F7FFFFF)
+              (7 0x7F800000)
+              (8 0xFF800000)
+              (9 0x7FC12345)
+              (_ 0x7F812345)))
+        (match i
+          (0 (: 0 u64))
+          (1 1)
+          (2 0xFFFFFFFFFFFFFFFF)
+          (3 (<< (: 1 u64) (cast u64 (- (* 8 (types/scalar-size base 8)) 1))))
+          (4 (- (<< (: 1 u64) (cast u64 (- (* 8 (types/scalar-size base 8)) 1)))
+                1))
+          (5 0x8080808080808080)
+          (6 0x7F7F7F7F7F7F7F7F)
+          (7 0xFFFF0000FFFF0000)
+          (8 0x123456789ABCDEF0)
+          (9 0xFFFFFFFFFFFFFFFE)
+          (_ 0x0102030405060708)))))
+
+(defn input-byte [(base i32) (index i64) (seed i64) (right? bool)] (-> u8)
+  (let [width (cast i64 (types/scalar-size base 8))]
+    (cast u8
+          (>> (pattern base (/ index width) seed right?)
+              (cast u64 (* (% index width) 8))))))
+
+(defn read-word [(buffer (slice u8)) (offset i64) (width i32)] (-> u64)
+  (let [(mut result) (: 0 u64)
+        (mut i) (: 0 i32)]
+    (while (< i width)
+      (set! result
+            (| result
+               (<< (cast u64 (get buffer (+ offset (cast i64 i))))
+                   (cast u64 (* i 8)))))
+      (set! i (+ i 1)))
+    result))
+
+(defn mask-width [(ty i32)] (-> u64)
+  (cast u64 (- (<< (: 1 u128) (cast u128 (* 8 (types/scalar-size ty 8)))) 1)))
+
+(defn count-value [(ty i32) (test i32)] (-> u64)
+  (let [raw
+          (match test
+            (0 (: 0 u64))
+            (1 1)
+            (2 2)
+            (3 3)
+            (4 4)
+            (5 7)
+            (6 8)
+            (7 15)
+            (8 16)
+            (9 31)
+            (10 32)
+            (11 63)
+            (12 64)
+            (13 127)
+            (14 128)
+            (15 255)
+            (16 256)
+            (17 0x100000001)
+            (18 0x8000000000000000)
+            (19 0xFFFFFFFFFFFFFFFF)
+            (20 0xFFFFFFFFFFFFFFFE)
+            (_ 0x123456789ABCDEF0))]
+    (& raw (mask-width ty))))
+
+(defn returned-call [(ty i32)
+                     (op i32)
+                     (address (ptr u8))
+                     (input (slice u8))
+                     (fresh u64)
+                     (index u64)
+                     (output (ptr u64))] (-> void)
+  (let [(mut scalar32) (: 0.0 f32)
+        (mut scalar64) (: 0.0 f64)
+        d (Lane8 :bits (v/vsplat [u64 1] (read-word input 0 8)))
+        q
+          (Lane16
+            :bits
+              (v/vinsert (v/vsplat [u64 2] (read-word input 0 8))
+                         1
+                         (read-word input 8 8)))]
+    (p/store! (p/cast (ptr u32) (mut scalar32)) (cast u32 fresh))
+    (p/store! (p/cast (ptr u64) (mut scalar64)) fresh)
+    (when (= ty 45)
+      (when (= op 61)
+        (let [f (p/cast (fnptr (cc/C) [Lane8 u64] f32) address)
+              result (call-ptr f d index)]
+          (p/store! (p/cast (ptr f32) output) result)))
+      (when (= op 62)
+        (let [f (p/cast (fnptr (cc/C) [f32 Lane8 u64] Lane8) address)
+              result (call-ptr f scalar32 d index)]
+          (p/store! output (v/vextract (.bits result) 0))))
+      (when (= op 63)
+        (let [f (p/cast (fnptr (cc/C) [f32] Lane8) address)
+              result (call-ptr f scalar32)]
+          (p/store! output (v/vextract (.bits result) 0)))))
+    (when (= ty 61)
+      (when (= op 61)
+        (let [f (p/cast (fnptr (cc/C) [Lane16 u64] f32) address)
+              result (call-ptr f q index)]
+          (p/store! (p/cast (ptr f32) output) result)))
+      (when (= op 62)
+        (let [f (p/cast (fnptr (cc/C) [f32 Lane16 u64] Lane16) address)
+              result (call-ptr f scalar32 q index)]
+          (p/store! output (v/vextract (.bits result) 0))
+          (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
+      (when (= op 63)
+        (let [f (p/cast (fnptr (cc/C) [f32] Lane16) address)
+              result (call-ptr f scalar32)]
+          (p/store! output (v/vextract (.bits result) 0))
+          (p/store! (p/index output 1) (v/vextract (.bits result) 1)))))
+    (when (= ty 28)
+      (when (= op 61)
+        (let [f (p/cast (fnptr (cc/C) [Lane8 u64] f64) address)
+              result (call-ptr f d index)]
+          (p/store! (p/cast (ptr f64) output) result)))
+      (when (= op 62)
+        (let [f (p/cast (fnptr (cc/C) [f64 Lane8 u64] Lane8) address)
+              result (call-ptr f scalar64 d index)]
+          (p/store! output (v/vextract (.bits result) 0))))
+      (when (= op 63)
+        (let [f (p/cast (fnptr (cc/C) [f64] Lane8) address)
+              result (call-ptr f scalar64)]
+          (p/store! output (v/vextract (.bits result) 0)))))
+    (when (= ty 44)
+      (when (= op 61)
+        (let [f (p/cast (fnptr (cc/C) [Lane16 u64] f64) address)
+              result (call-ptr f q index)]
+          (p/store! (p/cast (ptr f64) output) result)))
+      (when (= op 62)
+        (let [f (p/cast (fnptr (cc/C) [f64 Lane16 u64] Lane16) address)
+              result (call-ptr f scalar64 q index)]
+          (p/store! output (v/vextract (.bits result) 0))
+          (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
+      (when (= op 63)
+        (let [f (p/cast (fnptr (cc/C) [f64] Lane16) address)
+              result (call-ptr f scalar64)]
+          (p/store! output (v/vextract (.bits result) 0))
+          (p/store! (p/index output 1) (v/vextract (.bits result) 1)))))))
+
+(defn exercise [(ty i32) (op i32) (lane i32) (address (ptr u8))] (-> i64)
+  (let [width (types/size ty 8)
+        base (types/base-type ty)
+        element (types/scalar-size base 8)
+        (mut input) (ArrayList::new [u8] (malloc-allocator))
+        (mut failures) 0
+        (mut seed) (: 0 i64)]
+    (while (< seed 11)
+      (clear! (mut input))
+      (let [(mut byte) (: 0 i64)]
+        (while (< byte 16)
+          (push! (mut input) (input-byte base byte seed false))
+          (set! byte (+ byte 1))))
+      (let [(mut test) (: 0 i32)]
+        (while (< test (if (< lane 0) 22 1))
+          (let [index (count-value 5 test)
+                selected (if (< lane 0) index (cast u64 lane))
+                valid? (< selected (cast u64 (types/lanes ty)))
+                fresh (& (pattern base 0 (+ seed 5) false) (mask-width base))
+                (mut got) [(: 0 u64) 0]
+                (mut byte) (: 0 i64)]
+            (returned-call ty op address (slice input) fresh index (data got))
+            (while (< byte 16)
+              (let [wanted
+                      (if (>= byte (cast i64 (if (= op 61) element width)))
+                          (: 0 u8)
+                          (if (= op 61)
+                              (if valid?
+                                  (get input
+                                       (+ (* (cast i64 selected)
+                                             (cast i64 element))
+                                          byte))
+                                  (: 0 u8))
+                              (if (or (= op 63)
+                                      (and valid?
+                                           (= (/ byte (cast i64 element))
+                                              (cast i64 selected))))
+                                  (cast u8
+                                        (>> fresh
+                                            (cast u64
+                                                  (* (% byte (cast i64 element))
+                                                     8))))
+                                  (get input byte))))
+                    actual (p/load (p/index (p/cast (ptr u8) (data got)) byte))]
+                (when (!= actual wanted)
+                  (when (< failures 6)
+                    (println "lane return ty{} op{} lane{} seed{} test{} byte{} got{} expected{}"
+                             ty
+                             op
+                             lane
+                             seed
+                             test
+                             byte
+                             actual
+                             wanted))
+                  (set! failures (+ failures 1))))
+              (set! byte (+ byte 1))))
+          (set! test (+ test 1))))
+      (set! seed (+ seed 1)))
+    (free! (mut input))
+    failures))
+
+(import "coil.os" :as os)
+
+(defn linked [(ty i32) (op i32) (lane i32) (name (ptr i8))] (-> i64)
+  (let [address (os/dlsym (p/cast (ptr i8) (: -2 i64)) name)]
+    (if (= (p/cast u64 address) 0)
+        (do (println "missing lane return symbol") 1)
+        (exercise ty op lane (p/cast (ptr u8) address)))))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (set! failures
+          (+ failures (linked 45 61 -1 c"stogir_vector_lane_return_0")))
+    (set! failures (+ failures (linked 45 61 1 c"stogir_vector_lane_return_1")))
+    (set! failures
+          (+ failures (linked 45 62 -1 c"stogir_vector_lane_return_2")))
+    (set! failures (+ failures (linked 45 62 1 c"stogir_vector_lane_return_3")))
+    (set! failures (+ failures (linked 45 63 0 c"stogir_vector_lane_return_4")))
+    (set! failures
+          (+ failures (linked 61 61 -1 c"stogir_vector_lane_return_5")))
+    (set! failures (+ failures (linked 61 61 3 c"stogir_vector_lane_return_6")))
+    (set! failures
+          (+ failures (linked 61 62 -1 c"stogir_vector_lane_return_7")))
+    (set! failures (+ failures (linked 61 62 3 c"stogir_vector_lane_return_8")))
+    (set! failures (+ failures (linked 61 63 0 c"stogir_vector_lane_return_9")))
+    (set! failures
+          (+ failures (linked 28 61 -1 c"stogir_vector_lane_return_10")))
+    (set! failures
+          (+ failures (linked 28 61 0 c"stogir_vector_lane_return_11")))
+    (set! failures
+          (+ failures (linked 28 62 -1 c"stogir_vector_lane_return_12")))
+    (set! failures
+          (+ failures (linked 28 62 0 c"stogir_vector_lane_return_13")))
+    (set! failures
+          (+ failures (linked 28 63 0 c"stogir_vector_lane_return_14")))
+    (set! failures
+          (+ failures (linked 44 61 -1 c"stogir_vector_lane_return_15")))
+    (set! failures
+          (+ failures (linked 44 61 1 c"stogir_vector_lane_return_16")))
+    (set! failures
+          (+ failures (linked 44 62 -1 c"stogir_vector_lane_return_17")))
+    (set! failures
+          (+ failures (linked 44 62 1 c"stogir_vector_lane_return_18")))
+    (set! failures
+          (+ failures (linked 44 63 0 c"stogir_vector_lane_return_19")))
+    (println "linked typed floating lane returns: 20 objects; failures {}"
+             failures)
+    failures))

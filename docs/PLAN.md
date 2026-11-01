@@ -1333,3 +1333,13 @@ graphs and 1,490 linked objects. Integer extraction is also widened and checked
 for signedness; FP payloads, original values/counts, input memory and padding are
 checked exactly. The remaining shuffle/vector-conversion families and broader
 standalone/compiler/backend/benchmark work remain required.
+
+
+Twenty additional typed C-ABI return graphs now exercise FP EXTRACT/REPLACE/SPLAT
+for f32/f64 D/Q shapes in JIT and linked AOT. One-member vector records provide
+the host-side short-vector argument/result ABI without external-language probes.
+Replacement takes its scalar in v0 and vector in v1, then returns through v0;
+object inspection confirms scalar bits are captured before copying the vector
+over the aliased result register. The corpus compares complete NaN/zero payloads
+and dynamic out-of-range behavior. These add 20 linked return fixtures to the
+1,490 memory-result/pressure fixtures above.
