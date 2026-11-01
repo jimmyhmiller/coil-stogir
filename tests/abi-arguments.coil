@@ -1,0 +1,95 @@
+(module stogir.tests.abi-arguments)
+(import "stogir.a64.abi-arguments" :as abi)
+(import "stogir.call-groups" :as groups)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err])
+
+(defn check [(ty u8) (count i32) (alignment i32) (prefix i32) (unnamed? bool)]
+  (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut types) (ArrayList::new [u8] allocator)
+        (mut i) (: 0 i32)
+        (mut failures) 0]
+    (while (< i prefix) (push! (mut types) ty) (set! i (+ i 1)))
+    (set! i 0)
+    (while (< i count) (push! (mut types) ty) (set! i (+ i 1)))
+    (push! (mut types) ty)
+    (let [group
+            (groups/Group
+              :first prefix
+              :count count
+              :alignment alignment)
+          fixed (if unnamed? (cast i64 prefix) (len types))
+          width (if (= ty 13) (: 4 i64) (: 8 i64))
+          fits? (and (not unnamed?) (<= (+ prefix count) 8))
+          bank (if (= ty 5) (: 0 i32) (: 32 i32))]
+      (match (abi/plan (slice types) fixed unnamed? [group] allocator)
+        (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+        (Ok [layout]
+            (let [(mut layout) layout]
+              (set! i 0)
+              (while (< i count)
+                (let [part (get (.parts layout) (cast i64 (+ prefix i)))]
+                  (when (or (!= (.register part)
+                                (if fits? (+ bank prefix i) (: -1 i32)))
+                            (!= (.offset part)
+                                (if fits? -1 (* (cast i64 i) width)))
+                            (!= (.size part) (cast i32 width))
+                            (.promote? part))
+                    (set! failures (+ failures 1))))
+                (set! i (+ i 1)))
+              ; A rejected group consumes the remainder of its register bank.
+              (let [tail (get (.parts layout) (cast i64 (+ prefix count)))
+                    extent (* (cast i64 count) width)
+                    padded (if unnamed? (* (/ (+ extent 7) 8) 8) extent)]
+                (when (and (not fits?)
+                           (or (!= (.register tail) -1)
+                               (!= (.offset tail) padded)
+                               (!= (.size tail)
+                                   (if unnamed? 8 (cast i32 width)))
+                               (!= (.promote? tail) (and unnamed? (= ty 13)))))
+                  (set! failures (+ failures 1))))
+              (abi/release! (mut layout))))))
+    (free! (mut types))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for prefix [(: 0 i32) 1 5 6 7 8]
+      (for unnamed? [false true]
+        (for alignment [(: 8 i32) 16]
+          (set! failures (+ failures (check 5 2 alignment prefix unnamed?))))
+        (for count [(: 1 i32) 2 3 4]
+          (set! failures
+                (+ failures
+                   (check 13 count 4 prefix unnamed?)
+                   (check 12 count 8 prefix unnamed?))))))
+    ; LLVM's Darwin layout for eight GPRs, eight FPRs, char/HFA3/char/double:
+    ; the chars are at0/16, the HFA at4/8/12, and the final double at24.
+    (let [allocator (malloc-allocator)
+          (mut parameters) (ArrayList::new [u8] allocator)]
+      (for ty [(: 5 u8) 5 5 5 5 5 5 5 12 12 12 12 12 12 12 12 2 13 13 13 2 12]
+        (push! (mut parameters) ty))
+      (match (abi/plan (slice parameters)
+                       (len parameters)
+                       false
+                       [(groups/Group
+                          :first 17
+                          :count 3
+                          :alignment 4)]
+                       allocator)
+        (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+        (Ok [layout]
+            (let [(mut layout) layout
+                  (mut i) (: 16 i64)]
+              (for offset [(: 0 i64) 4 8 12 16 24]
+                (when (!= (.offset (get (.parts layout) i)) offset)
+                  (set! failures (+ failures 1)))
+                (set! i (+ i 1)))
+              (when (!= (.stack layout) 32) (set! failures (+ failures 1)))
+              (abi/release! (mut layout)))))
+      (free! (mut parameters)))
+    (println "Darwin argument groups, bank exhaustion and variadic packing: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

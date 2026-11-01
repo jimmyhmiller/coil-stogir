@@ -1,0 +1,115 @@
+;;; Explicit groups of scalar ABI pieces; this metadata is a Coil extension.
+(module stogir.call-groups)
+(import "stogir.types" :as types)
+(import "coil.arraylist" :use [ArrayList])
+
+;;; Ordinals index flattened scalar parameters. Integer pairs have two 64-bit
+;;; pieces; homogeneous floating groups have one through four identical pieces.
+(defstruct Group [(first i32) (count i32) (alignment i32)])
+
+(defn shape? [(group Group)] (-> bool)
+  (and (>= (.first group) 0)
+       (<= (.first group) 65532)
+       (>= (.count group) 1)
+       (<= (.count group) 4)
+       (<= (+ (.first group) (.count group)) 65533)
+       (>= (.alignment group) 4)
+       (<= (.alignment group) 16)
+       (= (& (.alignment group) (- (.alignment group) 1)) 0)))
+
+(defn members? [(group Group) (ty u8)] (-> bool)
+  (let [size (types/scalar-size (cast i32 ty) 8)]
+    (and (shape? group)
+         (or (and (= (.count group) 2) (or (= ty 5) (= ty 11)))
+             (types/floating? (cast i32 ty)))
+         (>= (.alignment group) size)
+         (= (% (* size (.count group)) (.alignment group)) 0))))
+
+;;; Sorted, disjoint records. A group cannot straddle the fixed/unnamed boundary.
+;;; Unnamed group types are checked later against the actual CALL operands.
+(defn valid? [(parameters (slice u8)) (groups (slice Group))] (-> bool)
+  (let [(mut end) (: 0 i32)
+        (mut good?) true]
+    (for group groups
+      (when (or (not (shape? group))
+                (< (.first group) end)
+                (and (< (cast i64 (.first group)) (len parameters))
+                     (> (cast i64 (+ (.first group) (.count group)))
+                        (len parameters))))
+        (set! good? false))
+      (when (and good? (< (cast i64 (.first group)) (len parameters)))
+        (let [ty (get parameters (cast i64 (.first group)))
+              (mut i) (: 0 i32)]
+          (when (not (members? group ty)) (set! good? false))
+          (while (< i (.count group))
+            (when (!= (get parameters (cast i64 (+ (.first group) i))) ty)
+              (set! good? false))
+            (set! i (+ i 1)))))
+      (when good? (set! end (+ (.first group) (.count group)))))
+    good?))
+
+;;; After the unchanged flags/result/count/type prefix: SGAG, version1, zero,
+;;; u16 count, then records {u16 first,u8 count,u8 alignment,u32 reserved=0}.
+(defn append! [(bytes (mut (ArrayList u8))) (groups (slice Group))] (-> void)
+  (when (> (len groups) 0)
+    (for byte [(: 83 u8) 71 65 71 1 0] (push! (mut bytes) byte))
+    (push! (mut bytes) (cast u8 (& (len groups) 255)))
+    (push! (mut bytes) (cast u8 (>> (len groups) 8)))
+    (for group groups
+      (push! (mut bytes) (cast u8 (& (.first group) 255)))
+      (push! (mut bytes) (cast u8 (>> (.first group) 8)))
+      (push! (mut bytes) (cast u8 (.count group)))
+      (push! (mut bytes) (cast u8 (.alignment group)))
+      (for byte [(: 0 u8) 0 0 0] (push! (mut bytes) byte)))))
+
+;;; Accessors require a validated complete prototype (including its prefix).
+(defn count [(bytes (slice u8))] (-> i64)
+  (let [base (+ 3 (cast i64 (get bytes 2)))]
+    (if (= (len bytes) base)
+        0
+        (+ (cast i64 (get bytes (+ base 6)))
+           (<< (cast i64 (get bytes (+ base 7))) 8)))))
+
+(defn at [(bytes (slice u8)) (index i64)] (-> Group)
+  (let [base (+ 11 (cast i64 (get bytes 2)) (* index 8))]
+    (Group
+      :first
+        (+ (cast i32 (get bytes base)) (<< (cast i32 (get bytes (+ base 1))) 8))
+      :count (cast i32 (get bytes (+ base 2)))
+      :alignment (cast i32 (get bytes (+ base 3))))))
+
+(defn valid-trailer? [(bytes (slice u8)) (parameters (slice u8))] (-> bool)
+  (if (or (< (len bytes) 3) (!= (cast i64 (get bytes 2)) (len parameters)))
+      false
+      (let [base (+ 3 (len parameters))]
+        (if (= (len bytes) base)
+            true
+            (if (< (len bytes) (+ base 8))
+                false
+                (if (or (!= (get bytes base) 83)
+                        (!= (get bytes (+ base 1)) 71)
+                        (!= (get bytes (+ base 2)) 65)
+                        (!= (get bytes (+ base 3)) 71)
+                        (!= (get bytes (+ base 4)) 1)
+                        (!= (get bytes (+ base 5)) 0))
+                    false
+                    (let [count (count bytes)
+                          (mut end) (: 0 i32)
+                          (mut good?) (> count 0)
+                          (mut i) (: 0 i64)]
+                      (when (!= (len bytes) (+ base 8 (* count 8)))
+                        (set! good? false))
+                      (while (and good? (< i count))
+                        (let [group (at bytes i)
+                              offset (+ base 8 (* i 8))]
+                          (when (or (not (valid? parameters [group]))
+                                    (< (.first group) end)
+                                    (!= (get bytes (+ offset 4)) 0)
+                                    (!= (get bytes (+ offset 5)) 0)
+                                    (!= (get bytes (+ offset 6)) 0)
+                                    (!= (get bytes (+ offset 7)) 0))
+                            (set! good? false))
+                          (when good?
+                            (set! end (+ (.first group) (.count group)))))
+                        (set! i (+ i 1)))
+                      good?)))))))
