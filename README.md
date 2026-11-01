@@ -112,3 +112,21 @@ The `dc90b58` construction checkpoint also passes the complete 211 standalone /
 operand ordering and truncation-of-extension folding now follow pinned upstream
 construction rules. SCCP, persistent matching/fusion before liveness, coalescing
 and block-scheduling parity remain open architectural work.
+
+
+Post-allocation block-layout checks include a transcript mode for comparing the
+same CFG facts with the pinned upstream scheduler:
+
+```sh
+coil run tests/block-layout.coil --debug-checks -- --oracle
+```
+
+The [recorded comparison](docs/validation/block-layout-oracle.json) has 59 matching
+block orders/alignment decisions. This is scheduling-core evidence, not complete
+optimizer parity. The shared-image AOT consumer now uses both image fixtures:
+
+```sh
+coil run tests/macho-image.coil --debug-checks
+coil run tests/jit-branch.coil --debug-checks
+coil run tests/aot-image-link.coil --debug-checks --link-flag /tmp/coil-stogir-image.o --link-flag /tmp/coil-stogir-long-relocated-branch.o
+```
