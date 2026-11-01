@@ -1,0 +1,124 @@
+(module stogir.tests.argument-value)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.argument-value" :as argval)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.call-abi" :as abi)
+(import "stogir.a64.compile" :as compile)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [message] (println "{}" message) 0)))
+
+(defn rejected [(r (Result i32 (slice u8)))] (-> i64)
+  (match r (Err [_] 0) (Ok [_] 1)))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        source (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        number (require (b/scalar-constant! (mut graph) 5 1 8))
+        variable (require (b/variable! (mut graph) 6 start "not-an-address" 8))
+        before (len (.instructions graph))
+        (mut failures)
+          (+ (rejected (b/argument-value! (mut graph) source -1 8))
+             (rejected (b/argument-value! (mut graph) source 21 -1))
+             (rejected (b/argument-value! (mut graph) source 21 3))
+             (rejected (b/argument-value! (mut graph) number 21 8))
+             (rejected (b/argument-value! (mut graph) variable 21 8)))]
+    (when (!= (len (.instructions graph)) before)
+      (set! failures (+ failures 1)))
+    (let [value (require (b/argument-value! (mut graph) source 21 4096))]
+      (set! failures
+            (+ failures (rejected (b/argument-value! (mut graph) value 21 8))))
+      (match (calls/create 9 5 [(: 6 u8) 6 6 6 6 6 6 6 6 6] allocator)
+        (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+        (Ok [prototype]
+            (let [(mut prototype) prototype
+                  called
+                    (require (calls/emit! (mut graph)
+                                          prototype
+                                          start
+                                          target
+                                          [value value value value value value
+                                           value value value value]
+                                          allocator))
+                  ret
+                    (require (b/emit! (mut graph)
+                                      120
+                                      5
+                                      [called called (: 0 i32)]))]
+              (match (argval/verify graph allocator)
+                (Err [message]
+                     (println "{}" message)
+                     (set! failures (+ failures 1)))
+                (Ok [count] (when (!= count 1) (set! failures (+ failures 1)))))
+              (match (abi/layout graph called allocator)
+                (Err [message]
+                     (println "{}" message)
+                     (set! failures (+ failures 1)))
+                (Ok [plan]
+                    (let [(mut plan) plan
+                          (mut i) (: 0 i64)]
+                      (when (!= (.stack plan) (+ 40960 21))
+                        (set! failures (+ failures 1)))
+                      (for arg (.arguments plan)
+                        (when (or (!= (.copy-offset arg) (* (+ i 1) 4096))
+                                  (!= (.register arg)
+                                      (if (< i 8) (cast i32 i) (: -1 i32)))
+                                  (!= (.offset arg)
+                                      (if (< i 8) -1 (* (- i 8) 8))))
+                          (set! failures (+ failures 1)))
+                        (set! i (+ i 1)))
+                      (abi/release! (mut plan)))))
+              (match (compile/text graph start [ret] allocator)
+                (Err [message]
+                     (println "{}" message)
+                     (set! failures (+ failures 1)))
+                (Ok [text] (let [(mut text) text] (free! (mut text)))))
+              ; A well-typed source address is still not an ordinary use of ARGVAL.
+              (let [bad
+                      (require (b/emit! (mut graph)
+                                        120
+                                        6
+                                        [called value (: 0 i32)]))]
+                (set! failures
+                      (+ failures (rejected (argval/verify graph allocator))))
+                (when (= bad 0) (set! failures (+ failures 1))))
+              (calls/release! (mut prototype))))))
+    (g/release! (mut graph))
+    (for size [(: 0 i32) 1 64 65 65537 0x7FFFFFFF]
+      (let [(mut graph) (g/create allocator)
+            start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+            target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+            source (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+            value (require (b/argument-value! (mut graph) source size 0))]
+        (match (calls/create 9 0 [(: 6 u8)] allocator)
+          (Err [_] (set! failures (+ failures 1)))
+          (Ok [prototype]
+              (let [(mut prototype) prototype
+                    called
+                      (require (calls/emit! (mut graph)
+                                            prototype
+                                            start
+                                            target
+                                            [value]
+                                            allocator))
+                    ret
+                      (require (b/emit! (mut graph) 120 0 [called (: 0 i32) 0]))]
+                (match (compile/text graph start [ret] allocator)
+                  (Err [message]
+                       (println "size {}: {}" size message)
+                       (set! failures (+ failures 1)))
+                  (Ok [text]
+                      (let [(mut text) text]
+                        (when (> (len text) 256) (set! failures (+ failures 1)))
+                        (free! (mut text)))))
+                (calls/release! (mut prototype)))))
+        (g/release! (mut graph))))
+    (println "ARGVAL construction, private layout and bounded emission: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

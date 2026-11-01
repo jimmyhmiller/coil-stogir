@@ -3,6 +3,8 @@
 (import "stogir.graph" :as g)
 (import "stogir.node" :as n)
 (import "stogir.calls" :as calls)
+(import "stogir.argument-value" :as argval)
+(import "stogir.alignment" :as alignment)
 (import "stogir.types" :as types)
 (import "stogir.a64.encode" :as encode)
 (import "stogir.bytes" :as bytes)
@@ -56,7 +58,13 @@
   (* (/ (+ offset (- alignment 1)) alignment) alignment))
 
 (defstruct Argument
-  [(value i32) (ty u8) (register i32) (offset i64) (size i32) (promote? bool)])
+  [(value i32)
+   (ty u8)
+   (register i32)
+   (offset i64)
+   (size i32)
+   (promote? bool)
+   (copy-offset i64)])
 
 (defstruct Layout [(arguments (ArrayList Argument)) (stack i64)])
 
@@ -120,7 +128,8 @@
                                                    (.stack result)
                                                    -1)
                                              :size size
-                                             :promote? (and unnamed? (= ty 13))))
+                                             :promote? (and unnamed? (= ty 13))
+                                             :copy-offset -1))
                                     (if (< register 0)
                                         (set! (.stack result)
                                               (+ (.stack result)
@@ -129,6 +138,35 @@
                                             (set! fp (+ fp 1))
                                             (set! gp (+ gp 1)))))))))))
             (set! j (+ j 1)))
+          ; Each occurrence gets distinct private storage after all scalar stack
+          ; arguments. Sharing an ARGVAL node must not alias two callee copies.
+          (let [(mut i) (: 0 i64)]
+            (while (and (= error "") (< i (len (.arguments result))))
+              (let [arg (elem (mut (.arguments result)) i)]
+                (match (g/lookup graph (.value arg))
+                  (None [] (set! error "call argument missing"))
+                  (Some [node]
+                        (when (= (n/opcode node) 70)
+                          (match (argval/validate graph (.value arg))
+                            (Err [message] (set! error message))
+                            (Ok [shape]
+                                (match (alignment/up (.stack result)
+                                                     (.alignment shape))
+                                  (Err [message] (set! error message))
+                                  (Ok [offset]
+                                      (let [size
+                                              (if (= (.size shape) 0)
+                                                  1
+                                                  (.size shape))]
+                                        (if (> offset
+                                               (- 0x7FFFFFFFFFFFFFFF size))
+                                            (set! error
+                                                  "ARGVAL copy area overflow")
+                                            (do
+                                              (set! (.copy-offset arg) offset)
+                                              (set! (.stack result)
+                                                    (+ offset size)))))))))))))
+              (set! i (+ i 1))))
           (if (= error "") (Ok result) (do (release! (mut result)) (Err error)))))))
 
 ;;; One outgoing area at SP is shared by calls and precedes all spill slots.
@@ -146,7 +184,7 @@
               (let [(mut owned) plan]
                 (when (> (.stack owned) maximum) (set! maximum (.stack owned)))
                 (release! (mut owned)))))))
-    (if (= error "") (Ok (align maximum 16)) (Err error))))
+    (if (= error "") (alignment/up maximum 16) (Err error))))
 
 ;;; Darwin callers extend sub-32-bit integer register arguments. Canonicalize
 ;;; narrow results and generated function returns the same way. No scratch is

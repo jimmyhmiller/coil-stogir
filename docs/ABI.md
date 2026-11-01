@@ -319,3 +319,49 @@ The caller must use a live snapshot from the same function invocation, preservin
 its stack/frame alignment, and must stop accessing objects released by restore.
 The IR does not insert runtime provenance checks on saved pointers. Whole-function
 return restores the entry stack regardless of remaining dynamic scopes.
+
+## Indirect aggregate arguments
+
+`builder/argument-value!(graph, source, size, alignment)` emits the reference
+ARGVAL node: an ADDR result with an ADDR source and signed i32 size/alignment
+metadata. Size must be nonnegative. Alignment may be zero (natural minimum) or a
+positive power of two. The AArch64 private copy has at least eight-byte alignment;
+requirements above sixteen also raise the function's actual frame alignment.
+A VAR identity is not an address; use VADDR. ARGVAL cannot wrap another ARGVAL.
+
+ARGVAL is only valid as a CALL argument. Declare that prototype parameter ADDR.
+At the consuming call, the object is copied into private caller storage and the
+copy's pointer is passed using the ordinary integer bank or stack pointer slot.
+Incoming indirect parameters are normal ADDR projections. A preceding
+control-ordered write is visible in the copy. The callee may mutate its copy
+without changing the source. Reusing one ARGVAL node in several argument
+positions creates distinct copies; each call refreshes its copies.
+
+Private buffers follow all scalar stack arguments in the outgoing area, with
+checked alignment and size accounting. Consequently they are distinct from
+fixed locals/spills and live dynamic allocations. Calls may reuse the outgoing
+area, and a pointer to a copy must not outlive that call. The source must denote a
+readable normal-memory range of the declared size and must not alias internal
+outgoing storage. A zero size performs no source access and reserves a distinct
+aligned byte for the private pointer. Available native stack space remains a
+platform limit.
+
+The copy emitter uses exact eight/four/two/one-byte accesses for small objects
+and bounded eight-byte loops with exact tails for larger objects. It uses only
+reserved x16/x17/x30/v31, before x30 captures an indirect target and before scalar
+argument copies. It makes no runtime helper call and preserves allocatable GP/FP
+values. Arguments passed through Darwin `...` receive their private pointer in
+an eight-byte stack slot.
+
+This implements the reference's indirect ARGVAL path. It does not by itself
+classify small C aggregates, HFAs/HVAs, grouped register arguments, multi-register
+returns, or the dedicated x8 indirect-result pointer. Those remain required for
+the complete compiler backend.
+
+Checks cover malformed construction and illegal uses, distinct/aligned per-use
+copy placement, bounded code through i32::MAX bytes (emission only), 74 native
+protected-boundary copy sizes, and 672 whole-function size/alignment/frame/GP-FP/
+fixed-variadic combinations. The latter retain forty values through repeated
+mutating calls, including two copy pointers on the stack, and verify untouched
+source bytes. Four linked fixtures exercise aligned dynamic objects and both
+result banks for fixed and variadic calls.

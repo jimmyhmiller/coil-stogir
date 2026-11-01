@@ -1,0 +1,100 @@
+(module stogir.tests.aot-argument-value-link)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+
+(extern gp :as "stogir_argval_gp" :cc (cc/C) [u64 u64 u64] (-> u64))
+
+(extern fp :as "stogir_argval_fp" :cc (cc/C) [u64 u64 u64] (-> f64))
+
+(extern var-gp :as "stogir_argval_var_gp" :cc (cc/C) [u64 u64 u64] (-> u64))
+
+(extern var-fp :as "stogir_argval_var_fp" :cc (cc/C) [u64 u64 u64] (-> f64))
+
+(defn pattern [(i i64)] (-> u8)
+  (cast u8 (% (+ (* i 37) 19) 251)))
+
+;;; Pointer arguments model ARGVAL's lowered indirect interface. Each occurrence
+;;; must receive an independent copy, including the two pointers passed on stack.
+(defn inspect :cc (cc/C) [(a u64)
+                          (b u64)
+                          (c u64)
+                          (d u64)
+                          (e u64)
+                          (f u64)
+                          (g u64)
+                          (h u64)
+                          (j u64)
+                          (k u64)
+                          (original u64)
+                          (size u64)
+                          (alignment u64)] (-> u64)
+  (let [(mut ordinal) (: 0 u64)
+        (mut errors) (: 0 u64)]
+    (for address [a b c d e f g h j k]
+      (when (or (= address original) (!= (& address (- alignment 1)) 0))
+        (set! errors 1000001))
+      (let [(mut other) (: 0 u64)]
+        (for previous [a b c d e f g h j k]
+          (when (and (< other ordinal) (= previous address))
+            (set! errors 1000002))
+          (set! other (+ other 1))))
+      (let [p (primitive/cast (ptr u8) address)
+            (mut i) (: 0 i64)]
+        (while (< i (cast i64 size))
+          (when (!= (primitive/load (primitive/index p i)) (pattern i))
+            (set! errors 1000003))
+          (primitive/store! (primitive/index p i) (: 255 u8))
+          (set! i (+ i 1))))
+      (set! ordinal (+ ordinal 1)))
+    (let [p (primitive/cast (ptr u8) original)
+          (mut i) (: 0 i64)]
+      (while (< i (cast i64 size))
+        (when (!= (primitive/load (primitive/index p i)) (pattern i))
+          (set! errors 1000004))
+        (set! i (+ i 1))))
+    (if (= errors 0) 7 errors)))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut bytes) (ArrayList::new [u8] allocator)
+        (mut integers) (ArrayList::new [u64] allocator)
+        (mut floats) (ArrayList::new [f64] allocator)
+        target (primitive/cast u64 (primitive/cast (ptr u8) (fnptr-of inspect)))
+        (mut failures) 0
+        (mut i) (: 0 i64)]
+    (while (< i 81)
+      (push! (mut bytes) (if (= i 3) 0 (pattern (- i 3))))
+      (set! i (+ i 1)))
+    (set! i 0)
+    (while (< i 40)
+      (push! (mut integers) (cast u64 (+ i 11)))
+      (push! (mut floats) (cast f64 (+ i 11)))
+      (set! i (+ i 1)))
+    (for variadic? [false true]
+      (let [g (if variadic? (fnptr-of var-gp) (fnptr-of gp))
+            f (if variadic? (fnptr-of var-fp) (fnptr-of fp))
+            input (primitive/cast u64 (primitive/index (.data bytes) 3))]
+        (when (or (!= (call-ptr g
+                                target
+                                input
+                                (primitive/cast u64 (.data integers)))
+                      1555)
+                  (!= (call-ptr f
+                                target
+                                input
+                                (primitive/cast u64 (.data floats)))
+                      1555.0))
+          (set! failures (+ failures 1)))
+        (set! i 0)
+        (while (< i (len bytes))
+          (when (!= (get bytes i) (if (= i 3) 0 (pattern (- i 3))))
+            (set! failures (+ failures 1)))
+          (set! i (+ i 1)))))
+    (free! (mut bytes))
+    (free! (mut integers))
+    (free! (mut floats))
+    (println "linked ARGVAL copies, fixed/variadic calls, GP/FP pressure and aligned frames: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

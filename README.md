@@ -39,6 +39,10 @@ Over-aligned frames preserve entry SP for incoming arguments and exact restorati
 FRAME_ADDR establishes a real frame record, including in leaf functions; fixed
 storage accesses then use an explicit x29-based frame context.
 
+ARGVAL supports indirect aggregate arguments through private aligned copies at
+call time, including repeated arguments, stack-passed pointers and variadic
+calls. Direct small-aggregate grouping and aggregate returns remain unfinished.
+
 Native copy, overlap-safe move and zero builders expand into existing memory
 and control nodes. Fixed small transfers use exact-width accesses; larger and
 dynamic operations use bounded loops. See the [bulk memory API](docs/MEMORY.md).

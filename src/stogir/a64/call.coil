@@ -9,6 +9,7 @@
 (import "stogir.a64.frame-address" :as frame)
 (import "stogir.a64.frame-memory" :as memory)
 (import "stogir.a64.call-abi" :as abi)
+(import "stogir.a64.argument-copy" :as argcopy)
 (import "stogir.a64.code" :as buffer)
 (import "stogir.a64.encode" :as encode)
 (import "stogir.bytes" :as bytes)
@@ -80,47 +81,59 @@
                           (arg abi/Argument)
                           (position i64)
                           (base frame/Base)] (-> (Result i32 (slice u8)))
-  (if (.promote? arg)
-      (match (capture-at! (mut output)
-                          graph
-                          parts
-                          (.value arg)
-                          position
-                          62
-                          base)
+  (if (>= (.copy-offset arg) 0)
+      (match (frame/address! (mut (.text output)) 16 31 (.copy-offset arg))
         (Err [message] (Err message))
         (Ok [_]
-            (match (word! (mut output) (encode/floating-convert true 30 30))
-              (Err [message] (Err message))
-              (Ok [_]
-                  (memory/access! (mut (.text output))
-                                  false
-                                  8
-                                  62
-                                  31
-                                  (.offset arg)
-                                  false
-                                  17)))))
-      (match (capture-at! (mut output)
-                          graph
-                          parts
-                          (.value arg)
-                          position
-                          16
-                          base)
-        (Err [message] (Err message))
-        (Ok [_]
-            (match (abi/normalize! (mut (.text output)) (.ty arg) 16)
-              (Err [message] (Err message))
-              (Ok [_]
-                  (memory/access! (mut (.text output))
-                                  false
-                                  (.size arg)
-                                  16
-                                  31
-                                  (.offset arg)
-                                  false
-                                  17)))))))
+            (memory/access! (mut (.text output))
+                            false
+                            8
+                            16
+                            31
+                            (.offset arg)
+                            false
+                            17)))
+      (if (.promote? arg)
+          (match (capture-at! (mut output)
+                              graph
+                              parts
+                              (.value arg)
+                              position
+                              62
+                              base)
+            (Err [message] (Err message))
+            (Ok [_]
+                (match (word! (mut output) (encode/floating-convert true 30 30))
+                  (Err [message] (Err message))
+                  (Ok [_]
+                      (memory/access! (mut (.text output))
+                                      false
+                                      8
+                                      62
+                                      31
+                                      (.offset arg)
+                                      false
+                                      17)))))
+          (match (capture-at! (mut output)
+                              graph
+                              parts
+                              (.value arg)
+                              position
+                              16
+                              base)
+            (Err [message] (Err message))
+            (Ok [_]
+                (match (abi/normalize! (mut (.text output)) (.ty arg) 16)
+                  (Err [message] (Err message))
+                  (Ok [_]
+                      (memory/access! (mut (.text output))
+                                      false
+                                      (.size arg)
+                                      16
+                                      31
+                                      (.offset arg)
+                                      false
+                                      17))))))))
 
 (defn emit-at! [(output (mut buffer/Buffer))
                 (graph g/Graph)
@@ -143,6 +156,32 @@
                       (Some [callee] (= (n/opcode callee) 74)))
                     false)
               (mut error) ""]
+          ; Copy before x30 captures the target and before any argument register
+          ; is overwritten. Only reserved x16/x17/x30/v31 are clobbered here.
+          (for arg (.arguments layout)
+            (when (and (= error "") (>= (.copy-offset arg) 0))
+              (match (capture-at! (mut code)
+                                  graph
+                                  parts
+                                  (.value arg)
+                                  position
+                                  16
+                                  base)
+                (Err [message] (set! error message))
+                (Ok [_]
+                    (match (frame/address! (mut (.text code))
+                                           17
+                                           31
+                                           (.copy-offset arg))
+                      (Err [message] (set! error message))
+                      (Ok [_]
+                          (let [source
+                                  (get (.instructions graph)
+                                       (cast i64 (.value arg)))]
+                            (match (argcopy/copy! (mut (.text code))
+                                                  (cast i64 (.op2 source)))
+                              (Err [message] (set! error message))
+                              (Ok [_] 0)))))))))
           ;; x30 captures an indirect target before any argument copies.
           (when (not direct?)
             (match (capture-at! (mut code)
@@ -165,7 +204,10 @@
                 (Err [message] (set! error message))
                 (Ok [_] 0))))
           (for arg (.arguments layout)
-            (when (and (= error "") (>= (.register arg) 0) (> (.value arg) 0))
+            (when (and (= error "")
+                       (>= (.register arg) 0)
+                       (> (.value arg) 0)
+                       (< (.copy-offset arg) 0))
               (match (loc/lookup parts (.value arg) position)
                 (Err [message] (set! error message))
                 (Ok [source]
@@ -187,14 +229,21 @@
               (Err [message] (set! error message))
               (Ok [_] 0)))
           (for arg (.arguments layout)
-            (when (and (= error "") (>= (.register arg) 0) (< (.value arg) 0))
-              (match (capture-at! (mut code)
-                                  graph
-                                  parts
-                                  (.value arg)
-                                  position
-                                  (.register arg)
-                                  base)
+            (when (and (= error "")
+                       (>= (.register arg) 0)
+                       (or (< (.value arg) 0) (>= (.copy-offset arg) 0)))
+              (match (if (>= (.copy-offset arg) 0)
+                         (frame/address! (mut (.text code))
+                                         (.register arg)
+                                         31
+                                         (.copy-offset arg))
+                         (capture-at! (mut code)
+                                      graph
+                                      parts
+                                      (.value arg)
+                                      position
+                                      (.register arg)
+                                      base))
                 (Err [message] (set! error message))
                 (Ok [_] 0))))
           (for arg (.arguments layout)
@@ -235,7 +284,12 @@
                        (parts (ArrayList allocation/Part))
                        (arg abi/Argument)
                        (position i64)] (-> (Result i32 (slice u8)))
-  (stack-argument-at! (mut output) graph parts arg position (frame/stack-base)))
+  (stack-argument-at! (mut output)
+                      graph
+                      parts
+                      arg
+                      position
+                      (frame/stack-base)))
 
 (defn emit! [(output (mut buffer/Buffer))
              (graph g/Graph)
