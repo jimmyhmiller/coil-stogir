@@ -19,6 +19,20 @@
            (!= (.value location) 31))
       (and (= (.kind location) 1) (>= (.value location) 0))))
 
+;;; A complete 128-bit value may inhabit only a SIMD register or stack slot.
+(defn width-location? [(location loc/Location) (size i32)] (-> bool)
+  (and (valid? location)
+       (or (!= size 16)
+           (= (.kind location) 1)
+           (registers/simd? (cast i32 (.value location))))))
+
+;;; Memory-to-memory data scratch must hold the whole value. Address scratch
+;;; ownership is separate, so large Q-register accesses never truncate payloads.
+(defn data-scratch? [(size i32) (scratch i32)] (-> bool)
+  (if (= size 16)
+      (registers/simd? scratch)
+      (and (>= scratch 0) (< scratch 31))))
+
 ;;; Scratch must be reserved/dead for this transfer. All encodings are checked
 ;;; before appending, so a failed transfer never partially mutates output.
 (defn emit-at! [(output (mut (ArrayList u8)))
@@ -47,11 +61,10 @@
         (Ok [offset] (set! (.value destination) offset))))
     (if (!= error "")
         (Err error)
-        (if (or (not (valid? source))
-                (not (valid? destination))
-                (not (or (= size 4) (= size 8)))
-                (< scratch 0)
-                (> scratch 30))
+        (if (or (not (width-location? source size))
+                (not (width-location? destination size))
+                (not (or (= size 4) (= size 8) (= size 16)))
+                (not (data-scratch? size scratch)))
             (Err "invalid physical transfer")
             (if (loc/same? source destination)
                 (Ok 0)
@@ -62,9 +75,9 @@
                             (if (= (.kind destination) 0)
                                 (if (registers/simd? src)
                                     (if (registers/simd? dst)
-                                        (e/floating-move (= size 8)
-                                                         (registers/physical dst)
-                                                         (registers/physical src))
+                                        (e/simd-move size
+                                                     (registers/physical dst)
+                                                     (registers/physical src))
                                         (e/scalar-transfer (= size 8)
                                                            false
                                                            dst
@@ -111,18 +124,30 @@
                           (Err [msg] (Err msg))
                           (Ok [word]
                               (do (bytes/append32! (mut output) word) (Ok 4))))
-                        (match (e/load-store true
-                                             size
-                                             scratch
-                                             (.reg base)
-                                             (.value source))
+                        (match (if (= size 16)
+                                   (e/floating-load-store true
+                                                          size
+                                                          (registers/physical scratch)
+                                                          (.reg base)
+                                                          (.value source))
+                                   (e/load-store true
+                                                 size
+                                                 scratch
+                                                 (.reg base)
+                                                 (.value source)))
                           (Err [msg] (Err msg))
                           (Ok [load-word]
-                              (match (e/load-store false
-                                                   size
-                                                   scratch
-                                                   (.reg base)
-                                                   (.value destination))
+                              (match (if (= size 16)
+                                         (e/floating-load-store false
+                                                                size
+                                                                (registers/physical scratch)
+                                                                (.reg base)
+                                                                (.value destination))
+                                         (e/load-store false
+                                                       size
+                                                       scratch
+                                                       (.reg base)
+                                                       (.value destination)))
                                 (Err [msg] (Err msg))
                                 (Ok [store-word]
                                     (do
@@ -138,7 +163,7 @@
   (-> (Result i32 (slice u8)))
   (emit-at! (mut output) source destination size scratch (frame/stack-base)))
 
-;;; Two distinct caller-owned GPRs allow large memory-to-memory copies. Keep
+;;; Distinct caller-owned data/address scratches allow large memory copies. Keep
 ;;; the immediate form allocation-free; temporary bytes make fallback errors atomic.
 (defn emit-addressed! [(output (mut (ArrayList u8)))
                        (source loc/Location)
@@ -152,11 +177,10 @@
           (> address-scratch 30)
           (= address-scratch scratch)
           (= address-scratch (.reg base))
-          (not (valid? source))
-          (not (valid? destination))
-          (not (or (= size 4) (= size 8)))
-          (< scratch 0)
-          (> scratch 30)
+          (not (width-location? source size))
+          (not (width-location? destination size))
+          (not (or (= size 4) (= size 8) (= size 16)))
+          (not (data-scratch? size scratch))
           (= scratch (.reg base))
           (not (frame/valid-base? base))
           (and (= (.reg base) 29)
@@ -249,7 +273,7 @@
                     (set! (mut indices) (.value location) id)
                     (Ok id)))))))
 
-;;; All copies form one simultaneous group and share one raw scalar width.
+;;; All copies form one simultaneous group and share one raw value width.
 ;;; Register IDs 0..63 and dense stack identities starting at 64 are disjoint.
 ;;; Scratch must be reserved and absent from copies. Temporary bytes keep errors atomic.
 (defn parallel-impl! [(output (mut (ArrayList u8)))
@@ -269,10 +293,12 @@
           (if (or (not (frame/valid-base? base))
                   (= memory-scratch (.reg base))
                   (= scratch (.reg base))
-                  (not (or (= size 4) (= size 8)))
+                  (not (or (= size 4) (= size 8) (= size 16)))
                   (< scratch 0)
-                  (> scratch (if (< address-scratch 0) 30 63))
+                  (> scratch
+                     (if (and (< address-scratch 0) (!= size 16)) 30 63))
                   (= scratch 31)
+                  (and (= size 16) (not (registers/simd? scratch)))
                   (< address-scratch -1)
                   (> address-scratch 30)
                   (and (>= address-scratch 0)
@@ -280,8 +306,7 @@
                            (= address-scratch memory-scratch)
                            (= address-scratch scratch)))
                   (= scratch memory-scratch)
-                  (< memory-scratch 0)
-                  (> memory-scratch 30))
+                  (not (data-scratch? size memory-scratch)))
               "invalid parallel scratch registers"
               "")]
     (for copy copies
@@ -300,8 +325,8 @@
                          (and (= (.kind destination) 0)
                               (= (.value destination)
                                  (cast i64 address-scratch)))))
-                (not (valid? source))
-                (not (valid? destination)))
+                (not (width-location? source size))
+                (not (width-location? destination size)))
             (set! error "invalid parallel transfer location")
             (match (location-id! source (mut slots) (mut indices))
               (Err [message] (set! error message))
@@ -378,15 +403,23 @@
                   base
                   -1))
 
-;;; Target-reserved v31 holds a raw scalar cycle value, leaving x16 for addresses
-;;; and x17 for memory data. No allocatable register or live cycle value is lost.
+;;; Target-reserved v31 holds the cycle value. Q-register copies use v30 for
+;;; memory data and x16 for addresses; smaller values use x17 for memory data.
+;;; No allocatable register or live cycle value is lost.
 (defn parallel-frame! [(output (mut (ArrayList u8)))
                        (copies (slice loc/Transfer))
                        (size i32)
                        (allocator (dyn Allocator))
                        (base frame/Base)]
   (-> (Result i32 (slice u8)))
-  (parallel-impl! (mut output) copies size 63 17 allocator base 16))
+  (parallel-impl! (mut output)
+                  copies
+                  size
+                  63
+                  (if (= size 16) 62 17)
+                  allocator
+                  base
+                  16))
 
 (defn parallel! [(output (mut (ArrayList u8)))
                  (copies (slice loc/Transfer))

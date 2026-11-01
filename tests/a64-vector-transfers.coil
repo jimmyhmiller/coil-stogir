@@ -1,0 +1,339 @@
+(module stogir.tests.a64-vector-transfers)
+(import "stogir.a64.encode" :as e)
+(import "stogir.a64.frame-address" :as frame)
+(import "stogir.a64.frame-memory" :as memory)
+(import "stogir.a64.transfers" :as transfers)
+(import "stogir.locations" :as loc)
+(import "stogir.bytes" :as bytes)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(extern reserve
+        :as
+        "mmap"
+        :cc
+        (cc/C)
+        [(ptr u8) i64 i32 i32 i32 i64]
+        (-> (ptr u8)))
+
+(extern protect :as "mprotect" :cc (cc/C) [(ptr u8) i64 i32] (-> i32))
+
+(extern release :as "munmap" :cc (cc/C) [(ptr u8) i64] (-> i32))
+
+(extern page-size :as "getpagesize" :cc (cc/C) [] (-> i32))
+
+(extern fork :cc (cc/C) [] (-> i32))
+
+(extern waitpid :cc (cc/C) [i32 (ptr i32) i32] (-> i32))
+
+(extern exit-child :as "_exit" :cc (cc/C) [i32] (-> void))
+
+(extern signal :cc (cc/C) [i32 u64] (-> u64))
+
+(defn fault-handler :cc (cc/C) [(number i32)] (-> void)
+  (exit-child 77))
+
+(defn reg [(number i32)] (-> loc/Location)
+  (loc/Location :kind 0 :value (cast i64 number)))
+
+(defn slot [(offset i64)] (-> loc/Location)
+  (loc/Location :kind 1 :value offset))
+
+(defn copy [(source loc/Location) (destination loc/Location)] (-> loc/Transfer)
+  (loc/Transfer
+    :position 0
+    :parent 0
+    :source source
+    :destination destination))
+
+(defn checked [(value (Result i32 (slice u8)))] (-> i64)
+  (match value (Ok [_] 0) (Err [message] (println "{}" message) 1)))
+
+(defn word! [(out (mut (ArrayList u8))) (value (Result u32 (slice u8)))]
+  (-> i64)
+  (match value
+    (Ok [word] (bytes/append32! (mut out) word) 0)
+    (Err [message] (println "{}" message) 1)))
+
+(defn pattern [(index i64)] (-> u8)
+  (cast u8 (% (+ (* index 37) (/ index 7) 19) 251)))
+
+;;; The reference operates on original byte locations simultaneously. Register
+;;; inputs live at0..63; register outputs are observed separately at64..127.
+(defn source-offset [(location loc/Location) (bias i64)] (-> i64)
+  (if (= (.kind location) 0)
+      (* (- (.value location) 32) 16)
+      (- (.value location) bias)))
+
+(defn run [(scenario i32) (offset i64) (bias i64)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut code) (ArrayList::new [u8] allocator)
+        (mut copies) (ArrayList::new [loc/Transfer] allocator)
+        (mut cells) (ArrayList::new [u8] allocator)
+        (mut expected) (ArrayList::new [u8] allocator)
+        a (slot (+ offset bias))
+        b (slot (+ offset bias 32))
+        c (slot (+ offset bias 64))
+        base (frame/Base :reg 29 :bias bias)
+        (mut failures) 0
+        (mut i) (: 0 i64)]
+    (match scenario
+      (0 (do
+           (push! (mut copies) (copy (reg 32) (reg 33)))
+           (push! (mut copies) (copy (reg 33) (reg 32)))))
+      (1 (do
+           (push! (mut copies) (copy (reg 32) a))
+           (push! (mut copies) (copy a (reg 32)))))
+      (2 (do
+           (push! (mut copies) (copy a b))
+           (push! (mut copies) (copy b a))))
+      (3 (do
+           (push! (mut copies) (copy (reg 32) (reg 33)))
+           (push! (mut copies) (copy (reg 33) (reg 34)))
+           (push! (mut copies) (copy (reg 34) (reg 32)))
+           (push! (mut copies) (copy a b))
+           (push! (mut copies) (copy b c))
+           (push! (mut copies) (copy c a))))
+      (4 (do
+           (push! (mut copies) (copy (reg 32) a))
+           (push! (mut copies) (copy a (reg 33)))
+           (push! (mut copies) (copy (reg 33) (reg 32)))))
+      (5 (do
+           (push! (mut copies) (copy (reg 32) a))
+           (push! (mut copies) (copy a b))
+           (push! (mut copies) (copy b (reg 33)))
+           (push! (mut copies) (copy (reg 33) (reg 32)))))
+      (6 (do
+           (push! (mut copies) (copy (reg 32) (reg 33)))
+           (push! (mut copies) (copy (reg 32) a))
+           (push! (mut copies) (copy a (reg 34)))))
+      (_ (do
+           (push! (mut copies) (copy (reg 32) (reg 33)))
+           (push! (mut copies) (copy (reg 33) (reg 32)))
+           (push! (mut copies) (copy a b))
+           (push! (mut copies) (copy b a)))))
+    (while (< i (+ offset 96))
+      (push! (mut cells) (pattern i))
+      (push! (mut expected) (pattern i))
+      (set! i (+ i 1)))
+    (for transfer copies
+      (when (= (.kind (.destination transfer)) 1)
+        (set! i 0)
+        (while (< i 16)
+          (p/store! (p/index (.data expected)
+                             (+ (- (.value (.destination transfer)) bias) i))
+                    (pattern (+ (source-offset (.source transfer) bias) i)))
+          (set! i (+ i 1)))))
+    (for number [(: 32 i32) 33 34 35]
+      (let [(mut source) (* (cast i64 (- number 32)) 16)]
+        (for transfer copies
+          (when (loc/same? (.destination transfer) (reg number))
+            (set! source (source-offset (.source transfer) bias))))
+        (set! i 0)
+        (while (< i 16)
+          (p/store! (p/index (.data expected)
+                             (+ 64 (* (cast i64 (- number 32)) 16) i))
+                    (pattern (+ source i)))
+          (set! i (+ i 1)))))
+    ; The wrapper uses only caller-saved x15 as host-x29 storage. Transfer
+    ; scratches are x16 and v30/v31; none may overwrite a pending cycle value.
+    (set! failures
+          (+ failures
+             (word! (mut code) (e/logical-register true 1 15 31 29))
+             (word! (mut code) (e/logical-register true 1 29 31 0))
+             (word! (mut code) (e/add-sub true true true 31 1 1))))
+    (for number [(: 0 i32) 1 2 3]
+      (set! failures
+            (+ failures
+               (checked (memory/access! (mut code)
+                                        true
+                                        16
+                                        (+ 32 number)
+                                        29
+                                        (* (cast i64 number) 16)
+                                        false
+                                        16)))))
+    (set! failures
+          (+ failures
+             (checked (transfers/parallel-frame! (mut code)
+                                                 (slice copies)
+                                                 16
+                                                 allocator
+                                                 base))))
+    (for number [(: 0 i32) 1 2 3]
+      (set! failures
+            (+ failures
+               (checked (memory/access! (mut code)
+                                        false
+                                        16
+                                        (+ 32 number)
+                                        29
+                                        (+ 64 (* (cast i64 number) 16))
+                                        false
+                                        16)))))
+    (set! failures
+          (+ failures
+             (word! (mut code) (e/logical-register true 1 29 31 15))
+             (word! (mut code) (e/move-wide true 2 1 1 0))
+             (word! (mut code) (e/conditional-select true 0 1 31 0))
+             (word! (mut code) (e/ret 30))))
+    (match (jit/map-text (slice code))
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [loaded]
+          (let [(mut loaded) loaded
+                f (p/cast (fnptr (cc/C) [(ptr u8)] u64) (.base loaded))]
+            (when (!= (call-ptr f (.data cells)) 1)
+              (set! failures (+ failures 1)))
+            (set! i 0)
+            (while (< i (len cells))
+              (when (!= (get cells i) (get expected i))
+                (println "Q transfer scenario{} offset{} bias{} byte{}: {} expected{}"
+                         scenario
+                         offset
+                         bias
+                         i
+                         (get cells i)
+                         (get expected i))
+                (set! failures (+ failures 1)))
+              (set! i (+ i 1)))
+            (jit/release! (mut loaded)))))
+    (free! (mut code))
+    (free! (mut copies))
+    (free! (mut cells))
+    (free! (mut expected))
+    failures))
+
+(defn guarded [(f (fnptr (cc/C) [(ptr u8) (ptr u8)] void)) (size i64)] (-> i64)
+  (let [page (cast i64 (page-size))
+        capacity (* page 5)
+        total (+ capacity (* page 2))
+        a (reserve (p/cast (ptr u8) 0) total 0 0x1002 -1 0)
+        b (reserve (p/cast (ptr u8) 0) total 0 0x1002 -1 0)
+        (mut failures) 0]
+    (if (or (= (p/cast i64 a) -1) (= (p/cast i64 b) -1))
+        (set! failures 1)
+        (if (or (!= (protect (p/index a page) capacity 3) 0)
+                (!= (protect (p/index b page) capacity 3) 0))
+            (set! failures 1)
+            (let [child (fork)]
+              (if (< child 0)
+                  (set! failures 1)
+                  (if (= child 0)
+                      (let [source (p/index a page)
+                            destination (p/index b page)
+                            handler
+                              (p/cast u64
+                                      (p/cast (ptr u8) (fnptr-of fault-handler)))
+                            (mut errors) 0
+                            (mut i) (: 0 i64)]
+                        (signal 10 handler)
+                        (signal 11 handler)
+                        (for source-offset [(: 0 i64) (- capacity size)]
+                          (for destination-offset [(: 0 i64) (- capacity size)]
+                            (set! i 0)
+                            (while (< i capacity)
+                              (p/store! (p/index source i) (pattern i))
+                              (p/store! (p/index destination i) (: 255 u8))
+                              (set! i (+ i 1)))
+                            (call-ptr f
+                                      (p/index source source-offset)
+                                      (p/index destination destination-offset))
+                            (set! i 0)
+                            (while (< i capacity)
+                              (when (or (!= (p/load (p/index source i))
+                                            (pattern i))
+                                        (!= (p/load (p/index destination i))
+                                            (if (and (>= i destination-offset)
+                                                     (< i
+                                                        (+ destination-offset
+                                                           size)))
+                                                (pattern (+ source-offset
+                                                            (- i
+                                                               destination-offset)))
+                                                255)))
+                                (set! errors (+ errors 1)))
+                              (set! i (+ i 1)))))
+                        (exit-child (if (= errors 0) 0 78)))
+                      (let [(mut status) (: 0 i32)]
+                        (when (or (!= (waitpid child (mut status) 0) child)
+                                  (!= status 0))
+                          (println "Q memory size {} child status {}"
+                                   size
+                                   status)
+                          (set! failures 1))))))))
+    (when (!= (p/cast i64 a) -1)
+      (when (!= (release a total) 0) (set! failures (+ failures 1))))
+    (when (!= (p/cast i64 b) -1)
+      (when (!= (release b total) 0) (set! failures (+ failures 1))))
+    failures))
+
+(defn boundaries [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut code) (ArrayList::new [u8] allocator)
+        (mut failures) 0]
+    (set! failures
+          (+ failures
+             (checked (memory/access! (mut code) true 16 32 0 0 false 16))
+             (word! (mut code) (e/simd-move 16 1 0))
+             (checked (memory/access! (mut code) false 16 33 1 0 false 16))
+             (word! (mut code) (e/ret 30))))
+    (match (jit/map-text (slice code))
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [loaded]
+          (let [(mut loaded) loaded
+                f
+                  (p/cast (fnptr (cc/C) [(ptr u8) (ptr u8)] void)
+                          (.base loaded))]
+            (set! failures (+ failures (guarded f 16)))
+            (jit/release! (mut loaded)))))
+    (free! (mut code))
+    failures))
+
+;;; Words independently checked with LLVM MC 23.1.4, arm64-apple-macosx.
+(defn encoding [(value (Result u32 (slice u8))) (expected u32)] (-> i64)
+  (match value (Ok [word] (if (= word expected) 0 1)) (Err [_] 1)))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut out) (ArrayList::new [u8] allocator)
+        (mut failures) 0]
+    (set! failures
+          (+ failures
+             (boundaries)
+             (encoding (e/simd-move 16 0 1) 0x4EA11C20)
+             (encoding (e/simd-move 16 29 31) 0x4EBF1FFD)
+             (encoding (e/floating-load-store true 16 0 1 0) 0x3DC00020)
+             (encoding (e/floating-load-store false 16 31 31 65520) 0x3DBFFFFF)
+             (encoding (e/floating-load-store true 16 17 29 32) 0x3DC00BB1)
+             (encoding (e/simd-move 8 3 4) 0x1E604083)
+             (encoding (e/simd-move 4 5 6) 0x1E2040C5)))
+    (for scenario [(: 0 i32) 1 2 3 4 5 6 7]
+      (for offset [(: 128 i64) 65536 65539]
+        (for bias [(: 0 i64) 4096]
+          (set! failures (+ failures (run scenario offset bias))))))
+    (for result [(transfers/emit! (mut out) (reg 0) (reg 32) 16 63)
+                 (transfers/emit! (mut out) (reg 32) (reg 0) 16 63)
+                 (transfers/emit! (mut out) (reg 0) (reg 0) 16 63)
+                 (transfers/emit! (mut out) (slot 0) (slot 16) 16 16)
+                 (transfers/parallel-frame! (mut out)
+                                            [(copy (reg 63) (reg 32))]
+                                            16
+                                            allocator
+                                            (frame/stack-base))
+                 (transfers/parallel-frame! (mut out)
+                                            [(copy (reg 62) (slot 0))]
+                                            16
+                                            allocator
+                                            (frame/stack-base))
+                 (memory/access! (mut out) true 16 0 31 0 false 16)
+                 (memory/access! (mut out) false 16 32 31 -1 false 16)]
+      (match result (Ok [_] (set! failures (+ failures 1))) (Err [_] 0)))
+    (when (!= (len out) 0) (set! failures (+ failures 1)))
+    (free! (mut out))
+    (println "48 complete Q-register transfer/cycle/frame cases: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))
