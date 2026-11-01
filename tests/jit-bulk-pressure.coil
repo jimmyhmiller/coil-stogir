@@ -1,0 +1,267 @@
+(module stogir.tests.jit-bulk-pressure)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.bulk" :as bulk)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [message] (println "{}" message) 0)))
+
+;;; C ABI probe overwrites every allocatable GPR and both emitter scratches.
+(defn probe :cc (cc/C) [] (-> u64)
+  (primitive/machine-code (Aarch64)
+                          0xe0
+                          0x00
+                          0x80
+                          0xd2
+                          0x21
+                          0x20
+                          0x80
+                          0xd2
+                          0x42
+                          0x20
+                          0x80
+                          0xd2
+                          0x63
+                          0x20
+                          0x80
+                          0xd2
+                          0x84
+                          0x20
+                          0x80
+                          0xd2
+                          0xa5
+                          0x20
+                          0x80
+                          0xd2
+                          0xc6
+                          0x20
+                          0x80
+                          0xd2
+                          0xe7
+                          0x20
+                          0x80
+                          0xd2
+                          0x08
+                          0x21
+                          0x80
+                          0xd2
+                          0x29
+                          0x21
+                          0x80
+                          0xd2
+                          0x4a
+                          0x21
+                          0x80
+                          0xd2
+                          0x6b
+                          0x21
+                          0x80
+                          0xd2
+                          0x8c
+                          0x21
+                          0x80
+                          0xd2
+                          0xad
+                          0x21
+                          0x80
+                          0xd2
+                          0xce
+                          0x21
+                          0x80
+                          0xd2
+                          0xef
+                          0x21
+                          0x80
+                          0xd2
+                          0x10
+                          0x22
+                          0x80
+                          0xd2
+                          0x31
+                          0x22
+                          0x80
+                          0xd2
+                          0xc0
+                          0x03
+                          0x5f
+                          0xd6))
+
+(defn check [(fixed i64) (alignment i32) (backward? bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        output (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        input (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        integers (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 3]))
+        n (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 4]))
+        count
+          (if (< fixed 0)
+              n
+              (require (b/scalar-constant! (mut graph) 5 (cast u64 fixed) 8)))
+        space (require (b/scalar-constant! (mut graph) 5 512 8))
+        guard (require (b/variable! (mut graph) 5 start "bulk-guard" alignment))
+        sentinel (require (b/scalar-constant! (mut graph) 5 321 8))
+        allocation
+          (require (b/stack-allocate! (mut graph) start space alignment))
+        (mut control)
+          (require (b/emit! (mut graph) 87 0 [allocation guard sentinel]))
+        (mut values) (ArrayList::new [i32] allocator)
+        (mut i) (: 0 i64)
+        (mut failures) 0]
+    ; Forty pinned reads remain live through the bulk operations and two calls.
+    ; This exceeds the sixteen allocatable GPRs and forces spill/reload traffic.
+    (while (< i 40)
+      (let [offset
+              (require (b/scalar-constant! (mut graph) 5 (cast u64 (* i 8)) 8))
+            address (require (b/emit! (mut graph) 26 6 [integers offset]))
+            loaded (require (b/emit! (mut graph) 91 5 [control address]))]
+        (push! (mut values) loaded)
+        (set! control loaded))
+      (set! i (+ i 1)))
+    (match (calls/create 9 5 [] allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut prototype) prototype
+                first
+                  (require (calls/emit! (mut graph)
+                                        prototype
+                                        control
+                                        target
+                                        []
+                                        allocator))
+                cleared
+                  (require (bulk/zero-bytes! (mut graph) first allocation 512))
+                offset (require (b/scalar-constant! (mut graph) 5 16 8))
+                source (require (b/emit! (mut graph) 26 6 [allocation offset]))
+                one (require (b/scalar-constant! (mut graph) 5 1 8))
+                destination
+                  (require (b/emit! (mut graph)
+                                    (if backward? 26 27)
+                                    6
+                                    [source one]))
+                initialized
+                  (require (bulk/copy! (mut graph) cleared source input count))
+                moved
+                  (require (bulk/move! (mut graph)
+                                       initialized
+                                       destination
+                                       source
+                                       count))
+                copied
+                  (require (bulk/copy! (mut graph)
+                                       moved
+                                       output
+                                       destination
+                                       count))
+                second
+                  (require (calls/emit! (mut graph)
+                                        prototype
+                                        copied
+                                        target
+                                        []
+                                        allocator))
+                saved (require (b/emit! (mut graph) 85 5 [second guard]))
+                (mut sum) (require (b/emit! (mut graph) 26 5 [first second]))]
+            (set! sum (require (b/emit! (mut graph) 26 5 [sum saved])))
+            (for value values
+              (set! sum (require (b/emit! (mut graph) 26 5 [sum value]))))
+            (let [ret
+                    (require (b/emit! (mut graph) 120 5 [saved sum (: 0 i32)]))]
+              (match (compile/text graph start [ret] allocator)
+                (Err [message]
+                     (println "{}" message)
+                     (set! failures (+ failures 1)))
+                (Ok [bytes]
+                    (let [(mut bytes) bytes]
+                      (match (jit/map-text (slice bytes))
+                        (Err [message]
+                             (println "{}" message)
+                             (set! failures (+ failures 1)))
+                        (Ok [image]
+                            (let [(mut image) image
+                                  f
+                                    (primitive/cast (fnptr (cc/C)
+                                                           [(ptr u8)
+                                                            (ptr u8)
+                                                            (ptr u64)
+                                                            u64
+                                                            u64]
+                                                           u64)
+                                                    (.base image))
+                                  (mut input) (ArrayList::new [u8] allocator)
+                                  (mut output) (ArrayList::new [u8] allocator)
+                                  (mut numbers) (ArrayList::new [u64] allocator)
+                                  target
+                                    (primitive/cast u64
+                                                    (primitive/cast (ptr u8)
+                                                                    (fnptr-of probe)))]
+                              (set! i 0)
+                              (while (< i 200)
+                                (push! (mut input) (cast u8 (+ i 19)))
+                                (push! (mut output) 0)
+                                (set! i (+ i 1)))
+                              (set! i 0)
+                              (while (< i 40)
+                                (push! (mut numbers) (cast u64 (+ i 11)))
+                                (set! i (+ i 1)))
+                              (for size [(: 0 i64) 1 7 8 9 17 63 64 65 127 129]
+                                (when (or (< fixed 0) (= fixed size))
+                                  (set! i 0)
+                                  (while (< i 200)
+                                    (primitive/store! (primitive/index (.data output)
+                                                                       i)
+                                                      (: 251 u8))
+                                    (set! i (+ i 1)))
+                                  (let [answer
+                                          (call-ptr f
+                                                    (primitive/index (.data output)
+                                                                     3)
+                                                    (.data input)
+                                                    (.data numbers)
+                                                    target
+                                                    (cast u64 size))]
+                                    (when (!= answer 1555)
+                                      (println "pressure result fixed {} alignment {} backward {} size {} = {}"
+                                               fixed
+                                               alignment
+                                               backward?
+                                               size
+                                               answer)
+                                      (set! failures (+ failures 1))))
+                                  (set! i 0)
+                                  (while (< i 200)
+                                    (when (!= (get output i)
+                                              (if (and (>= i 3)
+                                                       (< i (+ size 3)))
+                                                  (get input (- i 3))
+                                                  251))
+                                      (set! failures (+ failures 1)))
+                                    (set! i (+ i 1)))))
+                              (free! (mut input))
+                              (free! (mut output))
+                              (free! (mut numbers))
+                              (jit/release! (mut image)))))
+                      (free! (mut bytes))))))
+            (calls/release! (mut prototype)))))
+    (free! (mut values))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for fixed [(: -1 i64) 63 64 65]
+      (for alignment [(: 16 i32) 4096]
+        (for backward? [false true]
+          (set! failures (+ failures (check fixed alignment backward?))))))
+    (println "bulk memory with calls, spills and dynamic frames: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

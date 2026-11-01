@@ -735,3 +735,15 @@ Focused checks cover rejected inputs without graph mutation, no-op construction,
 bounded dynamic graphs, and native fixed/dynamic byte comparisons across size,
 alignment and overlap boundaries. Guard-page, spill-pressure and linked AOT bulk
 coverage remain required before treating this feature as a completed delivery gate.
+
+Bulk-memory pressure testing exposed a general block-entry transfer defect:
+contiguous split moves at a block's first use position were replayed after CFG
+edge copies had already established the entry locations. The preceding block in
+layout order need not be an actual predecessor, so that replay could overwrite
+live values with another path's register contents. Emission now leaves those
+entry transitions to edge reconciliation and retains ordered use/definition
+transfers inside blocks. The regression retains forty pinned integer values
+through bulk loops, two calls that overwrite all allocatable GPRs, dynamic stack
+storage, both move directions and 16-byte/4 KB frame alignment. All sixteen
+fixed/dynamic graph variants pass. Focused phi, floating-loop, switch-pressure
+and stack-scope checks also pass; the complete regression run is in progress.
