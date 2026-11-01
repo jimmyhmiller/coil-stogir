@@ -799,3 +799,42 @@ run; all other implementation behavior remained stable. The source inventory is
 multi-register and dedicated-x8 results remain aggregate ABI requirements, along
 with the remaining semantics, optimization/scaling, actual compiler adapter and
 LLVM/TPDE runtime/compile-time benchmarks.
+
+### Grouped argument ABI
+
+Grouped signatures now preserve scalar pieces that belong to one ABI argument.
+`calls/create-grouped` carries sorted ordinal/count/alignment records for integer
+pairs and homogeneous f32/f64 groups. Ordinary scalar prototypes retain their
+exact upstream-shaped encoding; grouped prototypes append the documented SGAG
+version1 extension. Named and actual unnamed types, group boundaries and record
+structure are checked. Incoming signatures retain complete groups even when
+PARAM projections are absent. Both directions now use one Darwin placement
+planner, with independent banks, all-or-stack group assignment, odd-register
+aligned pairs and group-aware variadic packing. See [ABI.md](ABI.md).
+
+The planner/metadata foundation is committed as 9b309f4 and full integration as
+741a625. Review found that a corrupted owned Prototype could serialize as a
+valid but different signature after its fixed-count byte wrapped. The concrete
+256-byte counterexample is covered, and 8708d3c checks the owned model before
+interning as well as validating serialized metadata.
+
+Native checks exercise 56 actual C aggregate interfaces and 165 generated graphs
+with five seeds each: complete/omitted incoming projections, indirect calls and
+selected named calls through resolved JIT images. Outgoing functions retain forty
+GP/FP values across C ABI thunks. Eighteen object fixtures exercise aligned integer
+pairs, f32/f64 groups, bank exhaustion, omitted pieces, variadic aggregate packing
+and both outgoing call forms. LLVM assembly emitted from Coil probes provides an
+independent Darwin stack-layout reference. All implementation/test sources remain
+Coil, with normative attribution centralized in PROVENANCE.md.
+
+The initial complete standalone run passed 173 checks. A complete repeat on the
+final owned-prototype validation source also passes all 173 checks, with exact
+source/pass-set equality and no duplicate runs. All 43 linked AOT consumers pass
+after fixture regeneration, with exact consumer coverage and no warnings.
+Formatting and git diff checks pass. All 310 implementation/test files are Coil.
+Validation used installed Coil d2a49bf21376; ABI assembly probes used Homebrew
+LLVM 23.1.4 on this arm64 Mac.
+Remaining aggregate work includes multi-register/x8 results, HVA/wide support and
+compiler-specific classification/marshaling. Full optimizer/verifier/scaling,
+other missing semantics, the compiler adapter and LLVM/TPDE compile-time/runtime
+comparisons remain open. These checks do not establish a performance result.
