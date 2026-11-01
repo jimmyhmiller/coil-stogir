@@ -13,15 +13,23 @@ Upstream optimized order:
 6. Virtual-register assignment, live ranges, coalescing and register allocation.
 7. Block scheduling, then emission into relocatable code/image data.
 
-Current Coil coverage is incomplete: compact Sea-of-Nodes graph and folding APIs exist; CFG/dominators/loop-aware placement and scheduling exist; split-interval linear scan exists. Missing/unverified stages include SCCP, mem2ssa, a persistent matched-rule/fusion plan consumed before liveness, explicit coalescing and upstream-equivalent block scheduling. The allocator is an independent implementation and still needs an invariant/algorithm audit against `ir_ra.c`, not a blanket equivalence claim.
+Current Coil coverage is incomplete: compact Sea-of-Nodes graph and folding APIs exist; CFG/dominators/loop-aware placement and scheduling exist; split-interval linear scan exists. Missing/unverified stages include SCCP, mem2ssa, full target fusion/reuse coverage, explicit coalescing and upstream-equivalent block scheduling. The allocator is an independent implementation and still needs an invariant/algorithm audit against `ir_ra.c`, not a blanket equivalence claim.
 
 Current local target work follows actual AArch64 rules: `ir_aarch64.dasc:ir_match_insn` explicitly selects `IR_MUL_PWR2` (around line 1337) and `IR_SHIFT_CONST` (around line 1513). Therefore power-of-two multiplication belongs in target selection; an intermediate spoken claim that it belonged exclusively in folding was incorrect and corrected. Copies/extensions also have upstream reuse constraints (`IR_MAY_REUSE`, `IR_DEF_REUSES_OP1_REG`) that must be reflected in matching/allocation, rather than relying only on late instruction removal.
 
 The Coil compiler adapter should translate CIR into the library graph and use construction folding. Optimizer algorithms belong in the independent library. JIT and AOT must use the same graph/pass/relocatable-image path. No backend fallback or benchmark-specific source rewrite is permitted. Automatic vectorization is not established as a feature of this pinned upstream pipeline; the LLVM stencil gap must not justify silently inventing a different optimizer architecture.
 
-Next architectural priorities: explicit pass-coverage/invariant gates; persistent target matching before liveness; port the missing upstream SCCP stage and fold/rewrite behavior; audit coalescing and block scheduling. Keep the original measured benchmark baseline unchanged and treat 10× IR-to-code generation / runtime within 10% as unachieved acceptance criteria.
+Next architectural priorities: explicit pass-coverage/invariant gates; extend persistent target matching/reuse; port the missing upstream SCCP stage and fold/rewrite behavior; audit coalescing and block scheduling. Keep the original measured benchmark baseline unchanged and treat ≥5× IR-to-code generation / runtime within 10% as unachieved acceptance criteria.
 
-
+Persistent matching now precedes register liveness in the AArch64 entry point.
+The plan stores selected scalar rules, omitted fused producers, and machine
+operand uses over unchanged graph references. Initial compare/branch fusion
+covers single-use, same-block 64-bit integer predicates; shared values and
+explicit roots remain materialized. Register liveness, constraints, allocation
+and emission consume this same plan. This is a conservative subset of upstream
+`IR_CMP_AND_BRANCH_INT`, not complete target matcher parity. Legacy low-level
+analysis/emission APIs use an unfused plan so existing callers cannot combine
+fused emission with lifetimes computed from the original operands.
 
 Status: scalar integer and selected floating AArch64 JIT/shared-image Mach-O AOT work;
 upstream compatibility, backend integration, and performance gates remain open.
@@ -1496,3 +1504,22 @@ aa64e44440df snapshot. An explicit formatting pass over all 389 Coil files found
 one previously unformatted anchored-transfer fixture; formatting-only cleanup
 and its focused debug-check rerun pass. All 389 files now pass formatting; diff
 checks pass. Backend work is in Coil's stogir-backend worktree.
+
+## Persistent matching validation — 2026-11-01
+
+The matching implementation passed all 211 standalone checks. Final emitter
+cleanup and the added comparison-through-call coverage passed eight focused
+selection, emission, allocation, branch, compare, conditional and pressure
+checks. All 71 object-generating fixtures were then rerun from the final source;
+all 65 linked AOT consumers passed. The frozen compiler/SDK inputs and complete
+project input snapshot were checked before and after the AOT run. Logs are
+`/tmp/stogir-match-suite.log`, `/tmp/stogir-match-linked.log` and
+`/tmp/stogir-match-linked-output.log`; input hashes are in
+`/tmp/stogir-match-project.json`. No new instruction encoding was introduced.
+
+The branch matrix checks all ten 64-bit signed/unsigned predicates on extreme
+values, with operands live through a call, both fused and shared/materialized.
+Structural checks cover explicit roots, shared comparisons, omitted result
+intervals and redirected branch operand uses. Existing narrow/32-bit, floating,
+SIMD and pressure fixtures retain their ordinary paths. Full target fusion and
+reuse parity remains open; these checks do not establish it.

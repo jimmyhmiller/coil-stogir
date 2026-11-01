@@ -2,6 +2,11 @@
 (import "stogir.graph" :as g)
 (import "stogir.builder" :as b)
 (import "stogir.a64.select" :as s)
+(import "stogir.a64.match" :as matching)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.register-live" :as live)
+(import "stogir.live-ranges" :as ranges)
+(import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.result" :use [Result Ok Err])
 
@@ -36,6 +41,86 @@
     (g/release! (mut graph))
     result))
 
+;;; Fusion changes machine def/uses, while graph nodes and explicit roots remain intact.
+(defn match-case [(protect bool) (shared bool)] (-> i64)
+  (let [(mut graph) (g/create (malloc-allocator))
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        q (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        cmp (require (b/emit! (mut graph) 16 1 [p q]))
+        split (require (b/emit! (mut graph) 116 0 [start cmp]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        extended (require (b/emit! (mut graph) 34 11 [cmp]))
+        yes-ret
+          (require (b/emit! (mut graph)
+                            120
+                            11
+                            [yes (if shared extended p) (: 0 i32)]))
+        no-ret (require (b/emit! (mut graph) 120 11 [no q (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] (malloc-allocator))
+        (mut failures) 0]
+    (push! (mut roots) yes-ret)
+    (push! (mut roots) no-ret)
+    (when protect (push! (mut roots) cmp))
+    (match (pipeline/prepare graph start (slice roots) (malloc-allocator))
+      (Err [_] (set! failures 1))
+      (Ok [prepared]
+          (let [(mut owned) prepared]
+            (match (matching/build graph
+                                   (.schedule owned)
+                                   (slice roots)
+                                   true
+                                   (malloc-allocator))
+              (Err [_] (set! failures 1))
+              (Ok [selected]
+                  (let [(mut plan) selected
+                        fused (not (or protect shared))
+                        (mut analysis)
+                          (live/analyze-matched graph
+                                                (.blocks owned)
+                                                (.schedule owned)
+                                                (.order owned)
+                                                (.operands plan)
+                                                (malloc-allocator))
+                        (mut intervals)
+                          (ranges/build-matched graph
+                                                (.schedule owned)
+                                                analysis
+                                                (.order owned)
+                                                (.operands plan)
+                                                (malloc-allocator))]
+                    (when (!= (get (.omitted (.operands plan)) (cast i64 cmp))
+                              fused)
+                      (set! failures (+ failures 1)))
+                    (when (!= (get (.comparisons plan) (cast i64 split))
+                              (if fused cmp 0))
+                      (set! failures (+ failures 1)))
+                    (when (!= (= (len (.ranges (get intervals (cast i64 cmp))))
+                                 0)
+                              fused)
+                      (set! failures (+ failures 1)))
+                    (when fused
+                      (let [inputs
+                              (get (.ranges (.operands plan)) (cast i64 split))]
+                        (when (!= (.count inputs) 2)
+                          (set! failures (+ failures 1)))
+                        (when (!= (get (.inputs (.operands plan))
+                                       (.offset inputs))
+                                  p)
+                          (set! failures (+ failures 1)))
+                        (when (!= (get (.inputs (.operands plan))
+                                       (+ (.offset inputs) 1))
+                                  q)
+                          (set! failures (+ failures 1)))))
+                    (ranges/release! (mut intervals))
+                    (live/release-analysis! (mut analysis))
+                    (matching/release! (mut plan)))))
+            (pipeline/release! (mut owned)))))
+    (free! (mut roots))
+    (g/release! (mut graph))
+    failures))
+
 (defn main [] (-> i64)
   (let [(mut graph) (g/create (malloc-allocator))
         start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
@@ -69,6 +154,11 @@
             (+ failures
                (shift-case ty 28 8 false 38 3)
                (shift-case ty 28 8 true 38 3))))
+    (set! failures
+          (+ failures
+             (match-case false false)
+             (match-case true false)
+             (match-case false true)))
     (g/release! (mut graph))
     (println "AArch64 selection checks: {} failures" failures)
     (if (= failures 0) 0 1)))

@@ -77,3 +77,18 @@ vendor/import step must carry these files into Coil along with the source.
 Keep this map current as more upstream modules are ported or
 other source is reused. Attribute algorithm and design references separately from
 copied or translated source so their roles remain clear.
+
+### Persistent target matching
+
+`stogir.a64.match` follows the placement of `ir_match` before virtual-register
+assignment/liveness in pinned `ir.h:ir_jit_compile`. Its initial fusion rule is a
+conservative subset of `IR_CMP_AND_BRANCH_INT` in `ir_aarch64.dasc:ir_match_insn`
+(around line 1698). The virtual-register omission and consumer-position operand
+uses follow
+`ir_ra.c:ir_assign_virtual_registers_slow` and `ir_add_fusion_ranges`. The plan,
+machine def/use metadata, ownership and integration are independent Coil
+implementations over the original graph references.
+Unlike upstream's broader all-fusible-users support, the initial rule requires
+one scheduled use, the same scheduled block, 64-bit integer operands and no
+explicit root. Other values retain ordinary materialization. This does not
+claim full matcher, coalescing or register-reuse parity.
