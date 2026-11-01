@@ -1,0 +1,336 @@
+(module stogir.tests.block-layout)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.builder" :as b)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.block-layout" :as layout)
+(import "stogir.adjacency" :as adj)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.args" :as args)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result
+    (Ok [value] value)
+    (Err [message] (do (println "{}" message) 0))))
+
+;;; The optional transcript feeds the pinned C scheduler during differential
+;;; validation. Production and regression implementation remain entirely Coil.
+(defn transcript [(facts layout/Facts) (plan layout/Plan)] (-> void)
+  (println "CASE {} {} {}"
+           (- (len (.items facts)) 1)
+           (len (.edges facts))
+           (if (.irreducible facts) 1 0))
+  (for [i 1 (len (.items facts))]
+    (let [block (get (.items facts) i)]
+      (println "BLOCK {} {} {} {} {} {}"
+               (.start-op block)
+               (.end-op block)
+               (.depth block)
+               (if (.header block) 1 0)
+               (if (.empty block) 1 0)
+               (.probability block))))
+  (for edge (.edges facts)
+    (println "EDGE {} {}" (.from edge) (.to edge)))
+  (print "ORDER")
+  (for reference (.blocks plan)
+    (print " {}" (get (.ranks facts) (cast i64 reference))))
+  (println "")
+  (print "ALIGN")
+  (for reference (.blocks plan)
+    (when (> (get (.alignment plan) (cast i64 reference)) 4)
+      (print " {}" (get (.ranks facts) (cast i64 reference)))))
+  (println ""))
+
+(defn check [(graph g/Graph)
+             (entry i32)
+             (roots (slice i32))
+             (expected-top-down bool)
+             (rotated-before i32)
+             (rotated-after i32)
+             (cold i32)
+             (oracle bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut failures) 0]
+    (match (pipeline/prepare graph entry roots a)
+      (Err [message] (do (println "{}" message) (set! failures 1)))
+      (Ok [prepared]
+          (let [(mut owned) prepared
+                (mut candidates) (ArrayList::new [bool] a)
+                (mut successors) (adj/build (.blocks owned) false a)]
+            (for [i 0 (len (.instructions graph))]
+              (push! (mut candidates) false))
+            ; These fixtures have no machine transfers in their start/END-only
+            ; blocks. Allocation-sensitive empty detection is checked by JIT/AOT.
+            (for reference (.order owned)
+              (let [range (get (.ranges (.schedule owned)) (cast i64 reference))
+                    outgoing (get (.ranges successors) (cast i64 reference))
+                    opcode
+                      (n/opcode (get (.instructions graph) (cast i64 reference)))]
+                (when (and (= (.count range) 2)
+                           (= (.count outgoing) 1)
+                           (!= opcode 104)
+                           (!= opcode 105))
+                  (let [ending
+                          (get (.nodes (.schedule owned)) (+ (.offset range) 1))
+                        end-op
+                          (n/opcode (get (.instructions graph)
+                                         (cast i64 ending)))]
+                    (when (or (= end-op 114) (= end-op 115))
+                      (set! (mut candidates) (cast i64 reference) true))))))
+            (let [(mut plan) (layout/build graph owned candidates a)
+                  (mut facts) (layout/facts graph owned candidates a)
+                  (mut seen) (ArrayList::new [bool] a)
+                  (mut emitted) (ArrayList::new [bool] a)
+                  (mut before) (: -1 i64)
+                  (mut after) (: -1 i64)
+                  (mut expected) (: 0 i64)]
+              (for [i 0 (len (.nodes (.schedule owned)))]
+                (push! (mut seen) false))
+              (for [i 0 (len (.instructions graph))]
+                (push! (mut emitted) false))
+              (when (or (!= (.top-down plan) expected-top-down)
+                        (= (len (.blocks plan)) 0)
+                        (!= (get (.blocks plan) 0) entry))
+                (set! failures (+ failures 1)))
+              (for [i 0 (len (.blocks plan))]
+                (let [reference (get (.blocks plan) i)
+                      range
+                        (get (.ranges (.schedule owned)) (cast i64 reference))]
+                  (when (get emitted (cast i64 reference))
+                    (set! failures (+ failures 1)))
+                  (set! (mut emitted) (cast i64 reference) true)
+                  (when (= reference rotated-before) (set! before i))
+                  (when (= reference rotated-after) (set! after i))
+                  (set! expected (+ expected (.count range)))))
+              (when (and (> rotated-before 0)
+                         (or (< before 0) (< after 0) (>= before after)))
+                (set! failures (+ failures 1)))
+              (when (and (> cold 0)
+                         (!= (get (.blocks plan) (- (len (.blocks plan)) 1))
+                             cold))
+                (set! failures (+ failures 1)))
+              (when (!= expected (len (.indices plan)))
+                (set! failures (+ failures 1)))
+              (for index (.indices plan)
+                (if (or (< index 0) (>= index (len seen)))
+                    (set! failures (+ failures 1))
+                    (do
+                      (when (get seen index) (set! failures (+ failures 1)))
+                      (set! (mut seen) index true))))
+              (for reference (.order owned)
+                (let [range
+                        (get (.ranges (.schedule owned)) (cast i64 reference))
+                      target (get (.aliases plan) (cast i64 reference))
+                      retained (get emitted (cast i64 reference))]
+                  (when (and (> (.count range) 0)
+                             (not (get emitted (cast i64 target))))
+                    (set! failures (+ failures 1)))
+                  (for [j 0 (.count range)]
+                    (when (!= (get seen (+ (.offset range) j)) retained)
+                      (set! failures (+ failures 1))))))
+              (when oracle (transcript facts plan))
+              (free! (mut emitted))
+              (free! (mut seen))
+              (layout/release-facts! (mut facts))
+              (layout/release! (mut plan)))
+            (adj/release! (mut successors))
+            (free! (mut candidates))
+            (pipeline/release! (mut owned)))))
+    failures))
+
+(defn linear [(count i64) (oracle bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        value (require (b/scalar-constant! (mut graph) 11 42 8))
+        (mut control) start]
+    (for [i 1 count]
+      (let [end (require (b/emit! (mut graph) 114 0 [control]))]
+        (set! control (require (b/emit! (mut graph) 106 0 [end (: 0 i32)])))))
+    (let [ret (require (b/emit! (mut graph) 120 11 [control value (: 0 i32)]))
+          failures (check graph start [ret] (> count 256) 0 0 0 oracle)]
+      (g/release! (mut graph))
+      failures)))
+
+(defn diamond [(yes-weight i32) (no-weight i32) (oracle bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        condition (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        split (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [split yes-weight]))
+        no (require (b/emit! (mut graph) 108 0 [split no-weight]))
+        yes-trap (require (b/emit! (mut graph) 96 0 [yes]))
+        no-trap (require (b/emit! (mut graph) 96 0 [no]))
+        yes-end (require (b/emit! (mut graph) 114 0 [yes-trap]))
+        no-end (require (b/emit! (mut graph) 114 0 [no-trap]))
+        merge (require (b/emit! (mut graph) 112 0 [yes-end no-end]))
+        value (require (b/scalar-constant! (mut graph) 11 42 8))
+        ret (require (b/emit! (mut graph) 120 11 [merge value (: 0 i32)]))
+        failures (check graph start [ret] false 0 0 0 oracle)]
+    (g/release! (mut graph))
+    failures))
+
+(defn loop-case [(nested bool) (oracle bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        limit (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        entry (require (b/emit! (mut graph) 114 0 [start]))
+        header (require (b/loop-begin! (mut graph) entry))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        index (require (b/loop-phi! (mut graph) header zero))
+        condition (require (b/emit! (mut graph) 16 1 [index limit]))
+        split (require (b/emit! (mut graph) 116 0 [header condition]))
+        body (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        exit (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        (mut control) body]
+    (when nested
+      (let [inner-entry (require (b/emit! (mut graph) 114 0 [body]))
+            inner (require (b/loop-begin! (mut graph) inner-entry))
+            j (require (b/loop-phi! (mut graph) inner zero))
+            cmp (require (b/emit! (mut graph) 16 1 [j limit]))
+            branch (require (b/emit! (mut graph) 116 0 [inner cmp]))
+            inner-body (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+            inner-exit (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+            next-j (require (b/emit! (mut graph) 26 11 [j one]))
+            back-j (require (b/emit! (mut graph) 115 0 [inner-body]))]
+        (b/patch! (mut graph) inner 2 back-j)
+        (b/patch! (mut graph) j 3 next-j)
+        (set! control inner-exit)))
+    (let [next (require (b/emit! (mut graph) 26 11 [index one]))
+          back (require (b/emit! (mut graph) 115 0 [control]))
+          ret (require (b/emit! (mut graph) 120 11 [exit index (: 0 i32)]))]
+      (b/patch! (mut graph) header 2 back)
+      (b/patch! (mut graph) index 3 next)
+      (let [failures
+              (check graph
+                     start
+                     [ret]
+                     false
+                     (if nested 0 body)
+                     (if nested 0 header)
+                     0
+                     oracle)]
+        (g/release! (mut graph))
+        failures))))
+
+(defn empty-cycle [(oracle bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        entry (require (b/emit! (mut graph) 114 0 [start]))
+        header (require (b/loop-begin! (mut graph) entry))
+        end (require (b/emit! (mut graph) 114 0 [header]))
+        body (require (b/emit! (mut graph) 106 0 [end (: 0 i32)]))
+        back (require (b/emit! (mut graph) 115 0 [body]))]
+    (b/patch! (mut graph) header 2 back)
+    (let [failures (check graph start [back] false 0 0 0 oracle)]
+      (g/release! (mut graph))
+      failures)))
+
+(defn irreducible [(oracle bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        condition (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        split (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        end-a (require (b/emit! (mut graph) 114 0 [yes]))
+        end-b (require (b/emit! (mut graph) 114 0 [no]))
+        first (require (b/loop-begin! (mut graph) end-a))
+        second (require (b/loop-begin! (mut graph) end-b))
+        branch (require (b/emit! (mut graph) 116 0 [first condition]))
+        stay (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        exit (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        back-a (require (b/emit! (mut graph) 115 0 [second]))
+        back-b (require (b/emit! (mut graph) 115 0 [stay]))
+        value (require (b/scalar-constant! (mut graph) 11 42 8))
+        ret (require (b/emit! (mut graph) 120 11 [exit value (: 0 i32)]))]
+    (b/patch! (mut graph) first 2 back-a)
+    (b/patch! (mut graph) second 2 back-b)
+    (let [failures (check graph start [ret back-a back-b] true 0 0 0 oracle)]
+      (g/release! (mut graph))
+      failures)))
+
+(defn cold-case [(oracle bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        condition (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        split (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        stop (require (b/unreachable! (mut graph) yes 0))
+        value (require (b/scalar-constant! (mut graph) 11 42 8))
+        ret (require (b/emit! (mut graph) 120 11 [no value (: 0 i32)]))
+        failures (check graph start [stop ret] false 0 0 yes oracle)]
+    (g/release! (mut graph))
+    failures))
+
+(defn switch-case [(count i64) (ranged bool) (oracle bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        selector (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        dispatch (require (b/switch! (mut graph) start selector))
+        (mut roots) (ArrayList::new [i32] a)]
+    (for [i 0 count]
+      (let [key
+              (require (b/scalar-constant! (mut graph) 11 (cast u64 (* i 2)) 8))
+            high
+              (require (b/scalar-constant! (mut graph)
+                                           11
+                                           (cast u64 (+ (* i 2) 1))
+                                           8))
+            projection
+              (if ranged
+                  (require (b/emit! (mut graph) 110 0 [dispatch key high]))
+                  (require (b/emit! (mut graph)
+                                    109
+                                    0
+                                    [dispatch
+                                     key
+                                     (if (= (% i 3) 0)
+                                         (: 0 i32)
+                                         (if (= (% i 3) 1) (: 1 i32) (: 90 i32)))])))
+            ret
+              (require (b/emit! (mut graph) 120 11 [projection key (: 0 i32)]))]
+        (push! (mut roots) ret)))
+    (let [fallback (require (b/emit! (mut graph) 111 0 [dispatch (: 0 i32)]))
+          zero (require (b/scalar-constant! (mut graph) 11 0 8))
+          ret (require (b/emit! (mut graph) 120 11 [fallback zero (: 0 i32)]))]
+      (push! (mut roots) ret))
+    (let [failures
+            (check graph start (slice roots) (> (+ count 2) 256) 0 0 0 oracle)]
+      (free! (mut roots))
+      (g/release! (mut graph))
+      failures)))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (args/init! argc argv)
+  (let [oracle (args/has? "--oracle")
+        (mut failures) 0]
+    (for count [(: 1 i64) 2 3 8 64 256 257 300]
+      (set! failures (+ failures (linear count oracle))))
+    (for p [(: 0 i32) 1 10 50 90 99]
+      (for q [(: 0 i32) 1 10 50 90 99]
+        (set! failures (+ failures (diamond p q oracle)))))
+    (for count [(: 1 i64) 3 16 254 255]
+      (set! failures
+            (+ failures
+               (switch-case count false oracle)
+               (switch-case count true oracle))))
+    (set! failures
+          (+ failures
+             (loop-case false oracle)
+             (loop-case true oracle)
+             (empty-cycle oracle)
+             (irreducible oracle)
+             (cold-case oracle)))
+    (println "block layout checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

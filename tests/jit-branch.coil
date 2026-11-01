@@ -20,12 +20,13 @@
 (defn require [(result (Result i32 (slice u8)))] (-> i32)
   (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
 
-(defn relaxed-execution [(backward bool)] (-> i64)
+(defn relaxed-execution [(backward bool) (aligned bool)] (-> i64)
   (let [allocator (malloc-allocator)
         (mut output) (code/create allocator)
         (mut labels) (ArrayList::new [i64] allocator)
         (mut branches) (ArrayList::new [f/Branch] allocator)
         (mut relatives) (ArrayList::new [f/Relative] allocator)
+        (mut alignment) (ArrayList::new [i32] allocator)
         far (: 1048592 i64)
         (mut failures) 0]
     (bytes/append32! (mut (.text output)) (if backward 0 0xF100001F))  ; CMP x0,#0
@@ -58,12 +59,22 @@
              :label 0
              :condition 0
              :link false))
-    (match (f/relax! (mut output) (mut labels) (mut branches) (mut relatives))
+    (for [i 0 (len labels)]
+      (push! (mut alignment) (if (and aligned (= i 0)) 8 4)))
+    (match (f/relax-aligned! (mut output)
+                             (mut labels)
+                             (mut branches)
+                             (mut relatives)
+                             alignment)
       (Err [message] (do (println "{}" message) (set! failures 1)))
       (Ok [count]
           (when (!= count 1) (set! failures (+ failures 1)))
-          (when (!= (read/read32 (.text output) (if backward (+ far 4) 4))
+          (when (!= (read/read32 (.text output)
+                                 (- (.offset (get branches (- (len branches) 1)))
+                                    4))
                     0x54000041)
+            (set! failures (+ failures 1)))
+          (when (and aligned (!= (% (get labels 0) 8) 0))
             (set! failures (+ failures 1)))
           (match (jit/map-text (slice (.text output)))
             (Err [message]
@@ -82,6 +93,7 @@
     (match (f/relax! (mut output) (mut labels) (mut branches) (mut relatives))
       (Err [_] (set! failures (+ failures 1)))
       (Ok [count] (when (!= count 0) (set! failures (+ failures 1)))))
+    (free! (mut alignment))
     (code/release! (mut output))
     (free! (mut labels))
     (free! (mut branches))
@@ -187,7 +199,11 @@
 
 (defn main [] (-> i64)
   (let [(mut text) (ArrayList::new [u8] (malloc-allocator))
-        (mut failures) (+ (relaxed-execution false) (relaxed-execution true))]
+        (mut failures)
+          (+ (relaxed-execution false false)
+             (relaxed-execution true false)
+             (relaxed-execution false true)
+             (relaxed-execution true true))]
     (let [(mut graph) (g/create (malloc-allocator))
           start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
           p (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))

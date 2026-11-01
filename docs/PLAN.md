@@ -1560,3 +1560,23 @@ failure. Existing native branch tests execute forward and backward relaxed
 branches beyond 1 MiB and reject avoidable B-to-next words in predicate fixtures.
 Scalar/floating/vector, checked, switch-table, pressure, call and stack JIT/AOT
 coverage remains green. Original performance baseline files remain unchanged.
+
+## Post-allocation block layout — implementation checkpoint
+
+The library now retains dominator and natural-loop-depth results through
+allocation, builds target empty-block facts after real edge/split transfers are
+known, then runs the pinned bottom-up/top-down scheduling core. Instruction
+subpositions stay fixed; emission follows an array of original schedule indices.
+Empty block labels alias canonical successors, with an anchor for all-empty
+cycles. Entry blocks remain explicit. Loop labels require eight-byte alignment
+through the code buffer, relocatable image, module merge, JIT and AOT boundaries.
+Far conditional relaxation preserves that alignment and all offset metadata.
+
+Focused checks pass for simple, nested, floating and stack loops, switches,
+pressure, image/module composition, long branches and alignment. The 59-case
+pinned-C differential checks match both block order and loop alignment, including
+weighted diamonds, switches/ranges, 256/257-block policy, cold stops, nested
+loops, empty cycles and irreducibility. Full regressions and compiler integration
+are pending. Optional empty-entry merging is disabled; optimizer-mode policy,
+SCCP, mem2ssa, full target reuse/coalescing and allocator/loop-analysis parity
+remain open. This is not completion of the performance goal.
