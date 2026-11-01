@@ -877,3 +877,41 @@ linked output contains no warnings. Formatting and git diff checks pass. All 316
 implementation/test source files remain Coil. Validation used installed Coil
 d2a49bf21376 on this arm64 Mac. These counts include the result metadata, contract,
 native matrix and linked consumer tests; remaining gates above remain open.
+
+
+### Named, recursive and protected aggregate results
+
+Checkpoint 3663bfc adds twelve named-call graphs to the result matrix (204 total)
+and twelve linked fixtures (thirty total). Named outgoing and forwarding calls
+use resolved JIT images and real external C ABI symbols, including register,
+partial-word and x8 indirect results under pressure and aligned dynamic frames.
+
+Checkpoint 8dc30cd adds twelve self-recursive aggregate functions: six result
+profiles with 16/4096-byte frame alignment. Seven depths through31 and seven bit
+patterns cover 588 calls in each of JIT and linked AOT. Both return paths execute;
+recursive calls retain the parent result place, depth, local guard and dynamic
+object. Parent frames check their guards and modify the returned first field.
+Each function's self-reference binds to its sole defined image entry.
+
+Checkpoint 0572960 tests all twelve supported register-result shapes against
+protected pages. The native wrapper loads the complete return bank from one
+region and captures it into another; start/end placements cover four boundary
+pairs per shape. Complete source and destination comparisons catch changes to
+surrounding accessible bytes, and fault-isolated children diagnose overreads or
+overwrites across either protected boundary. The wrapper preserves host x29/SP.
+No library implementation change was needed for these checks.
+
+These checks close the named/recursive and exact register-result access gates
+listed at the previous checkpoint. Remaining aggregate work is HVA/wide support
+and source-language classification/marshaling in the adapter. Other semantics,
+optimization/scaling, backend integration and runtime/compile-time comparisons
+remain open. Licensing and source attribution continue to be centralized.
+
+
+The extended result-verification checkpoint passes all 178 standalone checks
+and 45 linked AOT consumers with debug checks and freshly regenerated objects.
+Exact source/pass-set equality verifies complete coverage without duplicate runs;
+linked output has no warnings. Formatting and git diff checks pass. All 319
+implementation/test files remain Coil. The library implementation is unchanged
+from 71ec270; these additions expand execution coverage and preserve the remaining
+backend and benchmark gates. Logs and commits are indexed in the project pad.

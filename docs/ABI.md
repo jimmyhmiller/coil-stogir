@@ -453,9 +453,15 @@ result; kind2 is indirect and requires zero type/count. Kind0 uses the original
 scalar encoding or version1 grouped encoding. Unknown kinds, malformed shapes,
 invalid result roles, reserved bytes and truncated trailers are rejected.
 
-Focused tests cover 192 native graph variants with real C aggregate interfaces:
+Focused tests cover 204 native graph variants with real C aggregate interfaces:
 integer words, homogeneous floating results, indirect records and partial logical
 payloads. They check exact payload bits, live values across nested calls, dynamic
-stack storage, over-aligned frames and surrounding output bytes. Eighteen linked
-AOT objects exercise both directions. Named and recursive aggregate-result calls,
-protected result-buffer boundaries and vector results remain verification gates.
+stack storage, over-aligned frames and surrounding output bytes. Thirty linked
+AOT objects exercise both directions, including named calls through resolved JIT
+images and external C symbols. Twelve additional self-recursive functions run
+through JIT and linked AOT with 16/4096-byte alignment, dynamic storage, two return
+paths and depths through31. They check per-frame guards after recursive calls and
+exact logical field bits. Protected-page checks cover all twelve register-result
+shapes, with both ends of source/destination extents abutting inaccessible pages
+and complete surrounding-byte comparisons. Vector results and compiler-specific
+classification/marshaling remain open.
