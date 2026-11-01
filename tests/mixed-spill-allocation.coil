@@ -1,0 +1,271 @@
+(module stogir.tests.mixed-spill-allocation)
+(import "stogir.allocation" :as a)
+(import "stogir.allocation-check" :as check)
+(import "stogir.interval" :as interval)
+(import "stogir.constraints" :as constraints)
+(import "stogir.frame" :as frame)
+(import "stogir.locations" :as loc)
+(import "stogir.a64.typed-transfers" :as typed)
+(import "stogir.a64.frame-address" :as address)
+(import "stogir.a64.frame-memory" :as memory)
+(import "stogir.a64.encode" :as e)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.bytes" :as bytes)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn checked [(value (Result i32 (slice u8)))] (-> i64)
+  (match value (Ok [_] 0) (Err [message] (println "{}" message) 1)))
+
+(defn word! [(out (mut (ArrayList u8))) (value (Result u32 (slice u8)))]
+  (-> i64)
+  (match value
+    (Ok [word] (bytes/append32! (mut out) word) 0)
+    (Err [message] (println "{}" message) 1)))
+
+(defn pattern [(i i64) (seed i64)] (-> u8)
+  (cast u8 (% (+ (* i 37) (/ i 7) seed 19) 251)))
+
+(defn shape [(size i64)] (-> a/SpillShape)
+  (a/SpillShape :size size :alignment size))
+
+(defn owner-slot [(layout frame/Frame) (parent i32)] (-> frame/Slot)
+  (match (get (.parents layout) parent)
+    (Some [index] (get (.slots layout) index))
+    (None []
+          (frame/Slot
+            :offset -1
+            :size 0
+            :alignment 0))))
+
+(defn run [(sizes (slice i64)) (fixture? bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut parts) (ArrayList::new [a/Part] allocator)
+        (mut shapes) (ArrayList::new [a/SpillShape] allocator)
+        (mut layout) (frame/create allocator)
+        (mut code) (ArrayList::new [u8] allocator)
+        (mut group) (ArrayList::new [typed/Copy] allocator)
+        (mut cells) (ArrayList::new [u8] allocator)
+        (mut expected) (ArrayList::new [u8] allocator)
+        mask (<< (: 1 u64) 32)
+        (mut failures) 0
+        (mut i) (: 0 i64)]
+    ; A nonzero preexisting prefix catches bad alignment or local/spill overlap.
+    (set! (.size layout) 24)
+    (for parent [(: 0 i32) 1 2]
+      (let [(mut part) (a/create parent allocator)
+            start (if (= parent 0) (: 0 i64) (if (= parent 1) 4 6))
+            end (if (= parent 0) (: 20 i64) (if (= parent 1) 10 11))
+            next (if (= parent 0) (: 12 i64) (if (= parent 1) 7 9))]
+        (set! (.allowed part) mask)
+        (interval/add! (mut (.ranges part)) start end)
+        (constraints/add! (mut (.uses part)) start 1 -1)
+        (constraints/add! (mut (.uses part)) next 1 -1)
+        (push! (mut parts) part)
+        (push! (mut shapes) (shape (get sizes (cast i64 parent))))))
+    (set! failures
+          (+ failures
+             (checked (a/run-shaped! (mut parts)
+                                     (mut layout)
+                                     64
+                                     mask
+                                     (slice shapes)
+                                     allocator))))
+    (set! failures (+ failures (checked (check/verify parts 64 mask))))
+    (when (< (len parts) 9) (set! failures (+ failures 1)))
+    (for parent [(: 0 i32) 1 2]
+      (let [slot (owner-slot layout parent)
+            size (get sizes (cast i64 parent))]
+        (when (or (< (.offset slot) 24)
+                  (!= (.size slot) size)
+                  (!= (.alignment slot) size)
+                  (!= (% (.offset slot) size) 0))
+          (set! failures (+ failures 1)))
+        (for part parts
+          (when (and (= (.parent part) parent)
+                     (>= (.spill-slot part) 0)
+                     (!= (.spill-slot part) (.offset slot)))
+            (set! failures (+ failures 1))))))
+    (set! failures
+          (+ failures
+             (word! (mut code) (e/logical-register true 1 15 31 29))
+             (word! (mut code) (e/logical-register true 1 14 31 0))
+             (word! (mut code) (e/add-sub-immediate true false false 29 0 4096))
+             (word! (mut code) (e/add-sub true true true 31 1 1))))
+    (let [(mut moves) (loc/contiguous parts allocator)
+          (mut position) (: 0 i64)
+          (mut observed) (: 0 i64)]
+      (while (<= position 20)
+        (clear! (mut group))
+        (for move moves
+          (when (= (.position move) position)
+            (push! (mut group)
+                   (typed/Copy
+                     :transfer move
+                     :size (cast i32 (get sizes (cast i64 (.parent move))))))))
+        (set! failures
+              (+ failures
+                 (checked (typed/parallel-frame! (mut code)
+                                                 (slice group)
+                                                 allocator
+                                                 (address/Base :reg 29 :bias 0)))))
+        (for parent [(: 0 i32) 1 2]
+          (let [start (if (= parent 0) (: 0 i64) (if (= parent 1) 4 6))
+                next (if (= parent 0) (: 12 i64) (if (= parent 1) 7 9))
+                width (cast i32 (get sizes (cast i64 parent)))]
+            (when (or (= position start) (= position next))
+              (match (loc/lookup parts parent position)
+                (Err [message]
+                     (println "{}" message)
+                     (set! failures (+ failures 1)))
+                (Ok [place]
+                    (when (or (!= (.kind place) 0) (!= (.value place) 32))
+                      (set! failures (+ failures 1)))
+                    (when (= position start)
+                      (set! failures
+                            (+ failures
+                               (checked (memory/access! (mut code)
+                                                        true
+                                                        width
+                                                        32
+                                                        14
+                                                        (* (cast i64 parent) 16)
+                                                        false
+                                                        16)))))
+                    (set! failures
+                          (+ failures
+                             (checked (memory/access! (mut code)
+                                                      false
+                                                      width
+                                                      32
+                                                      14
+                                                      (+ 64 (* observed 16))
+                                                      false
+                                                      16))))
+                    (set! observed (+ observed 1)))))))
+        (set! position (+ position 1)))
+      (when (!= observed 6) (set! failures (+ failures 1)))
+      (free! (mut moves)))
+    (set! failures
+          (+ failures
+             (word! (mut code) (e/logical-register true 1 29 31 15))
+             (word! (mut code) (e/move-wide true 2 1 1 0))
+             (word! (mut code) (e/conditional-select true 0 1 31 0))
+             (word! (mut code) (e/ret 30))))
+    (when fixture?
+      (match (macho/text-object (slice code) "_stogir_shaped_spills" allocator)
+        (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+        (Ok [object]
+            (let [(mut object) object]
+              (match (fs/write-file allocator
+                                    "/tmp/coil-stogir-shaped-spills.o"
+                                    (slice object))
+                (Err [message]
+                     (println "{}" message)
+                     (set! failures (+ failures 1)))
+                (Ok [_] 0))
+              (free! (mut object))))))
+    (when (= failures 0)
+      (match (jit/map-text (slice code))
+        (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+        (Ok [loaded]
+            (let [(mut loaded) loaded
+                  f (p/cast (fnptr (cc/C) [(ptr u8)] u64) (.base loaded))]
+              (for seed [(: 0 i64) 1 17 255]
+                (clear! (mut cells))
+                (clear! (mut expected))
+                (set! i 0)
+                (while (< i (+ 4096 (.size layout) 32))
+                  (push! (mut cells) (pattern i seed))
+                  (push! (mut expected) (pattern i seed))
+                  (set! i (+ i 1)))
+                (let [(mut observation) (: 0 i64)]
+                  (for parent [(: 0 i32) 1 2 1 2 0]
+                    (set! i 0)
+                    (while (< i (get sizes (cast i64 parent)))
+                      (p/store! (p/index (.data expected)
+                                         (+ 64 (* observation 16) i))
+                                (pattern (+ (* (cast i64 parent) 16) i) seed))
+                      (set! i (+ i 1)))
+                    (set! observation (+ observation 1))))
+                (for parent [(: 0 i32) 1 2]
+                  (let [slot (owner-slot layout parent)]
+                    (set! i 0)
+                    (while (< i (.size slot))
+                      (p/store! (p/index (.data expected)
+                                         (+ 4096 (.offset slot) i))
+                                (pattern (+ (* (cast i64 parent) 16) i) seed))
+                      (set! i (+ i 1)))))
+                (when (!= (call-ptr f (.data cells)) 1)
+                  (set! failures (+ failures 1)))
+                (set! i 0)
+                (while (< i (len cells))
+                  (when (!= (get cells i) (get expected i))
+                    (println "mixed spills {} {} {} seed{} byte{} got{} expected{}"
+                             (get sizes 0)
+                             (get sizes 1)
+                             (get sizes 2)
+                             seed
+                             i
+                             (get cells i)
+                             (get expected i))
+                    (set! failures (+ failures 1)))
+                  (set! i (+ i 1))))
+              (jit/release! (mut loaded))))))
+    (set! i 0)
+    (while (< i (len parts)) (a/release! (elem (mut parts) i)) (set! i (+ i 1)))
+    (free! (mut parts))
+    (free! (mut shapes))
+    (frame/release! (mut layout))
+    (free! (mut code))
+    (free! (mut group))
+    (free! (mut cells))
+    (free! (mut expected))
+    failures))
+
+(defn rejects [(shapes (slice a/SpillShape))] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut parts) (ArrayList::new [a/Part] allocator)
+        (mut layout) (frame/create allocator)
+        (mut part) (a/create 0 allocator)
+        (mut failures) 0]
+    (set! (.size layout) 24)
+    (interval/add! (mut (.ranges part)) 0 2)
+    (constraints/add! (mut (.uses part)) 0 1 -1)
+    (push! (mut parts) part)
+    (match (a/run-shaped! (mut parts) (mut layout) 1 1 shapes allocator)
+      (Err [_] 0)
+      (Ok [_] (set! failures (+ failures 1))))
+    (when (or (!= (len parts) 1)
+              (!= (.register (get parts 0)) -1)
+              (!= (.spill-slot (get parts 0)) -1)
+              (!= (.size layout) 24)
+              (!= (len (.slots layout)) 0))
+      (set! failures (+ failures 1)))
+    (a/release! (elem (mut parts) 0))
+    (free! (mut parts))
+    (frame/release! (mut layout))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (set! failures
+          (+ failures
+             (run [(: 16 i64) 4 8] true)
+             (run [(: 16 i64) 8 4] false)
+             (run [(: 4 i64) 16 8] false)
+             (run [(: 4 i64) 8 16] false)
+             (run [(: 8 i64) 16 4] false)
+             (run [(: 8 i64) 4 16] false)
+             (rejects [])
+             (rejects [(a/SpillShape :size 0 :alignment 8)])
+             (rejects [(a/SpillShape :size 16 :alignment 0)])
+             (rejects [(a/SpillShape :size 16 :alignment 3)])))
+    (println "per-owner mixed spill shapes, eviction, splits and native payloads: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

@@ -346,16 +346,31 @@
               (set! count (+ count 1))))))
     (if (= error "") (Ok count) (Err error))))
 
+;;; Immutable spill geometry indexed by the virtual parent's identifier.
+;;; Physical reservations have negative parents and need no storage shape.
+(defstruct SpillShape [(size i64) (alignment i64)])
+
+(defn valid-shape? [(shape SpillShape)] (-> bool)
+  (and (> (.size shape) 0) (frame/valid-alignment? (.alignment shape))))
+
+(defn shape-of [(parent i32) (shapes (slice SpillShape)) (uniform SpillShape)]
+  (-> SpillShape)
+  (if (= (len shapes) 0)
+      uniform
+      (if (and (>= parent 0) (< (cast i64 parent) (len shapes)))
+          (get shapes (cast i64 parent))
+          (SpillShape :size 0 :alignment 0))))
+
 ;;; Allocate physical registers restricted by each value's admissible class mask.
-;;; Input parts are unassigned except reservations. Current scalar classes share
-;;; spill slot size/alignment; wider vector slots require target size metadata.
-(defn run! [(parts (mut (ArrayList Part)))
-            (frame (mut frame/Frame))
-            (register-count i32)
-            (allowed u64)
-            (size i64)
-            (alignment i64)
-            (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+;;; Input parts are unassigned except reservations. Shapes are immutable per
+;;; parent, so splitting and eviction always consult the owning value.
+(defn run-impl! [(parts (mut (ArrayList Part)))
+                 (frame (mut frame/Frame))
+                 (register-count i32)
+                 (allowed u64)
+                 (shapes (slice SpillShape))
+                 (uniform SpillShape)
+                 (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
   (let [(mut work) (ArrayList::new [queue/Item] allocator)
         (mut error) ""
         (mut i) 0
@@ -363,6 +378,11 @@
     (match (validate-input parts register-count allowed)
       (Err [message] (set! error message))
       (Ok [_] 0))
+    (for part parts
+      (when (and (>= (.parent part) 0) (> (len (.ranges part)) 0))
+        (let [shape (shape-of (.parent part) shapes uniform)]
+          (when (not (valid-shape? shape))
+            (set! error "missing or invalid parent spill shape")))))
     (while (and (= error "") (< i (len parts)))
       (let [part (at parts i)]
         (when (and (> (len (.ranges part)) 0) (< (.register part) 0))
@@ -386,6 +406,7 @@
                                         allowed
                                         allocator))
                   (let [part (at parts (cast i64 index))
+                        shape (shape-of (.parent part) shapes uniform)
                         decision
                           (blocked-decision (load part)
                                             (.next-use summary)
@@ -397,8 +418,8 @@
                                               (mut work)
                                               index
                                               (mut frame)
-                                              size
-                                              alignment
+                                              (.size shape)
+                                              (.alignment shape)
                                               allocator)
                           (Err [msg] (set! error msg))
                           (Ok [_] 0))
@@ -414,16 +435,20 @@
                                                 (.register decision))
                                              (range/covers? (.ranges owner)
                                                             position))
-                                    (match (evict! (mut parts)
-                                                   (mut work)
-                                                   (cast i32 owner-index)
-                                                   position
-                                                   (mut frame)
-                                                   size
-                                                   alignment
-                                                   allocator)
-                                      (Err [msg] (set! error msg))
-                                      (Ok [_] 0))))
+                                    (let [owner-shape
+                                            (shape-of (.parent owner)
+                                                      shapes
+                                                      uniform)]
+                                      (match (evict! (mut parts)
+                                                     (mut work)
+                                                     (cast i32 owner-index)
+                                                     position
+                                                     (mut frame)
+                                                     (.size owner-shape)
+                                                     (.alignment owner-shape)
+                                                     allocator)
+                                        (Err [msg] (set! error msg))
+                                        (Ok [_] 0)))))
                                 (set! owner-index (+ owner-index 1)))
                               (when (= error "")
                                 (let [(mut revised)
@@ -444,6 +469,41 @@
                 (set! processed (+ processed 1))))))
     (free! (mut work))
     (if (= error "") (Ok processed) (Err error))))
+
+;;; Explicit per-parent shapes. Missing/out-of-range live parents are errors,
+;;; even when a particular run would happen not to spill them.
+(defn run-shaped! [(parts (mut (ArrayList Part)))
+                   (layout (mut frame/Frame))
+                   (register-count i32)
+                   (allowed u64)
+                   (shapes (slice SpillShape))
+                   (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (run-impl! (mut parts)
+             (mut layout)
+             register-count
+             allowed
+             shapes
+             (SpillShape :size 0 :alignment 0)
+             allocator))
+
+;;; Compatibility interface for targets whose values all share one spill shape.
+(defn run! [(parts (mut (ArrayList Part)))
+            (layout (mut frame/Frame))
+            (register-count i32)
+            (allowed u64)
+            (size i64)
+            (alignment i64)
+            (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (let [uniform (SpillShape :size size :alignment alignment)]
+    (if (not (valid-shape? uniform))
+        (Err "invalid uniform spill shape")
+        (run-impl! (mut parts)
+                   (mut layout)
+                   register-count
+                   allowed
+                   []
+                   uniform
+                   allocator))))
 
 ;;; Non-evictable fixed interference interval; parent=-1 has no virtual value.
 ;;; Preassigned parts are reservations and are excluded from the unhandled queue.

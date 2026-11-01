@@ -59,16 +59,25 @@
             :entry-slot -1
             :result (results/ordinary)
             :result-slot -1)
+        (mut shapes) (ArrayList::new [allocation/SpillShape] allocator)
         (mut i) 1
         (mut frame-error) ""
         (mut anchored?) false
         (mut register-count) (: 16 i32)
         (mut allowed) (registers/gpr-mask)]
+    (push! (mut shapes) (allocation/SpillShape :size 0 :alignment 0))
     (while (< i (len intervals))
       (let [interval (at intervals i)
             uses (at requirements i)
             (mut part) (allocation/create (cast i32 i) allocator)]
-        (let [ty (cast i32 (n/type-id (get (.instructions graph) i)))]
+        (let [ty (cast i32 (n/type-id (get (.instructions graph) i)))
+              width (types/size ty 8)
+              extent (if (> width 8) (cast i64 width) (: 8 i64))]
+          (when (and (> (len (.ranges interval)) 0)
+                     (or (<= width 0) (> width 16)))
+            (set! frame-error "unsupported allocated value extent"))
+          (push! (mut shapes)
+                 (allocation/SpillShape :size extent :alignment extent))
           (set! (.allowed part) (registers/class-mask ty))
           (when (and (types/floating? ty) (> (len (.ranges interval)) 0))
             (set! register-count 64)
@@ -160,16 +169,18 @@
                   (Err [message] (set! frame-error message))
                   (Ok [_] 0)))))))
     (if (!= frame-error "")
-        (do (release! (mut assigned)) (Err frame-error))
-        (match (allocation/run! (mut (.parts assigned))
-                                (mut (.frame assigned))
-                                register-count
-                                allowed
-                                8
-                                8
-                                allocator)
-          (Err [msg] (do (release! (mut assigned)) (Err msg)))
-          (Ok [_]
-              (match (check/verify (.parts assigned) register-count allowed)
-                (Err [msg] (do (release! (mut assigned)) (Err msg)))
-                (Ok [_] (Ok assigned))))))))
+        (do (free! (mut shapes)) (release! (mut assigned)) (Err frame-error))
+        (let [result
+                (allocation/run-shaped! (mut (.parts assigned))
+                                        (mut (.frame assigned))
+                                        register-count
+                                        allowed
+                                        (slice shapes)
+                                        allocator)]
+          (free! (mut shapes))
+          (match result
+            (Err [msg] (do (release! (mut assigned)) (Err msg)))
+            (Ok [_]
+                (match (check/verify (.parts assigned) register-count allowed)
+                  (Err [msg] (do (release! (mut assigned)) (Err msg)))
+                  (Ok [_] (Ok assigned)))))))))

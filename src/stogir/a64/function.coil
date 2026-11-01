@@ -33,6 +33,7 @@
 (import "stogir.a64.value" :as value)
 (import "stogir.a64.truth" :as truth)
 (import "stogir.a64.transfers" :as transfers)
+(import "stogir.a64.typed-transfers" :as typed-transfers)
 (import "stogir.locations" :as locations)
 (import "stogir.transfer-index" :as transfer-index)
 (import "stogir.frame" :as frame)
@@ -45,6 +46,36 @@
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [Allocator])
 (import "coil.result" :use [Result Ok Err Some None])
+
+;;; Split and CFG-edge groups must remain simultaneous across value widths.
+;;; Byte/halfword scalar values retain their normalized32-bit register form.
+(defn typed-group! [(output (mut (ArrayList u8)))
+                    (graph g/Graph)
+                    (copies (slice locations/Transfer))
+                    (allocator (dyn Allocator))
+                    (base frame-address/Base)] (-> (Result i32 (slice u8)))
+  (let [(mut typed) (ArrayList::new [typed-transfers/Copy] allocator)
+        (mut error) ""]
+    (for copy copies
+      (match (g/lookup graph (.parent copy))
+        (None [] (set! error "transfer has no owning graph value"))
+        (Some [node]
+              (let [size (types/size (cast i32 (n/type-id node)) 8)]
+                (if (or (<= size 0) (> size 16))
+                    (set! error "unsupported graph transfer extent")
+                    (push! (mut typed)
+                           (typed-transfers/Copy
+                             :transfer copy
+                             :size (if (< size 4) 4 size))))))))
+    (let [result
+            (if (= error "")
+                (typed-transfers/parallel-frame! (mut output)
+                                                 (slice typed)
+                                                 allocator
+                                                 base)
+                (Err [i32 (slice u8)] error))]
+      (free! (mut typed))
+      result)))
 
 (defn word! [(output (mut code/Buffer))
              (instruction (Result u32 (slice u8)))]
@@ -125,11 +156,11 @@
                   (push! (mut group) (get moves cursor))
                   (set! cursor (get (.next move-index) cursor)))))
             (when (> (len group) 0)
-              (match (transfers/parallel-frame! (mut (.text output))
-                                                (slice group)
-                                                8
-                                                allocator
-                                                (.base assigned))
+              (match (typed-group! (mut (.text output))
+                                   graph
+                                   (slice group)
+                                   allocator
+                                   (.base assigned))
                 (Err [msg] (set! error msg))
                 (Ok [_] 0)))
             (set! phase (+ phase 1))))
@@ -623,11 +654,11 @@
               (Ok [group]
                   (let [(mut phis) group]
                     (for move (.moves phis) (push! (mut owned) move))
-                    (match (transfers/parallel-frame! (mut (.text output))
-                                                      (slice owned)
-                                                      8
-                                                      allocator
-                                                      (.base assigned))
+                    (match (typed-group! (mut (.text output))
+                                         graph
+                                         (slice owned)
+                                         allocator
+                                         (.base assigned))
                       (Err [msg] (set! error msg))
                       (Ok [_] 0))
                     (for literal (.literals phis)
