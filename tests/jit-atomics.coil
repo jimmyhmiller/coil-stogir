@@ -1,0 +1,500 @@
+(module stogir.tests.jit-atomics)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.image" :as image)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.thread" :use [Thread])
+
+(defn mask [(ty i32)] (-> u64)
+  (case ty 2 (: 255 u64) 3 65535 4 0xFFFFFFFF 0xFFFFFFFFFFFFFFFF))
+
+(defn width [(ty i32)] (-> i32)
+  (case ty 2 1 3 2 4 4 8))
+
+(defn sample [(i i32)] (-> u64)
+  (case i
+    0 (: 0 u64)
+    1 1
+    2 255
+    3 0x8000000000000000
+    4 0xFFFFFFFFFFFFFFFF
+    5 0x8000800080000080
+    6 0x7FFF7FFF7FFF007F
+    7 0x0123456789ABCDEF
+    0xFEDCBA9876543210))
+
+(defn updated [(ty i32) (op i32) (old u64) (input u64) (expected u64)] (-> u64)
+  (let [m (mask ty)
+        x (& input m)
+        sign (<< (: 1 u64) (cast u64 (- (* (width ty) 8) 1)))
+        sless (< (^ old sign) (^ x sign))]
+    (& (case op
+         0 (cast u64 (+ (cast u128 old) (cast u128 x)))
+         1 (p/isub old x)
+         2 (& old x)
+         3 (| old x)
+         4 (^ old x)
+         5 x
+         6 (if sless x old)
+         7 (if sless old x)
+         8 (if (< old x) x old)
+         9 (if (< old x) old x)
+         10 (if (= old (& expected m)) x old)
+         12 x
+         old)
+       m)))
+
+(defn exercise [(ty i32) (op i32) (preserve bool) (address (ptr u8))] (-> i64)
+  (let [f (p/cast (fnptr (cc/C) [u64 u64 u64 u64] u64) address)
+        (mut memory) (ArrayList::new [u8] (malloc-allocator))
+        (mut output) (ArrayList::new [u8] (malloc-allocator))
+        (mut failures) 0]
+    (for [i 0 32]
+      (push! (mut memory) (: 165 u8))
+      (push! (mut output) (: 165 u8)))
+    (for seed [(: 0 i32) 1 2 3 4 5 6 7 8]
+      (for input-seed [(: 0 i32) 1 2 3 4 5 6 7 8]
+        (for match? [false true]
+          (let [old (& (sample seed) (mask ty))
+                input (sample input-seed)
+                expected (if match? old (^ old 1))
+                cell (p/index (.data memory) 8)
+                pointer (p/cast u64 cell)]
+            (for [i 0 32] (set! (mut memory) i 165) (set! (mut output) i 165))
+            (for [i 0 (cast i64 (width ty))]
+              (set! (mut memory) (+ i 8) (cast u8 (>> old (* (cast u64 i) 8)))))
+            (let [got
+                    (call-ptr f
+                              pointer
+                              input
+                              expected
+                              (p/cast u64 (.data output)))
+                  wanted (if (or (= op 12) (= op 13)) (: 0 u64) old)
+                  after (updated ty op old input expected)]
+              (when (!= got wanted)
+                (println "atomic return ty{} op{} preserve{} seed{} input{} match{}: {} != {}"
+                         ty
+                         op
+                         preserve
+                         seed
+                         input-seed
+                         match?
+                         got
+                         wanted)
+                (set! failures (+ failures 1)))
+              (for [i 0 32]
+                (let [byte
+                        (if (and (>= i 8) (< i (+ 8 (cast i64 (width ty)))))
+                            (cast u8 (>> after (* (cast u64 (- i 8)) 8)))
+                            (: 165 u8))
+                      output-byte
+                        (if (and preserve (< i 24))
+                            (let [bits (case (/ i 8) 0 input 1 expected pointer)]
+                              (cast u8 (>> bits (* (cast u64 (% i 8)) 8))))
+                            (: 165 u8))]
+                  (when (or (!= (get memory i) byte)
+                            (!= (get output i) output-byte))
+                    (println "atomic bytes ty{} op{} preserve{} byte{}"
+                             ty
+                             op
+                             preserve
+                             i)
+                    (set! failures (+ failures 1))))))))))
+    (free! (mut memory))
+    (free! (mut output))
+    failures))
+
+(defstruct AtomicWork
+  [(function (fnptr (cc/C) [u64 u64 u64 u64] u64)) (cell (ptr u64)) (sum u64)])
+
+(defn worker :cc (cc/C) [(arg (ptr i8))] (-> (ptr i8))
+  (let [work (p/cast (ptr AtomicWork) arg)
+        (mut sum) (: 0 u64)]
+    (for [i 0 10000]
+      (set! sum
+            (+ sum (call-ptr (.function work) (p/cast u64 (.cell work)) 1 0 0))))
+    (set! (.sum work) sum)
+    (p/cast (ptr i8) 0)))
+
+(defn contention [(address (ptr u8))] (-> i64)
+  (let [f (p/cast (fnptr (cc/C) [u64 u64 u64 u64] u64) address)
+        (mut counter) (: 0 u64)
+        (mut jobs) (ArrayList::new [AtomicWork] (malloc-allocator))
+        (mut threads) (ArrayList::new [Thread] (malloc-allocator))
+        (mut started) (ArrayList::new [bool] (malloc-allocator))
+        (mut failures) 0
+        (mut sum) (: 0 u64)]
+    (for [i 0 4]
+      (push! (mut jobs)
+             (AtomicWork
+               :function f
+               :cell (p/cast (ptr u64) (mut counter))
+               :sum 0))
+      (push! (mut threads) (zeroed Thread))
+      (push! (mut started) false))
+    (let [body (: (fnptr-of worker) (fnptr (cc/C) [(ptr i8)] (ptr i8)))]
+      (for [i 0 4]
+        (let [rc
+                (Thread::spawn (p/cast (ptr Thread) (elem (mut threads) i))
+                               body
+                               (p/cast (ptr i8) (elem (mut jobs) i)))]
+          (if (= rc 0)
+              (set! (mut started) i true)
+              (set! failures (+ failures 1))))))
+    (for [i 0 4]
+      (when (get started i)
+        (when (!= (Thread::join (p/cast (ptr Thread) (elem (mut threads) i))) 0)
+          (set! failures (+ failures 1))))
+      (set! sum (+ sum (.sum (get jobs i)))))
+    (when (or (!= counter 40000) (!= sum 799980000))
+      (println "atomic contention count{} sum{}" counter sum)
+      (set! failures (+ failures 1)))
+    (free! (mut jobs))
+    (free! (mut threads))
+    (free! (mut started))
+    failures))
+
+(defn fixture-name [(id i32)] (-> (slice u8))
+  (match id
+    (0 "_stogir_atomic_0")
+    (1 "_stogir_atomic_1")
+    (2 "_stogir_atomic_2")
+    (3 "_stogir_atomic_3")
+    (4 "_stogir_atomic_4")
+    (5 "_stogir_atomic_5")
+    (6 "_stogir_atomic_6")
+    (7 "_stogir_atomic_7")
+    (8 "_stogir_atomic_8")
+    (9 "_stogir_atomic_9")
+    (10 "_stogir_atomic_10")
+    (11 "_stogir_atomic_11")
+    (12 "_stogir_atomic_12")
+    (13 "_stogir_atomic_13")
+    (14 "_stogir_atomic_14")
+    (15 "_stogir_atomic_15")
+    (16 "_stogir_atomic_16")
+    (17 "_stogir_atomic_17")
+    (18 "_stogir_atomic_18")
+    (19 "_stogir_atomic_19")
+    (20 "_stogir_atomic_20")
+    (21 "_stogir_atomic_21")
+    (22 "_stogir_atomic_22")
+    (23 "_stogir_atomic_23")
+    (24 "_stogir_atomic_24")
+    (25 "_stogir_atomic_25")
+    (26 "_stogir_atomic_26")
+    (27 "_stogir_atomic_27")
+    (28 "_stogir_atomic_28")
+    (29 "_stogir_atomic_29")
+    (30 "_stogir_atomic_30")
+    (31 "_stogir_atomic_31")
+    (32 "_stogir_atomic_32")
+    (33 "_stogir_atomic_33")
+    (34 "_stogir_atomic_34")
+    (35 "_stogir_atomic_35")
+    (36 "_stogir_atomic_36")
+    (37 "_stogir_atomic_37")
+    (38 "_stogir_atomic_38")
+    (39 "_stogir_atomic_39")
+    (40 "_stogir_atomic_40")
+    (41 "_stogir_atomic_41")
+    (42 "_stogir_atomic_42")
+    (43 "_stogir_atomic_43")
+    (44 "_stogir_atomic_44")
+    (45 "_stogir_atomic_45")
+    (46 "_stogir_atomic_46")
+    (47 "_stogir_atomic_47")
+    (48 "_stogir_atomic_48")
+    (49 "_stogir_atomic_49")
+    (50 "_stogir_atomic_50")
+    (51 "_stogir_atomic_51")
+    (52 "_stogir_atomic_52")
+    (53 "_stogir_atomic_53")
+    (54 "_stogir_atomic_54")
+    (55 "_stogir_atomic_55")
+    (56 "_stogir_atomic_56")
+    (57 "_stogir_atomic_57")
+    (58 "_stogir_atomic_58")
+    (59 "_stogir_atomic_59")
+    (60 "_stogir_atomic_60")
+    (61 "_stogir_atomic_61")
+    (62 "_stogir_atomic_62")
+    (63 "_stogir_atomic_63")
+    (64 "_stogir_atomic_64")
+    (65 "_stogir_atomic_65")
+    (66 "_stogir_atomic_66")
+    (67 "_stogir_atomic_67")
+    (68 "_stogir_atomic_68")
+    (69 "_stogir_atomic_69")
+    (70 "_stogir_atomic_70")
+    (71 "_stogir_atomic_71")
+    (72 "_stogir_atomic_72")
+    (73 "_stogir_atomic_73")
+    (74 "_stogir_atomic_74")
+    (75 "_stogir_atomic_75")
+    (76 "_stogir_atomic_76")
+    (77 "_stogir_atomic_77")
+    (78 "_stogir_atomic_78")
+    (79 "_stogir_atomic_79")
+    (80 "_stogir_atomic_80")
+    (81 "_stogir_atomic_81")
+    (82 "_stogir_atomic_82")
+    (83 "_stogir_atomic_83")
+    (84 "_stogir_atomic_84")
+    (85 "_stogir_atomic_85")
+    (86 "_stogir_atomic_86")
+    (87 "_stogir_atomic_87")
+    (88 "_stogir_atomic_88")
+    (89 "_stogir_atomic_89")
+    (90 "_stogir_atomic_90")
+    (91 "_stogir_atomic_91")
+    (92 "_stogir_atomic_92")
+    (93 "_stogir_atomic_93")
+    (94 "_stogir_atomic_94")
+    (95 "_stogir_atomic_95")
+    (96 "_stogir_atomic_96")
+    (97 "_stogir_atomic_97")
+    (98 "_stogir_atomic_98")
+    (99 "_stogir_atomic_99")
+    (100 "_stogir_atomic_100")
+    (101 "_stogir_atomic_101")
+    (102 "_stogir_atomic_102")
+    (103 "_stogir_atomic_103")
+    (104 "_stogir_atomic_104")
+    (105 "_stogir_atomic_105")
+    (106 "_stogir_atomic_106")
+    (107 "_stogir_atomic_107")
+    (108 "_stogir_atomic_108")
+    (109 "_stogir_atomic_109")
+    (110 "_stogir_atomic_110")
+    (111 "_stogir_atomic_111")
+    (_ "invalid")))
+
+(defn fixture-path [(id i32)] (-> (slice u8))
+  (match id
+    (0 "/tmp/coil-stogir-atomic-0.o")
+    (1 "/tmp/coil-stogir-atomic-1.o")
+    (2 "/tmp/coil-stogir-atomic-2.o")
+    (3 "/tmp/coil-stogir-atomic-3.o")
+    (4 "/tmp/coil-stogir-atomic-4.o")
+    (5 "/tmp/coil-stogir-atomic-5.o")
+    (6 "/tmp/coil-stogir-atomic-6.o")
+    (7 "/tmp/coil-stogir-atomic-7.o")
+    (8 "/tmp/coil-stogir-atomic-8.o")
+    (9 "/tmp/coil-stogir-atomic-9.o")
+    (10 "/tmp/coil-stogir-atomic-10.o")
+    (11 "/tmp/coil-stogir-atomic-11.o")
+    (12 "/tmp/coil-stogir-atomic-12.o")
+    (13 "/tmp/coil-stogir-atomic-13.o")
+    (14 "/tmp/coil-stogir-atomic-14.o")
+    (15 "/tmp/coil-stogir-atomic-15.o")
+    (16 "/tmp/coil-stogir-atomic-16.o")
+    (17 "/tmp/coil-stogir-atomic-17.o")
+    (18 "/tmp/coil-stogir-atomic-18.o")
+    (19 "/tmp/coil-stogir-atomic-19.o")
+    (20 "/tmp/coil-stogir-atomic-20.o")
+    (21 "/tmp/coil-stogir-atomic-21.o")
+    (22 "/tmp/coil-stogir-atomic-22.o")
+    (23 "/tmp/coil-stogir-atomic-23.o")
+    (24 "/tmp/coil-stogir-atomic-24.o")
+    (25 "/tmp/coil-stogir-atomic-25.o")
+    (26 "/tmp/coil-stogir-atomic-26.o")
+    (27 "/tmp/coil-stogir-atomic-27.o")
+    (28 "/tmp/coil-stogir-atomic-28.o")
+    (29 "/tmp/coil-stogir-atomic-29.o")
+    (30 "/tmp/coil-stogir-atomic-30.o")
+    (31 "/tmp/coil-stogir-atomic-31.o")
+    (32 "/tmp/coil-stogir-atomic-32.o")
+    (33 "/tmp/coil-stogir-atomic-33.o")
+    (34 "/tmp/coil-stogir-atomic-34.o")
+    (35 "/tmp/coil-stogir-atomic-35.o")
+    (36 "/tmp/coil-stogir-atomic-36.o")
+    (37 "/tmp/coil-stogir-atomic-37.o")
+    (38 "/tmp/coil-stogir-atomic-38.o")
+    (39 "/tmp/coil-stogir-atomic-39.o")
+    (40 "/tmp/coil-stogir-atomic-40.o")
+    (41 "/tmp/coil-stogir-atomic-41.o")
+    (42 "/tmp/coil-stogir-atomic-42.o")
+    (43 "/tmp/coil-stogir-atomic-43.o")
+    (44 "/tmp/coil-stogir-atomic-44.o")
+    (45 "/tmp/coil-stogir-atomic-45.o")
+    (46 "/tmp/coil-stogir-atomic-46.o")
+    (47 "/tmp/coil-stogir-atomic-47.o")
+    (48 "/tmp/coil-stogir-atomic-48.o")
+    (49 "/tmp/coil-stogir-atomic-49.o")
+    (50 "/tmp/coil-stogir-atomic-50.o")
+    (51 "/tmp/coil-stogir-atomic-51.o")
+    (52 "/tmp/coil-stogir-atomic-52.o")
+    (53 "/tmp/coil-stogir-atomic-53.o")
+    (54 "/tmp/coil-stogir-atomic-54.o")
+    (55 "/tmp/coil-stogir-atomic-55.o")
+    (56 "/tmp/coil-stogir-atomic-56.o")
+    (57 "/tmp/coil-stogir-atomic-57.o")
+    (58 "/tmp/coil-stogir-atomic-58.o")
+    (59 "/tmp/coil-stogir-atomic-59.o")
+    (60 "/tmp/coil-stogir-atomic-60.o")
+    (61 "/tmp/coil-stogir-atomic-61.o")
+    (62 "/tmp/coil-stogir-atomic-62.o")
+    (63 "/tmp/coil-stogir-atomic-63.o")
+    (64 "/tmp/coil-stogir-atomic-64.o")
+    (65 "/tmp/coil-stogir-atomic-65.o")
+    (66 "/tmp/coil-stogir-atomic-66.o")
+    (67 "/tmp/coil-stogir-atomic-67.o")
+    (68 "/tmp/coil-stogir-atomic-68.o")
+    (69 "/tmp/coil-stogir-atomic-69.o")
+    (70 "/tmp/coil-stogir-atomic-70.o")
+    (71 "/tmp/coil-stogir-atomic-71.o")
+    (72 "/tmp/coil-stogir-atomic-72.o")
+    (73 "/tmp/coil-stogir-atomic-73.o")
+    (74 "/tmp/coil-stogir-atomic-74.o")
+    (75 "/tmp/coil-stogir-atomic-75.o")
+    (76 "/tmp/coil-stogir-atomic-76.o")
+    (77 "/tmp/coil-stogir-atomic-77.o")
+    (78 "/tmp/coil-stogir-atomic-78.o")
+    (79 "/tmp/coil-stogir-atomic-79.o")
+    (80 "/tmp/coil-stogir-atomic-80.o")
+    (81 "/tmp/coil-stogir-atomic-81.o")
+    (82 "/tmp/coil-stogir-atomic-82.o")
+    (83 "/tmp/coil-stogir-atomic-83.o")
+    (84 "/tmp/coil-stogir-atomic-84.o")
+    (85 "/tmp/coil-stogir-atomic-85.o")
+    (86 "/tmp/coil-stogir-atomic-86.o")
+    (87 "/tmp/coil-stogir-atomic-87.o")
+    (88 "/tmp/coil-stogir-atomic-88.o")
+    (89 "/tmp/coil-stogir-atomic-89.o")
+    (90 "/tmp/coil-stogir-atomic-90.o")
+    (91 "/tmp/coil-stogir-atomic-91.o")
+    (92 "/tmp/coil-stogir-atomic-92.o")
+    (93 "/tmp/coil-stogir-atomic-93.o")
+    (94 "/tmp/coil-stogir-atomic-94.o")
+    (95 "/tmp/coil-stogir-atomic-95.o")
+    (96 "/tmp/coil-stogir-atomic-96.o")
+    (97 "/tmp/coil-stogir-atomic-97.o")
+    (98 "/tmp/coil-stogir-atomic-98.o")
+    (99 "/tmp/coil-stogir-atomic-99.o")
+    (100 "/tmp/coil-stogir-atomic-100.o")
+    (101 "/tmp/coil-stogir-atomic-101.o")
+    (102 "/tmp/coil-stogir-atomic-102.o")
+    (103 "/tmp/coil-stogir-atomic-103.o")
+    (104 "/tmp/coil-stogir-atomic-104.o")
+    (105 "/tmp/coil-stogir-atomic-105.o")
+    (106 "/tmp/coil-stogir-atomic-106.o")
+    (107 "/tmp/coil-stogir-atomic-107.o")
+    (108 "/tmp/coil-stogir-atomic-108.o")
+    (109 "/tmp/coil-stogir-atomic-109.o")
+    (110 "/tmp/coil-stogir-atomic-110.o")
+    (111 "/tmp/coil-stogir-atomic-111.o")
+    (_ "invalid")))
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [message] (println "{}" message) 0)))
+
+(defn generate [(ty i32) (op i32) (preserve bool) (id i32)] (-> i64)
+  (let [alc (malloc-allocator)
+        (mut graph) (g/create alc)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        pointer (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        input (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        expected (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        output (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 3]))
+        narrow
+          (if (= ty 5)
+              input
+              (require (b/conversion! (mut graph) 35 ty 8 input)))
+        narrow-expected
+          (if (= ty 5)
+              expected
+              (require (b/conversion! (mut graph) 35 ty 8 expected)))
+        atomic
+          (require (cond (< op 10)
+                           (b/emit! (mut graph)
+                                    128
+                                    ty
+                                    [start pointer narrow op])
+                         (= op 10)
+                           (b/emit! (mut graph)
+                                    129
+                                    ty
+                                    [start pointer narrow-expected narrow])
+                         (= op 11) (b/emit! (mut graph) 126 ty [start pointer])
+                         (= op 12)
+                           (b/emit! (mut graph) 127 0 [start pointer narrow])
+                         :else (b/emit! (mut graph) 130 0 [start])))
+        result
+          (if (or (= op 12) (= op 13))
+              (require (b/scalar-constant! (mut graph) 5 0 8))
+              (if (= ty 5)
+                  atomic
+                  (require (b/conversion! (mut graph) 34 5 8 atomic))))
+        (mut control) atomic
+        (mut failures) 0]
+    (when preserve
+      (for [i 0 3]
+        (let [offset
+                (require (b/scalar-constant! (mut graph) 5 (cast u64 (* i 8)) 8))
+              addr (require (b/emit! (mut graph) 26 6 [output offset]))
+              value
+                (case i
+                  0 input
+                  1 expected
+                  (require (b/conversion! (mut graph) 36 5 8 pointer)))]
+          (set! control
+                (require (b/emit! (mut graph) 93 0 [control addr value]))))))
+    (match (calls/create 9 5 [(: 6 u8) 5 5 6] alc)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [proto] (require (calls/function! (mut graph) proto alc))))
+    (let [ret (require (b/emit! (mut graph) 120 5 [control result (: 0 i32)]))]
+      (match (compile/object graph start [ret] (fixture-name id) alc)
+        (Err [message]
+             (println "atomic compile ty{} op{}: {}" ty op message)
+             (set! failures (+ failures 1)))
+        (Ok [object]
+            (let [(mut object) object]
+              (match (fs/write-file alc (fixture-path id) (slice object))
+                (Err [_] (set! failures (+ failures 1)))
+                (Ok [_] 0))
+              (free! (mut object)))))
+      (match (compile/image graph start [ret] "_atomic_jit" alc)
+        (Err [message]
+             (println "atomic image ty{} op{}: {}" ty op message)
+             (set! failures (+ failures 1)))
+        (Ok [source]
+            (let [(mut source) source]
+              (match (jit/map-image source alc)
+                (Err [message]
+                     (println "{}" message)
+                     (set! failures (+ failures 1)))
+                (Ok [loaded]
+                    (let [(mut loaded) loaded]
+                      (set! failures
+                            (+ failures
+                               (exercise ty
+                                         op
+                                         preserve
+                                         (.base (.memory loaded)))))
+                      (when (and (= ty 5) (= op 0) (not preserve))
+                        (set! failures
+                              (+ failures (contention (.base (.memory loaded))))))
+                      (jit/release-image! (mut loaded)))))
+              (image/release! (mut source))))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0
+        (mut id) (: 0 i32)]
+    (for ty [(: 2 i32) 3 4 5]
+      (for op [(: 0 i32) 1 2 3 4 5 6 7 8 9 10 11 12 13]
+        (for preserve [false true]
+          (set! failures (+ failures (generate ty op preserve id)))
+          (set! id (+ id 1)))))
+    (println "native atomics: {} graphs, {} failures" id failures)
+    (if (= failures 0) 0 1)))

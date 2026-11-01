@@ -68,7 +68,9 @@ Scalar conditions can also select complete vector values through COND, with
 bit-preserving native mask selection and the existing truth/folding/CSE rules.
 Equal-storage-size scalar/vector and vector/vector BITCAST preserves complete
 literal and runtime payloads, with native D/Q transfers and symbolic address
-relocations. Remaining vector operations and broader ABI coverage are unfinished.
+relocations. A Coil extension supplies sequentially consistent U8/U16/U32/U64 atomics: load,
+store, ten RMW operations, compare/exchange and fence. Native RMW/CAS requires
+AArch64 FEAT_LSE. Remaining vector operations and broader ABI coverage are unfinished.
 
 Native copy, overlap-safe move and zero builders expand into existing memory
 and control nodes. Fixed small transfers use exact-width accesses; larger and

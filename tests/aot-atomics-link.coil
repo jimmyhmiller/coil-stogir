@@ -1,0 +1,1285 @@
+(module stogir.tests.aot-atomics-link)
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.thread" :use [Thread])
+
+(defn mask [(ty i32)] (-> u64)
+  (case ty 2 (: 255 u64) 3 65535 4 0xFFFFFFFF 0xFFFFFFFFFFFFFFFF))
+
+(defn width [(ty i32)] (-> i32)
+  (case ty 2 1 3 2 4 4 8))
+
+(defn sample [(i i32)] (-> u64)
+  (case i
+    0 (: 0 u64)
+    1 1
+    2 255
+    3 0x8000000000000000
+    4 0xFFFFFFFFFFFFFFFF
+    5 0x8000800080000080
+    6 0x7FFF7FFF7FFF007F
+    7 0x0123456789ABCDEF
+    0xFEDCBA9876543210))
+
+(defn updated [(ty i32) (op i32) (old u64) (input u64) (expected u64)] (-> u64)
+  (let [m (mask ty)
+        x (& input m)
+        sign (<< (: 1 u64) (cast u64 (- (* (width ty) 8) 1)))
+        sless (< (^ old sign) (^ x sign))]
+    (& (case op
+         0 (cast u64 (+ (cast u128 old) (cast u128 x)))
+         1 (p/isub old x)
+         2 (& old x)
+         3 (| old x)
+         4 (^ old x)
+         5 x
+         6 (if sless x old)
+         7 (if sless old x)
+         8 (if (< old x) x old)
+         9 (if (< old x) old x)
+         10 (if (= old (& expected m)) x old)
+         12 x
+         old)
+       m)))
+
+(defn exercise [(ty i32) (op i32) (preserve bool) (address (ptr u8))] (-> i64)
+  (let [f (p/cast (fnptr (cc/C) [u64 u64 u64 u64] u64) address)
+        (mut memory) (ArrayList::new [u8] (malloc-allocator))
+        (mut output) (ArrayList::new [u8] (malloc-allocator))
+        (mut failures) 0]
+    (for [i 0 32]
+      (push! (mut memory) (: 165 u8))
+      (push! (mut output) (: 165 u8)))
+    (for seed [(: 0 i32) 1 2 3 4 5 6 7 8]
+      (for input-seed [(: 0 i32) 1 2 3 4 5 6 7 8]
+        (for match? [false true]
+          (let [old (& (sample seed) (mask ty))
+                input (sample input-seed)
+                expected (if match? old (^ old 1))
+                cell (p/index (.data memory) 8)
+                pointer (p/cast u64 cell)]
+            (for [i 0 32] (set! (mut memory) i 165) (set! (mut output) i 165))
+            (for [i 0 (cast i64 (width ty))]
+              (set! (mut memory) (+ i 8) (cast u8 (>> old (* (cast u64 i) 8)))))
+            (let [got
+                    (call-ptr f
+                              pointer
+                              input
+                              expected
+                              (p/cast u64 (.data output)))
+                  wanted (if (or (= op 12) (= op 13)) (: 0 u64) old)
+                  after (updated ty op old input expected)]
+              (when (!= got wanted)
+                (println "atomic return ty{} op{} preserve{} seed{} input{} match{}: {} != {}"
+                         ty
+                         op
+                         preserve
+                         seed
+                         input-seed
+                         match?
+                         got
+                         wanted)
+                (set! failures (+ failures 1)))
+              (for [i 0 32]
+                (let [byte
+                        (if (and (>= i 8) (< i (+ 8 (cast i64 (width ty)))))
+                            (cast u8 (>> after (* (cast u64 (- i 8)) 8)))
+                            (: 165 u8))
+                      output-byte
+                        (if (and preserve (< i 24))
+                            (let [bits (case (/ i 8) 0 input 1 expected pointer)]
+                              (cast u8 (>> bits (* (cast u64 (% i 8)) 8))))
+                            (: 165 u8))]
+                  (when (or (!= (get memory i) byte)
+                            (!= (get output i) output-byte))
+                    (println "atomic bytes ty{} op{} preserve{} byte{}"
+                             ty
+                             op
+                             preserve
+                             i)
+                    (set! failures (+ failures 1))))))))))
+    (free! (mut memory))
+    (free! (mut output))
+    failures))
+
+(defstruct AtomicWork
+  [(function (fnptr (cc/C) [u64 u64 u64 u64] u64)) (cell (ptr u64)) (sum u64)])
+
+(defn worker :cc (cc/C) [(arg (ptr i8))] (-> (ptr i8))
+  (let [work (p/cast (ptr AtomicWork) arg)
+        (mut sum) (: 0 u64)]
+    (for [i 0 10000]
+      (set! sum
+            (+ sum (call-ptr (.function work) (p/cast u64 (.cell work)) 1 0 0))))
+    (set! (.sum work) sum)
+    (p/cast (ptr i8) 0)))
+
+(defn contention [(address (ptr u8))] (-> i64)
+  (let [f (p/cast (fnptr (cc/C) [u64 u64 u64 u64] u64) address)
+        (mut counter) (: 0 u64)
+        (mut jobs) (ArrayList::new [AtomicWork] (malloc-allocator))
+        (mut threads) (ArrayList::new [Thread] (malloc-allocator))
+        (mut started) (ArrayList::new [bool] (malloc-allocator))
+        (mut failures) 0
+        (mut sum) (: 0 u64)]
+    (for [i 0 4]
+      (push! (mut jobs)
+             (AtomicWork
+               :function f
+               :cell (p/cast (ptr u64) (mut counter))
+               :sum 0))
+      (push! (mut threads) (zeroed Thread))
+      (push! (mut started) false))
+    (let [body (: (fnptr-of worker) (fnptr (cc/C) [(ptr i8)] (ptr i8)))]
+      (for [i 0 4]
+        (let [rc
+                (Thread::spawn (p/cast (ptr Thread) (elem (mut threads) i))
+                               body
+                               (p/cast (ptr i8) (elem (mut jobs) i)))]
+          (if (= rc 0)
+              (set! (mut started) i true)
+              (set! failures (+ failures 1))))))
+    (for [i 0 4]
+      (when (get started i)
+        (when (!= (Thread::join (p/cast (ptr Thread) (elem (mut threads) i))) 0)
+          (set! failures (+ failures 1))))
+      (set! sum (+ sum (.sum (get jobs i)))))
+    (when (or (!= counter 40000) (!= sum 799980000))
+      (println "atomic contention count{} sum{}" counter sum)
+      (set! failures (+ failures 1)))
+    (free! (mut jobs))
+    (free! (mut threads))
+    (free! (mut started))
+    failures))
+
+(extern entry0 :as "stogir_atomic_0" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry1 :as "stogir_atomic_1" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry2 :as "stogir_atomic_2" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry3 :as "stogir_atomic_3" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry4 :as "stogir_atomic_4" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry5 :as "stogir_atomic_5" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry6 :as "stogir_atomic_6" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry7 :as "stogir_atomic_7" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry8 :as "stogir_atomic_8" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry9 :as "stogir_atomic_9" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry10 :as "stogir_atomic_10" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry11 :as "stogir_atomic_11" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry12 :as "stogir_atomic_12" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry13 :as "stogir_atomic_13" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry14 :as "stogir_atomic_14" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry15 :as "stogir_atomic_15" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry16 :as "stogir_atomic_16" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry17 :as "stogir_atomic_17" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry18 :as "stogir_atomic_18" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry19 :as "stogir_atomic_19" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry20 :as "stogir_atomic_20" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry21 :as "stogir_atomic_21" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry22 :as "stogir_atomic_22" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry23 :as "stogir_atomic_23" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry24 :as "stogir_atomic_24" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry25 :as "stogir_atomic_25" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry26 :as "stogir_atomic_26" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry27 :as "stogir_atomic_27" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry28 :as "stogir_atomic_28" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry29 :as "stogir_atomic_29" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry30 :as "stogir_atomic_30" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry31 :as "stogir_atomic_31" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry32 :as "stogir_atomic_32" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry33 :as "stogir_atomic_33" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry34 :as "stogir_atomic_34" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry35 :as "stogir_atomic_35" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry36 :as "stogir_atomic_36" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry37 :as "stogir_atomic_37" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry38 :as "stogir_atomic_38" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry39 :as "stogir_atomic_39" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry40 :as "stogir_atomic_40" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry41 :as "stogir_atomic_41" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry42 :as "stogir_atomic_42" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry43 :as "stogir_atomic_43" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry44 :as "stogir_atomic_44" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry45 :as "stogir_atomic_45" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry46 :as "stogir_atomic_46" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry47 :as "stogir_atomic_47" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry48 :as "stogir_atomic_48" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry49 :as "stogir_atomic_49" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry50 :as "stogir_atomic_50" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry51 :as "stogir_atomic_51" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry52 :as "stogir_atomic_52" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry53 :as "stogir_atomic_53" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry54 :as "stogir_atomic_54" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry55 :as "stogir_atomic_55" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry56 :as "stogir_atomic_56" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry57 :as "stogir_atomic_57" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry58 :as "stogir_atomic_58" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry59 :as "stogir_atomic_59" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry60 :as "stogir_atomic_60" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry61 :as "stogir_atomic_61" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry62 :as "stogir_atomic_62" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry63 :as "stogir_atomic_63" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry64 :as "stogir_atomic_64" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry65 :as "stogir_atomic_65" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry66 :as "stogir_atomic_66" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry67 :as "stogir_atomic_67" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry68 :as "stogir_atomic_68" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry69 :as "stogir_atomic_69" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry70 :as "stogir_atomic_70" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry71 :as "stogir_atomic_71" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry72 :as "stogir_atomic_72" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry73 :as "stogir_atomic_73" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry74 :as "stogir_atomic_74" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry75 :as "stogir_atomic_75" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry76 :as "stogir_atomic_76" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry77 :as "stogir_atomic_77" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry78 :as "stogir_atomic_78" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry79 :as "stogir_atomic_79" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry80 :as "stogir_atomic_80" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry81 :as "stogir_atomic_81" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry82 :as "stogir_atomic_82" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry83 :as "stogir_atomic_83" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry84 :as "stogir_atomic_84" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry85 :as "stogir_atomic_85" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry86 :as "stogir_atomic_86" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry87 :as "stogir_atomic_87" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry88 :as "stogir_atomic_88" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry89 :as "stogir_atomic_89" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry90 :as "stogir_atomic_90" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry91 :as "stogir_atomic_91" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry92 :as "stogir_atomic_92" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry93 :as "stogir_atomic_93" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry94 :as "stogir_atomic_94" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry95 :as "stogir_atomic_95" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry96 :as "stogir_atomic_96" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry97 :as "stogir_atomic_97" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry98 :as "stogir_atomic_98" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry99 :as "stogir_atomic_99" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry100 :as "stogir_atomic_100" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry101 :as "stogir_atomic_101" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry102 :as "stogir_atomic_102" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry103 :as "stogir_atomic_103" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry104 :as "stogir_atomic_104" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry105 :as "stogir_atomic_105" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry106 :as "stogir_atomic_106" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry107 :as "stogir_atomic_107" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry108 :as "stogir_atomic_108" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry109 :as "stogir_atomic_109" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry110 :as "stogir_atomic_110" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(extern entry111 :as "stogir_atomic_111" :cc (cc/C) [u64 u64 u64 u64] (-> u64))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (set! failures
+          (+ failures
+             (exercise 2
+                       0
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry0)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       0
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry1)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       1
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry2)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       1
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry3)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       2
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry4)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       2
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry5)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       3
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry6)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       3
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry7)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       4
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry8)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       4
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry9)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       5
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry10)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       5
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry11)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       6
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry12)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       6
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry13)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       7
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry14)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       7
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry15)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       8
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry16)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       8
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry17)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       9
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry18)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       9
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry19)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       10
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry20)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       10
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry21)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       11
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry22)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       11
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry23)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       12
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry24)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       12
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry25)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       13
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry26)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 2
+                       13
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry27)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       0
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry28)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       0
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry29)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       1
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry30)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       1
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry31)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       2
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry32)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       2
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry33)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       3
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry34)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       3
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry35)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       4
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry36)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       4
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry37)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       5
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry38)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       5
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry39)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       6
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry40)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       6
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry41)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       7
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry42)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       7
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry43)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       8
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry44)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       8
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry45)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       9
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry46)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       9
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry47)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       10
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry48)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       10
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry49)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       11
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry50)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       11
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry51)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       12
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry52)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       12
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry53)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       13
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry54)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 3
+                       13
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry55)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       0
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry56)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       0
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry57)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       1
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry58)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       1
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry59)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       2
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry60)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       2
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry61)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       3
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry62)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       3
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry63)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       4
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry64)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       4
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry65)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       5
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry66)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       5
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry67)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       6
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry68)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       6
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry69)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       7
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry70)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       7
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry71)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       8
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry72)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       8
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry73)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       9
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry74)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       9
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry75)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       10
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry76)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       10
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry77)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       11
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry78)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       11
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry79)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       12
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry80)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       12
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry81)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       13
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry82)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 4
+                       13
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry83)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       0
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry84)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       0
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry85)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       1
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry86)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       1
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry87)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       2
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry88)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       2
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry89)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       3
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry90)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       3
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry91)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       4
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry92)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       4
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry93)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       5
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry94)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       5
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry95)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       6
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry96)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       6
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry97)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       7
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry98)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       7
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry99)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       8
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry100)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       8
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry101)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       9
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry102)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       9
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry103)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       10
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry104)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       10
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry105)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       11
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry106)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       11
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry107)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       12
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry108)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       12
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry109)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       13
+                       false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry110)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (exercise 5
+                       13
+                       true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry111)
+                                  (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (contention (p/cast (ptr u8)
+                                 (: (fnptr-of entry84)
+                                    (fnptr (cc/C) [u64 u64 u64 u64] u64))))))
+    (println "linked atomics: 112 graphs, {} failures" failures)
+    (if (= failures 0) 0 1)))

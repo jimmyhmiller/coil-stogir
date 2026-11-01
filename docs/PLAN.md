@@ -1434,3 +1434,32 @@ linked warnings. The existing fixed aa64e44440df compiler/stdlib/SDK/unit snapsh
 and all project input hashes remain unchanged across both passes. All 383
 implementation/test files are Coil; formatting and diff checks pass. Evidence is
 recorded in the project pad. Only documentation changes follow these passes.
+
+
+### Runtime-driven atomic extension for Coil backend integration
+
+Actual Coil compilation reached `coil.atomic.add`, which the pinned upstream IR
+has no opcode for. Five extension opcodes 126–130 now represent atomic load,
+store, ten RMW operations, strong compare/exchange and fence; upstream identifiers
+0–125 are unchanged. U8/U16/U32/U64 storage specifies exact bytes independently
+of signed min/max predicates. All operations participate in explicit control and
+are sequentially consistent. Native load/store use LDAR/STLR, RMW/CAS use
+acquire/release FEAT_LSE instructions, and fence uses DMB ISH. Native RMW/CAS
+requires FEAT_LSE, available on the development Apple M2; no software fallback is
+silently selected.
+
+The emitter captures addresses and input values in reserved x16/x17 before any
+result overwrite, preserving dying/still-live inputs and CAS expected/result
+aliases. Atomic result registers cannot be ZR, preserving acquire semantics even
+when only the memory effect is consumed. Validation and staged code append reject
+malformed inputs without partial output.
+
+Focused checks pass 52 independent LLVM MC words plus the fence word, malformed
+input/register/width and emission atomicity checks, 112 native graphs covering
+four storage widths, ten RMW operations, matching/failing CAS, load/store/fence
+and dying/still-live operands, and 112 linked objects. Each graph exercises 162
+input combinations with full memory/guard/source checks. Four native threads
+perform 40,000 contending increments in both JIT and linked modes, checking both
+the final count and the sum of returned old values. Full regression follows
+separately. This library change is driven by the new Coil backend worktree;
+actual backend execution and matched LLVM/TPDE benchmarks remain in progress.

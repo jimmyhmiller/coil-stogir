@@ -1,0 +1,199 @@
+(module stogir.tests.atomics)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.atomic" :as atomic)
+(import "stogir.a64.atomic-encode" :as enc)
+(import "stogir.a64.atomic" :as native)
+(import "stogir.a64.code" :as code)
+(import "stogir.allocation" :as a)
+(import "stogir.interval" :as interval)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [message] (println "{}" message) 0)))
+
+(defn rejected [(r (Result i32 (slice u8)))] (-> i64)
+  (match r (Ok [_] 1) (Err [_] 0)))
+
+(defn check [(r (Result u32 (slice u8))) (wanted u32)] (-> i64)
+  (match r (Ok [word] (if (= word wanted) 0 1)) (Err [_] 1)))
+
+(defn bad-encoding [(r (Result u32 (slice u8)))] (-> i64)
+  (match r (Ok [_] 1) (Err [_] 0)))
+
+(defn contracts [] (-> i64)
+  (let [alc (malloc-allocator)
+        (mut graph) (g/create alc)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        address (require (b/scalar-constant! (mut graph) 6 4096 8))
+        input (require (b/scalar-constant! (mut graph) 5 42 8))
+        narrow (require (b/scalar-constant! (mut graph) 2 42 8))
+        end (require (b/emit! (mut graph) 114 0 [start]))
+        (mut failures) 0]
+    (for ty [(: 2 i32) 3 4 5]
+      (let [literal (require (b/scalar-constant! (mut graph) ty 42 8))]
+        (for op [(: 0 i32) 1 2 3 4 5 6 7 8 9]
+          (let [r
+                  (require (b/emit! (mut graph)
+                                    128
+                                    ty
+                                    [start address literal op]))]
+            (match (atomic/validate graph r)
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [_] 0))))))
+    (for bad-op [(: -1 i32) 10 2147483647]
+      (let [r (require (b/emit! (mut graph) 128 5 [start address input bad-op]))]
+        (set! failures (+ failures (rejected (atomic/validate graph r))))))
+    (for shape [(: 0 i32) 1 2 3 4]
+      (let [r
+              (require (case shape
+                         0
+                           (b/emit! (mut graph)
+                                    128
+                                    5
+                                    [end address input (: 0 i32)])
+                         1
+                           (b/emit! (mut graph)
+                                    128
+                                    5
+                                    [start input input (: 0 i32)])
+                         2
+                           (b/emit! (mut graph)
+                                    128
+                                    5
+                                    [start address narrow (: 0 i32)])
+                         3
+                           (b/emit! (mut graph)
+                                    129
+                                    5
+                                    [start address input narrow])
+                         (b/emit! (mut graph) 130 5 [start])))]
+        (set! failures (+ failures (rejected (atomic/validate graph r))))))
+    (let [instruction
+            (require (b/emit! (mut graph) 128 5 [start address input (: 0 i32)]))
+          (mut output) (code/create alc)
+          (mut parts) (ArrayList::new [a/Part] alc)]
+      (for byte [(: 1 u8) 2 3 4] (push! (mut (.text output)) byte))
+      (set! failures
+            (+ failures
+               (rejected (native/emit! (mut output) graph parts instruction 0))))
+      (when (or (!= (len (.text output)) 4)
+                (!= (get (.text output) 0) 1)
+                (!= (get (.text output) 3) 4)
+                (!= (len (.references output)) 0))
+        (set! failures (+ failures 1)))
+      (let [(mut part) (a/create instruction alc)]
+        (set! (.register part) 32)
+        (interval/add! (mut (.ranges part)) 0 2)
+        (push! (mut parts) part))
+      (set! failures
+            (+ failures
+               (rejected (native/emit! (mut output) graph parts instruction 0))))
+      (when (or (!= (len (.text output)) 4)
+                (!= (get (.text output) 0) 1)
+                (!= (get (.text output) 3) 4)
+                (!= (len (.references output)) 0))
+        (set! failures (+ failures 1)))
+      (for [i 0 (len parts)]
+        (let [part (elem (mut parts) i)]
+          (free! (mut (.ranges part)))
+          (free! (mut (.uses part)))))
+      (free! (mut parts))
+      (code/release! (mut output)))
+    (let [fence (require (b/emit! (mut graph) 130 0 [start]))
+          (mut output) (code/create alc)
+          (mut parts) (ArrayList::new [a/Part] alc)]
+      (require (native/emit! (mut output) graph parts fence 0))
+      (when (or (!= (len (.text output)) 4)
+                (!= (get (.text output) 0) 191)
+                (!= (get (.text output) 1) 59)
+                (!= (get (.text output) 2) 3)
+                (!= (get (.text output) 3) 213))
+        (set! failures (+ failures 1)))
+      (free! (mut parts))
+      (code/release! (mut output)))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) (contracts)]
+    (set! failures (+ failures (check (enc/rmw 0 1 17 0 16) 0x38F10200)))
+    (set! failures (+ failures (check (enc/rmw 1 1 17 0 16) 0x38F10200)))
+    (set! failures (+ failures (check (enc/rmw 2 1 17 0 16) 0x38F11200)))
+    (set! failures (+ failures (check (enc/rmw 3 1 17 0 16) 0x38F13200)))
+    (set! failures (+ failures (check (enc/rmw 4 1 17 0 16) 0x38F12200)))
+    (set! failures (+ failures (check (enc/rmw 5 1 17 0 16) 0x38F18200)))
+    (set! failures (+ failures (check (enc/rmw 6 1 17 0 16) 0x38F14200)))
+    (set! failures (+ failures (check (enc/rmw 7 1 17 0 16) 0x38F15200)))
+    (set! failures (+ failures (check (enc/rmw 8 1 17 0 16) 0x38F16200)))
+    (set! failures (+ failures (check (enc/rmw 9 1 17 0 16) 0x38F17200)))
+    (set! failures (+ failures (check (enc/memory false 1 0 16) 0x08DFFE00)))
+    (set! failures (+ failures (check (enc/memory true 1 17 16) 0x089FFE11)))
+    (set! failures
+          (+ failures (check (enc/compare-exchange 1 0 17 16) 0x08E0FE11)))
+    (set! failures (+ failures (check (enc/rmw 0 2 17 0 16) 0x78F10200)))
+    (set! failures (+ failures (check (enc/rmw 1 2 17 0 16) 0x78F10200)))
+    (set! failures (+ failures (check (enc/rmw 2 2 17 0 16) 0x78F11200)))
+    (set! failures (+ failures (check (enc/rmw 3 2 17 0 16) 0x78F13200)))
+    (set! failures (+ failures (check (enc/rmw 4 2 17 0 16) 0x78F12200)))
+    (set! failures (+ failures (check (enc/rmw 5 2 17 0 16) 0x78F18200)))
+    (set! failures (+ failures (check (enc/rmw 6 2 17 0 16) 0x78F14200)))
+    (set! failures (+ failures (check (enc/rmw 7 2 17 0 16) 0x78F15200)))
+    (set! failures (+ failures (check (enc/rmw 8 2 17 0 16) 0x78F16200)))
+    (set! failures (+ failures (check (enc/rmw 9 2 17 0 16) 0x78F17200)))
+    (set! failures (+ failures (check (enc/memory false 2 0 16) 0x48DFFE00)))
+    (set! failures (+ failures (check (enc/memory true 2 17 16) 0x489FFE11)))
+    (set! failures
+          (+ failures (check (enc/compare-exchange 2 0 17 16) 0x48E0FE11)))
+    (set! failures (+ failures (check (enc/rmw 0 4 17 0 16) 0xB8F10200)))
+    (set! failures (+ failures (check (enc/rmw 1 4 17 0 16) 0xB8F10200)))
+    (set! failures (+ failures (check (enc/rmw 2 4 17 0 16) 0xB8F11200)))
+    (set! failures (+ failures (check (enc/rmw 3 4 17 0 16) 0xB8F13200)))
+    (set! failures (+ failures (check (enc/rmw 4 4 17 0 16) 0xB8F12200)))
+    (set! failures (+ failures (check (enc/rmw 5 4 17 0 16) 0xB8F18200)))
+    (set! failures (+ failures (check (enc/rmw 6 4 17 0 16) 0xB8F14200)))
+    (set! failures (+ failures (check (enc/rmw 7 4 17 0 16) 0xB8F15200)))
+    (set! failures (+ failures (check (enc/rmw 8 4 17 0 16) 0xB8F16200)))
+    (set! failures (+ failures (check (enc/rmw 9 4 17 0 16) 0xB8F17200)))
+    (set! failures (+ failures (check (enc/memory false 4 0 16) 0x88DFFE00)))
+    (set! failures (+ failures (check (enc/memory true 4 17 16) 0x889FFE11)))
+    (set! failures
+          (+ failures (check (enc/compare-exchange 4 0 17 16) 0x88E0FE11)))
+    (set! failures (+ failures (check (enc/rmw 0 8 17 0 16) 0xF8F10200)))
+    (set! failures (+ failures (check (enc/rmw 1 8 17 0 16) 0xF8F10200)))
+    (set! failures (+ failures (check (enc/rmw 2 8 17 0 16) 0xF8F11200)))
+    (set! failures (+ failures (check (enc/rmw 3 8 17 0 16) 0xF8F13200)))
+    (set! failures (+ failures (check (enc/rmw 4 8 17 0 16) 0xF8F12200)))
+    (set! failures (+ failures (check (enc/rmw 5 8 17 0 16) 0xF8F18200)))
+    (set! failures (+ failures (check (enc/rmw 6 8 17 0 16) 0xF8F14200)))
+    (set! failures (+ failures (check (enc/rmw 7 8 17 0 16) 0xF8F15200)))
+    (set! failures (+ failures (check (enc/rmw 8 8 17 0 16) 0xF8F16200)))
+    (set! failures (+ failures (check (enc/rmw 9 8 17 0 16) 0xF8F17200)))
+    (set! failures (+ failures (check (enc/memory false 8 0 16) 0xC8DFFE00)))
+    (set! failures (+ failures (check (enc/memory true 8 17 16) 0xC89FFE11)))
+    (set! failures
+          (+ failures (check (enc/compare-exchange 8 0 17 16) 0xC8E0FE11)))
+    (for reg [(: -1 i32) 31 32]
+      (set! failures
+            (+ failures
+               (bad-encoding (enc/memory false 8 reg 0))
+               (bad-encoding (enc/memory true 8 0 reg))
+               (bad-encoding (enc/rmw 0 8 reg 0 1))
+               (bad-encoding (enc/rmw 0 8 0 reg 1))
+               (bad-encoding (enc/rmw 0 8 0 1 reg))
+               (bad-encoding (enc/compare-exchange 8 reg 0 1))
+               (bad-encoding (enc/compare-exchange 8 0 reg 1))
+               (bad-encoding (enc/compare-exchange 8 0 1 reg)))))
+    (for bytes [(: 0 i32) 3 16]
+      (set! failures
+            (+ failures
+               (bad-encoding (enc/memory false bytes 0 1))
+               (bad-encoding (enc/rmw 0 bytes 0 1 2))
+               (bad-encoding (enc/compare-exchange bytes 0 1 2)))))
+    (for op [(: -1 i32) 10]
+      (set! failures (+ failures (bad-encoding (enc/rmw op 8 0 1 2)))))
+    (println "atomic contracts, 52 LLVM MC words, fence and failure atomicity: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))
