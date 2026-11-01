@@ -1,6 +1,7 @@
 ;;; Address-independent code image shared by loaders and object writers.
 (module stogir.image)
 (import "stogir.bytes" :as bytes)
+(import "stogir.alignment" :as alignment)
 (import "stogir.text-data" :as text-data)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.hashmap" :use [HashMap])
@@ -16,7 +17,9 @@
   [(section i32) (offset i64) (kind i32) (symbol i32) (addend i64)])
 
 (defstruct Image
-  [(text (ArrayList u8))
+  [(text-alignment i64)
+   (data-alignment i64)
+   (text (ArrayList u8))
    (text-data (ArrayList text-data/Range))
    (data (ArrayList u8))
    (names (ArrayList u8))
@@ -27,6 +30,8 @@
 
 (defn create [(allocator (dyn Allocator))] (-> Image)
   (Image
+    :text-alignment 4
+    :data-alignment 8
     :text (ArrayList::new [u8] allocator)
     :text-data (ArrayList::new [text-data/Range] allocator)
     :data (ArrayList::new [u8] allocator)
@@ -35,6 +40,47 @@
     :heads (HashMap::new-scalar [u64 i32] allocator)
     :relocations (ArrayList::new [Relocation] allocator)
     :local-sequence 0))
+
+(defn valid-alignments? [(image Image)] (-> bool)
+  (and (>= (.text-alignment image) 4)
+       (alignment/valid? (.text-alignment image))
+       (>= (.data-alignment image) 8)
+       (alignment/valid? (.data-alignment image))))
+
+;;; Requirements only increase; lowering one could invalidate earlier objects.
+(defn require-alignments! [(image (mut Image)) (text i64) (data i64)]
+  (-> (Result i32 (slice u8)))
+  (if (or (not (valid-alignments? image))
+          (< text 4)
+          (< data 8)
+          (not (alignment/valid? text))
+          (not (alignment/valid? data)))
+      (Err "invalid image section alignment")
+      (do
+        (set! (.text-alignment image)
+              (alignment/maximum text (.text-alignment image)))
+        (set! (.data-alignment image)
+              (alignment/maximum data (.data-alignment image)))
+        (Ok 0))))
+
+;;; Reserve zeroed object storage, including alignment padding. The returned
+;;; offset is section-relative; section alignment preserves it through linking.
+(defn data-space! [(image (mut Image)) (size i64) (required i64)]
+  (-> (Result i64 (slice u8)))
+  (if (or (not (valid-alignments? image)) (< size 0))
+      (Err "invalid image storage size or alignment")
+      (match (alignment/up (len (.data image)) required)
+        (Err [message] (Err message))
+        (Ok [offset]
+            (if (> size (- (: 0x7FFFFFFFFFFFFFFF i64) offset))
+                (Err "image object size overflow")
+                (let [end (+ offset size)]
+                  (reserve! (mut (.data image)) end)
+                  (while (< (len (.data image)) end)
+                    (push! (mut (.data image)) 0))
+                  (set! (.data-alignment image)
+                        (alignment/maximum required (.data-alignment image)))
+                  (Ok offset)))))))
 
 (defn hash-name [(name (slice u8))] (-> u64)
   (let [(mut hash) (: 14695981039346656037 u64)]

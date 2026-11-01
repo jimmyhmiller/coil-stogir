@@ -1,0 +1,309 @@
+(module stogir.tests.global-alignment)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.symbols" :as symbols)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.alignment" :as alignment)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.bytes" :as bytes)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(extern fork :cc (cc/C) [] (-> i32))
+
+(extern waitpid :cc (cc/C) [i32 (ptr i32) i32] (-> i32))
+
+(extern exit-child :as "_exit" :cc (cc/C) [i32] (-> void))
+
+(extern signal :cc (cc/C) [i32 u64] (-> u64))
+
+(extern page-size :as "getpagesize" :cc (cc/C) [] (-> i32))
+
+(extern protect-page :as "mprotect" :cc (cc/C) [(ptr u8) i64 i32] (-> i32))
+
+(defn fault-handler :cc (cc/C) [(number i32)] (-> void)
+  (exit-child 77))
+
+(defn protected [(address (ptr u8)) (mode i32)] (-> i64)
+  (let [child (fork)]
+    (if (< child 0)
+        1
+        (if (= child 0)
+            (do
+              (let [handler
+                      (primitive/cast u64
+                                      (primitive/cast (ptr u8)
+                                                      (fnptr-of fault-handler)))]
+                (signal 10 handler)
+                (signal 11 handler))
+              (if (= mode 0)
+                  (primitive/store! address (: 0 u8))
+                  (if (= mode 1)
+                      (do
+                        (primitive/store! (primitive/cast (ptr u32) address)
+                                          (: 0xD65F03C0 u32))
+                        (call-ptr (primitive/cast (fnptr (cc/C) [] void)
+                                                  address)))
+                      (let [value (primitive/load address)]
+                        (when (= value 255) (exit-child 98)))))
+              (exit-child 99)
+              1)
+            (let [(mut status) (: 0 i32)]
+              (if (and (= (waitpid child (mut status) 0) child)
+                       (= (& status 127) 0)
+                       (= (& (>> status 8) 255) 77))
+                  0
+                  1))))))
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn find [(source image/Image) (name (slice u8))] (-> i32)
+  (match (image/find-symbol source name) (Some [id] id) (None [] -1)))
+
+(defn run [(source image/Image)
+           (text-alignment i64)
+           (data-alignment i64)
+           (entry-name (slice u8))
+           (global-name (slice u8))] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut failures) 0
+        entry (find source entry-name)
+        global (find source global-name)
+        page (cast i64 (page-size))]
+    (if (or (< entry 0) (< global 0))
+        1
+        (do
+          (match (jit/map-image source allocator)
+            (Err [message]
+                 (println "{}" message)
+                 (set! failures (+ failures 1)))
+            (Ok [loaded]
+                (let [(mut owned) loaded
+                      target (get (.addresses owned) (cast i64 entry))
+                      expected (get (.addresses owned) (cast i64 global))
+                      f
+                        (primitive/cast (fnptr (cc/C) [] u64)
+                                        (primitive/cast (ptr u8) target))
+                      data (primitive/cast (ptr u64) expected)
+                      base (.base (.memory owned))
+                      allocation (.allocation (.memory owned))
+                      reserved (.allocation-size (.memory owned))]
+                  (when (or (!= (& target (cast u64 (- text-alignment 1))) 0)
+                            (!= (& expected (cast u64 (- data-alignment 1))) 0)
+                            (!= (call-ptr f) expected)
+                            (!= (primitive/load data) 42))
+                    (set! failures (+ failures 1)))
+                  (primitive/store! data 99)
+                  (when (!= (primitive/load data) 99)
+                    (set! failures (+ failures 1)))
+                  (when (>= data-alignment 65536)
+                    (set! failures
+                          (+ failures
+                             (protected base 0)
+                             (protected (primitive/cast (ptr u8) expected) 1)))
+                    (match (alignment/up (.text-size (.memory owned)) page)
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [text-pages]
+                          (when (> (.data-offset owned) text-pages)
+                            (set! failures
+                                  (+ failures
+                                     (protected (primitive/index base
+                                                                 text-pages)
+                                                2))))))
+                    (when (!= (primitive/cast u64 allocation)
+                              (primitive/cast u64 base))
+                      (set! failures (+ failures (protected allocation 2))))
+                    (let [end
+                            (+ (primitive/cast u64 base)
+                               (cast u64 (.size (.memory owned))))
+                          reservation-end
+                            (+ (primitive/cast u64 allocation)
+                               (cast u64 reserved))]
+                      (when (< end reservation-end)
+                        (set! failures
+                              (+ failures
+                                 (protected (primitive/cast (ptr u8) end) 2))))))
+                  (when (= data-alignment 65536)
+                    (when (!= (protect-page allocation reserved 0) 0)
+                      (set! failures (+ failures 1))))
+                  (when (not (jit/release-image! (mut owned)))
+                    (set! failures (+ failures 1)))
+                  ; Scan without allocating: every originally reserved page must
+                  ; be unmapped, including alignment prefix/suffix and guard gap.
+                  (when (= data-alignment 65536)
+                    (let [(mut offset) (: 0 i64)]
+                      (while (< offset reserved)
+                        (let [rc
+                                (protect-page (primitive/index allocation
+                                                               offset)
+                                              page
+                                              0)]
+                          (when (= rc 0) (set! failures (+ failures 1))))
+                        (set! offset (+ offset page))))))))
+          failures))))
+
+(defn check [(text-alignment i64) (data-alignment i64)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        entry-name
+          (if (= data-alignment 4096)
+              "_stogir_aligned_address_4096"
+              "_stogir_aligned_address_16384")
+        global-name
+          (if (= data-alignment 4096)
+              "_stogir_aligned_global_4096"
+              "_stogir_aligned_global_16384")
+        global (require (symbols/symbol! (mut graph) global-name))
+        ret (require (b/emit! (mut graph) 120 6 [start global (: 0 i32)]))
+        (mut prefix) (image/create allocator)
+        (mut failures) 0]
+    (bytes/append32! (mut (.text prefix)) 0xD65F03C0)
+    (push! (mut (.data prefix)) 1)
+    (match (compile/image graph start [ret] entry-name allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [source]
+          (let [(mut owned) source]
+            (require (image/require-alignments! (mut owned) text-alignment 8))
+            (match (image/data-space! (mut owned) 8 data-alignment)
+              (Err [message]
+                   (println "{}" message)
+                   (set! failures (+ failures 1)))
+              (Ok [offset]
+                  (bytes/patch32! (mut (.data owned)) offset 42)
+                  (require (image/symbol! (mut owned) global-name 2 offset))))
+            (match (link/compose [prefix owned] allocator)
+              (Err [message]
+                   (println "{}" message)
+                   (set! failures (+ failures 1)))
+              (Ok [module]
+                  (let [(mut composed) module]
+                    (when (or (!= (.text-alignment (.image composed))
+                                  text-alignment)
+                              (!= (.data-alignment (.image composed))
+                                  data-alignment)
+                              (!= (.text (get (.parts composed) 1))
+                                  text-alignment)
+                              (!= (.data (get (.parts composed) 1))
+                                  data-alignment))
+                      (set! failures (+ failures 1)))
+                    (set! failures
+                          (+ failures
+                             (run (.image composed)
+                                  text-alignment
+                                  data-alignment
+                                  entry-name
+                                  global-name)))
+                    (when (or (= data-alignment 4096)
+                              (and (= text-alignment 16384)
+                                   (= data-alignment 16384)))
+                      (match (macho/image-object (.image composed) allocator)
+                        (Err [message]
+                             (println "{}" message)
+                             (set! failures (+ failures 1)))
+                        (Ok [object]
+                            (let [(mut bytes) object]
+                              (match (fs/write-file allocator
+                                                    (if (= data-alignment 4096)
+                                                        "/tmp/coil-stogir-aligned-global-4096.o"
+                                                        "/tmp/coil-stogir-aligned-global-16384.o")
+                                                    (slice bytes))
+                                (Err [_] (set! failures (+ failures 1)))
+                                (Ok [_] 0))
+                              (free! (mut bytes))))))
+                    (link/release! (mut composed)))))
+            (image/release! (mut owned)))))
+    (image/release! (mut prefix))
+    (g/release! (mut graph))
+    failures))
+
+(defn data-only [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut source) (image/create allocator)
+        (mut failures) 0]
+    (match (image/data-space! (mut source) 8 65536)
+      (Err [_] (set! failures 1))
+      (Ok [offset]
+          (bytes/patch32! (mut (.data source)) offset 42)
+          (require (image/symbol! (mut source) "_data_only" 2 offset))))
+    (match (jit/map-image source allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [loaded]
+          (let [(mut owned) loaded
+                address (get (.addresses owned) 0)
+                data (primitive/cast (ptr u64) address)]
+            (when (or (!= (& address 65535) 0)
+                      (!= (primitive/load data) 42)
+                      (!= (.text-size (.memory owned)) 0))
+              (set! failures (+ failures 1)))
+            (primitive/store! data 99)
+            (jit/release-image! (mut owned)))))
+    (image/release! (mut source))
+    failures))
+
+(defn data-relocations [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut source) (image/create allocator)
+        (mut failures) 0]
+    (bytes/append32! (mut (.text source)) 0xD65F03C0)
+    (match (image/data-space! (mut source) 8 65536)
+      (Err [_] (set! failures 1))
+      (Ok [_] 0))
+    (bytes/patch32! (mut (.data source)) 0 0x90000000)
+    (bytes/patch32! (mut (.data source)) 4 0x91000000)
+    (let [target (require (image/symbol! (mut source) "_text_target" 1 0))
+          data (require (image/symbol! (mut source) "_data_template" 2 0))]
+      (image/relocate! (mut source)
+                       (image/Relocation
+                         :section 2
+                         :offset 0
+                         :kind 3
+                         :symbol target
+                         :addend 0))
+      (image/relocate! (mut source)
+                       (image/Relocation
+                         :section 2
+                         :offset 4
+                         :kind 4
+                         :symbol target
+                         :addend 0)))
+    (match (jit/map-image source allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [loaded]
+          (let [(mut owned) loaded
+                text (get (.addresses owned) 0)
+                data (get (.addresses owned) 1)
+                instruction (primitive/load (primitive/cast (ptr u32) data))
+                low (primitive/load (primitive/cast (ptr u32) (+ data 4)))
+                bits
+                  (| (& (>> instruction 29) 3)
+                     (<< (& (>> instruction 5) 0x7FFFF) 2))
+                pages
+                  (if (!= (& bits 0x100000) 0)
+                      (- (cast i64 bits) 0x200000)
+                      (cast i64 bits))
+                decoded
+                  (+ (cast i64 (& data 0xFFFFFFFFFFFFF000))
+                     (* pages 4096)
+                     (cast i64 (& (>> low 10) 4095)))]
+            (when (!= (cast u64 decoded) text) (set! failures (+ failures 1)))
+            (jit/release-image! (mut owned)))))
+    (image/release! (mut source))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) (+ (data-only) (data-relocations))]
+    (for data-alignment [(: 16 i64) 64 256 4096 16384 65536 1048576]
+      (set! failures (+ failures (check 32 data-alignment))))
+    (set! failures
+          (+ failures (check 65536 64) (check 65536 65536) (check 16384 16384)))
+    (println "aligned global addresses, composition and JIT protections: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

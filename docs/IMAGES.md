@@ -67,10 +67,13 @@ internally and is converted at the shared-buffer boundary.
 
 ## Sections and symbols
 
-The current model has text and mutable data sections. Text instructions align to
-four bytes; Mach-O data starts at eight-byte alignment. JIT storage separates
-executable text from writable data at the OS page boundary. Architectural ADRP
-pages are **4 KiB**, independent of the OS allocation granule.
+The model has text and mutable data sections. Each image carries power-of-two
+`text-alignment` and `data-alignment` requirements, defaulting to four and eight
+bytes. `image/require-alignments!` raises these requirements without weakening
+older objects. `image/data-space!` reserves zeroed object storage and padding,
+returns its section-relative offset, and raises the data requirement. The byte
+arena is staging storage; its host pointer does not represent the final global
+address. Architectural ADRP pages are **4 KiB**, independently of the OS granule.
 
 `image/symbol!` interns an exported definition or an undefined external.
 A later compatible definition fills an undefined symbol without changing its ID.
@@ -194,11 +197,11 @@ are generated, including names that use the private-label prefix.
 The name arena and symbol records are validated independently of an input's
 mutable lookup-cache fields. Duplicate raw symbol records, invalid name/section
 bounds, embedded zeros, malformed text/data ranges and invalid or overlapping
-relocation records are rejected. Inputs keep the current image alignment
-contract: four-byte instruction text and eight-byte data bases. Composition uses
-checked size/alignment arithmetic and zeroes data padding. Wider global-data
-alignment is not yet represented in the image format; aligned stack frames are a
-separate implemented feature.
+relocation records are rejected. Composition aligns each input's section base
+to that input's requirement and retains the maximum requirement in the output.
+This property survives nested composition. It uses checked layout arithmetic,
+NOP text padding and zeroed data padding. Aligned stack frames remain a separate
+implemented feature.
 
 Relocation locations and defined symbol offsets are rebased by section. Symbol
 target IDs are remapped; addends are preserved. Already-patched internal branches
@@ -213,3 +216,34 @@ once. Repeatedly composing an ever-growing prefix introduces repeated copying.
 The compiler adapter must establish module-level function bindings and final
 export visibility consistently; graph, aggregate and backend integration work
 remains unfinished.
+
+## Aligned runtime and object layout
+
+The JIT planner includes space for actual external-branch veneers, rounds text
+and data to OS pages, and places data at its required alignment. It over-reserves
+when section alignment exceeds a page and chooses an aligned usable base. Only
+text/data pages become accessible. Text is writable while copying and becomes
+RX before execution; data remains RW and non-executable. Alignment prefix, gap
+and suffix stay PROT_NONE. Data-only images require no executable text pages.
+
+`Loaded.memory.base` and `.size` describe the usable image span. `.allocation`
+and `.allocation-size` retain the original mmap reservation, which `release!`
+unmaps in full. Callers should use the release API rather than unmapping the
+interior usable base. Relocation planning uses the actual aligned text/data
+addresses, including for relocations stored in the data section. Layout and
+reservation arithmetic reject invalid powers, negative sizes and overflow before
+mapping. Metadata bounds remain relative to the original input text before any
+veneers are appended.
+
+Mach-O writes section alignment exponents and aligns the data VM address, then
+uses those VM addresses in symbol values. The object file positions follow the
+segment-relative VM layout; the file offsets need not be multiples of the
+requested section alignment, matching LLVM MC output. Default requirements keep
+the previous object layout.
+
+The current Darwin arm64 AOT writer accepts requirements through 16 KB. Larger
+requirements produce an explicit error: the tested Apple linker reduces 64 KB
+sections to its 16 KB segment maximum, so serialized metadata alone would not
+establish the requested final alignment. JIT images retain larger requirements;
+native tests exercise globals through 1 MB and code alignment above an OS page.
+This AOT target limit is explicit and never silently clamped.

@@ -677,3 +677,42 @@ new execution producer is named module-execution.coil to avoid the reserved
 implementation/test files are Coil. Stronger global-image alignment, compiler
 memory/aggregate/atomic/wide semantics, optimization/scaling, backend integration
 and LLVM/TPDE runtime/compile-time comparisons remain required.
+
+### Global image alignment
+
+Shared images now retain text/data alignment requirements with four/eight-byte
+minimum defaults. Requirements only increase. `image/data-space!` lays out zeroed
+objects and padding with checked arithmetic; composition aligns each contribution
+and preserves requirement maxima. Pure alignment/JIT planning landed separately
+as 48f0902, including overflow and data-only layout checks.
+
+The JIT reserves enough address space for alignment above an OS page, tracks its
+original mmap allocation separately from the aligned usable image, and releases
+the whole reservation. Prefix/gap/suffix pages remain inaccessible. Only actual
+text pages transition RW to RX; data stays RW/NX. The loader supports data-only
+images, reserves actual external-branch veneer space, and uses the aligned data
+base for relocations. Execution checks cover ten code/data requirement pairs,
+globals through 1 MB, above-page code alignment, composition, writable globals,
+page-relative data templates and isolated protection faults. Active/reserved-page
+probes verify complete release; an initial residency-based probe was replaced
+because residency is not a reliable mapping-existence check on this host.
+
+Mach-O retains alignment exponents and aligned data VM/symbol layout, matching
+LLVM MC reference objects. AOT checks exercise 4 KB and 16 KB globals/functions.
+Apple's linker reduced a 64 KB request to its 16 KB segment maximum, including
+with a segment-page-size override; an occasional aligned runtime address did not
+prove the requested guarantee. The Darwin arm64 writer now rejects requirements
+above 16 KB explicitly. JIT alignment is not restricted to that AOT limit. This
+platform boundary is documented rather than silently clamped.
+
+Malformed requirements, monotonicity, padding, reservation overflow and target
+limit diagnostics have focused checks. Full regression and commits are recorded
+in the project pad. Compiler bulk-memory/aggregate/atomic/wide semantics, full
+optimization/scaling, backend integration and LLVM/TPDE comparisons remain open.
+
+The aligned-image checkpoint passes all 163 standalone files and all 40 linked
+AOT consumers with debug checks and regenerated objects. Exact source/pass-set
+comparison confirms full standalone coverage without duplicates. The linked log
+has no warnings. Formatting and git diff checks pass. All 292 implementation/test
+files remain Coil. The pure planning checkpoint is 48f0902; the shared image,
+loader, composition and target-writer changes form the next checkpoint.

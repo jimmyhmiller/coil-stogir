@@ -1,0 +1,130 @@
+(module stogir.tests.image-alignment)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.jit.darwin" :as jit)
+(import "stogir.relocate" :as read)
+(import "stogir.bytes" :as bytes)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn rejected [(result (Result i64 (slice u8)))] (-> i64)
+  (match result (Err [_] 0) (Ok [_] 1)))
+
+(defn storage [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut source) (image/create allocator)
+        (mut failures) 0]
+    (for byte [(: 1 u8) 2 3] (push! (mut (.data source)) byte))
+    (match (image/data-space! (mut source) 8 64)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [offset]
+          (when (or (!= offset 64)
+                    (!= (len (.data source)) 72)
+                    (!= (.data-alignment source) 64))
+            (set! failures (+ failures 1)))))
+    (let [(mut i) (: 3 i64)]
+      (while (< i (len (.data source)))
+        (when (!= (get (.data source) i) 0) (set! failures (+ failures 1)))
+        (set! i (+ i 1))))
+    (image/require-alignments! (mut source) 32 256)
+    (image/require-alignments! (mut source) 4 8)
+    (when (or (!= (.text-alignment source) 32)
+              (!= (.data-alignment source) 256))
+      (set! failures (+ failures 1)))
+    (set! failures
+          (+ failures
+             (rejected (image/data-space! (mut source) -1 64))
+             (rejected (image/data-space! (mut source) 1 3))
+             (rejected (image/data-space! (mut source) 1 0))
+             (rejected (image/data-space! (mut source) 0x7FFFFFFFFFFFFFFF 64))))
+    (match (image/require-alignments! (mut source) 2 256)
+      (Err [_] 0)
+      (Ok [_] (set! failures (+ failures 1))))
+    (when (or (!= (len (.data source)) 72)
+              (!= (.text-alignment source) 32)
+              (!= (.data-alignment source) 256)
+              (!= (get (.data source) 0) 1))
+      (set! failures (+ failures 1)))
+    (image/release! (mut source))
+    failures))
+
+(defn invalid [(text i64) (data i64)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut source) (image/create allocator)
+        (mut failures) 0]
+    (bytes/append32! (mut (.text source)) 0xD65F03C0)
+    (bytes/append32! (mut (.data source)) 0)
+    (bytes/append32! (mut (.data source)) 0)
+    (set! (.text-alignment source) text)
+    (set! (.data-alignment source) data)
+    (match (link/compose [source] allocator)
+      (Err [_] 0)
+      (Ok [module]
+          (let [(mut owned) module]
+            (link/release! (mut owned))
+            (set! failures (+ failures 1)))))
+    (match (macho/image-object source allocator)
+      (Err [_] 0)
+      (Ok [object]
+          (let [(mut bytes) object]
+            (free! (mut bytes))
+            (set! failures (+ failures 1)))))
+    (match (jit/map-image source allocator)
+      (Err [_] 0)
+      (Ok [loaded]
+          (let [(mut owned) loaded]
+            (jit/release-image! (mut owned))
+            (set! failures (+ failures 1)))))
+    (image/release! (mut source))
+    failures))
+
+(defn object-check [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut source) (image/create allocator)
+        (mut failures) 0]
+    (bytes/append32! (mut (.text source)) 0xD65F03C0)
+    (bytes/append32! (mut (.data source)) 42)
+    (bytes/append32! (mut (.data source)) 0)
+    (image/symbol! (mut source) "_aligned_data_reference" 2 0)
+    (image/require-alignments! (mut source) 32 256)
+    (match (macho/image-object source allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [object]
+          (let [(mut bytes) object
+                text-offset (read/read32 bytes 152)
+                data-offset (read/read32 bytes 232)
+                symbol-offset (cast i64 (read/read32 bytes 272))]
+            ; Match LLVM MC's VM alignment and relative file/VM layout. File
+            ; offsets themselves need not be multiples of section alignment.
+            (when (or (!= (read/read32 bytes 156) 5)
+                      (!= (read/read32 bytes 236) 8)
+                      (!= (read/read32 bytes 216) 256)
+                      (!= data-offset (+ text-offset 256))
+                      (!= (read/read32 bytes (+ symbol-offset 8)) 256))
+              (set! failures (+ failures 1)))
+            (free! (mut bytes)))))
+    ; The final Apple arm64 linker reduces requirements above its 16 KB
+    ; segment limit. Reject that request instead of emitting a silent downgrade.
+    (image/require-alignments! (mut source) 65536 256)
+    (match (macho/image-object source allocator)
+      (Err [_] 0)
+      (Ok [object]
+          (let [(mut bytes) object]
+            (free! (mut bytes))
+            (set! failures (+ failures 1)))))
+    (image/release! (mut source))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures
+          (+ (storage)
+             (object-check)
+             (invalid 0 8)
+             (invalid 3 8)
+             (invalid 4 0)
+             (invalid 4 7)
+             (invalid -4 8))]
+    (println "image alignment storage, validation and Mach-O declarations: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

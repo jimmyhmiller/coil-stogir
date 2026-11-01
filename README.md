@@ -25,6 +25,8 @@ branch, and page relocations. Named function/data references and binary string
 literals compile through this shared image, including recursive calls.
 Module composition resolves public declarations, renames private symbols and
 remaps relocations across independently compiled functions and data.
+Shared images retain global/code alignment through composition, JIT layout and
+Mach-O section declarations, with checked target limits.
 
 Scalar local storage supports VAR, VADDR, VLOAD/VSTORE and their volatile
 variants, with typed views that fit the declared object and power-of-two

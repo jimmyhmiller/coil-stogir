@@ -1,6 +1,7 @@
 ;;; Compose address-independent images without mutating inputs or their IDs.
 (module stogir.link)
 (import "stogir.image" :as image)
+(import "stogir.alignment" :as alignment)
 (import "stogir.image-order" :as order)
 (import "stogir.text-data" :as text-data)
 (import "stogir.bytes" :as bytes)
@@ -82,12 +83,8 @@
               (Ok [records]
                   (let [(mut owned) records] (free! (mut owned)) (Ok count))))))))
 
-(defn aligned [(offset i64) (alignment i64)] (-> (Result i64 (slice u8)))
-  (if (or (< offset 0)
-          (not (or (= alignment 4) (= alignment 8)))
-          (> offset (- (: 0x7FFFFFFFFFFFFFFF i64) (- alignment 1))))
-      (Err "image composition alignment overflow")
-      (Ok (* (/ (+ offset (- alignment 1)) alignment) alignment))))
+(defn aligned [(offset i64) (required i64)] (-> (Result i64 (slice u8)))
+  (alignment/up offset required))
 
 (defn bind-global! [(output (mut image/Image))
                     (source image/Image)
@@ -106,8 +103,8 @@
         (Err "multiple public symbol definitions")
         (image/symbol! (mut output) text (.section symbol) offset))))
 
-;;; Preserve the existing image contract: instruction-aligned text, data bases
-;;; aligned to eight bytes. Wider section alignment is not represented by Image.
+;;; Preserve every input section requirement and raise output requirements to
+;;; their maxima, so nested composition retains absolute object alignment.
 (defn compose [(sources (slice image/Image)) (allocator (dyn Allocator))]
   (-> (Result Module (slice u8)))
   (let [(mut result)
@@ -124,13 +121,16 @@
         (match (validate source allocator)
           (Err [message] (set! error message))
           (Ok [_] 0))
-        (match (aligned text-size 4)
+        (match (aligned text-size (.text-alignment source))
           (Err [message] (set! error message))
           (Ok [value] (set! text-size value)))
-        (match (aligned data-size 8)
+        (match (aligned data-size (.data-alignment source))
           (Err [message] (set! error message))
           (Ok [value] (set! data-size value)))
         (when (= error "")
+          (image/require-alignments! (mut (.image result))
+                                     (.text-alignment source)
+                                     (.data-alignment source))
           (let [(mut ids) (ArrayList::new [i32] allocator)]
             (for symbol (.symbols source) (push! (mut ids) -1))
             (push! (mut (.parts result))
