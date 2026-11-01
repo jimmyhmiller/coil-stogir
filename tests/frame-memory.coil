@@ -1,0 +1,150 @@
+(module stogir.tests.frame-memory)
+(import "stogir.a64.frame-memory" :as memory)
+(import "stogir.a64.frame-address" :as frame)
+(import "stogir.a64.transfers" :as transfers)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.locations" :as loc)
+(import "stogir.bytes" :as bytes)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn checked [(result (Result i32 (slice u8)))] (-> i64)
+  (match result (Ok [_] 0) (Err [message] (println "{}" message) 1)))
+
+(defn word! [(out (mut (ArrayList u8))) (result (Result u32 (slice u8)))]
+  (-> i64)
+  (match result
+    (Ok [word] (bytes/append32! (mut out) word) 0)
+    (Err [message] (println "{}" message) 1)))
+
+(defn check [(size i32) (floating? bool) (signed? bool) (offset i64)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut text) (ArrayList::new [u8] allocator)
+        (mut cells) (ArrayList::new [u8] allocator)
+        bits
+          (if floating?
+              (if (= size 8) (: 0xFFF0123456789ABC u64) 0x7F812345)
+              (: 0xFEDCBA9876543281 u64))
+        mask (cast u64 (- (<< (: 1 u128) (cast u128 (* size 8))) 1))
+        raw (& bits mask)
+        expected
+          (if (and signed?
+                   (< size 4)
+                   (!= (& raw (<< (: 1 u64) (cast u64 (- (* size 8) 1)))) 0))
+              (| raw (^ (: 0xFFFFFFFF u64) mask))
+              raw)
+        (mut failures) 0
+        (mut i) (: 0 i64)]
+    (while (< i (+ offset (+ (cast i64 size) 4)))
+      (push! (mut cells) 0xA5)
+      (set! i (+ i 1)))
+    (when floating?
+      (set! failures
+            (+ failures
+               (word! (mut text) (encode/scalar-transfer (= size 8) true 0 1)))))
+    (set! failures
+          (+ failures
+             (word! (mut text) (encode/add-sub true true true 31 1 1))
+             (checked (memory/access! (mut text)
+                                      false
+                                      size
+                                      (if floating? 32 1)
+                                      0
+                                      offset
+                                      false
+                                      16))
+             (checked (memory/access! (mut text)
+                                      true
+                                      size
+                                      (if floating? 33 2)
+                                      0
+                                      offset
+                                      signed?
+                                      16))))
+    (when floating?
+      (set! failures
+            (+ failures
+               (word! (mut text) (encode/scalar-transfer (= size 8) false 2 1)))))
+    (set! failures
+          (+ failures
+             (word! (mut text) (encode/conditional-select true 0 2 31 0))
+             (word! (mut text) (encode/ret 30))))
+    (when (= failures 0)
+      (match (jit/map-text (slice text))
+        (Err [_] (set! failures (+ failures 1)))
+        (Ok [image]
+            (let [(mut owned) image
+                  f
+                    (primitive/cast (fnptr (cc/C) [(ptr u8) u64] u64)
+                                    (.base owned))
+                  got (call-ptr f (.data cells) bits)]
+              (when (!= got expected)
+                (println "memory size={} FP={} signed={} offset={}: expected={} got={}"
+                         size
+                         floating?
+                         signed?
+                         offset
+                         expected
+                         got)
+                (set! failures (+ failures 1)))
+              (set! i 0)
+              (while (< i (len cells))
+                (let [wanted
+                        (if (and (>= i offset) (< i (+ offset (cast i64 size))))
+                            (cast u8 (>> bits (cast u64 (* (- i offset) 8))))
+                            (: 0xA5 u8))]
+                  (when (!= (get cells i) wanted)
+                    (set! failures (+ failures 1))))
+                (set! i (+ i 1)))
+              (jit/release! (mut owned))))))
+    (free! (mut cells))
+    (free! (mut text))
+    failures))
+
+(defn slot [(offset i64)] (-> loc/Location)
+  (loc/Location :kind 1 :value offset))
+
+(defn copy [(a i64) (b i64)] (-> loc/Transfer)
+  (loc/Transfer
+    :position 0
+    :parent 0
+    :source (slot a)
+    :destination (slot b)))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut text) (ArrayList::new [u8] allocator)
+        (mut failures) 0]
+    (for offset [(: 0 i64) 1 4095 4096 8190 8192 16380 16384 32760 32768 65539]
+      (for size [(: 1 i32) 2 4 8]
+        (set! failures
+              (+ failures
+                 (check size false false offset)
+                 (check size false true offset))))
+      (set! failures
+            (+ failures (check 4 true false offset) (check 8 true false offset))))
+    (for result [(memory/access! (mut text) true 3 0 31 0 false 16)
+                 (memory/access! (mut text) true 1 32 31 0 false 16)
+                 (memory/access! (mut text) true 8 0 31 -1 false 16)
+                 (memory/access! (mut text) false 8 16 31 65536 false 16)]
+      (match result (Ok [_] (set! failures (+ failures 1))) (Err [_] 0)))
+    (when (!= (len text) 0) (set! failures (+ failures 1)))
+    ; Emission-only boundary: abstract stack identities must not truncate byte
+    ; offsets to i32. Runtime memory checks above use bounded allocated buffers.
+    (set! failures
+          (+ failures
+             (checked (transfers/parallel-frame! (mut text)
+                                                 [(copy 0x80000000 0x100000000)
+                                                  (copy 0x100000000 0x80000000)]
+                                                 8
+                                                 allocator
+                                                 (frame/stack-base)))))
+    (when (= (len text) 0) (set! failures (+ failures 1)))
+    (free! (mut text))
+    (println "110 scalar memory cases and wide stack identities: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

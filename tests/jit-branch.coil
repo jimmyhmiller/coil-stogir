@@ -1,0 +1,64 @@
+(module stogir.tests.jit-branch)
+(import "stogir.jit.darwin" :as jit)
+(import "stogir.a64.encode" :as e)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.a64.select" :as select)
+(import "stogir.a64.emit" :as emit)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn main [] (-> i64)
+  (let [(mut text) (ArrayList::new [u8] (malloc-allocator))
+        (mut failures) 0]
+    (let [(mut graph) (g/create (malloc-allocator))
+          start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+          p (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+          q (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+          constant (require (b/scalar-constant! (mut graph) 11 42 8))
+          sum (require (b/emit! (mut graph) 26 11 [p constant]))
+          product (require (b/emit! (mut graph) 16 1 [p q]))
+          split (require (b/emit! (mut graph) 116 0 [start product]))
+          yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+          no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+          yes-ret (require (b/emit! (mut graph) 120 11 [yes p (: 0 i32)]))
+          no-ret (require (b/emit! (mut graph) 120 11 [no q (: 0 i32)]))]
+      ; An unused projection must not replace the live true target.
+      (b/emit! (mut graph) 107 0 [split (: 0 i32)])
+      (match (compile/text graph start [yes-ret no-ret] (malloc-allocator))
+        (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+        (Ok [compiled]
+            (let [(mut code) compiled]
+              (for byte code (push! (mut text) byte))
+              (free! (mut code)))))
+      (g/release! (mut graph)))
+    (match (jit/map-text (slice text))
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [image]
+          (let [(mut owned) image
+                f (primitive/cast (fnptr (cc/C) [i64 i64] i64) (.base owned))]
+            (when (!= (call-ptr f 100 2) 2) (set! failures (+ failures 1)))
+            (when (!= (call-ptr f -42 5) -42) (set! failures (+ failures 1)))
+            (let [(mut x) -100]
+              (while (<= x 100)
+                (let [(mut y) -4]
+                  (while (<= y 4)
+                    (when (!= (call-ptr f x y) (if (< x y) x y))
+                      (set! failures (+ failures 1)))
+                    (set! y (+ y 1))))
+                (set! x (+ x 1))))
+            (when (not (jit/release! (mut owned)))
+              (set! failures (+ failures 1)))
+            (when (not (jit/release! (mut owned)))
+              (set! failures (+ failures 1))))))
+    (free! (mut text))
+    (println "compiled branch checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

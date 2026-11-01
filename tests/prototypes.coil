@@ -1,0 +1,98 @@
+(module stogir.tests.prototypes)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.calls" :as calls)
+(import "stogir.verify" :as verify)
+(import "stogir.strings" :as strings)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [reference] reference) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn corrupt [(kind i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        input (require (b/scalar-constant! (mut graph) 11 42 8))
+        other (require (b/scalar-constant! (mut graph) 5 42 8))
+        (mut failures) 0]
+    (match (strings/intern! (mut (.strings graph))
+                            (if (= kind 0)
+                                [(: 0 u8) 11 2 11]
+                                [(: 0 u8) 11 1 11]))
+      (None [] (set! failures (+ failures 1)))
+      (Some [id]
+            (let [annotated (require (b/emit! (mut graph) 40 6 [target id]))
+                  call
+                    (require (b/emit! (mut graph)
+                                      79
+                                      (if (= kind 1) 5 11)
+                                      [start
+                                       annotated
+                                       (if (= kind 2) other input)]))]
+              (match (verify/structure graph)
+                (Err [_] (set! failures (+ failures 1)))
+                (Ok [_] 0))
+              (match (calls/validate-call graph call)
+                (Ok [_] (set! failures (+ failures 1)))
+                (Err [_] 0)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        input (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        (mut reference) (: 0 i32)
+        (mut failures) (+ (corrupt 0) (corrupt 1) (corrupt 2))]
+    (match (calls/create 96 11 [(: 11 u8)] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype
+                annotated
+                  (require (calls/attach! (mut graph) owned target allocator))]
+            (b/integer-binary! (mut graph) 26 11 8 input input)
+            (let [same
+                    (require (calls/attach! (mut graph) owned target allocator))]
+              (when (!= same annotated) (set! failures (+ failures 1))))
+            (set! reference
+                  (require (calls/emit! (mut graph)
+                                        owned
+                                        start
+                                        target
+                                        [input]
+                                        allocator)))
+            (when (!= (.op2 (get (.instructions graph) (cast i64 reference)))
+                      annotated)
+              (set! failures (+ failures 1)))
+            (calls/release! (mut owned)))))
+    ; Graph metadata must remain valid after freeing the caller-owned prototype.
+    (match (calls/validate-call graph reference)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [signature]
+          (when (or (!= (.flags signature) 96)
+                    (!= (.count signature) 1)
+                    (!= (.result signature) 11)
+                    (<= (.id signature) 0))
+            (set! failures (+ failures 1)))))
+    (match (calls/verify graph)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [_] 0))
+    (match (b/emit! (mut graph) 40 6 [target (: 99999 i32)])
+      (Ok [_] (set! failures (+ failures 1)))
+      (Err [_] 0))
+    (match (calls/validate-call graph -1)
+      (Ok [_] (set! failures (+ failures 1)))
+      (Err [_] 0))
+    (g/append-inputs! (mut graph) 40 6 [target (: 99999 i32)])
+    (match (verify/structure graph)
+      (Ok [_] (set! failures (+ failures 1)))
+      (Err [_] 0))
+    (g/release! (mut graph))
+    (println "prototype retention checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

@@ -1,0 +1,252 @@
+;;; Typed scalar direct/indirect calls with independent GPR and SIMD banks.
+(module stogir.a64.call)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.allocation" :as allocation)
+(import "stogir.locations" :as loc)
+(import "stogir.a64.transfers" :as transfers)
+(import "stogir.a64.frame-address" :as frame)
+(import "stogir.a64.frame-memory" :as memory)
+(import "stogir.a64.call-abi" :as abi)
+(import "stogir.a64.code" :as buffer)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.bytes" :as bytes)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn word! [(output (mut buffer/Buffer)) (result (Result u32 (slice u8)))]
+  (-> (Result i32 (slice u8)))
+  (match result
+    (Err [message] (Err message))
+    (Ok [word] (do (bytes/append32! (mut (.text output)) word) (Ok 4)))))
+
+;;; Constants are installed only after simultaneous argument copies. Encoded
+;;; SIMD destinations use an integer scratch for exact-bit materialization.
+(defn capture-at! [(output (mut buffer/Buffer))
+                   (graph g/Graph)
+                   (parts (ArrayList allocation/Part))
+                   (value i32)
+                   (position i64)
+                   (reg i32)
+                   (base frame/Base)] (-> (Result i32 (slice u8)))
+  (if (or (not (frame/valid-base? base))
+          (and (= (.reg base) 29) (= reg 29)))
+      (Err "invalid capture frame base or anchor destination")
+      (if (< value 0)
+          (match (g/lookup graph value)
+            (None [] (Err "missing call constant"))
+            (Some [constant]
+                  (if (>= reg 32)
+                      (let [wide
+                              (= (types/scalar-size (cast i32
+                                                          (n/type-id constant))
+                                                    8)
+                                 8)]
+                        (match (buffer/materialize! (mut output)
+                                                    graph
+                                                    value
+                                                    wide
+                                                    16)
+                          (Err [message] (Err message))
+                          (Ok [size]
+                              (match (word! (mut output)
+                                            (encode/scalar-transfer wide
+                                                                    true
+                                                                    (- reg 32)
+                                                                    16))
+                                (Err [message] (Err message))
+                                (Ok [more] (Ok (+ size more)))))))
+                      (buffer/materialize! (mut output) graph value true reg))))
+          (match (loc/lookup parts value position)
+            (Err [message] (Err message))
+            (Ok [source]
+                (transfers/emit-addressed! (mut (.text output))
+                                           source
+                                           (loc/Location
+                                             :kind 0
+                                             :value (cast i64 reg))
+                                           8
+                                           17
+                                           base
+                                           16))))))
+
+;;; All stack sources are captured before argument destinations overwrite any
+;;; register. A float variadic argument is converted to double, not bit-extended.
+(defn stack-argument-at! [(output (mut buffer/Buffer))
+                          (graph g/Graph)
+                          (parts (ArrayList allocation/Part))
+                          (arg abi/Argument)
+                          (position i64)
+                          (base frame/Base)] (-> (Result i32 (slice u8)))
+  (if (.promote? arg)
+      (match (capture-at! (mut output)
+                          graph
+                          parts
+                          (.value arg)
+                          position
+                          62
+                          base)
+        (Err [message] (Err message))
+        (Ok [_]
+            (match (word! (mut output) (encode/floating-convert true 30 30))
+              (Err [message] (Err message))
+              (Ok [_]
+                  (memory/access! (mut (.text output))
+                                  false
+                                  8
+                                  62
+                                  31
+                                  (.offset arg)
+                                  false
+                                  17)))))
+      (match (capture-at! (mut output)
+                          graph
+                          parts
+                          (.value arg)
+                          position
+                          16
+                          base)
+        (Err [message] (Err message))
+        (Ok [_]
+            (match (abi/normalize! (mut (.text output)) (.ty arg) 16)
+              (Err [message] (Err message))
+              (Ok [_]
+                  (memory/access! (mut (.text output))
+                                  false
+                                  (.size arg)
+                                  16
+                                  31
+                                  (.offset arg)
+                                  false
+                                  17)))))))
+
+(defn emit-at! [(output (mut buffer/Buffer))
+                (graph g/Graph)
+                (parts (ArrayList allocation/Part))
+                (reference i32)
+                (position i64)
+                (allocator (dyn Allocator))
+                (base frame/Base)] (-> (Result i32 (slice u8)))
+  (match (abi/layout graph reference allocator)
+    (Err [message] (Err message))
+    (Ok [plan]
+        (let [(mut layout) plan
+              (mut code) (buffer/create allocator)
+              (mut copies) (ArrayList::new [loc/Transfer] allocator)
+              node (get (.instructions graph) (cast i64 reference))
+              direct?
+                (if (< (.op2 node) 0)
+                    (match (g/lookup graph (.op2 node))
+                      (None [] false)
+                      (Some [callee] (= (n/opcode callee) 74)))
+                    false)
+              (mut error) ""]
+          ;; x30 captures an indirect target before any argument copies.
+          (when (not direct?)
+            (match (capture-at! (mut code)
+                                graph
+                                parts
+                                (.op2 node)
+                                position
+                                30
+                                base)
+              (Err [message] (set! error message))
+              (Ok [_] 0)))
+          (for arg (.arguments layout)
+            (when (and (= error "") (< (.register arg) 0))
+              (match (stack-argument-at! (mut code)
+                                         graph
+                                         parts
+                                         arg
+                                         position
+                                         base)
+                (Err [message] (set! error message))
+                (Ok [_] 0))))
+          (for arg (.arguments layout)
+            (when (and (= error "") (>= (.register arg) 0) (> (.value arg) 0))
+              (match (loc/lookup parts (.value arg) position)
+                (Err [message] (set! error message))
+                (Ok [source]
+                    (push! (mut copies)
+                           (loc/Transfer
+                             :position position
+                             :parent (.value arg)
+                             :source source
+                             :destination
+                               (loc/Location
+                                 :kind 0
+                                 :value (cast i64 (.register arg)))))))))
+          (when (= error "")
+            (match (transfers/parallel-frame! (mut (.text code))
+                                              (slice copies)
+                                              8
+                                              allocator
+                                              base)
+              (Err [message] (set! error message))
+              (Ok [_] 0)))
+          (for arg (.arguments layout)
+            (when (and (= error "") (>= (.register arg) 0) (< (.value arg) 0))
+              (match (capture-at! (mut code)
+                                  graph
+                                  parts
+                                  (.value arg)
+                                  position
+                                  (.register arg)
+                                  base)
+                (Err [message] (set! error message))
+                (Ok [_] 0))))
+          (for arg (.arguments layout)
+            (when (and (= error "") (>= (.register arg) 0))
+              (match (abi/normalize! (mut (.text code))
+                                     (.ty arg)
+                                     (.register arg))
+                (Err [message] (set! error message))
+                (Ok [_] 0))))
+          (when (= error "")
+            (match (if direct?
+                       (buffer/direct-call! (mut code) graph (.op2 node))
+                       (word! (mut code) (encode/call-register 30)))
+              (Err [message] (set! error message))
+              (Ok [_] 0)))
+          (when (= error "")
+            (match (abi/normalize! (mut (.text code)) (n/type-id node) 0)
+              (Err [message] (set! error message))
+              (Ok [_] 0)))
+          (free! (mut copies))
+          (abi/release! (mut layout))
+          (let [size (cast i32 (len (.text code)))]
+            (when (and (= error "") (not (buffer/append! (mut output) code)))
+              (set! error "invalid call code references"))
+            (buffer/release! (mut code))
+            (if (= error "") (Ok size) (Err error)))))))
+
+(defn capture! [(output (mut buffer/Buffer))
+                (graph g/Graph)
+                (parts (ArrayList allocation/Part))
+                (value i32)
+                (position i64)
+                (reg i32)] (-> (Result i32 (slice u8)))
+  (capture-at! (mut output) graph parts value position reg (frame/stack-base)))
+
+(defn stack-argument! [(output (mut buffer/Buffer))
+                       (graph g/Graph)
+                       (parts (ArrayList allocation/Part))
+                       (arg abi/Argument)
+                       (position i64)] (-> (Result i32 (slice u8)))
+  (stack-argument-at! (mut output) graph parts arg position (frame/stack-base)))
+
+(defn emit! [(output (mut buffer/Buffer))
+             (graph g/Graph)
+             (parts (ArrayList allocation/Part))
+             (reference i32)
+             (position i64)
+             (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (emit-at! (mut output)
+            graph
+            parts
+            reference
+            position
+            allocator
+            (frame/stack-base)))

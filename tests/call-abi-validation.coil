@@ -1,0 +1,67 @@
+(module stogir.tests.call-abi-validation)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [reference] reference) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn check [(flags u8) (ty i32) (expected (slice u8))] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        value (require (b/scalar-constant! (mut graph) ty 1 8))
+        (mut parameters) (ArrayList::new [u8] allocator)
+        (mut failures) 0]
+    (when (= (& flags 16) 0) (push! (mut parameters) (cast u8 ty)))
+    (match (calls/create flags 11 (slice parameters) allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype
+                call
+                  (require (calls/emit! (mut graph)
+                                        owned
+                                        start
+                                        target
+                                        [value]
+                                        allocator))
+                ret (require (b/emit! (mut graph) 120 11 [call call (: 0 i32)]))]
+            (match (compile/text graph start [ret] allocator)
+              (Err [msg]
+                   (when (!= msg expected)
+                     (println "flags={} type={} expected={} actual={}"
+                              flags
+                              ty
+                              expected
+                              msg)
+                     (set! failures (+ failures 1))))
+              (Ok [compiled]
+                  (let [(mut code) compiled]
+                    (when (!= expected "") (set! failures (+ failures 1)))
+                    (free! (mut code)))))
+            (calls/release! (mut owned)))))
+    (free! (mut parameters))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures
+          (+ (check 0 11 "")
+             (check 9 11 "")
+             (check 96 11 "")
+             (check 16 10 "")
+             (check 16 11 "")
+             (check 8 11 "unsupported AArch64 calling convention")
+             (check 16 2 "")
+             (check 0 8 "")
+             (check 0 9 "")
+             (check 0 7 "")
+             (check 0 1 "")
+             (check 16 12 ""))]
+    (println "call ABI validation checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

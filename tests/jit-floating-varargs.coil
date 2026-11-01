@@ -1,0 +1,104 @@
+(module stogir.tests.jit-floating-varargs)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(extern snprintf :cc (cc/C) [(ptr u8) u64 (ptr i8) ...] (-> i32))
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        buffer (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        format (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        d (require (b/emit! (mut graph) 71 12 [start (: 0 i32) 3]))
+        f (require (b/emit! (mut graph) 71 13 [start (: 0 i32) 4]))
+        size (require (b/scalar-constant! (mut graph) 5 128 8))
+        minus-one (require (b/scalar-constant! (mut graph) 8 255 8))
+        (mut failures) 0]
+    (match (calls/create 16 10 [(: 6 u8) 5 6] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype
+                call
+                  (require (calls/emit! (mut graph)
+                                        owned
+                                        start
+                                        target
+                                        [buffer size format d f minus-one]
+                                        allocator))
+                ret (require (b/emit! (mut graph) 120 10 [call call (: 0 i32)]))]
+            (match (compile/object graph
+                                   start
+                                   [ret]
+                                   "_stogir_fp_varargs"
+                                   allocator)
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [object]
+                  (let [(mut bytes) object]
+                    (match (fs/write-file allocator
+                                          "/tmp/coil-stogir-fp-varargs.o"
+                                          (slice bytes))
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [_] 0))
+                    (free! (mut bytes)))))
+            (match (compile/text graph start [ret] allocator)
+              (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+              (Ok [text]
+                  (let [(mut code) text]
+                    (match (jit/map-text (slice code))
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [loaded]
+                          (let [(mut image) loaded
+                                fun
+                                  (primitive/cast (fnptr (cc/C)
+                                                         [u64
+                                                          (ptr u8)
+                                                          (ptr i8)
+                                                          f64
+                                                          f32]
+                                                         i32)
+                                                  (.base image))
+                                address
+                                  (primitive/cast u64
+                                                  (primitive/cast (ptr u8)
+                                                                  (fnptr-of snprintf)))
+                                (mut output) (ArrayList::new [u8] allocator)
+                                (mut i) 0]
+                            (while (< i 128)
+                              (push! (mut output) 0)
+                              (set! i (+ i 1)))
+                            (let [actual
+                                    (call-ptr fun
+                                              address
+                                              (.data output)
+                                              c"%.2f %.2f %d"
+                                              1.25
+                                              (: -2.5 f32))
+                                  expected "1.25 -2.50 -1"]
+                              (when (!= actual (cast i32 (len expected)))
+                                (set! failures (+ failures 1)))
+                              (set! i 0)
+                              (while (< i (len expected))
+                                (when (!= (get output i) (get expected i))
+                                  (set! failures (+ failures 1)))
+                                (set! i (+ i 1))))
+                            (free! (mut output))
+                            (jit/release! (mut image)))))
+                    (free! (mut code)))))
+            (calls/release! (mut owned)))))
+    (g/release! (mut graph))
+    (println "native float variadic promotion: {} failures" failures)
+    (if (= failures 0) 0 1)))

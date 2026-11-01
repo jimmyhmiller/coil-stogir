@@ -1,0 +1,69 @@
+(module stogir.tests.jit-memory)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defstruct Cells [(first i64) (second i64)])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn check [(value i64)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        address (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        input (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        offset (require (b/scalar-constant! (mut graph) 5 8 8))
+        shifted (require (b/emit! (mut graph) 26 6 [address offset]))
+        store (require (b/emit! (mut graph) 93 0 [start shifted input]))
+        loaded (require (b/emit! (mut graph) 91 11 [store shifted]))
+        ret (require (b/emit! (mut graph) 120 11 [loaded loaded (: 0 i32)]))
+        (mut failures) 0]
+    (match (compile/text graph start [ret] allocator)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [text]
+          (let [(mut bytes) text]
+            (match (jit/map-text (slice bytes))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [image]
+                  (let [(mut owned) image
+                        (mut cell) (Cells :first 123 :second 0)
+                        f
+                          (primitive/cast (fnptr (cc/C) [(ptr i64) i64] i64)
+                                          (.base owned))]
+                    (when (!= (call-ptr f
+                                        (primitive/cast (ptr i64) (mut cell))
+                                        value)
+                              value)
+                      (set! failures (+ failures 1)))
+                    (when (!= (.first cell) 123) (set! failures (+ failures 1)))
+                    (when (!= (.second cell) value)
+                      (set! failures (+ failures 1)))
+                    (jit/release! (mut owned)))))
+            (free! (mut bytes)))))
+    (match (compile/text graph start [(: 999 i32)] allocator)
+      (Err [_] 0)
+      (Ok [text]
+          (let [(mut bytes) text]
+            (set! failures (+ failures 1))
+            (free! (mut bytes)))))
+    (match (compile/text graph ret [ret] allocator)
+      (Err [_] 0)
+      (Ok [text]
+          (let [(mut bytes) text]
+            (set! failures (+ failures 1))
+            (free! (mut bytes)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures
+          (+ (check 0) (check 42) (check -1) (check -9223372036854775808))]
+    (println "compiled memory checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

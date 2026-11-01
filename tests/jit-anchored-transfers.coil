@@ -1,0 +1,157 @@
+(module stogir.tests.jit-anchored-transfers)
+(import "stogir.a64.frame-address" :as frame)
+(import "stogir.a64.transfers" :as transfers)
+(import "stogir.a64.encode" :as e)
+(import "stogir.a64.constants" :as constants)
+(import "stogir.locations" :as loc)
+(import "stogir.bytes" :as bytes)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn checked [(result (Result i32 (slice u8)))] (-> i64)
+  (match result (Ok [_] 0) (Err [message] (println "{}" message) 1)))
+
+(defn word! [(out (mut (ArrayList u8))) (result (Result u32 (slice u8)))]
+  (-> i64)
+  (match result
+    (Ok [word] (bytes/append32! (mut out) word) 0)
+    (Err [message] (println "{}" message) 1)))
+
+(defn copy [(source loc/Location) (destination loc/Location)] (-> loc/Transfer)
+  (loc/Transfer
+    :position 0
+    :parent 0
+    :source source
+    :destination destination))
+
+(defn register [(number i64)] (-> loc/Location)
+  (loc/Location :kind 0 :value number))
+
+(defn slot [(offset i64)] (-> loc/Location)
+  (loc/Location :kind 1 :value offset))
+
+;;; Accumulate equality checks in x4, preserving the original x0/x1 values.
+(defn verify! [(out (mut (ArrayList u8))) (reg i32) (value u64) (wide bool)]
+  (-> i64)
+  (+ (checked (constants/emit! (mut out) wide 2 value))
+     (word! (mut out) (e/add-sub wide true true 31 reg 2))
+     (word! (mut out) (e/conditional-set false 3 0))
+     (word! (mut out) (e/logical-register false 0 4 4 3))))
+
+(defn check [(size i32) (bias i64)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut text) (ArrayList::new [u8] allocator)
+        base (frame/Base :reg 29 :bias bias)
+        wide (= size 8)
+        first (if wide (: 0x8000123456789ABC u64) 0x89ABCDEF)
+        second (if wide (: 0xFFE123456789ABCD u64) 0x7F812345)
+        a (+ bias 16)
+        b (+ bias 24)
+        frame-size (+ bias 48)
+        (mut failures) 0]
+    (set! failures
+          (+ failures
+             (checked (frame/adjust! (mut text) true frame-size 16))
+             (word! (mut text) (e/load-store false 8 29 31 bias))
+             (word! (mut text) (e/load-store false 8 30 31 (+ bias 8)))
+             (checked (frame/address! (mut text) 29 31 bias))
+             (checked (constants/emit! (mut text) wide 0 first))
+             (checked (constants/emit! (mut text) wide 1 second))
+             (checked (transfers/emit-at! (mut text)
+                                          (register 0)
+                                          (slot a)
+                                          size
+                                          17
+                                          base))
+             (checked (transfers/emit-at! (mut text)
+                                          (register 1)
+                                          (slot b)
+                                          size
+                                          17
+                                          base))
+             (word! (mut text) (e/scalar-transfer wide true 0 0))
+             (word! (mut text) (e/scalar-transfer wide true 1 1))
+             (checked (frame/adjust! (mut text) true 256 17))))
+    ; SP now points elsewhere. All fixed memory copies must remain x29-based.
+    (set! failures
+          (+ failures
+             (checked (transfers/parallel-at! (mut text)
+                                              [(copy (register 0) (register 1))
+                                               (copy (register 1) (register 0))
+                                               (copy (register 32)
+                                                     (register 33))
+                                               (copy (register 33)
+                                                     (register 32))
+                                               (copy (slot a) (slot b))
+                                               (copy (slot b) (slot a))]
+                                              size
+                                              16
+                                              17
+                                              allocator
+                                              base))
+             (checked (constants/emit! (mut text) false 4 1))
+             (verify! (mut text) 0 second wide)
+             (verify! (mut text) 1 first wide)
+             (checked (transfers/emit-at! (mut text)
+                                          (slot a)
+                                          (register 0)
+                                          size
+                                          17
+                                          base))
+             (verify! (mut text) 0 second wide)
+             (checked (transfers/emit-at! (mut text)
+                                          (slot b)
+                                          (register 0)
+                                          size
+                                          17
+                                          base))
+             (verify! (mut text) 0 first wide)
+             (word! (mut text) (e/scalar-transfer wide false 0 0))
+             (verify! (mut text) 0 second wide)
+             (word! (mut text) (e/scalar-transfer wide false 0 1))
+             (verify! (mut text) 0 first wide)
+             (word! (mut text) (e/logical-register false 1 0 31 4))
+             (checked (frame/restore! (mut text) base))
+             (word! (mut text) (e/load-store true 8 29 31 bias))
+             (word! (mut text) (e/load-store true 8 30 31 (+ bias 8)))
+             (checked (frame/adjust! (mut text) false frame-size 16))
+             (word! (mut text) (e/ret 30))))
+    (when (= failures 0)
+      (match (jit/map-text (slice text))
+        (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+        (Ok [image]
+            (let [(mut owned) image
+                  f (primitive/cast (fnptr (cc/C) [] u64) (.base owned))]
+              (when (!= (call-ptr f) 1) (set! failures (+ failures 1)))
+              (jit/release! (mut owned))))))
+    (free! (mut text))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut text) (ArrayList::new [u8] (malloc-allocator))
+        base (frame/Base :reg 29 :bias 16)
+        (mut failures) (+ (check 4 0) (check 4 128) (check 4 8800)
+                          (check 8 0) (check 8 128) (check 8 8800))]
+    (for result [(transfers/emit-at! (mut text) (slot 8) (register 0) 8 17 base)
+                 (transfers/emit-at! (mut text)
+                                     (register 0)
+                                     (register 29)
+                                     8
+                                     17
+                                     base)
+                 (transfers/emit-at! (mut text)
+                                     (slot 32)
+                                     (register 0)
+                                     8
+                                     29
+                                     base)]
+      (match result (Ok [_] (set! failures (+ failures 1))) (Err [_] 0)))
+    (when (!= (len text) 0) (set! failures (+ failures 1)))
+    (free! (mut text))
+    (println "anchored GPR/SIMD/memory cycles after moving SP: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

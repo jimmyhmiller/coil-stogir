@@ -1,0 +1,81 @@
+(module stogir.tests.jit-conversions)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn expected [(width i32) (signed? bool) (value i64)] (-> i64)
+  (if signed?
+      (if (= width 8)
+          (cast i64 (cast i8 value))
+          (if (= width 16)
+              (cast i64 (cast i16 value))
+              (cast i64 (cast i32 value))))
+      (if (= width 8)
+          (cast i64 (cast u8 value))
+          (if (= width 16)
+              (cast i64 (cast u16 value))
+              (cast i64 (cast u32 value))))))
+
+(defn check [(width i32) (signed? bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        param (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        narrow-type
+          (if signed?
+              (if (= width 8) 8 (if (= width 16) 9 10))
+              (if (= width 8) 2 (if (= width 16) 3 4)))
+        wide-type (if signed? 11 5)
+        narrow (require (b/emit! (mut graph) 35 (cast i32 narrow-type) [param]))
+        extended
+          (require (b/emit! (mut graph)
+                            (if signed? 33 34)
+                            (cast i32 wide-type)
+                            [narrow]))
+        ret
+          (require (b/emit! (mut graph)
+                            120
+                            (cast i32 wide-type)
+                            [start extended (: 0 i32)]))
+        (mut failures) 0]
+    (match (compile/text graph start [ret] allocator)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [text]
+          (let [(mut bytes) text]
+            (match (jit/map-text (slice bytes))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [image]
+                  (let [(mut owned) image
+                        f
+                          (primitive/cast (fnptr (cc/C) [i64] i64)
+                                          (.base owned))
+                        (mut x) -300]
+                    (while (<= x 300)
+                      (when (!= (call-ptr f x) (expected width signed? x))
+                        (set! failures (+ failures 1)))
+                      (set! x (+ x 1)))
+                    (for value [-9223372036854775808 -65537 -32769 -129 -128 -1
+                                0 127 128 255 256 32767 32768 65535 65536
+                                2147483648 9223372036854775807]
+                      (when (!= (call-ptr f value)
+                                (expected width signed? value))
+                        (set! failures (+ failures 1))))
+                    (jit/release! (mut owned)))))
+            (free! (mut bytes)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for width [(: 8 i32) 16 32]
+      (set! failures (+ failures (check width true) (check width false))))
+    (println "integer conversion matrix checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

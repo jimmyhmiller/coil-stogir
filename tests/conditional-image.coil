@@ -1,0 +1,113 @@
+(module stogir.tests.conditional-image)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.symbols" :as symbols)
+(import "stogir.image" :as image)
+(import "stogir.bytes" :as bytes)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.fs" :as fs)
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn save [(source image/Image) (path (slice u8))] (-> i64)
+  (let [allocator (malloc-allocator)]
+    (match (macho/image-object source allocator)
+      (Err [message] (do (println "{}" message) 1))
+      (Ok [object]
+          (let [(mut owned) object
+                result
+                  (match (fs/write-file allocator path (slice owned))
+                    (Err [_] (: 1 i64))
+                    (Ok [_] (: 0 i64)))]
+            (free! (mut owned))
+            result)))))
+
+(defn make [] (-> (Result image/Image (slice u8)))
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        c (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        named (require (symbols/symbol! (mut graph) "_stogir_condition"))
+        yes (require (symbols/string! (mut graph) "A\0B"))
+        no (require (symbols/string! (mut graph) "XYZ"))
+        fallback (require (symbols/string! (mut graph) "NIL"))
+        first (require (b/conditional! (mut graph) 6 named yes no))
+        second (require (b/conditional! (mut graph) 6 c first fallback))
+        ret (require (b/emit! (mut graph) 120 6 [start second (: 0 i32)]))
+        result
+          (compile/image graph
+                         start
+                         [ret]
+                         "_stogir_conditional_image"
+                         allocator)]
+    (g/release! (mut graph))
+    result))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut failures) 0
+        (mut provider) (image/create allocator)]
+    (bytes/append32! (mut (.data provider)) 0)
+    (bytes/append32! (mut (.data provider)) 0)
+    (require (image/symbol! (mut provider) "_stogir_condition" 2 0))
+    (set! failures
+          (+ failures (save provider "/tmp/coil-stogir-condition-data.o")))
+    (image/release! (mut provider))
+    (match (make)
+      (Err [message]
+           (do (println "compile: {}" message) (set! failures (+ failures 1))))
+      (Ok [compiled]
+          (let [(mut source) compiled]
+            (set! failures
+                  (+ failures
+                     (save source "/tmp/coil-stogir-conditional-image.o")))
+            (for resolution [(: 0 u64) 1 0xFEDCBA9876543210]
+              (let [(mut addresses) (ArrayList::new [u64] allocator)
+                    (mut present) (ArrayList::new [bool] allocator)]
+                (for symbol (.symbols source)
+                  (push! (mut addresses) resolution)
+                  (push! (mut present) true))
+                (match (jit/map-image-resolved source
+                                               (slice addresses)
+                                               (slice present)
+                                               allocator)
+                  (Err [message]
+                       (do
+                         (println "map: {}" message)
+                         (set! failures (+ failures 1))))
+                  (Ok [loaded]
+                      (let [(mut owned) loaded
+                            f
+                              (primitive/cast (fnptr (cc/C) [i64] (ptr u8))
+                                              (.base (.memory owned)))
+                            (mut c) (: -100 i64)]
+                        (while (<= c 100)
+                          (let [pointer (call-ptr f c)
+                                first
+                                  (if (= c 0)
+                                      (: 78 u8)
+                                      (if (= resolution 0) (: 88 u8) (: 65 u8)))
+                                second
+                                  (if (= c 0)
+                                      (: 73 u8)
+                                      (if (= resolution 0) (: 89 u8) (: 0 u8)))]
+                            (when (or (!= (load pointer) first)
+                                      (!= (load (primitive/index pointer 1))
+                                          second)
+                                      (!= (load (primitive/index pointer 3)) 0))
+                              (set! failures (+ failures 1))))
+                          (set! c (+ c 1)))
+                        (jit/release-image! (mut owned)))))
+                (free! (mut addresses))
+                (free! (mut present))))
+            (image/release! (mut source)))))
+    (println "symbolic conditional image checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

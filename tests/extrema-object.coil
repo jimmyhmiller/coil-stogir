@@ -1,0 +1,86 @@
+(module stogir.tests.extrema-object)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.types" :as types)
+(import "stogir.a64.compile" :as compile)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn write-function [(ty u8) (symbol (slice u8)) (path (slice u8))] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        c (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        a (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 1]))
+        other
+          (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 2]))
+        minimum
+          (require (b/integer-binary! (mut graph) 58 (cast i32 ty) 8 a other))
+        maximum
+          (require (b/integer-binary! (mut graph) 59 (cast i32 ty) 8 a other))
+        selected
+          (require (b/conditional! (mut graph) (cast i32 ty) c minimum maximum))
+        extend? (and (!= ty 1) (< (types/scalar-size (cast i32 ty) 8) 8))
+        result-type
+          (if extend? (if (types/signed? (cast i32 ty)) 11 5) (cast i32 ty))
+        result
+          (if extend?
+              (require (b/emit! (mut graph)
+                                (if (types/signed? (cast i32 ty)) 33 34)
+                                result-type
+                                [selected]))
+              selected)
+        ret
+          (require (b/emit! (mut graph)
+                            120
+                            result-type
+                            [start result (: 0 i32)]))
+        (mut failures) 0]
+    (match (calls/create 0 (cast u8 result-type) [(: 11 u8) ty ty] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype]
+            (require (calls/function! (mut graph) owned allocator))
+            (calls/release! (mut owned)))))
+    (match (compile/object graph start [ret] symbol allocator)
+      (Err [message] (do (println "{}" message) (set! failures (+ failures 1))))
+      (Ok [object]
+          (let [(mut owned) object]
+            (match (fs/write-file allocator path (slice owned))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [_] 0))
+            (free! (mut owned)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures
+          (+ (write-function 8
+                             "_stogir_extrema_i8"
+                             "/tmp/coil-stogir-extrema-i8.o")
+             (write-function 2
+                             "_stogir_extrema_u8"
+                             "/tmp/coil-stogir-extrema-u8.o")
+             (write-function 9
+                             "_stogir_extrema_i16"
+                             "/tmp/coil-stogir-extrema-i16.o")
+             (write-function 10
+                             "_stogir_extrema_i32"
+                             "/tmp/coil-stogir-extrema-i32.o")
+             (write-function 11
+                             "_stogir_extrema_i64"
+                             "/tmp/coil-stogir-extrema-i64.o")
+             (write-function 5
+                             "_stogir_extrema_u64"
+                             "/tmp/coil-stogir-extrema-u64.o")
+             (write-function 1
+                             "_stogir_extrema_bool"
+                             "/tmp/coil-stogir-extrema-bool.o"))]
+    (println "extrema/conditional object generation checks: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

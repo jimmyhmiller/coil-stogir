@@ -1,0 +1,83 @@
+(module stogir.tests.jit-frame-address)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.stack" :as stack)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.bytes" :as bytes)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        (mut probe) (ArrayList::new [u8] allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        expected (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        frame (require (b/frame-address! (mut graph)))
+        previous (require (b/emit! (mut graph) 91 6 [start frame]))
+        eight (require (b/scalar-constant! (mut graph) 6 8 8))
+        lr-address (require (b/emit! (mut graph) 26 6 [frame eight]))
+        lr (require (b/emit! (mut graph) 91 6 [previous lr-address]))
+        link-ok (require (b/emit! (mut graph) 14 1 [previous expected]))
+        mask (require (b/scalar-constant! (mut graph) 6 15 8))
+        low (require (b/emit! (mut graph) 47 6 [frame mask]))
+        zero-address (require (b/scalar-constant! (mut graph) 6 0 8))
+        aligned (require (b/emit! (mut graph) 14 1 [low zero-address]))
+        zero (require (b/scalar-constant! (mut graph) 1 0 8))
+        one (require (b/scalar-constant! (mut graph) 1 1 8))
+        lr-ok (require (b/emit! (mut graph) 60 1 [lr one zero]))
+        both (require (b/emit! (mut graph) 47 1 [link-ok aligned]))
+        result (require (b/emit! (mut graph) 47 1 [both lr-ok]))
+        ret (require (b/emit! (mut graph) 120 1 [lr result (: 0 i32)]))
+        (mut failures) 0]
+    ; Read the native caller's current x29 before entering the generated leaf.
+    (match (encode/add-sub-immediate true false false 0 29 0)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [word] (bytes/append32! (mut probe) word)))
+    (match (encode/ret 30)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [word] (bytes/append32! (mut probe) word)))
+    (match (compile/text graph start [ret] allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [text]
+          (let [(mut bytes) text]
+            (match (jit/map-text (slice bytes))
+              (Err [message]
+                   (println "{}" message)
+                   (set! failures (+ failures 1)))
+              (Ok [image]
+                  (let [(mut mapped) image
+                        f
+                          (primitive/cast (fnptr (cc/C) [u64] u8)
+                                          (.base mapped))]
+                    (match (jit/map-text (slice probe))
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [probe-image]
+                          (let [(mut mapped-probe) probe-image
+                                get-frame
+                                  (primitive/cast (fnptr (cc/C) [] u64)
+                                                  (.base mapped-probe))
+                                caller-frame (call-ptr get-frame)]
+                            (when (or (= caller-frame 0)
+                                      (!= (call-ptr f caller-frame) 1))
+                              (set! failures (+ failures 1)))
+                            (jit/release! (mut mapped-probe)))))
+                    (jit/release! (mut mapped)))))
+            (free! (mut bytes)))))
+    (let [bad (require (b/emit! (mut graph) 66 5 []))]
+      (match (stack/validate-frame-address graph bad)
+        (Ok [_] (set! failures (+ failures 1)))
+        (Err [_] 0)))
+    (free! (mut probe))
+    (g/release! (mut graph))
+    (println "leaf FRAME_ADDR record, prior frame link and saved LR: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

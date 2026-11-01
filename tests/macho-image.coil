@@ -1,0 +1,196 @@
+(module stogir.tests.macho-image)
+(import "stogir.image" :as image)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.a64.encode" :as e)
+(import "stogir.bytes" :as b)
+(import "stogir.relocate" :as relocation)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(extern labs :cc (cc/C) [i64] (-> i64))
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [id] id) (Err [msg] (do (println "{}" msg) -1))))
+
+(defn word! [(text (mut (ArrayList u8))) (value (Result u32 (slice u8)))]
+  (-> void)
+  (match value
+    (Ok [word] (b/append32! (mut text) word))
+    (Err [msg] (println "{}" msg))))
+
+(defn u64! [(data (mut (ArrayList u8))) (value u64)] (-> void)
+  (b/append32! (mut data) (cast u32 value))
+  (b/append32! (mut data) (cast u32 (>> value 32))))
+
+(defn fixup! [(source (mut image/Image))
+              (section i32)
+              (offset i64)
+              (kind i32)
+              (symbol i32)
+              (addend i64)] (-> void)
+  (when (not (image/relocate! (mut source)
+                              (image/Relocation
+                                :section section
+                                :offset offset
+                                :kind kind
+                                :symbol symbol
+                                :addend addend)))
+    (println "invalid fixture relocation")))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut source) (image/create allocator)
+        external (require (image/symbol! (mut source) "_labs" 0 0))
+        entry (require (image/symbol! (mut source) "_stogir_image_entry" 1 0))
+        data
+          (require (image/local-symbol! (mut source) "_stogir_local_data" 2 0))
+        pointer
+          (require (image/symbol! (mut source) "_stogir_image_pointer" 2 16))
+        end
+          (require (image/local-symbol! (mut source) "_stogir_local_end" 2 16))
+        alternate
+          (require (image/local-symbol! (mut source) "_stogir_pointer_alt" 2 24))
+        via-pointer
+          (require (image/symbol! (mut source) "_stogir_image_via_pointer" 1 48))
+        via-negative
+          (require (image/symbol! (mut source)
+                                  "_stogir_image_via_negative"
+                                  1
+                                  64))
+        branch
+          (require (image/symbol! (mut source)
+                                  "_stogir_image_branch_addend"
+                                  1
+                                  80))
+        helper
+          (require (image/local-symbol! (mut source) "_stogir_helper_base" 1 84))
+        via-add
+          (require (image/symbol! (mut source) "_stogir_image_page_add" 1 100))
+        (mut failures) 0]
+    ; Non-leaf: labs(x) + local_data[513] (page carry and low-page offset). Deliberately nonzero old immediate
+    ; fields must be replaced, not added to the image's explicit addend.
+    (word! (mut (.text source)) (e/add-sub-immediate true true false 31 31 16))
+    (word! (mut (.text source)) (e/load-store false 8 29 31 0))
+    (word! (mut (.text source)) (e/load-store false 8 30 31 8))
+    (word! (mut (.text source)) (e/add-sub-immediate true false false 29 31 0))
+    (b/append32! (mut (.text source)) 0x94000001)
+    (b/append32! (mut (.text source)) 0xB0000001)
+    (word! (mut (.text source)) (e/load-store true 8 1 1 8))
+    (word! (mut (.text source)) (e/add-sub true false false 0 0 1))
+    (word! (mut (.text source)) (e/load-store true 8 29 31 0))
+    (word! (mut (.text source)) (e/load-store true 8 30 31 8))
+    (word! (mut (.text source)) (e/add-sub-immediate true false false 31 31 16))
+    (word! (mut (.text source)) (e/ret 30))
+    ; Two pointer indirections exercise ABS64 in data with +8 and -8 addends.
+    (b/append32! (mut (.text source)) 0x90000000)
+    (word! (mut (.text source)) (e/load-store true 8 0 0 0))
+    (word! (mut (.text source)) (e/load-store true 8 0 0 0))
+    (word! (mut (.text source)) (e/ret 30))
+    (b/append32! (mut (.text source)) 0x90000000)
+    (word! (mut (.text source)) (e/load-store true 8 0 0 0))
+    (word! (mut (.text source)) (e/load-store true 8 0 0 0))
+    (word! (mut (.text source)) (e/ret 30))
+    ; Tail branch skips a distinct return-11 sequence through a nonzero addend.
+    (b/append32! (mut (.text source)) 0x14000000)
+    (word! (mut (.text source)) (e/move-wide true 2 0 11 0))
+    (word! (mut (.text source)) (e/ret 30))
+    (word! (mut (.text source)) (e/move-wide true 2 0 37 0))
+    (word! (mut (.text source)) (e/ret 30))
+    ; ADD PAGEOFF12 and signed relocation addends share the same target.
+    (b/append32! (mut (.text source)) 0x90000000)
+    (word! (mut (.text source)) (e/add-sub-immediate true false false 0 0 0))
+    (word! (mut (.text source)) (e/load-store true 8 0 0 0))
+    (word! (mut (.text source)) (e/ret 30))
+    (u64! (mut (.data source)) 9)
+    (u64! (mut (.data source)) 100)
+    (u64! (mut (.data source)) 0x1122334455667788)
+    (u64! (mut (.data source)) 0x8877665544332211)
+    (while (< (len (.data source)) 4096) (push! (mut (.data source)) 0))
+    (u64! (mut (.data source)) 201)
+    (u64! (mut (.data source)) 202)
+    ; Append deliberately out of address/section order.
+    (fixup! (mut source) 2 24 1 end -8)
+    (fixup! (mut source) 1 24 4 data 4104)
+    (fixup! (mut source) 1 16 2 external 0)
+    (fixup! (mut source) 1 20 3 data 4104)
+    (fixup! (mut source) 2 16 1 data 8)
+    (fixup! (mut source) 1 52 4 pointer 0)
+    (fixup! (mut source) 1 48 3 pointer 0)
+    (fixup! (mut source) 1 68 4 alternate 0)
+    (fixup! (mut source) 1 64 3 alternate 0)
+    (fixup! (mut source) 1 80 2 helper 8)
+    (fixup! (mut source) 1 104 4 end -8)
+    (fixup! (mut source) 1 100 3 end -8)
+    (match (macho/image-object source allocator)
+      (Err [msg] (do (println "object: {}" msg) (set! failures (+ failures 1))))
+      (Ok [object]
+          (let [(mut owned) object]
+            (match (fs/write-file allocator
+                                  "/tmp/coil-stogir-image.o"
+                                  (slice owned))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [_] 0))
+            (match (macho/image-object source allocator)
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [second]
+                  (let [(mut again) second]
+                    (when (!= (slice owned) (slice again))
+                      (set! failures (+ failures 1)))
+                    (free! (mut again)))))
+            (free! (mut owned)))))
+    (let [(mut addresses) (ArrayList::new [u64] allocator)
+          (mut present) (ArrayList::new [bool] allocator)]
+      (for symbol (.symbols source)
+        (push! (mut addresses) 0)
+        (push! (mut present) false))
+      (set! (mut addresses)
+            (cast i64 external)
+            (primitive/cast u64 (primitive/cast (ptr u8) (fnptr-of labs))))
+      (set! (mut present) (cast i64 external) true)
+      (match (jit/map-image-resolved source
+                                     (slice addresses)
+                                     (slice present)
+                                     allocator)
+        (Err [msg] (do (println "JIT: {}" msg) (set! failures (+ failures 1))))
+        (Ok [loaded]
+            (let [(mut owned) loaded
+                  f
+                    (primitive/cast (fnptr (cc/C) [i64] i64)
+                                    (primitive/cast (ptr u8)
+                                                    (get (.addresses owned)
+                                                         (cast i64 entry))))
+                  (mut x) (: -100 i64)]
+              (while (<= x 100)
+                (when (!= (call-ptr f x) (+ (if (< x 0) (- 0 x) x) 202))
+                  (set! failures (+ failures 1)))
+                (set! x (+ x 1)))
+              (for id [via-pointer via-negative via-add]
+                (let [read
+                        (primitive/cast (fnptr (cc/C) [] i64)
+                                        (primitive/cast (ptr u8)
+                                                        (get (.addresses owned)
+                                                             (cast i64 id))))]
+                  (when (!= (call-ptr read) 100) (set! failures (+ failures 1)))))
+              (let [f
+                      (primitive/cast (fnptr (cc/C) [] i64)
+                                      (primitive/cast (ptr u8)
+                                                      (get (.addresses owned)
+                                                           (cast i64 branch))))]
+                (when (!= (call-ptr f) 37) (set! failures (+ failures 1))))
+              (jit/release-image! (mut owned)))))
+      (free! (mut addresses))
+      (free! (mut present)))
+    (when (or (!= (relocation/read32 (.text source) 16) 0x94000001)
+              (!= (relocation/read32 (.text source) 20) 0xB0000001)
+              (!= (relocation/read32 (.data source) 16) 0x55667788)
+              (!= (len (.text source)) 116)
+              (!= (len (.symbols source)) 11))
+      (set! failures (+ failures 1)))
+    (image/release! (mut source))
+    (println "shared JIT/AOT image checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

@@ -1,0 +1,78 @@
+(module stogir.tests.jit-call-void)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn store :cc (cc/C) [(address u64) (value i64)] (-> void)
+  (set! (index (primitive/cast (ptr i64) address) 0) value))
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        address (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        value (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        (mut failures) 0]
+    (match (calls/create 0 0 [(: 6 u8) 11] allocator)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [prototype]
+          (let [(mut owned-prototype) prototype
+                call
+                  (require (calls/emit! (mut graph)
+                                        owned-prototype
+                                        start
+                                        target
+                                        [address value]
+                                        allocator))
+                square (require (b/emit! (mut graph) 28 11 [value value]))
+                ret
+                  (require (b/emit! (mut graph) 120 11 [call square (: 0 i32)]))]
+            (match (compile/text graph start [ret] allocator)
+              (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+              (Ok [compiled]
+                  (let [(mut code) compiled]
+                    (match (jit/map-text (slice code))
+                      (Err [msg]
+                           (do
+                             (println "{}" msg)
+                             (set! failures (+ failures 1))))
+                      (Ok [image]
+                          (let [(mut owned-image) image
+                                f
+                                  (primitive/cast (fnptr (cc/C)
+                                                         [u64 u64 i64]
+                                                         i64)
+                                                  (.base owned-image))
+                                fn-address
+                                  (primitive/cast u64
+                                                  (primitive/cast (ptr u8)
+                                                                  (fnptr-of store)))
+                                (mut cell) (: 0 i64)
+                                address
+                                  (primitive/cast u64
+                                                  (primitive/cast (ptr u8)
+                                                                  (mut cell)))
+                                (mut x) -100]
+                            (while (<= x 100)
+                              (when (!= (call-ptr f fn-address address x)
+                                        (* x x))
+                                (set! failures (+ failures 1)))
+                              (when (!= cell x) (set! failures (+ failures 1)))
+                              (set! x (+ x 1)))
+                            (when (not (jit/release! (mut owned-image)))
+                              (set! failures (+ failures 1))))))
+                    (free! (mut code)))))
+            (calls/release! (mut owned-prototype)))))
+    (g/release! (mut graph))
+    (println "native void call checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

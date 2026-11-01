@@ -1,0 +1,159 @@
+(module stogir.tests.jit-locals)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.types" :as types)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn check [(ty i32)
+             (mode i32)
+             (literal? bool)
+             (alignment i32)
+             (wide-storage? bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        variable
+          (require (b/variable! (mut graph)
+                                (if wide-storage? 5 ty)
+                                start
+                                "value"
+                                alignment))
+        guard (require (b/variable! (mut graph) 5 start "guard" 8))
+        address (require (b/variable-address! (mut graph) variable))
+        width (types/scalar-size ty 8)
+        unsigned
+          (if (= width 1) (: 2 i32) (if (= width 2) 3 (if (= width 4) 4 5)))
+        mask (cast u64 (- (<< (: 1 u128) (cast u128 (* width 8))) 1))
+        wanted (if (= ty 1) (: 1 u64) (& (: 0xFFE123456789ABCD u64) mask))
+        raw
+          (if literal?
+              (require (b/scalar-constant! (mut graph) ty wanted 8))
+              (let [param
+                      (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+                    narrow
+                      (if (< width 8)
+                          (require (b/emit! (mut graph) 35 unsigned [param]))
+                          param)]
+                (require (b/emit! (mut graph) 36 ty [narrow]))))
+        sentinel
+          (require (b/scalar-constant! (mut graph) 5 0x123456789ABCDEF0 8))
+        guard-store (require (b/emit! (mut graph) 87 0 [start guard sentinel]))
+        stored
+          (require (b/emit! (mut graph)
+                            (if (= mode 1) 93 (if (= mode 3) 88 87))
+                            0
+                            [guard-store (if (= mode 1) address variable) raw]))
+        loaded
+          (require (b/emit! (mut graph)
+                            (if (= mode 2) 91 (if (= mode 3) 86 85))
+                            ty
+                            [stored (if (= mode 2) address variable)]))
+        guard-load (require (b/emit! (mut graph) 85 5 [loaded guard]))
+        guard-ok (require (b/emit! (mut graph) 14 1 [guard-load sentinel]))
+        bits (require (b/emit! (mut graph) 36 unsigned [loaded]))
+        result (if (< width 8) (require (b/emit! (mut graph) 34 5 [bits])) bits)
+        address-bits (require (b/emit! (mut graph) 36 5 [address]))
+        alignment-mask
+          (require (b/scalar-constant! (mut graph)
+                                       5
+                                       (cast u64
+                                             (- (if (= alignment 0)
+                                                    width
+                                                    alignment)
+                                                1))
+                                       8))
+        masked
+          (require (b/emit! (mut graph) 47 5 [address-bits alignment-mask]))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        aligned (require (b/emit! (mut graph) 14 1 [masked zero]))
+        bad (require (b/scalar-constant! (mut graph) 5 0xBAD 8))
+        guarded (require (b/emit! (mut graph) 60 5 [guard-ok result bad]))
+        final (require (b/emit! (mut graph) 60 5 [aligned guarded bad]))
+        ret (require (b/emit! (mut graph) 120 5 [guard-load final (: 0 i32)]))
+        (mut failures) 0]
+    (when (and (= mode 2)
+               (not literal?)
+               (= alignment 16)
+               (or (= ty 1) (= ty 11) (= ty 12) (= ty 13)))
+      (match (compile/object graph
+                             start
+                             [ret]
+                             (if (= ty 1)
+                                 "_stogir_local_bool"
+                                 (if (= ty 11)
+                                     "_stogir_local_i64"
+                                     (if (= ty 12)
+                                         "_stogir_local_f64"
+                                         "_stogir_local_f32")))
+                             allocator)
+        (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+        (Ok [object]
+            (let [(mut owned) object]
+              (match (fs/write-file allocator
+                                    (if (= ty 1)
+                                        "/tmp/coil-stogir-local-bool.o"
+                                        (if (= ty 11)
+                                            "/tmp/coil-stogir-local-i64.o"
+                                            (if (= ty 12)
+                                                "/tmp/coil-stogir-local-f64.o"
+                                                "/tmp/coil-stogir-local-f32.o")))
+                                    (slice owned))
+                (Err [_] (set! failures (+ failures 1)))
+                (Ok [_] 0))
+              (free! (mut owned))))))
+    (match (compile/text graph start [ret] allocator)
+      (Err [message]
+           (println "local ty={} mode={} literal={} align={}: {}"
+                    ty
+                    mode
+                    literal?
+                    alignment
+                    message)
+           (set! failures (+ failures 1)))
+      (Ok [text]
+          (let [(mut owned) text]
+            (match (jit/map-text (slice owned))
+              (Err [message]
+                   (println "{}" message)
+                   (set! failures (+ failures 1)))
+              (Ok [image]
+                  (let [(mut mapped) image
+                        f
+                          (primitive/cast (fnptr (cc/C) [u64] u64)
+                                          (.base mapped))
+                        got (call-ptr f wanted)]
+                    (when (!= got wanted)
+                      (println "local ty={} mode={} literal={} align={}: wanted={} got={}"
+                               ty
+                               mode
+                               literal?
+                               alignment
+                               wanted
+                               got)
+                      (set! failures (+ failures 1)))
+                    (jit/release! (mut mapped)))))
+            (free! (mut owned)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for ty [(: 1 i32) 2 3 4 5 6 7 8 9 10 11 12 13]
+      (for mode [(: 0 i32) 1 2 3]
+        (for alignment [(: 0 i32) 1 8 16]
+          (for wide-storage? [false true]
+            (set! failures
+                  (+ failures
+                     (check ty mode false alignment wide-storage?)
+                     (check ty mode true alignment wide-storage?)))))))
+    (println "832 native scalar local-storage variants: {} failures" failures)
+    (if (= failures 0) 0 1)))

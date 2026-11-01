@@ -1,0 +1,126 @@
+(module stogir.tests.named-call-arguments)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.symbols" :as symbols)
+(import "stogir.image" :as image)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn receiver :cc (cc/C) [(a (ptr u8))
+                           (b (ptr u8))
+                           (c (ptr u8))
+                           (d (ptr u8))
+                           (e (ptr u8))
+                           (f (ptr u8))
+                           (g (ptr u8))
+                           (h (ptr u8))
+                           (i (ptr u8))
+                           (j (ptr u8))] (-> i64)
+  (+ (cast i64 (load a))
+     (cast i64 (load b))
+     (cast i64 (load c))
+     (cast i64 (load d))
+     (cast i64 (load e))
+     (cast i64 (load f))
+     (cast i64 (load g))
+     (cast i64 (load h))
+     (cast i64 (load i))
+     (cast i64 (load j))))
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        (mut arguments) (ArrayList::new [i32] allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target
+          (require (symbols/function! (mut graph) "_stogir_named_receiver" 0))
+        (mut byte) (: 200 u8)
+        (mut failures) 0]
+    (for text ["1" "2" "3" "4" "5" "6" "7" "8" "9"]
+      (push! (mut arguments) (require (symbols/string! (mut graph) text))))
+    (push! (mut arguments)
+           (require (symbols/symbol! (mut graph) "_stogir_named_byte")))
+    (match (calls/create 0 11 [(: 6 u8) 6 6 6 6 6 6 6 6 6] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned-prototype) prototype
+                first
+                  (require (calls/emit! (mut graph)
+                                        owned-prototype
+                                        start
+                                        target
+                                        (slice arguments)
+                                        allocator))
+                second
+                  (require (calls/emit! (mut graph)
+                                        owned-prototype
+                                        first
+                                        target
+                                        (slice arguments)
+                                        allocator))
+                sum (require (b/emit! (mut graph) 26 11 [first second]))
+                ret
+                  (require (b/emit! (mut graph) 120 11 [second sum (: 0 i32)]))]
+            (match (compile/image graph
+                                  start
+                                  [ret]
+                                  "_stogir_named_arguments"
+                                  allocator)
+              (Err [msg]
+                   (do
+                     (println "compile: {}" msg)
+                     (set! failures (+ failures 1))))
+              (Ok [source]
+                  (let [(mut owned-source) source
+                        (mut addresses) (ArrayList::new [u64] allocator)
+                        (mut present) (ArrayList::new [bool] allocator)]
+                    (for symbol (.symbols owned-source)
+                      (push! (mut addresses)
+                             (if (image/same-name? owned-source
+                                                   symbol
+                                                   "_stogir_named_receiver")
+                                 (primitive/cast u64
+                                                 (primitive/cast (ptr u8)
+                                                                 (fnptr-of receiver)))
+                                 (primitive/cast u64
+                                                 (primitive/cast (ptr u8)
+                                                                 (mut byte)))))
+                      (push! (mut present) true))
+                    (match (jit/map-image-resolved owned-source
+                                                   (slice addresses)
+                                                   (slice present)
+                                                   allocator)
+                      (Err [msg]
+                           (do
+                             (println "map: {}" msg)
+                             (set! failures (+ failures 1))))
+                      (Ok [loaded]
+                          (let [(mut owned) loaded
+                                f
+                                  (primitive/cast (fnptr (cc/C) [] i64)
+                                                  (.base (.memory owned)))
+                                (mut value) (: 150 i64)]
+                            (while (<= value 250)
+                              (set! byte (cast u8 value))
+                              (when (!= (call-ptr f) (* 2 (+ 477 value)))
+                                (set! failures (+ failures 1)))
+                              (set! value (+ value 1)))
+                            (jit/release-image! (mut owned)))))
+                    (free! (mut addresses))
+                    (free! (mut present))
+                    (image/release! (mut owned-source)))))
+            (calls/release! (mut owned-prototype)))))
+    (free! (mut arguments))
+    (g/release! (mut graph))
+    (println "named register/stack call argument checks: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

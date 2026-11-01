@@ -1,0 +1,151 @@
+# Shared code images, JIT, and AOT
+
+The standalone pipeline has an address-independent image boundary. Code and data
+belong to the image, together with stable symbol IDs and explicit relocations.
+The JIT resolves those IDs to runtime addresses. The Mach-O writer records them
+for the system linker. Writing an object or loading an image leaves the source
+image unchanged.
+
+## Construction and ownership
+
+`stogir.a64.compile/image` compiles a scalar function into an owned
+`stogir.image/Image`, with its text and exported entry symbol. The image remains
+valid after the graph is released. `compile/object` consumes that same path and
+serializes it; it does not use a separate machine-code emitter or clone the text
+into an intermediate image.
+
+The image builder can additionally hold multiple functions, local/exported data,
+undefined external symbols, and relocations. Graph compilation lowers named
+FUNC/SYM/STR references into the same representation. Raw image construction
+remains available for multiple definitions and explicit section layouts.
+
+Use `image/release!` to release an image. `macho/image-object` returns owned object
+bytes. `jit/map-image` and `jit/map-image-resolved` return an owned loaded image;
+release it with `jit/release-image!`. See the executable ownership example in
+[compile-image.coil](../tests/compile-image.coil).
+
+## Named graph constants
+
+`stogir.symbols` constructs FUNC, FUNC_ADDR, SYM, and STR constants using
+upstream opcode/type/header conventions. `function!` accepts an exact object
+name and a prototype string ID (zero means unspecified). `symbol!` accepts a
+nonempty name without embedded zero bytes. `string!` accepts arbitrary bytes,
+including an empty string or embedded zeros. `function-address!` represents a
+numeric address and optional prototype. Each returns a graph-owned negative
+constant reference.
+
+`calls/attach!` stores a FUNC/FUNC_ADDR prototype ID in the constant's 16-bit
+auxiliary header; other addresses retain the PROTO identity instruction.
+Function, symbol, string, and numeric address constants remain distinct even
+when their payloads match. Folding and immediate selection never interpret
+unresolved name IDs as numeric addresses.
+
+A named FUNC in a call emits BL with a BRANCH26 relocation. A matching exported
+entry name binds recursive calls inside the image. Other named FUNC/SYM uses
+emit ADRP/LDR through an aligned local data slot with an ABS64 relocation to the
+actual symbol. The slot supports arbitrary 64-bit external addresses without
+assuming that JIT code and external data are within ADRP range. STR materializes
+ADRP/ADD to owned literal bytes with an appended zero; embedded zeros are retained.
+Slots are shared by symbol, including function constants with different prototype
+metadata. STR storage is shared by graph constant reference.
+
+Temporary code buffers carry reference records as well as bytes; appending a
+buffer rebases its records. Returns, arithmetic operands, memory operands, call
+arguments/targets, and phi-edge literals use this common materializer. Public
+names are registered before fresh private data labels are generated, so an entry
+or external name cannot collide with a generated label. The image owns all
+literal bytes and names independently of the graph. `compile/text` rejects code
+with pending relocations; use `compile/image` or `compile/object` for such graphs.
+
+COND supports named address conditions and arms. Named truth is evaluated at
+runtime so an explicit zero-valued external binding selects the false arm.
+Materialization preserves NZCV: conditional emission captures the condition
+before reusing x16/x17 for both value arms. `code/materialize!` reports emitted
+bytes for numeric and symbolic forms; its numeric primitive counts words
+internally and is converted at the shared-buffer boundary.
+
+
+## Sections and symbols
+
+The current model has text and mutable data sections. Text instructions align to
+four bytes; Mach-O data starts at eight-byte alignment. JIT storage separates
+executable text from writable data at the OS page boundary. Architectural ADRP
+pages are **4 KiB**, independent of the OS allocation granule.
+
+`image/symbol!` interns an exported definition or an undefined external.
+A later compatible definition fills an undefined symbol without changing its ID.
+`image/local-symbol!` creates a definition that is not exported by the object.
+Conflicting bindings or definitions fail. Symbol names are copied into an owned
+arena, including when the supplied name is a substring of that arena.
+
+Names are exact target object names. Darwin C symbols normally include the
+leading underscore, such as `_labs`. The loader resolves by stable ID using
+explicit address/presence arrays; it does not implicitly rewrite names or treat
+address zero as a missing value.
+
+Mach-O serialization orders local symbols, exported definitions, and undefined
+symbols, sorting names within groups and remapping all relocation symbol indices.
+Symbol values include the section's object address. Stable image IDs remain
+unchanged. The writer emits LC_SYMTAB, LC_DYSYMTAB, and a macOS build-version
+command. Symbol/relocation sorting uses merge sort rather than quadratic insertion
+sorting, and section serialization uses reserved output storage and bulk copies.
+These are implementation choices; throughput has not yet been benchmarked.
+
+## Relocations
+
+The relocation record's signed addend is authoritative. Existing pointer payloads
+or instruction-immediate bits are replaced rather than counted as another addend.
+Sites must fit their section; instruction sites align to four bytes. Overlapping
+logical relocations fail validation in both consumers.
+
+| Image kind | Meaning | Mach-O record |
+| --- | --- | --- |
+| ABS64 | 64-bit symbol address plus signed addend | ARM64_RELOC_UNSIGNED, addend in section bytes |
+| BRANCH26 | B/BL displacement to symbol plus addend | ARM64_RELOC_BRANCH26 |
+| PAGE21 | ADRP page displacement to symbol plus addend | ARM64_RELOC_PAGE21 |
+| PAGEOFF12 | Low-page offset in ADD or unsigned-offset load/store | ARM64_RELOC_PAGEOFF12 |
+
+Mach-O branch/page relocations with nonzero addends use a preceding
+ARM64_RELOC_ADDEND record. That format has a signed 24-bit addend limit; ABS64
+retains the full signed 64-bit addend. Relocations are written in descending
+address order within each section. Local targets also use symbol-table references.
+
+JIT instruction relocation checks final displacement and scaled-offset alignment.
+It plans every patch before modifying the private copy, so a failed page/branch
+relocation cannot leave a partially patched image. External branch veneers handle
+out-of-range external function addresses. The object writer checks representable
+records and instruction forms; the linker chooses final addresses and validates
+final target range/alignment.
+
+## Evidence and remaining work
+
+[macho-image.coil](../tests/macho-image.coil) builds one shared image containing an
+external call to libc `labs`, local data, exported functions/data, ABS64 pointers,
+positive and negative addends, ADRP plus scaled load and ADD forms, and a branch
+addend. It runs through JIT and writes an object executed by
+[aot-image-link.coil](../tests/aot-image-link.coil).
+
+The page target crosses a 4 KiB boundary and selects a different low-page slot;
+the branch addend skips a different return sequence. Ignoring either page addend
+or the branch addend would change the result. Repeated serialization produces
+identical bytes, and source bytes/IDs remain unchanged. LLVM reads the resulting
+symbols and relocation records, and the macOS linker links them successfully.
+
+[named-image.coil](../tests/named-image.coil) compiles an external call, external
+data access, and a binary string literal into one image, releases the graph,
+executes the image with explicit resolutions, and writes objects executed by
+[aot-named-link.coil](../tests/aot-named-link.coil). The recursive factorial graph
+in [named-recursion.coil](../tests/named-recursion.coil) runs through JIT and AOT
+with its FUNC bound to its own exported entry. Address-phi/return/arithmetic and
+nested-buffer tests cover literal ownership, 64-bit numeric address preservation,
+reference rebasing, slot deduplication, and private-name collisions.
+
+The current format is Darwin arm64 Mach-O. Arbitrary extra sections, BSS/readonly
+section policy, weak/common/TLS/GOT symbol/relocation features, unwind/debug
+metadata, other object formats, and additional special constant kinds remain
+unfinished. Full optimization/target parity, Coil compiler integration, and the
+LLVM/TPDE runtime and compile-time comparisons also remain open.
+
+Format references are Apple's SDK `mach-o/loader.h`, `mach-o/nlist.h`, and
+`mach-o/arm64/reloc.h`; no SDK source is vendored. The writer is Coil code under
+the project license, with upstream port attribution retained in LICENSE/NOTICE.

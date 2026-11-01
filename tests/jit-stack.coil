@@ -1,0 +1,97 @@
+(module stogir.tests.jit-stack)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn check [(ty i32) (n u64) (constant? bool) (free? bool) (alignment i32)]
+  (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        size
+          (if constant?
+              (require (b/scalar-constant! (mut graph) ty n 8))
+              (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 0])))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        baseline (require (b/stack-allocate! (mut graph) start zero alignment))
+        first (require (b/stack-allocate! (mut graph) baseline size alignment))
+        second (require (b/stack-allocate! (mut graph) first size alignment))
+        control
+          (if free? (require (b/stack-free! (mut graph) second size)) second)
+        marker (require (b/stack-allocate! (mut graph) control zero alignment))
+        difference (require (b/emit! (mut graph) 27 6 [baseline first]))
+        other (require (b/emit! (mut graph) 27 6 [first second]))
+        equal (require (b/emit! (mut graph) 14 1 [difference other]))
+        restored
+          (require (b/emit! (mut graph) 14 1 [marker (if free? first second)]))
+        good (require (b/emit! (mut graph) 47 1 [equal restored]))
+        amount (require (b/emit! (mut graph) 36 5 [difference]))
+        bad (require (b/scalar-constant! (mut graph) 5 0xBAD 8))
+        result (require (b/emit! (mut graph) 60 5 [good amount bad]))
+        ret (require (b/emit! (mut graph) 120 5 [marker result (: 0 i32)]))
+        (mut failures) 0]
+    ; One or two objects deliberately remain live; return must restore the anchor.
+    (match (compile/text graph start [ret] allocator)
+      (Err [message]
+           (println "stack ty={} n={} constant={} free={} align={}: {}"
+                    ty
+                    n
+                    constant?
+                    free?
+                    alignment
+                    message)
+           (set! failures (+ failures 1)))
+      (Ok [text]
+          (let [(mut bytes) text]
+            (match (jit/map-text (slice bytes))
+              (Err [message]
+                   (println "{}" message)
+                   (set! failures (+ failures 1)))
+              (Ok [image]
+                  (let [(mut owned) image
+                        f
+                          (primitive/cast (fnptr (cc/C) [u64] u64)
+                                          (.base owned))
+                        got (call-ptr f n)
+                        expected (* (/ (+ n 15) 16) 16)]
+                    (when (!= got expected)
+                      (println "stack ty={} n={} constant={} free={} align={}: expected={} got={}"
+                               ty
+                               n
+                               constant?
+                               free?
+                               alignment
+                               expected
+                               got)
+                      (set! failures (+ failures 1)))
+                    (jit/release! (mut owned)))))
+            (free! (mut bytes)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for ty [(: 1 i32) 2 3 4 5 6 7 8 9 10 11]
+      (for n [(: 0 u64) 1 8 15 16 17 63 65]
+        (when (or (!= ty 1) (<= n 1))
+          (for constant? [false true]
+            (for free? [false true]
+              (for alignment [(: 0 i32) 8 16]
+                (set! failures
+                      (+ failures (check ty n constant? free? alignment)))))))))
+    (for ty [(: 5 i32) 11]
+      (for n [(: 4097 u64) 8801]
+        (for constant? [false true]
+          (for free? [false true]
+            (set! failures (+ failures (check ty n constant? free? 16)))))))
+    (println "1000 native nested stack allocation/free variants: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

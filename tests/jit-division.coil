@@ -1,0 +1,166 @@
+(module stogir.tests.jit-division)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.types" :as types)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+;;; Independent arithmetic oracle uses wider arithmetic and explicit A64 edge
+;;; results; generated DIV/MOD use divide/MSUB, ROL uses NEG/RORV.
+(defn expected [(opcode i32) (ty i32) (a u64) (b u64)] (-> u64)
+  (let [width (* 8 (types/scalar-size ty 8))
+        modulus (<< (: 1 i128) (cast i128 width))
+        mask (cast u64 (- modulus 1))
+        x (& a mask)
+        y (& b mask)
+        sign (cast u64 (/ modulus 2))]
+    (if (= opcode 52)
+        (let [shift (& y (cast u64 (- width 1)))]
+          (if (= shift 0)
+              x
+              (& (cast u64
+                       (+ (<< (cast u128 x) (cast u128 shift))
+                          (>> (cast u128 x)
+                              (- (cast u128 width) (cast u128 shift)))))
+                 mask)))
+        (if (= y 0)
+            (if (= opcode 29) (: 0 u64) x)
+            (if (types/signed? ty)
+                (let [sx
+                        (if (>= x sign) (- (cast i128 x) modulus) (cast i128 x))
+                      sy
+                        (if (>= y sign) (- (cast i128 y) modulus) (cast i128 y))
+                      quotient (/ sx sy)
+                      result (if (= opcode 29) quotient (- sx (* quotient sy)))]
+                  (& (cast u64 result) mask))
+                (if (= opcode 29) (/ x y) (- x (* (/ x y) y))))))))
+
+;;; Exercise allocated operand/result overlap and all combinations of constant
+;;; materialization, including both reserved scratch registers being occupied.
+(defn check [(opcode i32) (ty u8) (mode i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 0]))
+        q (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 1]))
+        width (* 8 (types/scalar-size (cast i32 ty) 8))
+        mask (cast u64 (- (<< (: 1 u128) (cast u128 width)) 1))
+        literal (& (: 0xFEDCBA9876543210 u64) mask)
+        left
+          (if (or (= mode 1) (= mode 3) (= mode 4))
+              (require (b/scalar-constant! (mut graph) (cast i32 ty) literal 8))
+              p)
+        right
+          (if (>= mode 2)
+              (require (b/scalar-constant! (mut graph)
+                                           (cast i32 ty)
+                                           (if (= mode 4) (: 0 u64) (: 3 u64))
+                                           8))
+              q)
+        result
+          (require (if (= opcode 52)
+                       (b/emit! (mut graph) opcode (cast i32 ty) [left right])
+                       (b/emit! (mut graph)
+                                opcode
+                                (cast i32 ty)
+                                [left
+                                 right
+                                 (if (= (% mode 2) 0) start (: 0 i32))])))
+        ret
+          (require (b/emit! (mut graph)
+                            120
+                            (cast i32 ty)
+                            [start result (: 0 i32)]))
+        (mut failures) 0]
+    (match (calls/create 0 ty [ty ty] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype]
+            (require (calls/function! (mut graph) owned allocator))
+            (calls/release! (mut owned)))))
+    (match (compile/text graph start [ret] allocator)
+      (Err [msg]
+           (do
+             (println "compile op={} ty={} mode={}: {}" opcode ty mode msg)
+             (set! failures (+ failures 1))))
+      (Ok [compiled]
+          (let [(mut code) compiled]
+            (match (jit/map-text (slice code))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [loaded]
+                  (let [(mut owned) loaded
+                        f
+                          (primitive/cast (fnptr (cc/C) [u64 u64] u64)
+                                          (.base owned))]
+                    (for a [(: 0 u64)
+                            1
+                            2
+                            3
+                            7
+                            0xFFFFFFFF
+                            0x80000000
+                            0x7FFFFFFF
+                            0x8000000000000000
+                            0x7FFFFFFFFFFFFFFF
+                            0xFFFFFFFFFFFFFFFF
+                            0xFEDCBA9876543210]
+                      (for b [(: 0 u64)
+                              1
+                              2
+                              3
+                              7
+                              31
+                              32
+                              63
+                              64
+                              65
+                              127
+                              0x80000000
+                              0x8000000000000000
+                              0xFFFFFFFFFFFFFFFF]
+                        (let [x
+                                (if (or (= mode 1) (= mode 3) (= mode 4))
+                                    literal
+                                    a)
+                              y
+                                (if (>= mode 2)
+                                    (if (= mode 4) (: 0 u64) (: 3 u64))
+                                    b)
+                              wanted (expected opcode (cast i32 ty) x y)
+                              actual (call-ptr f a b)]
+                          (when (!= actual wanted)
+                            (when (= failures 0)
+                              (println "op={} ty={} mode={} a={} b={} expected={} actual={}"
+                                       opcode
+                                       ty
+                                       mode
+                                       x
+                                       y
+                                       wanted
+                                       actual))
+                            (set! failures (+ failures 1))))))
+                    (jit/release! (mut owned)))))
+            (free! (mut code)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for ty [(: 4 u8) 5 6 10 11]
+      (for opcode [(: 29 i32) 30 52]
+        (when (or (!= ty 6) (!= opcode 52))
+          (let [(mut mode) (: 0 i32)]
+            (while (< mode 5)
+              (set! failures (+ failures (check opcode ty mode)))
+              (set! mode (+ mode 1)))))))
+    (println "native integer division/remainder/rotate-left checks: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

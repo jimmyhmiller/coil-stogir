@@ -1,0 +1,146 @@
+(module stogir.tests.jit-large-outgoing)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.frame-memory" :as memory)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.bytes" :as bytes)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn write! [(object (Result (ArrayList u8) (slice u8))) (path (slice u8))]
+  (-> i64)
+  (match object
+    (Err [message] (println "{}" message) 1)
+    (Ok [value]
+        (let [(mut bytes) value
+              result
+                (match (fs/write-file (malloc-allocator) path (slice bytes))
+                  (Err [_] 1)
+                  (Ok [_] 0))]
+          (free! (mut bytes))
+          result))))
+
+(defn check [(dynamic? bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        (mut probe) (ArrayList::new [u8] allocator)
+        (mut arguments) (ArrayList::new [i32] allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        count (require (b/scalar-constant! (mut graph) 5 17 8))
+        sentinel (require (b/scalar-constant! (mut graph) 5 321 8))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        last (require (b/scalar-constant! (mut graph) 5 0x123456789ABCDEF0 8))
+        allocation
+          (if dynamic?
+              (require (b/stack-allocate! (mut graph) start count 16))
+              start)
+        control
+          (if dynamic?
+              (require (b/emit! (mut graph)
+                                93
+                                0
+                                [allocation allocation sentinel]))
+              start)
+        (mut i) (: 0 i64)
+        (mut failures) 0]
+    ; 8 GP arguments + 4097 stack arguments: the last starts at SP+32768,
+    ; beyond the scaled load/store range. The frame record is higher still.
+    (while (< i 4105)
+      (push! (mut arguments) (if (= i 4104) last zero))
+      (set! i (+ i 1)))
+    (match (memory/access! (mut probe) true 8 0 31 32768 false 16)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [_] 0))
+    (match (encode/ret 30)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [word] (bytes/append32! (mut probe) word)))
+    (match (calls/create 16 5 [(: 5 u8) 5 5 5 5 5 5 5] allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype
+                call
+                  (require (calls/emit! (mut graph)
+                                        owned
+                                        control
+                                        target
+                                        (slice arguments)
+                                        allocator))
+                loaded
+                  (if dynamic?
+                      (require (b/emit! (mut graph) 91 5 [call allocation]))
+                      call)
+                result
+                  (if dynamic?
+                      (require (b/emit! (mut graph) 26 5 [call loaded]))
+                      call)
+                ret
+                  (require (b/emit! (mut graph) 120 5 [loaded result (: 0 i32)]))]
+            (set! failures
+                  (+ failures
+                     (write! (compile/object graph
+                                             start
+                                             [ret]
+                                             (if dynamic?
+                                                 "_stogir_large_outgoing_dynamic"
+                                                 "_stogir_large_outgoing")
+                                             allocator)
+                             (if dynamic?
+                                 "/tmp/coil-stogir-large-outgoing-dynamic.o"
+                                 "/tmp/coil-stogir-large-outgoing.o"))))
+            (match (compile/text graph start [ret] allocator)
+              (Err [message]
+                   (println "{}" message)
+                   (set! failures (+ failures 1)))
+              (Ok [text]
+                  (let [(mut bytes) text]
+                    (match (jit/map-text (slice bytes))
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [image]
+                          (let [(mut mapped) image
+                                f
+                                  (primitive/cast (fnptr (cc/C) [u64] u64)
+                                                  (.base mapped))]
+                            (match (jit/map-text (slice probe))
+                              (Err [_] (set! failures (+ failures 1)))
+                              (Ok [probe-image]
+                                  (let [(mut mapped-probe) probe-image
+                                        address
+                                          (primitive/cast u64
+                                                          (.base mapped-probe))
+                                        expected
+                                          (+ (: 0x123456789ABCDEF0 u64)
+                                             (if dynamic? 321 0))]
+                                    (when (!= (call-ptr f address) expected)
+                                      (set! failures (+ failures 1)))
+                                    (jit/release! (mut mapped-probe)))))
+                            (jit/release! (mut mapped)))))
+                    (free! (mut bytes)))))
+            (calls/release! (mut owned)))))
+    (set! failures
+          (+ failures
+             (write! (macho/text-object (slice probe)
+                                        "_stogir_large_probe"
+                                        allocator)
+                     "/tmp/coil-stogir-large-probe.o")))
+    (free! (mut arguments))
+    (free! (mut probe))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures (+ (check false) (check true))]
+    (println "4105-argument calls with large outgoing/frame offsets: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

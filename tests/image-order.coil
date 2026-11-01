@@ -1,0 +1,152 @@
+(module stogir.tests.image-order)
+(import "stogir.image" :as image)
+(import "stogir.image-order" :as order)
+(import "stogir.aot.macho-symbols" :as symbols)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.slice" :use [subslice])
+(import "coil.result" :use [Ok Err])
+
+(defn relocation-order [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut source) (image/create allocator)
+        (mut failures) 0
+        (mut i) (: 0 i64)]
+    (image/local-symbol! (mut source) "target" 1 0)
+    (while (< i 1000)
+      (bytes/append32! (mut (.text source)) 0x14000000)
+      (set! i (+ i 1)))
+    (set! i 0)
+    (while (< i 1000)
+      (image/relocate! (mut source)
+                       (image/Relocation
+                         :section 1
+                         :offset (* i 4)
+                         :kind 2
+                         :symbol 0
+                         :addend 0))
+      (set! i (+ i 1)))
+    (match (order/relocations source allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [records]
+          (let [(mut owned) records]
+            (set! i 0)
+            (while (< i (len owned))
+              (when (!= (.offset (get owned i)) (* (- 999 i) 4))
+                (set! failures (+ failures 1)))
+              (set! i (+ i 1)))
+            (free! (mut owned)))))
+    (when (!= (.offset (get (.relocations source) 0)) 0)
+      (set! failures (+ failures 1)))
+    (image/relocate! (mut source)
+                     (image/Relocation
+                       :section 1
+                       :offset 0
+                       :kind 1
+                       :symbol 0
+                       :addend 0))
+    (match (order/relocations source allocator)
+      (Err [_] 0)
+      (Ok [records]
+          (let [(mut owned) records]
+            (free! (mut owned))
+            (set! failures (+ failures 1)))))
+    (image/release! (mut source))
+    failures))
+
+(defn symbol-order [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut source) (image/create allocator)
+        (mut failures) 0
+        (mut i) (: 0 i64)]
+    (bytes/append32! (mut (.text source)) 0xD65F03C0)
+    (bytes/append32! (mut (.data source)) 0)
+    (bytes/append32! (mut (.data source)) 0)
+    (while (< i 1000)
+      (let [n (- 999 i)
+            group (% i 4)
+            section (cast i32 (if (= group 0) 0 (if (= group 1) 1 2)))
+            name
+              [(: 95 u8)
+               115
+               (cast u8 (+ 65 (/ n 676)))
+               (cast u8 (+ 65 (% (/ n 26) 26)))
+               (cast u8 (+ 65 (% n 26)))]]
+        (match (if (or (= group 1) (= group 3))
+                   (image/local-symbol! (mut source) name section 0)
+                   (image/symbol! (mut source) name section 0))
+          (Err [_] (set! failures (+ failures 1)))
+          (Ok [_] 0)))
+      (set! i (+ i 1)))
+    (match (symbols/build source allocator)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [table]
+          (let [(mut owned) table
+                (mut previous-group) (: -1 i32)
+                (mut previous-id) (: 1001 i32)]
+            (when (or (!= (.locals owned) 500)
+                      (!= (.defined owned) 250)
+                      (!= (.string-size owned) 6001))
+              (set! failures (+ failures 1)))
+            (set! i 0)
+            (while (< i (len (.order owned)))
+              (let [id (get (.order owned) i)
+                    symbol (get (.symbols source) (cast i64 id))
+                    group
+                      (cast i32
+                            (if (not (.global? symbol))
+                                0
+                                (if (= (.section symbol) 0) 2 1)))]
+                (when (or (< group previous-group)
+                          (and (= group previous-group) (>= id previous-id))
+                          (!= (get (.indices owned) (cast i64 id)) (cast i32 i))
+                          (!= (get (.strings owned) (cast i64 id))
+                              (+ (* i 6) 1)))
+                  (set! failures (+ failures 1)))
+                (set! previous-id id)
+                (set! previous-group group))
+              (set! i (+ i 1)))
+            (symbols/release! (mut owned)))))
+    (image/release! (mut source))
+    failures))
+
+(defn alias-names [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut source) (image/create allocator)
+        (mut name) (ArrayList::new [u8] allocator)
+        (mut i) 0
+        (mut failures) 0]
+    (while (< i 1024)
+      (push! (mut name) (cast u8 (+ 65 (% i 26))))
+      (set! i (+ i 1)))
+    (image/symbol! (mut source) (slice name) 1 0)
+    (match (image/local-symbol! (mut source)
+                                (subslice (slice (.names source)) 1 1024)
+                                1
+                                0)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [id]
+          (let [symbol (get (.symbols source) (cast i64 id))]
+            (when (or (.global? symbol) (!= (.length symbol) 1023))
+              (set! failures (+ failures 1)))
+            (set! i 0)
+            (while (< i 1023)
+              (when (!= (get (.names source) (+ (.name symbol) i))
+                        (get name (+ i 1)))
+                (set! failures (+ failures 1)))
+              (set! i (+ i 1))))))
+    (match (image/local-symbol! (mut source) (slice name) 1 0)
+      (Err [_] 0)
+      (Ok [_] (set! failures (+ failures 1))))
+    (match (image/local-symbol! (mut source) "undefined-local" 0 0)
+      (Err [_] 0)
+      (Ok [_] (set! failures (+ failures 1))))
+    (free! (mut name))
+    (image/release! (mut source))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures (+ (relocation-order) (symbol-order) (alias-names))]
+    (println "image ordering and arena checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

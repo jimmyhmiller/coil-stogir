@@ -1,0 +1,112 @@
+(module stogir.tests.a64-allocate)
+(import "stogir.a64.code" :as buffer)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.cfg" :as cfg)
+(import "stogir.schedule" :as schedule)
+(import "stogir.register-live" :as live)
+(import "stogir.live-ranges" :as ranges)
+(import "stogir.a64.constraints" :as constraints)
+(import "stogir.a64.allocate" :as allocate)
+(import "stogir.locations" :as locations)
+(import "stogir.a64.emit" :as emit)
+(import "stogir.a64.function" :as function)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.bytes" :as bytes)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        param (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        constant (require (b/scalar-constant! (mut graph) 11 42 8))
+        sum (require (b/emit! (mut graph) 26 11 [param constant]))
+        ret (require (b/emit! (mut graph) 120 11 [start sum (: 0 i32)]))
+        (mut local) (ArrayList::new [i32] a)
+        (mut order) (ArrayList::new [i32] a)
+        (mut mapping) (ArrayList::new [i32] a)
+        (mut i) 0
+        (mut failures) 0]
+    (while (< i (len (.instructions graph)))
+      (push! (mut mapping) start)
+      (set! i (+ i 1)))
+    (for node [start param sum ret] (push! (mut local) node))
+    (push! (mut order) start)
+    (let [(mut packed) (schedule/pack local mapping order a)]
+      (match (cfg/build graph a)
+        (Err [_] (set! failures (+ failures 1)))
+        (Ok [blocks]
+            (let [(mut owned) blocks
+                  (mut analysis) (live/analyze graph owned packed order a)
+                  (mut intervals) (ranges/build graph packed analysis order a)]
+              (match (constraints/build graph packed a)
+                (Err [_] (set! failures (+ failures 1)))
+                (Ok [requirements]
+                    (let [(mut req) requirements]
+                      (match (allocate/build intervals req graph packed a)
+                        (Err [msg]
+                             (do
+                               (println "{}" msg)
+                               (set! failures (+ failures 1))))
+                        (Ok [assigned]
+                            (let [(mut allocation) assigned]
+                              (match (locations/lookup (.parts allocation)
+                                                       sum
+                                                       6)
+                                (Err [_] (set! failures (+ failures 1)))
+                                (Ok [location]
+                                    (when (!= (.value location) 0)
+                                      (set! failures (+ failures 1)))))
+                              (let [(mut text) (ArrayList::new [u8] a)]
+                                (match (function/body graph
+                                                      packed
+                                                      allocation
+                                                      analysis
+                                                      req
+                                                      a)
+                                  (Err [msg]
+                                       (do
+                                         (println "{}" msg)
+                                         (set! failures (+ failures 1))))
+                                  (Ok [emitted]
+                                      (let [(mut owned-text) emitted]
+                                        (for byte (.text owned-text)
+                                          (push! (mut text) byte))
+                                        (buffer/release! (mut owned-text)))))
+                                (match (jit/map-text (slice text))
+                                  (Err [_] (set! failures (+ failures 1)))
+                                  (Ok [image]
+                                      (let [(mut owned-image) image
+                                            f
+                                              (primitive/cast (fnptr (cc/C)
+                                                                     [i64]
+                                                                     i64)
+                                                              (.base owned-image))
+                                            (mut x) -100]
+                                        (while (<= x 100)
+                                          (when (!= (call-ptr f x) (+ x 42))
+                                            (set! failures (+ failures 1)))
+                                          (set! x (+ x 1)))
+                                        (jit/release! (mut owned-image)))))
+                                (free! (mut text)))
+                              (allocate/release! (mut allocation)))))
+                      (constraints/release! (mut req)))))
+              (ranges/release! (mut intervals))
+              (live/release-analysis! (mut analysis))
+              (cfg/release! (mut owned)))))
+      (schedule/release! (mut packed)))
+    (free! (mut local))
+    (free! (mut order))
+    (free! (mut mapping))
+    (g/release! (mut graph))
+    (println "AArch64 allocation integration checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

@@ -1,0 +1,216 @@
+(module stogir.tests.jit-floating-loop)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defstruct Pattern [(wide u64) (narrow u64)])
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn nan? [(ty u8) (bits u64)] (-> bool)
+  (let [exp (if (= ty 12) (: 0x7FF0000000000000 u64) 0x7F800000)
+        fraction (if (= ty 12) (: 0xFFFFFFFFFFFFF u64) 0x7FFFFF)]
+    (and (= (& bits exp) exp) (!= (& bits fraction) 0))))
+
+(defn check [(ty u8) (swap? bool) (anchored? bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        frame
+          (if anchored?
+              (require (b/emit! (mut graph) 66 6 []))
+              (require (b/scalar-constant! (mut graph) 6 1 8)))
+        limit (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        input
+          (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 1]))
+        entry (require (b/emit! (mut graph) 114 0 [start]))
+        loop (require (b/loop-begin! (mut graph) entry))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        negative-zero (if (= ty 12) (: 0x8000000000000000 u64) 0x80000000)
+        initial
+          (require (b/scalar-constant! (mut graph)
+                                       (cast i32 ty)
+                                       negative-zero
+                                       8))
+        fp-one
+          (require (b/scalar-constant! (mut graph)
+                                       (cast i32 ty)
+                                       (if (= ty 12)
+                                           (: 0x3FF0000000000000 u64)
+                                           0x3F800000)
+                                       8))
+        index (require (b/loop-phi! (mut graph) loop zero))
+        value (require (b/loop-phi! (mut graph) loop input))
+        other (if swap? (require (b/loop-phi! (mut graph) loop initial)) 0)
+        condition (require (b/emit! (mut graph) 16 1 [index limit]))
+        split (require (b/emit! (mut graph) 116 0 [loop condition]))
+        body (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        exit (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        next-index (require (b/emit! (mut graph) 26 11 [index one]))
+        next-value
+          (if swap?
+              other
+              (require (b/floating! (mut graph) 26 (cast i32 ty) value fp-one 0)))
+        back (require (b/emit! (mut graph) 115 0 [body]))
+        fallback (require (b/scalar-constant! (mut graph) (cast i32 ty) 0 8))
+        checked
+          (require (b/emit! (mut graph) 60 (cast i32 ty) [frame value fallback]))
+        ret
+          (require (b/emit! (mut graph)
+                            120
+                            (cast i32 ty)
+                            [exit checked (: 0 i32)]))
+        (mut failures) 0]
+    (require (b/patch! (mut graph) loop 2 back))
+    (require (b/patch! (mut graph) index 3 next-index))
+    (require (b/patch! (mut graph) value 3 next-value))
+    (when swap? (require (b/patch! (mut graph) other 3 value)))
+    (match (calls/create 0 ty [(: 11 u8) ty] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype]
+            (require (calls/function! (mut graph) owned allocator))
+            (calls/release! (mut owned)))))
+    (match (compile/object graph
+                           start
+                           [ret]
+                           (if (= ty 12)
+                               (if swap?
+                                   "_stogir_fp_swap_f64"
+                                   "_stogir_fp_add_f64")
+                               (if swap?
+                                   "_stogir_fp_swap_f32"
+                                   "_stogir_fp_add_f32"))
+                           allocator)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [object]
+          (let [(mut bytes) object]
+            (match (fs/write-file allocator
+                                  (if (= ty 12)
+                                      (if swap?
+                                          "/tmp/coil-stogir-fp-swap-f64.o"
+                                          "/tmp/coil-stogir-fp-add-f64.o")
+                                      (if swap?
+                                          "/tmp/coil-stogir-fp-swap-f32.o"
+                                          "/tmp/coil-stogir-fp-add-f32.o"))
+                                  (slice bytes))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [_] 0))
+            (free! (mut bytes)))))
+    (match (compile/text graph start [ret] allocator)
+      (Err [msg]
+           (do
+             (println "FP loop ty={} swap={}: {}" ty swap? msg)
+             (set! failures (+ failures 1))))
+      (Ok [text]
+          (let [(mut code) text]
+            (match (jit/map-text (slice code))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [loaded]
+                  (let [(mut image) loaded]
+                    (for n [(: -2 i64) -1 0 1 2 3 10 31]
+                      (for row [(Pattern :wide 0 :narrow 0)
+                                (Pattern
+                                  :wide 0x8000000000000000
+                                  :narrow 0x80000000)
+                                (Pattern
+                                  :wide 0x3FF4000000000000
+                                  :narrow 0x3FA00000)
+                                (Pattern
+                                  :wide 0xBFF4000000000000
+                                  :narrow 0xBFA00000)
+                                (Pattern
+                                  :wide 0x7FF0000000000000
+                                  :narrow 0x7F800000)
+                                (Pattern
+                                  :wide 0x7FF0123456789ABC
+                                  :narrow 0x7F812345)
+                                (Pattern
+                                  :wide 0xFFF8123456789ABC
+                                  :narrow 0xFFC12345)]
+                        (let [bits (if (= ty 12) (.wide row) (.narrow row))
+                              (mut actual) (: 0 u64)
+                              (mut wanted) bits
+                              (mut i) (: 0 i64)]
+                          (if (= ty 12)
+                              (let [fun
+                                      (primitive/cast (fnptr (cc/C)
+                                                             [i64 f64]
+                                                             f64)
+                                                      (.base image))
+                                    (mut input) (: 0.0 f64)]
+                                (store! (primitive/cast (ptr u64) (mut input))
+                                        bits)
+                                (let [(mut result) (call-ptr fun n input)
+                                      (mut expected) input]
+                                  (set! actual
+                                        (load (primitive/cast (ptr u64)
+                                                              (mut result))))
+                                  (while (< i n)
+                                    (set! expected (+ expected 1.0))
+                                    (set! i (+ i 1)))
+                                  (when (not swap?)
+                                    (set! wanted
+                                          (load (primitive/cast (ptr u64)
+                                                                (mut expected)))))))
+                              (let [fun
+                                      (primitive/cast (fnptr (cc/C)
+                                                             [i64 f32]
+                                                             f32)
+                                                      (.base image))
+                                    (mut input) (: 0.0 f32)]
+                                (store! (primitive/cast (ptr u32) (mut input))
+                                        (cast u32 bits))
+                                (let [(mut result) (call-ptr fun n input)
+                                      (mut expected) input]
+                                  (set! actual
+                                        (cast u64
+                                              (load (primitive/cast (ptr u32)
+                                                                    (mut result)))))
+                                  (while (< i n)
+                                    (set! expected (+ expected (: 1.0 f32)))
+                                    (set! i (+ i 1)))
+                                  (when (not swap?)
+                                    (set! wanted
+                                          (cast u64
+                                                (load (primitive/cast (ptr u32)
+                                                                      (mut expected)))))))))
+                          (when (and swap? (> n 0) (= (% n 2) 1))
+                            (set! wanted negative-zero))
+                          (when (if (and (not swap?) (> n 0) (nan? ty wanted))
+                                    (not (nan? ty actual))
+                                    (!= actual wanted))
+                            (when (= failures 0)
+                              (println "FP loop mismatch ty={} swap={} n={} wanted={} actual={}"
+                                       ty
+                                       swap?
+                                       n
+                                       wanted
+                                       actual))
+                            (set! failures (+ failures 1))))))
+                    (jit/release! (mut image)))))
+            (free! (mut code)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures
+          (+ (check 12 false false)
+             (check 12 true false)
+             (check 13 false false)
+             (check 13 true false)
+             (check 12 false true)
+             (check 12 true true)
+             (check 13 false true)
+             (check 13 true true))]
+    (println "native floating arithmetic/swap loops: {} failures" failures)
+    (if (= failures 0) 0 1)))

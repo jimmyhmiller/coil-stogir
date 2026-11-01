@@ -1,0 +1,107 @@
+(module stogir.tests.locals)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.locals" :as local)
+(import "stogir.verify" :as verify)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.register-live" :as live)
+(import "stogir.live-ranges" :as ranges)
+(import "stogir.a64.compile" :as compile)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn rejected [(result (Result i32 (slice u8)))] (-> i64)
+  (match result (Ok [_] 1) (Err [_] 0)))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        variable (require (b/variable! (mut graph) 5 start "scalar" 0))
+        byte (require (b/variable! (mut graph) 2 start "byte" 1))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        stored (require (b/emit! (mut graph) 87 0 [start variable zero]))
+        address (require (b/variable-address! (mut graph) variable))
+        loaded (require (b/emit! (mut graph) 85 5 [stored variable]))
+        aliased (require (b/emit! (mut graph) 91 5 [loaded address]))
+        ret (require (b/emit! (mut graph) 120 5 [aliased aliased (: 0 i32)]))
+        (mut failures) 0]
+    (match (local/shape graph variable 8)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [shape]
+          (when (or (!= (.size shape) 8) (!= (.alignment shape) 8))
+            (set! failures (+ failures 1)))))
+    (set! failures
+          (+ failures
+             (rejected (b/variable! (mut graph) 0 start "void" 0))
+             (rejected (b/variable! (mut graph) 5 stored "region" 0))
+             (rejected (b/variable! (mut graph) 5 start "alignment" 3))
+             (rejected (b/variable! (mut graph) 5 start "alignment" -1))
+             (rejected (b/variable-address! (mut graph) zero))))
+    ; Storage contributes dependencies but has no live register interval.
+    (match (pipeline/prepare graph start [ret] allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [prepared]
+          (let [(mut owned) prepared
+                (mut analysis)
+                  (live/analyze graph
+                                (.blocks owned)
+                                (.schedule owned)
+                                (.order owned)
+                                allocator)
+                (mut intervals)
+                  (ranges/build graph
+                                (.schedule owned)
+                                analysis
+                                (.order owned)
+                                allocator)]
+            (when (or (!= (len (.ranges (get intervals (cast i64 variable)))) 0)
+                      (= (len (.ranges (get intervals (cast i64 address)))) 0))
+              (set! failures (+ failures 1)))
+            (ranges/release! (mut intervals))
+            (live/release-analysis! (mut analysis))
+            (pipeline/release! (mut owned)))))
+    (for bad [(require (b/emit! (mut graph) 85 5 [start byte]))
+              (require (b/emit! (mut graph) 87 0 [start byte zero]))
+              (require (b/emit! (mut graph) 87 5 [start variable zero]))
+              (require (b/emit! (mut graph) 85 5 [zero variable]))
+              (require (b/emit! (mut graph) 85 0 [start variable]))
+              (require (b/emit! (mut graph) 85 5 [start zero]))
+              (require (b/emit! (mut graph) 65 5 [variable]))
+              (require (b/emit! (mut graph) 87 0 [start variable variable]))
+              (require (b/emit! (mut graph) 72 5 [stored (: 0 i32) 0]))
+              (require (b/emit! (mut graph) 72 5 [start (: 999 i32) 0]))
+              (require (b/emit! (mut graph) 72 5 [start (: 0 i32) 3]))]
+      (set! failures (+ failures (rejected (local/validate graph bad 8)))))
+    (g/release! (mut graph))
+    ; Ordinary data operands must not turn VAR into an integer value.
+    (let [(mut other) (g/create allocator)
+          entry (require (b/emit! (mut other) 104 0 [(: 0 i32)]))
+          variable (require (b/variable! (mut other) 5 entry "bad-data" 8))
+          add (require (b/emit! (mut other) 26 5 [variable variable]))
+          ret (require (b/emit! (mut other) 120 5 [entry add (: 0 i32)]))]
+      (set! failures (+ failures (rejected (verify/structure other))))
+      (g/release! (mut other)))
+    ; The generic shape preserves alignment 32, but the current SP-based target
+    ; must reject it until it can actually establish an aligned frame anchor.
+    (let [(mut other) (g/create allocator)
+          entry (require (b/emit! (mut other) 104 0 [(: 0 i32)]))
+          variable (require (b/variable! (mut other) 5 entry "aligned" 32))
+          address (require (b/variable-address! (mut other) variable))
+          ret (require (b/emit! (mut other) 120 6 [entry address (: 0 i32)]))]
+      (match (local/validate other variable 8)
+        (Err [_] (set! failures (+ failures 1)))
+        (Ok [width] (when (!= width 8) (set! failures (+ failures 1)))))
+      (match (compile/text other entry [ret] allocator)
+        (Err [_] 0)
+        (Ok [text]
+            (let [(mut bytes) text]
+              (set! failures (+ failures 1))
+              (free! (mut bytes)))))
+      (g/release! (mut other)))
+    (println "local storage shape, extent, dependency and target validation: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

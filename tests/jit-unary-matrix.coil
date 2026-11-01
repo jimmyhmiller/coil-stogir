@@ -1,0 +1,192 @@
+(module stogir.tests.jit-unary-matrix)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.types" :as types)
+(import "stogir.fold" :as fold)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+;;; Arithmetic reference independent of the emitted instruction sequences.
+(defn expected [(opcode i32) (ty i32) (input u64)] (-> (Option u64))
+  (let [width (* 8 (types/scalar-size ty 8))
+        modulus (<< (: 1 u128) (cast u128 width))
+        mask (cast u64 (- modulus 1))
+        value (& input mask)
+        (mut result) (: 0 u64)
+        (mut valid?) true]
+    (match opcode
+      (31 (set! result (& (cast u64 (- modulus (cast u128 value))) mask)))
+      (32 (set! result
+                (if (>= (cast u128 value) (/ modulus 2))
+                    (cast u64 (- modulus (cast u128 value)))
+                    value)))
+      (45 (set! result
+                (if (= ty 1)
+                    (if (= value 0) (: 1 u64) (: 0 u64))
+                    (- mask value))))
+      (54 (let [(mut x) value
+                (mut i) (: 0 i32)]
+            (while (< i (/ width 8))
+              (set! result (+ (* result 256) (% x 256)))
+              (set! x (/ x 256))
+              (set! i (+ i 1)))))
+      (55 (let [(mut x) value]
+            (while (!= x 0) (set! result (+ result (% x 2))) (set! x (/ x 2)))))
+      (56 (if (= value 0)
+              (set! valid? false)
+              (let [(mut x) value
+                    (mut significant) (: 0 u64)]
+                (while (!= x 0)
+                  (set! significant (+ significant 1))
+                  (set! x (/ x 2)))
+                (set! result (- (cast u64 width) significant)))))
+      (57 (if (= value 0)
+              (set! valid? false)
+              (let [(mut x) value]
+                (while (= (% x 2) 0)
+                  (set! result (+ result 1))
+                  (set! x (/ x 2))))))
+      (_ (set! valid? false)))
+    (if valid?
+        (Some (if (and (types/signed? ty) (>= (cast u128 result) (/ modulus 2)))
+                  (cast u64 (- (cast i128 result) (cast i128 modulus)))
+                  result))
+        (None))))
+
+(defn check [(opcode i32) (ty u8) (mode i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 0]))
+        width (* 8 (types/scalar-size (cast i32 ty) 8))
+        mask (cast u64 (- (<< (: 1 u128) (cast u128 width)) 1))
+        literal
+          (if (= ty 1)
+              (if (= mode 3) (: 0 u64) (: 1 u64))
+              (if (= mode 3)
+                  (: 0 u64)
+                  (if (= mode 2)
+                      (<< (: 1 u64) (cast u64 (- width 1)))
+                      (& (: 0xFEDCBA9876543280 u64) mask))))
+        source
+          (if (= mode 0)
+              p
+              (require (b/scalar-constant! (mut graph) (cast i32 ty) literal 8)))
+        value (require (b/emit! (mut graph) opcode (cast i32 ty) [source]))
+        result-type
+          (if (and (< width 64) (!= ty 1))
+              (if (types/signed? (cast i32 ty)) 11 5)
+              (cast i32 ty))
+        result
+          (if (and (< width 64) (!= ty 1))
+              (require (b/emit! (mut graph)
+                                (if (types/signed? (cast i32 ty)) 33 34)
+                                result-type
+                                [value]))
+              value)
+        ret
+          (require (b/emit! (mut graph)
+                            120
+                            result-type
+                            [start result (: 0 i32)]))
+        (mut failures) 0]
+    (match (calls/create 0 (cast u8 result-type) [ty] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype]
+            (require (calls/function! (mut graph) owned allocator))
+            (calls/release! (mut owned)))))
+    (match (compile/text graph start [ret] allocator)
+      (Err [msg]
+           (do
+             (println "compile op={} ty={} mode={}: {}" opcode ty mode msg)
+             (set! failures (+ failures 1))))
+      (Ok [compiled]
+          (let [(mut code) compiled]
+            (match (jit/map-text (slice code))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [loaded]
+                  (let [(mut owned) loaded
+                        f
+                          (primitive/cast (fnptr (cc/C) [u64] u64)
+                                          (.base owned))]
+                    (for input [(: 0 u64)
+                                1
+                                2
+                                127
+                                128
+                                255
+                                256
+                                32767
+                                32768
+                                65535
+                                0x80000000
+                                0xFFFFFFFF
+                                0x8000000000000000
+                                0xFFFFFFFFFFFFFFFF
+                                0xFEDCBA9876543280]
+                      (when (or (!= ty 1) (<= input 1))
+                        (let [x (if (= mode 0) input literal)
+                              actual (call-ptr f input)
+                              oracle (expected opcode (cast i32 ty) x)
+                              folded
+                                (fold/integer-unary opcode (cast i32 ty) 8 x)]
+                          (match oracle
+                            (None []
+                                  (match folded
+                                    (Some [_] (set! failures (+ failures 1)))
+                                    (None [] 0)))
+                            (Some [wanted]
+                                  (when (!= actual wanted)
+                                    (when (= failures 0)
+                                      (println "op={} ty={} mode={} x={} expected={} actual={}"
+                                               opcode
+                                               ty
+                                               mode
+                                               x
+                                               wanted
+                                               actual))
+                                    (set! failures (+ failures 1)))
+                                  (match folded
+                                    (None [] (set! failures (+ failures 1)))
+                                    (Some [bits]
+                                          (when (!= bits (& wanted mask))
+                                            (set! failures (+ failures 1))))))))))
+                    (jit/release! (mut owned)))))
+            (free! (mut code)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for ty [(: 1 u8) 2 3 4 5 6 7 8 9 10 11]
+      (for opcode [(: 31 i32) 32 45 54 55 56 57]
+        (when (or (= opcode 45)
+                  (and (!= ty 1)
+                       (if (= opcode 31)
+                           (!= ty 6)
+                           (if (= opcode 32)
+                               (>= ty 7)
+                               (if (= opcode 54)
+                                   (or (= ty 3)
+                                       (= ty 4)
+                                       (= ty 5)
+                                       (= ty 6)
+                                       (= ty 9)
+                                       (= ty 10)
+                                       (= ty 11))
+                                   true)))))
+          (let [(mut mode) (: 0 i32)]
+            (while (< mode 4)
+              (set! failures (+ failures (check opcode ty mode)))
+              (set! mode (+ mode 1)))))))
+    (println "native integer unary matrix checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

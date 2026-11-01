@@ -1,0 +1,145 @@
+(module stogir.tests.aot-floating-arithmetic-link)
+(import "stogir.floating" :as floating)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Some None])
+
+(extern wide :as "stogir_floating_f64" :cc (cc/C) [f64 f64 (ptr u64)] (-> void))
+
+(extern narrow
+        :as
+        "stogir_floating_f32"
+        :cc
+        (cc/C)
+        [f32 f32 (ptr u64)]
+        (-> void))
+
+(defstruct Pattern [(wide u64) (narrow u64)])
+
+(defn nan? [(ty u8) (bits u64)] (-> bool)
+  (let [exponent (if (= ty 12) (: 0x7FF0000000000000 u64) 0x7F800000)
+        fraction (if (= ty 12) (: 0xFFFFFFFFFFFFF u64) 0x7FFFFF)]
+    (and (= (& bits exponent) exponent) (!= (& bits fraction) 0))))
+
+;;; Independent comparison oracle: IEEE bit classification plus monotonic keys,
+;;; with the two signed zeros equal. No floating comparison instructions here.
+(defn predicate [(opcode i32) (ty u8) (a u64) (b u64)] (-> bool)
+  (let [mask (if (= ty 12) (: 0xFFFFFFFFFFFFFFFF u64) 0xFFFFFFFF)
+        sign (if (= ty 12) (: 0x8000000000000000 u64) 0x80000000)
+        unordered? (or (nan? ty a) (nan? ty b))
+        equal?
+          (and (not unordered?)
+               (or (= a b)
+                   (and (= (& a (^ mask sign)) 0) (= (& b (^ mask sign)) 0))))
+        ak (if (= (& a sign) 0) (^ a sign) (^ a mask))
+        bk (if (= (& b sign) 0) (^ b sign) (^ b mask))
+        less? (and (not unordered?) (not equal?) (< ak bk))
+        greater? (and (not unordered?) (not equal?) (> ak bk))]
+    (match opcode
+      (14 equal?)
+      (15 (not equal?))
+      (16 less?)
+      (17 (or greater? equal?))
+      (18 (or less? equal?))
+      (19 greater?)
+      (20 (or unordered? less?))
+      (21 (or unordered? greater? equal?))
+      (22 (or unordered? less? equal?))
+      (23 (or unordered? greater?))
+      (24 (not unordered?))
+      (25 unordered?)
+      (_ false))))
+
+(defn expected [(opcode i32) (ty u8) (a u64) (b u64)] (-> u64)
+  (let [sign (if (= ty 12) (: 0x8000000000000000 u64) 0x80000000)
+        mask (if (= ty 12) (: 0xFFFFFFFFFFFFFFFF u64) 0xFFFFFFFF)]
+    (if (floating/comparison? opcode)
+        (if (predicate opcode ty a b) (: 1 u64) 0)
+        (if (= opcode 31)
+            (^ a sign)
+            (if (= opcode 32)
+                (& a (^ mask sign))
+                (if (or (= opcode 58) (= opcode 59))
+                    (if (predicate (if (= opcode 58) 18 17) ty a b) a b)
+                    (match (floating/evaluate opcode (cast i32 ty) a b)
+                      (None [] (: 0 u64))
+                      (Some [bits] bits))))))))
+
+(defn main [] (-> i64)
+  (let [(mut cells) (ArrayList::new [u64] (malloc-allocator))
+        (mut i) (: 0 i64)
+        (mut failures) 0
+        patterns
+          [(Pattern :wide 0 :narrow 0)
+           (Pattern :wide 0x8000000000000000 :narrow 0x80000000)
+           (Pattern :wide 1 :narrow 1)
+           (Pattern :wide 0x8000000000000001 :narrow 0x80000001)
+           (Pattern :wide 0x3FF0000000000000 :narrow 0x3F800000)
+           (Pattern :wide 0xBFF0000000000000 :narrow 0xBF800000)
+           (Pattern :wide 0x4000000000000000 :narrow 0x40000000)
+           (Pattern :wide 0x4018000000000000 :narrow 0x40C00000)
+           (Pattern :wide 0x7FF0000000000000 :narrow 0x7F800000)
+           (Pattern :wide 0xFFF0000000000000 :narrow 0xFF800000)
+           (Pattern :wide 0x7FF8123456789ABC :narrow 0x7FC12345)
+           (Pattern :wide 0xFFF8123456789ABC :narrow 0xFFC12345)
+           (Pattern :wide 0x7FF0123456789ABC :narrow 0x7F812345)
+           (Pattern :wide 0x7FEFFFFFFFFFFFFF :narrow 0x7F7FFFFF)]]
+    (while (< i 20) (push! (mut cells) 0) (set! i (+ i 1)))
+    (for ty [(: 12 u8) 13]
+      (for a patterns
+        (for b patterns
+          (let [x (if (= ty 12) (.wide a) (.narrow a))
+                y (if (= ty 12) (.wide b) (.narrow b))]
+            (if (= ty 12)
+                (let [(mut left) (: 0.0 f64)
+                      (mut right) (: 0.0 f64)]
+                  (store! (primitive/cast (ptr u64) (mut left)) x)
+                  (store! (primitive/cast (ptr u64) (mut right)) y)
+                  (wide left right (.data cells)))
+                (let [(mut left) (: 0.0 f32)
+                      (mut right) (: 0.0 f32)]
+                  (store! (primitive/cast (ptr u32) (mut left)) (cast u32 x))
+                  (store! (primitive/cast (ptr u32) (mut right)) (cast u32 y))
+                  (narrow left right (.data cells))))
+            (set! i 0)
+            (for opcode [(: 14 i32)
+                         15
+                         16
+                         17
+                         18
+                         19
+                         20
+                         21
+                         22
+                         23
+                         24
+                         25
+                         26
+                         27
+                         28
+                         29
+                         31
+                         32
+                         58
+                         59]
+              (let [wanted (expected opcode ty x y)
+                    actual (get cells i)]
+                (when (if (and (>= opcode 26) (<= opcode 29) (nan? ty wanted))
+                          (not (nan? ty actual))
+                          (!= actual wanted))
+                  (when (= failures 0)
+                    (println "linked FP ty={} op={} x={} y={} wanted={} actual={}"
+                             ty
+                             opcode
+                             x
+                             y
+                             wanted
+                             actual))
+                  (set! failures (+ failures 1))))
+              (set! i (+ i 1)))))))
+    (free! (mut cells))
+    (println "linked floating arithmetic/predicates/extrema: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

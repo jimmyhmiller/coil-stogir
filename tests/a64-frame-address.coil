@@ -1,0 +1,77 @@
+(module stogir.tests.a64-frame-address)
+(import "stogir.a64.frame-address" :as frame)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.bytes" :as bytes)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn word! [(output (mut (ArrayList u8))) (result (Result u32 (slice u8)))]
+  (-> i64)
+  (match result
+    (Ok [word] (bytes/append32! (mut output) word) 0)
+    (Err [message] (println "{}" message) 1)))
+
+(defn checked [(result (Result i32 (slice u8)))] (-> i64)
+  (match result (Ok [_] 0) (Err [message] (println "{}" message) 1)))
+
+(defn run [(size i64)] (-> i64)
+  (let [(mut text) (ArrayList::new [u8] (malloc-allocator))
+        (mut failures) 0]
+    ; CMP before all helpers; their MOV/ADD/SUB must leave EQ set.
+    (set! failures
+          (+ failures
+             (word! (mut text)
+                    (encode/add-sub true true true 31 0 0))))
+    (set! failures
+          (+ failures (checked (frame/adjust! (mut text) true size 17))))
+    (set! failures
+          (+ failures (checked (frame/address! (mut text) 16 31 (- size 8)))))
+    (set! failures
+          (+ failures (word! (mut text) (encode/load-store false 8 0 16 0))))
+    (set! failures
+          (+ failures (word! (mut text) (encode/load-store true 8 0 16 0))))
+    (set! failures
+          (+ failures (checked (frame/adjust! (mut text) false size 17))))
+    (set! failures
+          (+ failures (word! (mut text) (encode/conditional-set true 1 0))))
+    (set! failures
+          (+ failures
+             (word! (mut text) (encode/add-sub true false false 0 0 1))))
+    (set! failures (+ failures (word! (mut text) (encode/ret 30))))
+    (when (= failures 0)
+      (match (jit/map-text (slice text))
+        (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+        (Ok [image]
+            (let [(mut owned) image
+                  f (primitive/cast (fnptr (cc/C) [u64] u64) (.base owned))]
+              (when (!= (f 42) 43) (set! failures (+ failures 1)))
+              (jit/release! (mut owned))))))
+    (free! (mut text))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut text) (ArrayList::new [u8] (malloc-allocator))
+        (mut failures) (+ (run 16) (run 4096) (run 8800) (run 65552))]
+    (match (frame/adjust! (mut text) false 0 16)
+      (Ok [count] (when (!= count 0) (set! failures (+ failures 1))))
+      (Err [_] (set! failures (+ failures 1))))
+    (match (frame/adjust! (mut text) true 17 16)
+      (Ok [_] (set! failures (+ failures 1)))
+      (Err [_] 0))
+    (match (frame/address! (mut text) 16 16 8800)
+      (Ok [_] (set! failures (+ failures 1)))
+      (Err [_] 0))
+    (match (frame/address! (mut text) 31 0 8800)
+      (Ok [_] (set! failures (+ failures 1)))
+      (Err [_] 0))
+    (match (frame/address! (mut text) 16 31 -1)
+      (Ok [_] (set! failures (+ failures 1)))
+      (Err [_] 0))
+    (when (!= (len text) 0) (set! failures (+ failures 1)))
+    (free! (mut text))
+    (println "frame address and stack adjustment: {} failures" failures)
+    (if (= failures 0) 0 1)))

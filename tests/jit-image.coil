@@ -1,0 +1,80 @@
+(module stogir.tests.jit-image)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "stogir.bytes" :as bytes)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Ok Err])
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut code) (image/create allocator)
+        (mut failures) 0]
+    (image/symbol! (mut code) "entry" 1 0)
+    (image/symbol! (mut code) "callee" 1 4)
+    (bytes/append32! (mut (.text code)) 0x14000000)
+    (bytes/append32! (mut (.text code)) 0xD2800540)
+    (bytes/append32! (mut (.text code)) 0xD65F03C0)
+    (bytes/append32! (mut (.data code)) 0)
+    (bytes/append32! (mut (.data code)) 0)
+    (image/relocate! (mut code)
+                     (image/Relocation
+                       :section 1
+                       :offset 0
+                       :kind 2
+                       :symbol 1
+                       :addend 0))
+    (image/relocate! (mut code)
+                     (image/Relocation
+                       :section 2
+                       :offset 0
+                       :kind 1
+                       :symbol 1
+                       :addend 0))
+    (match (jit/map-image code allocator)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [loaded]
+          (let [(mut owned) loaded
+                f (primitive/cast (fnptr (cc/C) [] i64) (.base (.memory owned)))
+                pointer
+                  (primitive/cast (ptr u64)
+                                  (index (.base (.memory owned))
+                                         (.data-offset owned)))]
+            (when (!= (call-ptr f) 42) (set! failures (+ failures 1)))
+            (when (!= (load pointer) (get (.addresses owned) 1))
+              (set! failures (+ failures 1)))
+            (set! pointer (: 123 u64))
+            (when (!= (load pointer) 123) (set! failures (+ failures 1)))
+            (jit/release-image! (mut owned)))))
+    (when (!= (get (.text code) 0) 0) (set! failures (+ failures 1)))
+    (image/symbol! (mut code) "external" 0 0)
+    (match (jit/map-image-resolved code
+                                   [(: 0 u64) 0 12345]
+                                   [false false true]
+                                   allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [loaded]
+          (let [(mut owned) loaded]
+            (when (!= (get (.addresses owned) 2) 12345)
+              (set! failures (+ failures 1)))
+            (jit/release-image! (mut owned)))))
+    (match (jit/map-image-resolved code
+                                   [(: 0 u64) 0 0]
+                                   [false false true]
+                                   allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [loaded]
+          (let [(mut owned) loaded]
+            (when (!= (get (.addresses owned) 2) 0)
+              (set! failures (+ failures 1)))
+            (jit/release-image! (mut owned)))))
+    (match (jit/map-image code allocator)
+      (Err [_] 0)
+      (Ok [loaded]
+          (let [(mut owned) loaded]
+            (set! failures (+ failures 1))
+            (jit/release-image! (mut owned)))))
+    (image/release! (mut code))
+    (println "relocated JIT image checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

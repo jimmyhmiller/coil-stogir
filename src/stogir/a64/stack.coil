@@ -1,0 +1,143 @@
+; Dynamic stack lowering follows dstogov/ir ir_aarch64.dasc, 92171d0. See NOTICE.
+(module stogir.a64.stack)
+(import "stogir.stack" :as stack)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.allocation" :as allocation)
+(import "stogir.locations" :as locations)
+(import "stogir.a64.frame-address" :as frame)
+(import "stogir.a64.value" :as value)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.a64.emit" :as emit)
+(import "stogir.a64.constants" :as constants)
+(import "stogir.a64.code" :as code)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn constant! [(output (mut code/Buffer)) (error (mut (slice u8))) (bits u64)]
+  (-> void)
+  (match (constants/emit! (mut (.text output)) true 17 bits)
+    (Err [message] (set! error message))
+    (Ok [_] 0)))
+
+;;; Count normalization and rounding are identical for ALLOCA and AFREE. Invalid
+;;; runtime counts trap before SP changes, including negative signed operands.
+(defn dynamic! [(output (mut code/Buffer))
+                (graph g/Graph)
+                (parts (ArrayList allocation/Part))
+                (size i32)
+                (position i64)
+                (subtract? bool)] (-> (Result i32 (slice u8)))
+  (match (g/lookup graph size)
+    (None [] (Err "dynamic stack count missing"))
+    (Some [input]
+          (let [ty (cast i32 (n/type-id input))
+                width (types/scalar-size ty 8)
+                begin (len (.text output))
+                (mut error) ""]
+            (match (value/register! (mut output)
+                                    graph
+                                    parts
+                                    size
+                                    position
+                                    16
+                                    62)
+              (Err [message] (set! error message))
+              (Ok [reg]
+                  (emit/word! (mut (.text output))
+                              (mut error)
+                              (encode/extend true
+                                             (types/signed? ty)
+                                             (* width 8)
+                                             16
+                                             reg))))
+            (when (and (= error "") (or (= width 8) (types/signed? ty)))
+              (constant! (mut output) (mut error) 0x7FFFFFFFFFFFFFF0)
+              (emit/word! (mut (.text output))
+                          (mut error)
+                          (encode/add-sub true true true 31 16 17))
+              (emit/word! (mut (.text output))
+                          (mut error)
+                          (encode/conditional-branch 9 8))
+              ; BRK #0: the unsigned comparison rejects negative/overflowing counts.
+              (emit/word! (mut (.text output))
+                          (mut error)
+                          (Ok (: 0xD4200000 u32))))
+            (when (= error "")
+              (emit/word! (mut (.text output))
+                          (mut error)
+                          (encode/add-sub-immediate true false false 16 16 15))
+              (constant! (mut output) (mut error) 0xFFFFFFFFFFFFFFF0)
+              (emit/word! (mut (.text output))
+                          (mut error)
+                          (encode/logical-register true 0 16 16 17))
+              (emit/word! (mut (.text output))
+                          (mut error)
+                          (encode/add-sub-extended subtract? 31 31 16)))
+            (if (= error "")
+                (Ok (cast i32 (- (len (.text output)) begin)))
+                (Err error))))))
+
+;;; The function reserves an outgoing prefix below every active dynamic object.
+;;; Allocate d bytes: newSP=oldSP-d, result=newSP+outgoing. Fixed slots use x29.
+(defn emit! [(output (mut code/Buffer))
+             (graph g/Graph)
+             (parts (ArrayList allocation/Part))
+             (reference i32)
+             (position i64)
+             (base frame/Base)
+             (outgoing i64)] (-> (Result i32 (slice u8)))
+  (match (stack/validate graph reference)
+    (Err [message] (Err message))
+    (Ok [_]
+        (let [node (get (.instructions graph) (cast i64 reference))
+              allocating? (= (n/opcode node) 81)
+              (mut temporary) (code/create (.alc (.text output)))
+              (mut error) ""]
+          (if (or (not (frame/valid-base? base))
+                  (!= (.reg base) 29)
+                  (< outgoing 0)
+                  (!= (% outgoing 16) 0)
+                  (> outgoing (.bias base))
+                  (not (or (= (n/opcode node) 81) (= (n/opcode node) 82)))
+                  (and allocating? (> (.op3 node) 16)))
+              (set! error
+                    "dynamic stack requires anchored frame and supported alignment")
+              (if (< (.op2 node) 0)
+                  (match (stack/constant-size graph (.op2 node))
+                    (Err [message] (set! error message))
+                    (Ok [size]
+                        (match (frame/adjust! (mut (.text temporary))
+                                              allocating?
+                                              size
+                                              16)
+                          (Err [message] (set! error message))
+                          (Ok [_] 0))))
+                  (match (dynamic! (mut temporary)
+                                   graph
+                                   parts
+                                   (.op2 node)
+                                   position
+                                   allocating?)
+                    (Err [message] (set! error message))
+                    (Ok [_] 0))))
+          (when (and (= error "") allocating?)
+            (match (locations/lookup parts reference (+ position 1))
+              (Err [message] (set! error message))
+              (Ok [destination]
+                  (if (or (!= (.kind destination) 0)
+                          (< (.value destination) 0)
+                          (> (.value destination) 15))
+                      (set! error "ALLOCA result requires an allocatable GPR")
+                      (match (frame/address! (mut (.text temporary))
+                                             (cast i32 (.value destination))
+                                             31
+                                             outgoing)
+                        (Err [message] (set! error message))
+                        (Ok [_] 0))))))
+          (let [count (cast i32 (len (.text temporary)))]
+            (when (and (= error "") (not (code/append! (mut output) temporary)))
+              (set! error "invalid dynamic stack code references"))
+            (code/release! (mut temporary))
+            (if (= error "") (Ok count) (Err error)))))))

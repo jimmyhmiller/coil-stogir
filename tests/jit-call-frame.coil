@@ -1,0 +1,112 @@
+(module stogir.tests.jit-call-frame)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.encode" :as e)
+(import "stogir.bytes" :as bytes)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn word! [(code (mut (ArrayList u8))) (result (Result u32 (slice u8)))]
+  (-> void)
+  (match result
+    (Ok [word] (bytes/append32! (mut code) word))
+    (Err [msg] (println "{}" msg))))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut probe) (ArrayList::new [u8] allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        outer (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        (mut failures) 0]
+    ; Probe checks the previous-frame link against the expected caller frame,
+    ; and verifies its caller's frame record is above the outgoing stack area.
+    (word! (mut probe) (e/load-store true 8 1 29 0))
+    (word! (mut probe) (e/add-sub true true true 31 1 0))
+    (word! (mut probe) (e/conditional-set false 0 0))
+    (word! (mut probe) (e/add-sub-immediate true false false 1 31 0))
+    (word! (mut probe) (e/add-sub true true false 1 29 1))
+    (word! (mut probe) (e/add-sub-immediate true true true 31 1 16))
+    (word! (mut probe) (e/conditional-set false 1 0))
+    (word! (mut probe) (e/logical-register false 0 0 0 1))
+    (word! (mut probe) (e/ret 30))
+    (match (calls/create 0 10 [(: 6 u8) 11 11 11 11 11 11 11 11] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype
+                call
+                  (require (calls/emit! (mut graph)
+                                        owned
+                                        start
+                                        target
+                                        [outer zero zero zero zero zero zero
+                                         zero zero]
+                                        allocator))
+                ret (require (b/emit! (mut graph) 120 10 [call call (: 0 i32)]))]
+            (match (compile/text graph start [ret] allocator)
+              (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+              (Ok [compiled]
+                  (let [(mut code) compiled]
+                    (match (jit/map-text (slice code))
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [image]
+                          (let [(mut owned-image) image]
+                            (match (jit/map-text (slice probe))
+                              (Err [_] (set! failures (+ failures 1)))
+                              (Ok [probe-image]
+                                  (let [(mut owned-probe) probe-image
+                                        f
+                                          (primitive/cast (fnptr (cc/C)
+                                                                 [u64 u64]
+                                                                 i32)
+                                                          (.base owned-image))
+                                        ; Read the active Coil caller frame directly.
+                                        (mut capture-code)
+                                          (ArrayList::new [u8] allocator)]
+                                    (word! (mut capture-code)
+                                           (e/add-sub-immediate true
+                                                                false
+                                                                false
+                                                                0
+                                                                29
+                                                                0))
+                                    (word! (mut capture-code) (e/ret 30))
+                                    (match (jit/map-text (slice capture-code))
+                                      (Err [_] (set! failures (+ failures 1)))
+                                      (Ok [capture-image]
+                                          (let [(mut owned-capture)
+                                                  capture-image
+                                                get-frame
+                                                  (primitive/cast (fnptr (cc/C)
+                                                                         []
+                                                                         u64)
+                                                                  (.base owned-capture))
+                                                frame (call-ptr get-frame)]
+                                            (when (or (= frame 0)
+                                                      (!= (call-ptr f
+                                                                    (primitive/cast u64
+                                                                                    (.base owned-probe))
+                                                                    frame)
+                                                          1))
+                                              (set! failures (+ failures 1)))
+                                            (jit/release! (mut owned-capture)))))
+                                    (free! (mut capture-code))
+                                    (jit/release! (mut owned-probe)))))
+                            (jit/release! (mut owned-image)))))
+                    (free! (mut code)))))
+            (calls/release! (mut owned)))))
+    (free! (mut probe))
+    (g/release! (mut graph))
+    (println "native call frame checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

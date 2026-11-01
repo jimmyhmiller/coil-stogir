@@ -1,0 +1,125 @@
+(module stogir.tests.jit-call-stack)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.fs" :as fs)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn combine :cc (cc/C) [(a i64)
+                          (b i64)
+                          (c i64)
+                          (d i64)
+                          (e i64)
+                          (f i64)
+                          (g i64)
+                          (h i64)
+                          (i i32)
+                          (j i32)
+                          (k i64)
+                          (l i32)
+                          (m i64)] (-> i64)
+  (+ a
+     (* b 2)
+     (* c 3)
+     (* d 4)
+     (* e 5)
+     (* f 6)
+     (* g 7)
+     (* h 8)
+     (* (cast i64 i) 11)
+     (* (cast i64 j) 13)
+     (* k 17)
+     (* (cast i64 l) 19)
+     (* m 23)))
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        x (require (b/emit! (mut graph) 71 10 [start (: 0 i32) 1]))
+        y (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        (mut failures) 0]
+    (match (calls/create 0
+                         11
+                         [(: 11 u8) 11 11 11 11 11 11 11 10 10 11 10 11]
+                         allocator)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [prototype]
+          (let [(mut owned-prototype) prototype
+                call
+                  (require (calls/emit! (mut graph)
+                                        owned-prototype
+                                        start
+                                        target
+                                        [y y y y y y y y x x y x y]
+                                        allocator))
+                result (require (b/emit! (mut graph) 26 11 [call y]))
+                ret
+                  (require (b/emit! (mut graph) 120 11 [call result (: 0 i32)]))]
+            (match (compile/object graph
+                                   start
+                                   [ret]
+                                   "_stogir_stack_call_test"
+                                   allocator)
+              (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+              (Ok [object]
+                  (let [(mut owned) object]
+                    (match (fs/write-file allocator
+                                          "/tmp/coil-stogir-stack-call.o"
+                                          (slice owned))
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [_] 0))
+                    (free! (mut owned)))))
+            (match (compile/text graph start [ret] allocator)
+              (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+              (Ok [compiled]
+                  (let [(mut code) compiled]
+                    (match (jit/map-text (slice code))
+                      (Err [msg]
+                           (do
+                             (println "{}" msg)
+                             (set! failures (+ failures 1))))
+                      (Ok [image]
+                          (let [(mut owned-image) image
+                                f
+                                  (primitive/cast (fnptr (cc/C)
+                                                         [u64 i32 i64]
+                                                         i64)
+                                                  (.base owned-image))
+                                fn-address
+                                  (primitive/cast u64
+                                                  (primitive/cast (ptr u8)
+                                                                  (fnptr-of combine)))
+                                (mut x) (: -30 i32)]
+                            (while (<= x 30)
+                              (let [(mut y) (: -5 i64)]
+                                (while (<= y 5)
+                                  (let [actual (call-ptr f fn-address x y)
+                                        expected
+                                          (+ (* (cast i64 x) 43) (* y 77))]
+                                    (when (!= actual expected)
+                                      (when (= failures 0)
+                                        (println "x={} y={} expected={} actual={}"
+                                                 x
+                                                 y
+                                                 expected
+                                                 actual))
+                                      (set! failures (+ failures 1))))
+                                  (set! y (+ y 1))))
+                              (set! x (+ x 1)))
+                            (when (not (jit/release! (mut owned-image)))
+                              (set! failures (+ failures 1))))))
+                    (free! (mut code)))))
+            (calls/release! (mut owned-prototype)))))
+    (g/release! (mut graph))
+    (println "native stack call checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

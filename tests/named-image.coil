@@ -1,0 +1,138 @@
+(module stogir.tests.named-image)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.symbols" :as symbols)
+(import "stogir.image" :as image)
+(import "stogir.bytes" :as bytes)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.fs" :as fs)
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(extern labs :cc (cc/C) [i64] (-> i64))
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn save [(source image/Image) (path (slice u8))] (-> i64)
+  (let [allocator (malloc-allocator)]
+    (match (macho/image-object source allocator)
+      (Err [msg] (do (println "object: {}" msg) 1))
+      (Ok [object]
+          (let [(mut owned) object
+                result
+                  (match (fs/write-file allocator path (slice owned))
+                    (Err [_] (: 1 i64))
+                    (Ok [_] (: 0 i64)))]
+            (free! (mut owned))
+            result)))))
+
+(defn make [] (-> (Result image/Image (slice u8)))
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        target (require (symbols/function! (mut graph) "_labs" 0))
+        counter (require (symbols/symbol! (mut graph) "_stogir_named_counter"))
+        text (require (symbols/string! (mut graph) "A\0B"))
+        result
+          (match (calls/create 0 11 [(: 11 u8)] allocator)
+            (Err [msg] (Err [image/Image (slice u8)] msg))
+            (Ok [prototype]
+                (let [(mut owned) prototype
+                      called
+                        (require (calls/emit! (mut graph)
+                                              owned
+                                              start
+                                              target
+                                              [x]
+                                              allocator))
+                      loaded
+                        (require (b/emit! (mut graph) 91 11 [called counter]))
+                      byte (require (b/emit! (mut graph) 91 2 [loaded text]))
+                      extended (require (b/emit! (mut graph) 34 11 [byte]))
+                      sum (require (b/emit! (mut graph) 26 11 [called loaded]))
+                      total (require (b/emit! (mut graph) 26 11 [sum extended]))
+                      ret
+                        (require (b/emit! (mut graph)
+                                          120
+                                          11
+                                          [byte total (: 0 i32)]))
+                      compiled
+                        (match (compile/text graph start [ret] allocator)
+                          (Err [_]
+                               (compile/image graph
+                                              start
+                                              [ret]
+                                              "_stogir_named"
+                                              allocator))
+                          (Ok [raw]
+                              (let [(mut invalid) raw]
+                                (free! (mut invalid))
+                                (Err [image/Image (slice u8)]
+                                     "text API accepted symbolic code"))))]
+                  (calls/release! (mut owned))
+                  compiled)))]
+    (g/release! (mut graph))
+    result))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut failures) 0
+        (mut counter) (: 201 i64)
+        (mut provider) (image/create allocator)]
+    (bytes/append32! (mut (.data provider)) 201)
+    (bytes/append32! (mut (.data provider)) 0)
+    (require (image/symbol! (mut provider) "_stogir_named_counter" 2 0))
+    (set! failures (+ failures (save provider "/tmp/coil-stogir-named-data.o")))
+    (image/release! (mut provider))
+    (match (make)
+      (Err [msg]
+           (do (println "compile: {}" msg) (set! failures (+ failures 1))))
+      (Ok [compiled]
+          (let [(mut source) compiled
+                (mut addresses) (ArrayList::new [u64] allocator)
+                (mut present) (ArrayList::new [bool] allocator)]
+            (set! failures
+                  (+ failures (save source "/tmp/coil-stogir-named.o")))
+            ;; The graph is already released: all text, literal bytes and names
+            ;; must be independent owners. The external data lives on this stack.
+            (for symbol (.symbols source)
+              (push! (mut addresses)
+                     (if (image/same-name? source symbol "_labs")
+                         (primitive/cast u64
+                                         (primitive/cast (ptr u8)
+                                                         (fnptr-of labs)))
+                         (primitive/cast u64
+                                         (primitive/cast (ptr i64)
+                                                         (mut counter)))))
+              (push! (mut present) true))
+            (match (jit/map-image-resolved source
+                                           (slice addresses)
+                                           (slice present)
+                                           allocator)
+              (Err [msg]
+                   (do (println "map: {}" msg) (set! failures (+ failures 1))))
+              (Ok [loaded]
+                  (let [(mut owned) loaded
+                        f
+                          (primitive/cast (fnptr (cc/C) [i64] i64)
+                                          (.base (.memory owned)))
+                        (mut x) (: -100 i64)]
+                    (while (<= x 100)
+                      (set! counter (+ x 301))
+                      (when (!= (call-ptr f x) (+ (labs x) (+ counter 65)))
+                        (set! failures (+ failures 1)))
+                      (set! x (+ x 1)))
+                    (jit/release-image! (mut owned)))))
+            (free! (mut addresses))
+            (free! (mut present))
+            (image/release! (mut source)))))
+    (println "named IR JIT/AOT image checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

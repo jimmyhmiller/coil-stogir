@@ -1,0 +1,157 @@
+(module stogir.tests.named-addresses)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.symbols" :as symbols)
+(import "stogir.image" :as image)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(extern labs :cc (cc/C) [i64] (-> i64))
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+;;; Mode 0 tests wide numeric address phis, 1 symbolic literal phis,
+;;; 2 a named function return, 3 symbolic arithmetic, 4 NOT, 5 pointer ROL.
+(defn check [(mode i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        condition (require (b/emit! (mut graph) 16 1 [p zero]))
+        split (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        yes-end (require (b/emit! (mut graph) 114 0 [yes]))
+        no-end (require (b/emit! (mut graph) 114 0 [no]))
+        merge (require (b/emit! (mut graph) 112 0 [yes-end no-end]))
+        left
+          (require (if (= mode 0)
+                       (b/scalar-constant! (mut graph) 6 0xFEDCBA9876543210 8)
+                       (symbols/string! (mut graph) "A\0B")))
+        right
+          (require (if (= mode 0)
+                       (b/scalar-constant! (mut graph) 6 0x123456789ABCDEF0 8)
+                       (symbols/string! (mut graph) "XYZ")))
+        phi (require (b/emit! (mut graph) 67 6 [merge left right]))
+        target
+          (if (or (= mode 2) (= mode 4) (= mode 5) (= mode 6))
+              (require (symbols/function! (mut graph) "_labs" 0))
+              phi)
+        offset (require (b/scalar-constant! (mut graph) 11 2 8))
+        rotation (require (b/scalar-constant! (mut graph) 6 2 8))
+        pointer
+          (if (= mode 5)
+              (require (b/integer-binary! (mut graph) 52 6 8 target rotation))
+              (if (= mode 4)
+                  (require (b/integer-unary! (mut graph) 45 6 8 target))
+                  (if (= mode 3)
+                      (require (b/emit! (mut graph) 26 6 [left offset]))
+                      target)))
+        result
+          (if (>= mode 6)
+              (require (b/conversion! (mut graph) 36 5 8 pointer))
+              pointer)
+        ret
+          (require (b/emit! (mut graph)
+                            120
+                            (if (>= mode 6) 5 6)
+                            [merge result (: 0 i32)]))
+        compiled (compile/image graph start [ret] "_stogir_addresses" allocator)
+        (mut failures) 0]
+    (g/release! (mut graph))
+    (match compiled
+      (Err [msg]
+           (do (println "compile: {}" msg) (set! failures (+ failures 1))))
+      (Ok [source]
+          (let [(mut owned-source) source
+                (mut addresses) (ArrayList::new [u64] allocator)
+                (mut present) (ArrayList::new [bool] allocator)]
+            (for symbol (.symbols owned-source)
+              (push! (mut addresses)
+                     (primitive/cast u64
+                                     (primitive/cast (ptr u8) (fnptr-of labs))))
+              (push! (mut present) true))
+            (match (jit/map-image-resolved owned-source
+                                           (slice addresses)
+                                           (slice present)
+                                           allocator)
+              (Err [msg]
+                   (do (println "map: {}" msg) (set! failures (+ failures 1))))
+              (Ok [loaded]
+                  (let [(mut owned) loaded
+                        f
+                          (primitive/cast (fnptr (cc/C) [i64] u64)
+                                          (.base (.memory owned)))
+                        (mut x) (: -3 i64)]
+                    (while (<= x 3)
+                      (let [raw (call-ptr f x)
+                            value
+                              (if (= mode 5)
+                                  (| (>> raw 2) (<< raw 62))
+                                  (if (= mode 4)
+                                      (^ raw (: 0xFFFFFFFFFFFFFFFF u64))
+                                      raw))]
+                        (if (= mode 0)
+                            (when (!= value
+                                      (if (< x 0)
+                                          (: 0xFEDCBA9876543210 u64)
+                                          (: 0x123456789ABCDEF0 u64)))
+                              (set! failures (+ failures 1)))
+                            (if (or (= mode 2) (= mode 4) (= mode 5) (= mode 6))
+                                (let [expected-address
+                                        (primitive/cast u64
+                                                        (primitive/cast (ptr u8)
+                                                                        (fnptr-of labs)))]
+                                  (if (!= value expected-address)
+                                      (do
+                                        (println "mode={} expected pointer={} actual={}"
+                                                 mode
+                                                 expected-address
+                                                 value)
+                                        (set! failures (+ failures 1)))
+                                      (let [callee
+                                              (primitive/cast (fnptr (cc/C)
+                                                                     [i64]
+                                                                     i64)
+                                                              (primitive/cast (ptr u8)
+                                                                              value))]
+                                        (when (!= (call-ptr callee x) (labs x))
+                                          (set! failures (+ failures 1))))))
+                                (let [pointer (primitive/cast (ptr u8) value)]
+                                  (when (!= (load pointer)
+                                            (if (= mode 3)
+                                                (: 66 u8)
+                                                (if (< x 0) (: 65 u8) (: 88 u8))))
+                                    (set! failures (+ failures 1)))
+                                  (when (and (= mode 1)
+                                             (< x 0)
+                                             (!= (load (primitive/index pointer
+                                                                        1))
+                                                 0))
+                                    (set! failures (+ failures 1)))))))
+                      (set! x (+ x 1)))
+                    (jit/release-image! (mut owned)))))
+            (free! (mut addresses))
+            (free! (mut present))
+            (image/release! (mut owned-source)))))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures
+          (+ (check 0)
+             (check 1)
+             (check 2)
+             (check 3)
+             (check 4)
+             (check 5)
+             (check 6)
+             (check 7))]
+    (println "address phi/return/arithmetic checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

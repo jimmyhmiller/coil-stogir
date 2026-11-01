@@ -1,0 +1,129 @@
+; Conversion policy/folding adapted from dstogov/ir ir_fold.h, 92171d0. See NOTICE.
+(module stogir.conversion)
+
+(export operation? policy validate evaluate build!)
+
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.symbols" :as symbols)
+(import "stogir.numeric-conversion" :as numeric)
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+(defn operation? [(opcode i32)] (-> bool)
+  (and (>= opcode 33) (<= opcode 39)))
+
+;;; BOOL occupies a byte. SEXT extends bit 7, not LLVM i1's bit 0.
+(defn policy [(opcode i32) (src i32) (dst i32) (pointer-bytes i32)]
+  (-> (Result i32 (slice u8)))
+  (let [from (* 8 (types/scalar-size src pointer-bytes))
+        to (* 8 (types/scalar-size dst pointer-bytes))]
+    (if (or (not (operation? opcode))
+            (<= from 0)
+            (<= to 0)
+            (if (numeric/operation? opcode)
+                (not (numeric/valid-types? opcode src dst))
+                (if (= opcode 36)
+                    (!= from to)
+                    (or (not (types/integer? src))
+                        (not (types/integer? dst))
+                        (if (= opcode 35) (>= to from) (<= to from))))))
+        (Err "invalid scalar conversion types or widths")
+        (Ok (if (or (= opcode 35) (= opcode 38)) to from)))))
+
+(defn validate [(graph g/Graph) (reference i32) (pointer-bytes i32)]
+  (-> (Result i32 (slice u8)))
+  (match (g/lookup graph reference)
+    (None [] (Err "conversion missing"))
+    (Some [node]
+          (if (or (<= reference 0)
+                  (not (operation? (cast i32 (n/opcode node))))
+                  (!= (get (.arities graph) (cast i64 reference)) 1))
+              (Err "invalid conversion instruction")
+              (match (g/lookup graph (.op1 node))
+                (None [] (Err "conversion source missing"))
+                (Some [source]
+                      (policy (cast i32 (n/opcode node))
+                              (cast i32 (n/type-id source))
+                              (cast i32 (n/type-id node))
+                              pointer-bytes)))))))
+
+;;; Canonicalize Boolean destinations after truncating to their storage byte.
+;;; This agrees with upstream constant folding and keeps BOOL values in {0,1}.
+(defn bits-evaluate [(opcode i32)
+                     (src i32)
+                     (dst i32)
+                     (pointer-bytes i32)
+                     (bits u64)]
+  (-> (Option u64))
+  (match (policy opcode src dst pointer-bytes)
+    (Err [_] (None))
+    (Ok [_]
+        (let [from (* 8 (types/scalar-size src pointer-bytes))
+              to (* 8 (types/scalar-size dst pointer-bytes))
+              src-modulus (<< (: 1 u128) (cast u128 from))
+              dst-mask (cast u64 (- (<< (: 1 u128) (cast u128 to)) 1))
+              x (& bits (cast u64 (- src-modulus 1)))
+              value
+                (if (and (= opcode 33) (>= (cast u128 x) (/ src-modulus 2)))
+                    (cast u64 (- (cast i128 x) (cast i128 src-modulus)))
+                    x)
+              result (& value dst-mask)]
+          (Some (if (= dst 1) (if (= result 0) (: 0 u64) 1) result))))))
+
+(defn evaluate [(opcode i32) (src i32) (dst i32) (pointer-bytes i32) (bits u64)]
+  (-> (Option u64))
+  (if (numeric/operation? opcode)
+      (numeric/evaluate opcode src dst pointer-bytes bits)
+      (bits-evaluate opcode src dst pointer-bytes bits)))
+
+(defn build! [(graph (mut g/Graph))
+              (opcode i32)
+              (dst i32)
+              (pointer-bytes i32)
+              (source i32)] (-> (Result i32 (slice u8)))
+  (match (g/lookup graph source)
+    (None [] (Err "conversion source missing"))
+    (Some [input]
+          (let [src (cast i32 (n/type-id input))]
+            (match (policy opcode src dst pointer-bytes)
+              (Err [message] (Err message))
+              (Ok [_]
+                  (if (and (or (= opcode 36) (= opcode 39)) (= src dst))
+                      (Ok source)
+                      (let [(mut folded) (: 0 i32)]
+                        (when (and (< source 0) (symbols/numeric? input))
+                          (match (evaluate opcode
+                                           src
+                                           dst
+                                           pointer-bytes
+                                           (n/constant-bits input))
+                            (None [] 0)
+                            (Some [bits]
+                                  (match (g/intern-scalar! (mut graph)
+                                                           (cast u8 dst)
+                                                           bits)
+                                    (None [] 0)
+                                    (Some [reference] (set! folded reference))))))
+                        (if (!= folded 0)
+                            (Ok folded)
+                            (let [key
+                                    (| (cast u128 opcode)
+                                       (<< (cast u128 dst) 8)
+                                       (<< (cast u128 pointer-bytes) 16)
+                                       (<< (cast u128 (cast u32 source)) 24))]
+                              (match (get (.expressions graph) key)
+                                (Some [reference] (Ok reference))
+                                (None []
+                                      (match (g/append-inputs! (mut graph)
+                                                               (cast u8 opcode)
+                                                               (cast u8 dst)
+                                                               [source])
+                                        (None []
+                                              (Err "conversion reference space exhausted"))
+                                        (Some [reference]
+                                              (do
+                                                (set! (mut (.expressions graph))
+                                                      key
+                                                      reference)
+                                                (Ok reference))))))))))))))))

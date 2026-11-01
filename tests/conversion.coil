@@ -1,0 +1,99 @@
+(module stogir.tests.conversion)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.conversion" :as conversion)
+(import "stogir.verify" :as verify)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn rejected [(value (Result i32 (slice u8)))] (-> i64)
+  (match value (Ok [_] 1) (Err [_] 0)))
+
+(defn folded [(opcode i32)
+              (src i32)
+              (dst i32)
+              (pointer-bytes i32)
+              (input u64)
+              (wanted u64)] (-> i64)
+  (let [(mut graph) (g/create (malloc-allocator))
+        constant
+          (require (b/scalar-constant! (mut graph) src input pointer-bytes))
+        result
+          (require (b/conversion! (mut graph) opcode dst pointer-bytes constant))
+        (mut failures) 0]
+    (when (>= result 0) (set! failures (+ failures 1)))
+    (match (g/lookup graph result)
+      (None [] (set! failures (+ failures 1)))
+      (Some [node]
+            (when (or (!= (n/type-id node) (cast u8 dst))
+                      (!= (n/constant-bits node) wanted))
+              (println "fold mismatch op={} src={} dst={} pointer={} input={} wanted={} actual={}"
+                       opcode
+                       src
+                       dst
+                       pointer-bytes
+                       input
+                       wanted
+                       (n/constant-bits node))
+              (set! failures (+ failures 1)))))
+    (match (verify/scalar-constants graph pointer-bytes)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [_] 0))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures)
+          (+ (folded 33 8 11 8 128 0xFFFFFFFFFFFFFF80)
+             (folded 33 2 11 8 255 0xFFFFFFFFFFFFFFFF)
+             (folded 34 8 11 8 255 255)
+             (folded 33 1 11 8 1 1)
+             (folded 34 1 5 8 1 1)
+             (folded 35 5 1 8 256 0)
+             (folded 35 5 1 8 258 1)
+             (folded 36 8 1 8 128 1)
+             (folded 36 2 1 8 0 0)
+             (folded 36 13 4 8 0xFFC12345 0xFFC12345)
+             (folded 36 4 13 8 0x7FC12345 0x7FC12345)
+             (folded 36 12 5 8 0x8000000000000000 0x8000000000000000)
+             (folded 36 5 12 8 0x7FF8123456789ABC 0x7FF8123456789ABC)
+             (folded 36 6 4 4 0xFEDCBA98 0xFEDCBA98)
+             (folded 34 6 5 4 0xFEDCBA98 0xFEDCBA98)
+             (folded 35 5 6 4 0xFFFFFFFF12345678 0x12345678)
+             (folded 36 6 5 8 0xFEDCBA9876543210 0xFEDCBA9876543210))
+        (mut graph) (g/create (malloc-allocator))
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (require (b/emit! (mut graph) 71 8 [start (: 0 i32) 0]))
+        q (require (b/emit! (mut graph) 71 8 [start (: 0 i32) 1]))
+        first (require (b/conversion! (mut graph) 33 11 8 p))
+        same (require (b/conversion! (mut graph) 33 11 8 p))
+        other (require (b/conversion! (mut graph) 34 11 8 p))]
+    (when (or (<= first 0)
+              (!= first same)
+              (= first other)
+              (!= p (require (b/conversion! (mut graph) 36 8 8 p))))
+      (set! failures (+ failures 1)))
+    (set! failures
+          (+ failures
+             (rejected (b/conversion! (mut graph) 33 2 8 p))
+             (rejected (b/conversion! (mut graph) 34 12 8 p))
+             (rejected (b/conversion! (mut graph) 36 5 8 p))
+             (rejected (b/conversion! (mut graph) 35 0 8 p))
+             (rejected (b/conversion! (mut graph) 37 11 8 p))
+             (rejected (b/conversion! (mut graph) 33 11 3 p))))
+    (require (b/patch! (mut graph) first 1 q))
+    (when (= first (require (b/conversion! (mut graph) 33 11 8 p)))
+      (set! failures (+ failures 1)))
+    (g/release! (mut graph))
+    (let [(mut malformed) (g/create (malloc-allocator))
+          constant (require (b/scalar-constant! (mut malformed) 8 1 8))]
+      (require (b/emit! (mut malformed) 36 5 [constant]))
+      (set! failures
+            (+ failures (rejected (verify/integer-operations malformed))))
+      (g/release! (mut malformed)))
+    (println "conversion construction/folding/validation: {} failures" failures)
+    (if (= failures 0) 0 1)))

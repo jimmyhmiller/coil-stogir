@@ -1,0 +1,67 @@
+(module stogir.tests.jit-stack-branch)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        condition (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        size (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        allocation (require (b/stack-allocate! (mut graph) start size 16))
+        split (require (b/emit! (mut graph) 116 0 [allocation condition]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        freed (require (b/stack-free! (mut graph) yes size))
+        extra (require (b/stack-allocate! (mut graph) no size 16))
+        seven (require (b/scalar-constant! (mut graph) 5 7 8))
+        nine (require (b/scalar-constant! (mut graph) 5 9 8))
+        yes-ret (require (b/emit! (mut graph) 120 5 [freed seven (: 0 i32)]))
+        no-ret (require (b/emit! (mut graph) 120 5 [extra nine (: 0 i32)]))
+        (mut failures) 0]
+    (match (compile/text graph start [yes-ret no-ret] allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [text]
+          (let [(mut bytes) text]
+            (match (jit/map-text (slice bytes))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [image]
+                  (let [(mut owned) image
+                        f
+                          (primitive/cast (fnptr (cc/C) [u64 u64] u64)
+                                          (.base owned))]
+                    (for condition [(: 0 u64) 1 0x100000000]
+                      (for size [(: 0 u64) 1 17 4097]
+                        (when (!= (call-ptr f condition size)
+                                  (if (= condition 0) (: 9 u64) 7))
+                          (set! failures (+ failures 1)))))
+                    (jit/release! (mut owned)))))
+            (free! (mut bytes)))))
+    (match (compile/object graph
+                           start
+                           [yes-ret no-ret]
+                           "_stogir_stack_branch"
+                           allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [object]
+          (let [(mut bytes) object]
+            (match (fs/write-file allocator
+                                  "/tmp/coil-stogir-stack-branch.o"
+                                  (slice bytes))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [_] 0))
+            (free! (mut bytes)))))
+    (g/release! (mut graph))
+    (println "dynamic stack depths and restoration at distinct returns: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

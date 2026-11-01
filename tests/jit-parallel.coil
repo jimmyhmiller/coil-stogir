@@ -1,0 +1,89 @@
+(module stogir.tests.jit-parallel)
+(import "stogir.jit.darwin" :as jit)
+(import "stogir.a64.transfers" :as t)
+(import "stogir.a64.encode" :as e)
+(import "stogir.locations" :as loc)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn append! [(output (mut (ArrayList u8))) (word (Result u32 (slice u8)))]
+  (-> i64)
+  (match word
+    (Err [_] 1)
+    (Ok [value] (do (bytes/append32! (mut output) value) 0))))
+
+(defn transfer! [(output (mut (ArrayList u8)))
+                 (source loc/Location)
+                 (destination loc/Location)] (-> i64)
+  (match (t/emit! (mut output) source destination 8 17) (Err [_] 1) (Ok [_] 0)))
+
+(defn check [(stack? bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut output) (ArrayList::new [u8] allocator)
+        (mut failures) 0
+        x0 (loc/Location :kind 0 :value 0)
+        x1 (loc/Location :kind 0 :value 1)
+        slot0 (loc/Location :kind 1 :value 0)
+        slot8 (loc/Location :kind 1 :value 8)
+        first (if stack? slot0 x0)
+        second (if stack? slot8 x1)]
+    (when stack?
+      (set! failures
+            (+ failures
+               (append! (mut output)
+                        (e/add-sub-immediate true true false 31 31 16))))
+      (set! failures (+ failures (transfer! (mut output) x0 slot0)))
+      (set! failures (+ failures (transfer! (mut output) x1 slot8))))
+    (match (t/parallel! (mut output)
+                        [(loc/Transfer
+                           :position 0
+                           :parent 1
+                           :source first
+                           :destination second)
+                         (loc/Transfer
+                           :position 0
+                           :parent 2
+                           :source second
+                           :destination first)]
+                        8
+                        16
+                        17
+                        allocator)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [_] 0))
+    (when stack?
+      (set! failures (+ failures (transfer! (mut output) slot0 x0)))
+      (set! failures (+ failures (transfer! (mut output) slot8 x1)))
+      (set! failures
+            (+ failures
+               (append! (mut output)
+                        (e/add-sub-immediate true false false 31 31 16)))))
+    (set! failures
+          (+ failures (append! (mut output) (e/add-sub true true false 0 0 1))))
+    (set! failures (+ failures (append! (mut output) (e/ret 30))))
+    (match (jit/map-text (slice output))
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [image]
+          (let [(mut owned) image
+                f (primitive/cast (fnptr (cc/C) [i64 i64] i64) (.base owned))
+                (mut x) -20]
+            (while (<= x 20)
+              (let [(mut y) -20]
+                (while (<= y 20)
+                  (when (!= (call-ptr f x y) (- y x))
+                    (set! failures (+ failures 1)))
+                  (set! y (+ y 1))))
+              (set! x (+ x 1)))
+            (when (not (jit/release! (mut owned)))
+              (set! failures (+ failures 1))))))
+    (free! (mut output))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures (+ (check false) (check true))]
+    (println "native parallel transfer checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

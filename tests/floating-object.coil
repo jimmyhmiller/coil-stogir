@@ -1,0 +1,95 @@
+(module stogir.tests.floating-object)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.floating" :as floating)
+(import "stogir.a64.compile" :as compile)
+(import "coil.fs" :as fs)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn write [(ty u8)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 0]))
+        q (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 1]))
+        output (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        (mut control) start
+        (mut offset) (: 0 u64)
+        (mut failures) 0]
+    (for opcode [(: 14 i32)
+                 15
+                 16
+                 17
+                 18
+                 19
+                 20
+                 21
+                 22
+                 23
+                 24
+                 25
+                 26
+                 27
+                 28
+                 29
+                 31
+                 32
+                 58
+                 59]
+      (let [result
+              (require (b/floating! (mut graph)
+                                    opcode
+                                    (cast i32 ty)
+                                    p
+                                    q
+                                    (if (= opcode 29) start 0)))
+            bits
+              (if (floating/comparison? opcode)
+                  (require (b/emit! (mut graph) 34 5 [result]))
+                  (require (b/emit! (mut graph) 36 (if (= ty 12) 5 4) [result])))
+            value
+              (if (and (not (floating/comparison? opcode)) (= ty 13))
+                  (require (b/emit! (mut graph) 34 5 [bits]))
+                  bits)
+            displacement (require (b/scalar-constant! (mut graph) 6 offset 8))
+            address (require (b/emit! (mut graph) 26 6 [output displacement]))]
+        (set! control
+              (require (b/emit! (mut graph) 93 0 [control address value])))
+        (set! offset (+ offset 8))))
+    (let [ret (require (b/emit! (mut graph) 120 0 [control (: 0 i32) 0]))]
+      (match (calls/create 0 0 [ty ty (: 6 u8)] allocator)
+        (Err [_] (set! failures (+ failures 1)))
+        (Ok [prototype]
+            (let [(mut owned) prototype]
+              (require (calls/function! (mut graph) owned allocator))
+              (calls/release! (mut owned)))))
+      (match (compile/object graph
+                             start
+                             [ret]
+                             (if (= ty 12)
+                                 "_stogir_floating_f64"
+                                 "_stogir_floating_f32")
+                             allocator)
+        (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+        (Ok [object]
+            (let [(mut bytes) object]
+              (match (fs/write-file allocator
+                                    (if (= ty 12)
+                                        "/tmp/coil-stogir-floating-f64.o"
+                                        "/tmp/coil-stogir-floating-f32.o")
+                                    (slice bytes))
+                (Err [_] (set! failures (+ failures 1)))
+                (Ok [_] 0))
+              (free! (mut bytes))))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures (+ (write 12) (write 13))]
+    (println "floating arithmetic object generation: {} failures" failures)
+    (if (= failures 0) 0 1)))

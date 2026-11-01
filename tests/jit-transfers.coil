@@ -1,0 +1,56 @@
+(module stogir.tests.jit-transfers)
+(import "stogir.jit.darwin" :as jit)
+(import "stogir.a64.transfers" :as t)
+(import "stogir.a64.encode" :as e)
+(import "stogir.locations" :as loc)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn append! [(output (mut (ArrayList u8))) (word (Result u32 (slice u8)))]
+  (-> i64)
+  (match word
+    (Err [_] 1)
+    (Ok [value] (do (bytes/append32! (mut output) value) 0))))
+
+(defn transfer! [(output (mut (ArrayList u8)))
+                 (source loc/Location)
+                 (destination loc/Location)] (-> i64)
+  (match (t/emit! (mut output) source destination 8 16) (Err [_] 1) (Ok [_] 0)))
+
+(defn main [] (-> i64)
+  (let [(mut output) (ArrayList::new [u8] (malloc-allocator))
+        (mut failures) 0
+        reg (loc/Location :kind 0 :value 0)
+        slot0 (loc/Location :kind 1 :value 0)
+        slot8 (loc/Location :kind 1 :value 8)]
+    (set! failures
+          (+ failures
+             (append! (mut output)
+                      (e/add-sub-immediate true true false 31 31 16))))
+    (set! failures (+ failures (transfer! (mut output) reg slot0)))
+    (set! failures (+ failures (transfer! (mut output) slot0 slot8)))
+    (set! failures (+ failures (transfer! (mut output) slot8 reg)))
+    (set! failures
+          (+ failures
+             (append! (mut output)
+                      (e/add-sub-immediate true false false 31 31 16))))
+    (set! failures (+ failures (append! (mut output) (e/ret 30))))
+    (match (jit/map-text (slice output))
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [image]
+          (let [(mut owned) image
+                f (primitive/cast (fnptr (cc/C) [i64] i64) (.base owned))
+                (mut value) -100]
+            (while (<= value 100)
+              (when (!= (call-ptr f value) value)
+                (set! failures (+ failures 1)))
+              (set! value (+ value 1)))
+            (when (not (jit/release! (mut owned)))
+              (set! failures (+ failures 1))))))
+    (free! (mut output))
+    (println "native spill transfer checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

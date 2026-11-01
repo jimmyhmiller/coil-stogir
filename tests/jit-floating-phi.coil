@@ -1,0 +1,139 @@
+(module stogir.tests.jit-floating-phi)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn check [(ty u8) (mode i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        condition (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        p (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 1]))
+        q (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 2]))
+        literal-a (if (= ty 12) (: 0x7FF0123456789ABC u64) 0x7F812345)
+        literal-b (if (= ty 12) (: 0x8000000000000000 u64) 0x80000000)
+        left
+          (if (or (= mode 0) (= mode 2))
+              (require (b/scalar-constant! (mut graph)
+                                           (cast i32 ty)
+                                           literal-a
+                                           8))
+              p)
+        right
+          (if (or (= mode 1) (= mode 2))
+              (require (b/scalar-constant! (mut graph)
+                                           (cast i32 ty)
+                                           literal-b
+                                           8))
+              q)
+        split (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        yes-end (require (b/emit! (mut graph) 114 0 [yes]))
+        no-end (require (b/emit! (mut graph) 114 0 [no]))
+        merge (require (b/emit! (mut graph) 112 0 [yes-end no-end]))
+        phi (require (b/emit! (mut graph) 67 (cast i32 ty) [merge left right]))
+        bits (require (b/emit! (mut graph) 36 (if (= ty 12) 5 4) [phi]))
+        result (if (= ty 12) bits (require (b/emit! (mut graph) 34 5 [bits])))
+        ret (require (b/emit! (mut graph) 120 5 [merge result (: 0 i32)]))
+        (mut failures) 0]
+    (match (calls/create 0 5 [(: 11 u8) ty ty] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype]
+            (require (calls/function! (mut graph) owned allocator))
+            (calls/release! (mut owned)))))
+    (when (= mode 2)
+      (match (compile/object graph
+                             start
+                             [ret]
+                             (if (= ty 12)
+                                 "_stogir_fp_phi_f64"
+                                 "_stogir_fp_phi_f32")
+                             allocator)
+        (Err [_] (set! failures (+ failures 1)))
+        (Ok [object]
+            (let [(mut bytes) object]
+              (match (fs/write-file allocator
+                                    (if (= ty 12)
+                                        "/tmp/coil-stogir-fp-phi-f64.o"
+                                        "/tmp/coil-stogir-fp-phi-f32.o")
+                                    (slice bytes))
+                (Err [_] (set! failures (+ failures 1)))
+                (Ok [_] 0))
+              (free! (mut bytes))))))
+    (match (compile/text graph start [ret] allocator)
+      (Err [msg] (do (println "FP phi: {}" msg) (set! failures (+ failures 1))))
+      (Ok [text]
+          (let [(mut code) text]
+            (match (jit/map-text (slice code))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [loaded]
+                  (let [(mut image) loaded]
+                    (for control [(: -1 i64) 0 1]
+                      (for input [(: 0 u64)
+                                  0x80000000
+                                  0x7FC12345
+                                  0x8000000000000000
+                                  0xFFF8123456789ABC]
+                        (let [other (^ input (: 0x12345678 u64))
+                              expected
+                                (if (!= control 0)
+                                    (if (or (= mode 0) (= mode 2))
+                                        literal-a
+                                        input)
+                                    (if (or (= mode 1) (= mode 2))
+                                        literal-b
+                                        other))
+                              (mut actual) (: 0 u64)]
+                          (if (= ty 12)
+                              (let [(mut a) (: 0.0 f64)
+                                    (mut b) (: 0.0 f64)
+                                    f
+                                      (primitive/cast (fnptr (cc/C)
+                                                             [i64 f64 f64]
+                                                             u64)
+                                                      (.base image))]
+                                (store! (primitive/cast (ptr u64) (mut a))
+                                        input)
+                                (store! (primitive/cast (ptr u64) (mut b))
+                                        other)
+                                (set! actual (call-ptr f control a b)))
+                              (let [(mut a) (: 0.0 f32)
+                                    (mut b) (: 0.0 f32)
+                                    f
+                                      (primitive/cast (fnptr (cc/C)
+                                                             [i64 f32 f32]
+                                                             u64)
+                                                      (.base image))]
+                                (store! (primitive/cast (ptr u32) (mut a))
+                                        (cast u32 input))
+                                (store! (primitive/cast (ptr u32) (mut b))
+                                        (cast u32 other))
+                                (set! actual (call-ptr f control a b))))
+                          (when (!= actual
+                                    (if (= ty 12)
+                                        expected
+                                        (cast u64 (cast u32 expected))))
+                            (set! failures (+ failures 1))))))
+                    (jit/release! (mut image)))))
+            (free! (mut code)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for ty [(: 12 u8) 13]
+      (for mode [(: 0 i32) 1 2 3] (set! failures (+ failures (check ty mode)))))
+    (println "native floating phi constants/registers: {} failures" failures)
+    (if (= failures 0) 0 1)))

@@ -1,0 +1,180 @@
+(module stogir.tests.aot-checked-link)
+(import "coil.cc" :as cc)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "stogir.types" :as types)
+
+(extern check-u8 :as "stogir_checked_u8" :cc (cc/C) [u8 u8 (ptr u64)] (-> void))
+
+(extern check-u16
+        :as
+        "stogir_checked_u16"
+        :cc
+        (cc/C)
+        [u16 u16 (ptr u64)]
+        (-> void))
+
+(extern check-u32
+        :as
+        "stogir_checked_u32"
+        :cc
+        (cc/C)
+        [u32 u32 (ptr u64)]
+        (-> void))
+
+(extern check-u64
+        :as
+        "stogir_checked_u64"
+        :cc
+        (cc/C)
+        [u64 u64 (ptr u64)]
+        (-> void))
+
+(extern check-addr
+        :as
+        "stogir_checked_addr"
+        :cc
+        (cc/C)
+        [u64 u64 (ptr u64)]
+        (-> void))
+
+(extern check-char
+        :as
+        "stogir_checked_char"
+        :cc
+        (cc/C)
+        [u8 u8 (ptr u64)]
+        (-> void))
+
+(extern check-i8 :as "stogir_checked_i8" :cc (cc/C) [i8 i8 (ptr u64)] (-> void))
+
+(extern check-i16
+        :as
+        "stogir_checked_i16"
+        :cc
+        (cc/C)
+        [i16 i16 (ptr u64)]
+        (-> void))
+
+(extern check-i32
+        :as
+        "stogir_checked_i32"
+        :cc
+        (cc/C)
+        [i32 i32 (ptr u64)]
+        (-> void))
+
+(extern check-i64
+        :as
+        "stogir_checked_i64"
+        :cc
+        (cc/C)
+        [i64 i64 (ptr u64)]
+        (-> void))
+
+(defstruct Expected [(value u64) (overflow? bool)])
+
+(defn expected [(opcode i32) (ty i32) (a u64) (b u64)] (-> Expected)
+  (let [width (* 8 (types/scalar-size ty 8))
+        modulus (<< (: 1 u128) (cast u128 width))
+        mask (cast u64 (- modulus 1))
+        x (& a mask)
+        y (& b mask)
+        (mut bits) (: 0 u64)
+        (mut overflow?) false]
+    (if (types/signed? ty)
+        (let [limit (cast i128 (/ modulus 2))
+              sx
+                (if (>= (cast u128 x) (/ modulus 2))
+                    (- (cast i128 x) (cast i128 modulus))
+                    (cast i128 x))
+              sy
+                (if (>= (cast u128 y) (/ modulus 2))
+                    (- (cast i128 y) (cast i128 modulus))
+                    (cast i128 y))
+              value
+                (if (= opcode 41)
+                    (+ sx sy)
+                    (if (= opcode 42) (- sx sy) (* sx sy)))]
+          (set! bits (& (cast u64 value) mask))
+          (set! overflow? (or (< value (- 0 limit)) (> value (- limit 1)))))
+        (do
+          (set! overflow?
+                (if (= opcode 41)
+                    (> y (- mask x))
+                    (if (= opcode 42) (< x y) (and (!= x 0) (> y (/ mask x))))))
+          (set! bits
+                (& (cast u64
+                         (if (= opcode 41)
+                             (+ (cast u128 x) (cast u128 y))
+                             (if (= opcode 42)
+                                 (- (+ (cast u128 x) modulus) (cast u128 y))
+                                 (* (cast u128 x) (cast u128 y)))))
+                   mask))))
+    (Expected
+      :overflow? overflow?
+      :value
+        (if (and (types/signed? ty) (>= (cast u128 bits) (/ modulus 2)))
+            (cast u64 (- (cast i128 bits) (cast i128 modulus)))
+            bits))))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0
+        (mut output) (ArrayList::new [u64] (malloc-allocator))]
+    (for initial [(: 0 u64) 0 0 0 0 0] (push! (mut output) initial))
+    (for a [(: 0 u64)
+            1
+            127
+            128
+            255
+            32767
+            32768
+            65535
+            0x7FFFFFFF
+            0x80000000
+            0xFFFFFFFF
+            0x7FFFFFFFFFFFFFFF
+            0x8000000000000000
+            0xFFFFFFFFFFFFFFFF]
+      (for b [(: 0 u64)
+              1
+              2
+              127
+              128
+              255
+              32767
+              32768
+              65535
+              0x7FFFFFFF
+              0x80000000
+              0xFFFFFFFF
+              0x7FFFFFFFFFFFFFFF
+              0x8000000000000000
+              0xFFFFFFFFFFFFFFFF]
+        (for ty [(: 2 i32) 3 4 5 6 7 8 9 10 11]
+          (let [address (.data output)]
+            (match ty
+              (2 (check-u8 (cast u8 a) (cast u8 b) address))
+              (3 (check-u16 (cast u16 a) (cast u16 b) address))
+              (4 (check-u32 (cast u32 a) (cast u32 b) address))
+              (5 (check-u64 (cast u64 a) (cast u64 b) address))
+              (6 (check-addr (cast u64 a) (cast u64 b) address))
+              (7 (check-char (cast u8 a) (cast u8 b) address))
+              (8 (check-i8 (cast i8 a) (cast i8 b) address))
+              (9 (check-i16 (cast i16 a) (cast i16 b) address))
+              (10 (check-i32 (cast i32 a) (cast i32 b) address))
+              (11 (check-i64 (cast i64 a) (cast i64 b) address))
+              (_ 0)))
+          (let [(mut index) (: 0 i64)]
+            (for opcode [(: 41 i32) 42 43]
+              (let [wanted (expected opcode ty a b)]
+                (when (or (!= (get output index) (.value wanted))
+                          (!= (get output (+ index 1))
+                              (if (.overflow? wanted) (: 1 u64) 0)))
+                  (when (= failures 0)
+                    (println "AOT mismatch ty={} op={} a={} b={}" ty opcode a b))
+                  (set! failures (+ failures 1))))
+              (set! index (+ index 2)))))))
+    (free! (mut output))
+    (println "linked checked arithmetic: {} failures" failures)
+    (if (= failures 0) 0 1)))

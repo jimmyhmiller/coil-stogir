@@ -1,0 +1,164 @@
+(module stogir.tests.jit-conversion-matrix)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.types" :as types)
+(import "stogir.conversion" :as conversion)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+;;; Independent width/cast oracle, extending byte/halfword/word source bits.
+(defn expected [(opcode i32) (src i32) (dst i32) (bits u64)] (-> u64)
+  (let [from (types/scalar-size src 8)
+        to (types/scalar-size dst 8)
+        x (if (= src 1) (& bits 1) bits)
+        extended
+          (if (= opcode 33)
+              (if (= from 1)
+                  (cast u64 (cast i64 (cast i8 x)))
+                  (if (= from 2)
+                      (cast u64 (cast i64 (cast i16 x)))
+                      (cast u64 (cast i64 (cast i32 x)))))
+              (if (= from 1)
+                  (cast u64 (cast u8 x))
+                  (if (= from 2)
+                      (cast u64 (cast u16 x))
+                      (if (= from 4) (cast u64 (cast u32 x)) x))))
+        result
+          (if (= to 1)
+              (cast u64 (cast u8 extended))
+              (if (= to 2)
+                  (cast u64 (cast u16 extended))
+                  (if (= to 4) (cast u64 (cast u32 extended)) extended)))]
+    (if (= dst 1) (if (= result 0) (: 0 u64) 1) result)))
+
+(defn check [(opcode i32) (src i32) (dst i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (require (b/emit! (mut graph) 71 src [start (: 0 i32) 0]))
+        converted (require (b/emit! (mut graph) opcode dst [p]))
+        to (types/scalar-size dst 8)
+        value
+          (if (< to 8)
+              (require (b/emit! (mut graph) 34 5 [converted]))
+              converted)
+        result-type (if (< to 8) 5 dst)
+        ret
+          (require (b/emit! (mut graph) 120 result-type [start value (: 0 i32)]))
+        (mut failures) 0]
+    (match (calls/create 0 (cast u8 result-type) [(cast u8 src)] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype]
+            (require (calls/function! (mut graph) owned allocator))
+            (calls/release! (mut owned)))))
+    (match (compile/text graph start [ret] allocator)
+      (Err [msg]
+           (do
+             (println "conversion op={} src={} dst={}: {}" opcode src dst msg)
+             (set! failures (+ failures 1))))
+      (Ok [text]
+          (let [(mut code) text]
+            (match (jit/map-text (slice code))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [loaded]
+                  (let [(mut image) loaded
+                        f
+                          (primitive/cast (fnptr (cc/C) [u64] u64)
+                                          (.base image))]
+                    (for bits [(: 0 u64)
+                               1
+                               2
+                               127
+                               128
+                               255
+                               256
+                               257
+                               32767
+                               32768
+                               65535
+                               65536
+                               65537
+                               0x7FFFFFFF
+                               0x80000000
+                               0xFFFFFFFF
+                               0x100000000
+                               0x7FFFFFFFFFFFFFFF
+                               0x8000000000000000
+                               0xFFFFFFFFFFFFFFFF]
+                      (let [input (if (= src 1) (& bits 1) bits)
+                            wanted (expected opcode src dst input)
+                            actual (call-ptr f input)]
+                        (when (!= wanted actual)
+                          (when (= failures 0)
+                            (println "conversion mismatch op={} src={} dst={} input={} wanted={} actual={}"
+                                     opcode
+                                     src
+                                     dst
+                                     input
+                                     wanted
+                                     actual))
+                          (set! failures (+ failures 1)))))
+                    (jit/release! (mut image)))))
+            (free! (mut code)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn constant-bitcast [(src i32) (dst i32) (bits u64)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        input (require (b/scalar-constant! (mut graph) src bits 8))
+        raw (require (b/emit! (mut graph) 36 dst [input]))
+        value (if (= dst 4) (require (b/emit! (mut graph) 34 5 [raw])) raw)
+        ret (require (b/emit! (mut graph) 120 5 [start value (: 0 i32)]))
+        (mut failures) 0]
+    (match (compile/text graph start [ret] allocator)
+      (Err [msg]
+           (do
+             (println "constant bitcast: {}" msg)
+             (set! failures (+ failures 1))))
+      (Ok [text]
+          (let [(mut code) text]
+            (match (jit/map-text (slice code))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [loaded]
+                  (let [(mut image) loaded
+                        f (primitive/cast (fnptr (cc/C) [] u64) (.base image))]
+                    (when (!= (call-ptr f) bits) (set! failures (+ failures 1)))
+                    (jit/release! (mut image)))))
+            (free! (mut code)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0
+        (mut count) 0]
+    (for src [(: 1 i32) 2 3 4 5 6 7 8 9 10 11]
+      (for dst [(: 1 i32) 2 3 4 5 6 7 8 9 10 11]
+        (for opcode [(: 33 i32) 34 35 36]
+          (match (conversion/policy opcode src dst 8)
+            (Err [_] 0)
+            (Ok [_]
+                (do
+                  (set! count (+ count 1))
+                  (set! failures (+ failures (check opcode src dst)))))))))
+    (set! failures
+          (+ failures
+             (constant-bitcast 12 5 0x7FF8123456789ABC)
+             (constant-bitcast 12 5 0x8000000000000000)
+             (constant-bitcast 13 4 0xFFC12345)
+             (constant-bitcast 13 4 0x80000000)))
+    (when (!= count 165) (set! failures (+ failures 1)))
+    (println "native scalar conversion matrix: {} variants, {} failures"
+             count
+             failures)
+    (if (= failures 0) 0 1)))

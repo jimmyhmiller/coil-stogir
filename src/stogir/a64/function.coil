@@ -1,0 +1,648 @@
+;;; Allocated scalar function emission shared by JIT and AOT consumers.
+(module stogir.a64.function)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.schedule" :as schedule)
+(import "stogir.a64.constraints" :as constraints)
+(import "stogir.a64.incoming" :as incoming)
+(import "stogir.a64.allocate" :as allocate)
+(import "stogir.allocation" :as allocation)
+(import "stogir.a64.emit" :as emit)
+(import "stogir.a64.memory" :as memory)
+(import "stogir.a64.locals" :as local)
+(import "stogir.a64.stack" :as stackemit)
+(import "stogir.locals" :as locals)
+(import "stogir.a64.convert" :as convert)
+(import "stogir.a64.unary" :as unary)
+(import "stogir.a64.conditional" :as cond)
+(import "stogir.a64.checked" :as checked)
+(import "stogir.floating" :as floating)
+(import "stogir.a64.floating" :as fpemit)
+(import "stogir.checked-schedule" :as checked-schedule)
+(import "stogir.a64.call" :as call)
+(import "stogir.a64.call-abi" :as abi)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.a64.frame-address" :as frame-address)
+(import "stogir.a64.frame-memory" :as frame-memory)
+(import "stogir.a64.code" :as code)
+(import "stogir.a64.value" :as value)
+(import "stogir.a64.truth" :as truth)
+(import "stogir.a64.transfers" :as transfers)
+(import "stogir.locations" :as locations)
+(import "stogir.transfer-index" :as transfer-index)
+(import "stogir.frame" :as frame)
+(import "stogir.a64.fixups" :as fixups)
+(import "stogir.opcode" :as op)
+(import "stogir.uses" :as uses)
+(import "stogir.register-live" :as live)
+(import "stogir.edge-moves" :as edges)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn word! [(output (mut code/Buffer))
+             (instruction (Result u32 (slice u8)))]
+  (-> (Result i32 (slice u8)))
+  (match instruction
+    (Err [msg] (Err msg))
+    (Ok [word] (do (bytes/append32! (mut (.text output)) word) (Ok 4)))))
+
+;;; Unsupported instructions and ABI cases report errors. Odd boundaries that
+;;; write registers require instruction-specific lowering; spill stores precede
+;;; the instruction so they preserve values about to be clobbered.
+(defn body [(graph g/Graph)
+            (scheduled schedule/Schedule)
+            (assigned allocate/Assigned)
+            (analysis live/Analysis)
+            (requirements (ArrayList constraints/Value))
+            (allocator (dyn Allocator))] (-> (Result code/Buffer (slice u8)))
+  (let [(mut output) (code/create allocator)
+        (mut moves) (locations/contiguous (.parts assigned) allocator)
+        (mut group) (ArrayList::new [locations/Transfer] allocator)
+        (mut move-index) (transfer-index/create allocator)
+        (mut labels) (ArrayList::new [i64] allocator)
+        (mut branches) (ArrayList::new [fixups/Branch] allocator)
+        (mut indexed-users) (uses/build graph allocator)
+        (mut selected) (ArrayList::new [bool] allocator)
+        (mut frame-size) (: 0 i64)
+        (mut error) ""
+        (mut i) 0]
+    (match (checked-schedule/validate graph scheduled)
+      (Err [message] (set! error message))
+      (Ok [_] 0))
+    (match (transfer-index/build (slice moves)
+                                 (* (len (.nodes scheduled)) 2)
+                                 allocator)
+      (Err [message] (set! error message))
+      (Ok [index] (set! move-index index)))
+    (let [(mut j) 0]
+      (while (< j (len (.instructions graph)))
+        (push! (mut labels) -1)
+        (push! (mut selected) false)
+        (set! j (+ j 1))))
+    (for reference (.nodes scheduled)
+      (set! (mut selected) (cast i64 reference) true))
+    (match (frame/aligned-size (.frame assigned) 16)
+      (Err [msg] (set! error msg))
+      (Ok [size] (set! frame-size size)))
+    (for move moves
+      (when (and (!= (% (.position move) 2) 0)
+                 (not (and (= (.kind (.source move)) 0)
+                           (= (.kind (.destination move)) 1))))
+        (set! error "odd split boundary needs instruction-specific lowering")))
+    (when (and (= error "") (> frame-size 0))
+      (match (frame-address/adjust! (mut (.text output)) true frame-size 16)
+        (Err [msg] (set! error msg))
+        (Ok [_] 0)))
+    ; Non-leaf functions link a frame record containing previous x29 and x30.
+    (when (and (= error "") (>= (.link-slot assigned) 0))
+      (match (frame-memory/access! (mut (.text output))
+                                   false
+                                   8
+                                   29
+                                   31
+                                   (- (.link-slot assigned) 8)
+                                   false
+                                   16)
+        (Err [msg] (set! error msg))
+        (Ok [_] 0))
+      (match (frame-memory/access! (mut (.text output))
+                                   false
+                                   8
+                                   30
+                                   31
+                                   (.link-slot assigned)
+                                   false
+                                   16)
+        (Err [msg] (set! error msg))
+        (Ok [_] 0))
+      (match (frame-address/address! (mut (.text output))
+                                     29
+                                     31
+                                     (- (.link-slot assigned) 8))
+        (Err [msg] (set! error msg))
+        (Ok [_] 0)))
+    (while (and (= error "") (< i (len (.nodes scheduled))))
+      (let [reference (get (.nodes scheduled) i)
+            node (get (.instructions graph) (cast i64 reference))
+            opcode (n/opcode node)
+            position (* i 2)]
+        (when (op/block-start? (cast i32 opcode))
+          (set! (mut labels) (cast i64 reference) (len (.text output))))
+        ; The use and definition subpositions are ordered phases. In particular,
+        ; a reload at the even use position must complete before an odd spill
+        ; store preserves that same value ahead of a clobbering definition.
+        ; Combining them as parallel copies would store the register's old value.
+        (let [(mut phase) (: 0 i64)]
+          (while (and (= error "") (< phase 2))
+            (clear! (mut group))
+            (let [(mut cursor) (get (.heads move-index) (+ position phase))]
+              (while (>= cursor 0)
+                (push! (mut group) (get moves cursor))
+                (set! cursor (get (.next move-index) cursor))))
+            (when (> (len group) 0)
+              (match (transfers/parallel-frame! (mut (.text output))
+                                                (slice group)
+                                                8
+                                                allocator
+                                                (.base assigned))
+                (Err [msg] (set! error msg))
+                (Ok [_] 0)))
+            (set! phase (+ phase 1))))
+        (when (and (= error "") (= opcode 71))
+          (match (incoming/emit-at! (mut (.text output))
+                                    graph
+                                    (.parts assigned)
+                                    (.parameter (at requirements
+                                                    (cast i64 reference)))
+                                    position
+                                    frame-size
+                                    (.base assigned))
+            (Err [msg] (set! error msg))
+            (Ok [_] 0)))
+        (when (= error "")
+          (if (or (op/block-start? (cast i32 opcode))
+                  (= opcode 71)
+                  (= opcode 72)
+                  (= opcode 67))
+              0
+              (if (= opcode 120)
+                  (do
+                    (when (< (.op2 node) 0)
+                      (match (g/lookup graph (.op2 node))
+                        (None [] (set! error "return constant missing"))
+                        (Some [constant]
+                              (match (value/constant! (mut output)
+                                                      graph
+                                                      (.op2 node)
+                                                      (if (or (= (n/type-id constant)
+                                                                 12)
+                                                              (= (n/type-id constant)
+                                                                 13))
+                                                          32
+                                                          0)
+                                                      16)
+                                (Err [msg] (set! error msg))
+                                (Ok [_] 0)))))
+                    (match (abi/normalize! (mut (.text output))
+                                           (n/type-id node)
+                                           0)
+                      (Err [msg] (set! error msg))
+                      (Ok [_] 0))
+                    (match (frame-address/restore! (mut (.text output))
+                                                   (.base assigned))
+                      (Err [msg] (set! error msg))
+                      (Ok [_] 0))
+                    (when (>= (.link-slot assigned) 0)
+                      (match (frame-memory/access! (mut (.text output))
+                                                   true
+                                                   8
+                                                   29
+                                                   31
+                                                   (- (.link-slot assigned)
+                                                      8)
+                                                   false
+                                                   16)
+                        (Err [msg] (set! error msg))
+                        (Ok [_] 0))
+                      (match (frame-memory/access! (mut (.text output))
+                                                   true
+                                                   8
+                                                   30
+                                                   31
+                                                   (.link-slot assigned)
+                                                   false
+                                                   16)
+                        (Err [msg] (set! error msg))
+                        (Ok [_] 0)))
+                    (when (> frame-size 0)
+                      (match (frame-address/adjust! (mut (.text output))
+                                                    false
+                                                    frame-size
+                                                    16)
+                        (Err [msg] (set! error msg))
+                        (Ok [_] 0)))
+                    (match (word! (mut output) (encode/ret 30))
+                      (Err [msg] (set! error msg))
+                      (Ok [_] 0)))
+                  (if (or (= opcode 114) (= opcode 115))
+                      (match (unconditional! (mut output)
+                                             graph
+                                             assigned
+                                             scheduled
+                                             analysis
+                                             reference
+                                             position
+                                             indexed-users
+                                             selected
+                                             (mut branches)
+                                             allocator)
+                        (Err [msg] (set! error msg))
+                        (Ok [_] 0))
+                      (if (= opcode 116)
+                          (match (conditional! (mut output)
+                                               graph
+                                               assigned
+                                               reference
+                                               position
+                                               indexed-users
+                                               selected
+                                               scheduled
+                                               analysis
+                                               (mut labels)
+                                               (mut branches)
+                                               allocator)
+                            (Err [msg] (set! error msg))
+                            (Ok [_] 0))
+                          (if (= opcode 66)
+                              (match (frame-value! (mut output)
+                                                   (.parts assigned)
+                                                   reference
+                                                   position
+                                                   (.base assigned))
+                                (Err [msg] (set! error msg))
+                                (Ok [_] 0))
+                              (if (or (= opcode 81) (= opcode 82))
+                                  (match (stackemit/emit! (mut output)
+                                                          graph
+                                                          (.parts assigned)
+                                                          reference
+                                                          position
+                                                          (.base assigned)
+                                                          (.outgoing-size assigned))
+                                    (Err [msg] (set! error msg))
+                                    (Ok [_] 0))
+                                  (if (= opcode 40)
+                                      (match (locations/lookup (.parts assigned)
+                                                               reference
+                                                               (+ position 1))
+                                        (Err [msg] (set! error msg))
+                                        (Ok [destination]
+                                            (if (!= (.kind destination) 0)
+                                                (set! error
+                                                      "PROTO result requires register")
+                                                (match (call/capture-at! (mut output)
+                                                                         graph
+                                                                         (.parts assigned)
+                                                                         (.op1 node)
+                                                                         position
+                                                                         (cast i32
+                                                                               (.value destination))
+                                                                         (.base assigned))
+                                                  (Err [msg] (set! error msg))
+                                                  (Ok [_] 0)))))
+                                      (if (= opcode 79)
+                                          (match (call/emit-at! (mut output)
+                                                                graph
+                                                                (.parts assigned)
+                                                                reference
+                                                                position
+                                                                allocator
+                                                                (.base assigned))
+                                            (Err [msg] (set! error msg))
+                                            (Ok [_] 0))
+                                          (if (locals/operation? (cast i32
+                                                                       opcode))
+                                              (match (local/emit-at! (mut output)
+                                                                     graph
+                                                                     (.parts assigned)
+                                                                     (.frame assigned)
+                                                                     reference
+                                                                     position
+                                                                     (.base assigned))
+                                                (Err [msg] (set! error msg))
+                                                (Ok [_] 0))
+                                              (if (and (>= opcode 91)
+                                                       (<= opcode 94))
+                                                  (match (memory/emit! (mut output)
+                                                                       graph
+                                                                       (.parts assigned)
+                                                                       reference
+                                                                       position)
+                                                    (Err [msg] (set! error msg))
+                                                    (Ok [_] 0))
+                                                  (if (or (floating/node? graph
+                                                                          reference)
+                                                          (checked/operation? (cast i32
+                                                                                    opcode))
+                                                          (= opcode 60)
+                                                          (and (>= opcode 33)
+                                                               (<= opcode 39))
+                                                          (unary/operation? (cast i32
+                                                                                  opcode)))
+                                                      (match (if (floating/node? graph
+                                                                                 reference)
+                                                                 (fpemit/emit! (mut output)
+                                                                               graph
+                                                                               (.parts assigned)
+                                                                               reference
+                                                                               position)
+                                                                 (if (checked/operation? (cast i32
+                                                                                               opcode))
+                                                                     (checked/emit! (mut output)
+                                                                                    graph
+                                                                                    (.parts assigned)
+                                                                                    reference
+                                                                                    position
+                                                                                    (and (< (+ i
+                                                                                               1)
+                                                                                            (len (.nodes scheduled)))
+                                                                                         (let [next
+                                                                                                 (get (.instructions graph)
+                                                                                                      (cast i64
+                                                                                                            (get (.nodes scheduled)
+                                                                                                                 (+ i
+                                                                                                                    1))))]
+                                                                                           (and (= (n/opcode next)
+                                                                                                   44)
+                                                                                                (= (.op1 next)
+                                                                                                   reference))))
+                                                                                    allocator)
+                                                                     (if (= opcode
+                                                                            60)
+                                                                         (cond/emit! (mut output)
+                                                                                     graph
+                                                                                     (.parts assigned)
+                                                                                     reference
+                                                                                     position
+                                                                                     allocator)
+                                                                         (if (unary/operation? (cast i32
+                                                                                                     opcode))
+                                                                             (unary/emit! (mut output)
+                                                                                          graph
+                                                                                          (.parts assigned)
+                                                                                          reference
+                                                                                          position
+                                                                                          allocator)
+                                                                             (convert/emit! (mut output)
+                                                                                            graph
+                                                                                            (.parts assigned)
+                                                                                            reference
+                                                                                            position)))))
+                                                        (Err [msg]
+                                                             (set! error msg))
+                                                        (Ok [_] 0))
+                                                      (match (emit/allocated-arithmetic! (mut output)
+                                                                                         graph
+                                                                                         (.parts assigned)
+                                                                                         reference
+                                                                                         position
+                                                                                         allocator)
+                                                        (Err [msg]
+                                                             (set! error msg))
+                                                        (Ok [_] 0)))))))))))))))
+      (set! i (+ i 1)))
+    (when (= error "")
+      (match (fixups/apply! (mut (.text output)) labels branches)
+        (Err [msg] (set! error msg))
+        (Ok [_] 0)))
+    (free! (mut selected))
+    (uses/release! (mut indexed-users))
+    (free! (mut labels))
+    (free! (mut branches))
+    (transfer-index/release! (mut move-index))
+    (free! (mut moves))
+    (free! (mut group))
+    (if (= error "") (Ok output) (do (code/release! (mut output)) (Err error)))))
+
+(defn conditional! [(output (mut code/Buffer))
+                    (graph g/Graph)
+                    (assigned allocate/Assigned)
+                    (reference i32)
+                    (position i64)
+                    (indexed-users uses/Uses)
+                    (selected (ArrayList bool))
+                    (scheduled schedule/Schedule)
+                    (analysis live/Analysis)
+                    (labels (mut (ArrayList i64)))
+                    (branches (mut (ArrayList fixups/Branch)))
+                    (allocator (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (let [(mut yes) (: 0 i32)
+        (mut no) (: 0 i32)
+        (mut r) 1]
+    (let [range (get (.ranges indexed-users) (cast i64 reference))]
+      (set! r 0)
+      (while (< r (.count range))
+        (let [edge (get (.edges indexed-users) (+ (.offset range) r))
+              user (.user edge)
+              node (get (.instructions graph) (cast i64 user))]
+          (when (and (= (.operand edge) 1) (get selected (cast i64 user)))
+            (when (= (n/opcode node) 107) (set! yes user))
+            (when (= (n/opcode node) 108) (set! no user))))
+        (set! r (+ r 1))))
+    (if (or (= yes 0) (= no 0))
+        (Err "IF requires both projections")
+        (let [node (get (.instructions graph) (cast i64 reference))]
+          (match (truth/flags! (mut output)
+                               graph
+                               (.parts assigned)
+                               (.op2 node)
+                               position)
+            (Err [msg] (Err msg))
+            (Ok [_]
+                (let [true-label (cast i32 (len labels))]
+                  (push! (mut labels) -1)
+                  (push! (mut branches)
+                         (fixups/Branch
+                           :offset (len (.text output))
+                           :label true-label
+                           :condition 1
+                           :link false))
+                  (bytes/append32! (mut (.text output)) 0)
+                  (match (edge! (mut output)
+                                graph
+                                assigned
+                                scheduled
+                                analysis
+                                no
+                                (+ position 1)
+                                allocator)
+                    (Err [msg] (Err msg))
+                    (Ok [_]
+                        (do
+                          (push! (mut branches)
+                                 (fixups/Branch
+                                   :offset (len (.text output))
+                                   :label no
+                                   :condition -1
+                                   :link false))
+                          (bytes/append32! (mut (.text output)) 0)
+                          (set! (mut labels)
+                                (cast i64 true-label)
+                                (len (.text output)))
+                          (match (edge! (mut output)
+                                        graph
+                                        assigned
+                                        scheduled
+                                        analysis
+                                        yes
+                                        (+ position 1)
+                                        allocator)
+                            (Err [msg] (Err msg))
+                            (Ok [_]
+                                (do
+                                  (push! (mut branches)
+                                         (fixups/Branch
+                                           :offset (len (.text output))
+                                           :label yes
+                                           :condition -1
+                                           :link false))
+                                  (bytes/append32! (mut (.text output)) 0)
+                                  (Ok 0))))))))))))))
+
+(defn edge! [(output (mut code/Buffer))
+             (graph g/Graph)
+             (assigned allocate/Assigned)
+             (scheduled schedule/Schedule)
+             (analysis live/Analysis)
+             (target i32)
+             (source-position i64)
+             (allocator (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (let [state-index (get (.indices analysis) (cast i64 target))
+        state (at (.states analysis) state-index)
+        range (get (.ranges scheduled) (cast i64 target))
+        source-ref (get (.nodes scheduled) (/ source-position 2))
+        header (get (.instructions graph) (cast i64 target))
+        count (get (.arities graph) (cast i64 target))
+        (mut ordinal) (: 0 i32)
+        (mut i) (: 1 i32)]
+    (while (<= i count)
+      (match (g/operand graph target i)
+        (None [] 0)
+        (Some [value] (when (= value source-ref) (set! ordinal i))))
+      (set! i (+ i 1)))
+    (match (edges/ordinary (.parts assigned)
+                           (.input state)
+                           source-position
+                           (* (.offset range) 2)
+                           allocator)
+      (Err [msg] (Err msg))
+      (Ok [moves]
+          (let [(mut owned) moves
+                (mut error) ""]
+            (match (edges/phis graph
+                               scheduled
+                               (.parts assigned)
+                               target
+                               ordinal
+                               source-position
+                               allocator)
+              (Err [msg] (set! error msg))
+              (Ok [group]
+                  (let [(mut phis) group]
+                    (for move (.moves phis) (push! (mut owned) move))
+                    (match (transfers/parallel-frame! (mut (.text output))
+                                                      (slice owned)
+                                                      8
+                                                      allocator
+                                                      (.base assigned))
+                      (Err [msg] (set! error msg))
+                      (Ok [_] 0))
+                    (for literal (.literals phis)
+                      (when (= error "")
+                        (let [destination (.destination literal)
+                              floating?
+                                (match (g/lookup graph (.reference literal))
+                                  (None [] false)
+                                  (Some [constant]
+                                        (or (= (n/type-id constant) 12)
+                                            (= (n/type-id constant) 13))))
+                              reg
+                                (if (= (.kind destination) 0)
+                                    (cast i32 (.value destination))
+                                    (if floating? 62 16))]
+                          (match (value/constant! (mut output)
+                                                  graph
+                                                  (.reference literal)
+                                                  reg
+                                                  16)
+                            (Err [msg] (set! error msg))
+                            (Ok [_] 0))
+                          (when (= (.kind destination) 1)
+                            (match (transfers/emit-addressed! (mut (.text output))
+                                                              (locations/Location
+                                                                :kind 0
+                                                                :value
+                                                                  (cast i64 reg))
+                                                              destination
+                                                              8
+                                                              17
+                                                              (.base assigned)
+                                                              16)
+                              (Err [msg] (set! error msg))
+                              (Ok [_] 0))))))
+                    (edges/release-phis! (mut phis)))))
+            (free! (mut owned))
+            (if (= error "") (Ok 0) (Err error)))))))
+
+(defn unconditional! [(output (mut code/Buffer))
+                      (graph g/Graph)
+                      (assigned allocate/Assigned)
+                      (scheduled schedule/Schedule)
+                      (analysis live/Analysis)
+                      (reference i32)
+                      (position i64)
+                      (users uses/Uses)
+                      (selected (ArrayList bool))
+                      (branches (mut (ArrayList fixups/Branch)))
+                      (allocator (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (let [range (get (.ranges users) (cast i64 reference))
+        (mut target) (: 0 i32)
+        (mut i) 0]
+    (while (< i (.count range))
+      (let [edge (get (.edges users) (+ (.offset range) i))
+            user (.user edge)
+            node (get (.instructions graph) (cast i64 user))]
+        (when (and (get selected (cast i64 user))
+                   (op/block-start? (cast i32 (n/opcode node))))
+          (set! target user)))
+      (set! i (+ i 1)))
+    (if (= target 0)
+        (Err "block end has no scheduled successor")
+        (match (edge! (mut output)
+                      graph
+                      assigned
+                      scheduled
+                      analysis
+                      target
+                      (+ position 1)
+                      allocator)
+          (Err [msg] (Err msg))
+          (Ok [_]
+              (do
+                (push! (mut branches)
+                       (fixups/Branch
+                         :offset (len (.text output))
+                         :label target
+                         :condition -1
+                         :link false))
+                (bytes/append32! (mut (.text output)) 0)
+                (Ok 4)))))))
+
+;;; FRAME_ADDR forces a real frame record even in a leaf function.
+(defn frame-value! [(output (mut code/Buffer))
+                    (parts (ArrayList allocation/Part))
+                    (reference i32)
+                    (position i64)
+                    (base frame-address/Base)]
+  (-> (Result i32 (slice u8)))
+  (if (or (not (frame-address/valid-base? base)) (!= (.reg base) 29))
+      (Err "FRAME_ADDR requires an anchored frame")
+      (match (locations/lookup parts reference (+ position 1))
+        (Err [message] (Err message))
+        (Ok [destination]
+            (if (or (!= (.kind destination) 0)
+                    (< (.value destination) 0)
+                    (> (.value destination) 15))
+                (Err "frame address requires an allocatable GPR")
+                (word! (mut output)
+                       (encode/add-sub-immediate true
+                                                 false
+                                                 false
+                                                 (cast i32 (.value destination))
+                                                 29
+                                                 0)))))))

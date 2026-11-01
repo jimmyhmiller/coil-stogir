@@ -1,0 +1,166 @@
+(module stogir.tests.jit-incoming)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn combine :cc (cc/C) [(a i64) (b i64)] (-> i64)
+  (+ (* a 3) (* b 5)))
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn check [(anchored? bool) (dynamic? bool) (padding? bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        frame
+          (if anchored?
+              (require (b/emit! (mut graph) 66 6 []))
+              (require (b/scalar-constant! (mut graph) 6 1 8)))
+        ; Deliberately reversed stack projections, with other parameters omitted.
+        e (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 12]))
+        c (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 10]))
+        a (require (b/emit! (mut graph) 71 10 [start (: 0 i32) 8]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        wide-a (require (b/emit! (mut graph) 33 11 [a]))
+        count (require (b/scalar-constant! (mut graph) 5 17 8))
+        allocation
+          (let [(mut control) start
+                (mut j) (: 0 i64)
+                zero (require (b/scalar-constant! (mut graph) 5 0 8))]
+            (when padding?
+              (while (< j 4200)
+                (let [variable
+                        (require (b/variable! (mut graph)
+                                              5
+                                              start
+                                              "large-padding"
+                                              8))]
+                  (set! control
+                        (require (b/emit! (mut graph)
+                                          87
+                                          0
+                                          [control variable zero]))))
+                (set! j (+ j 1))))
+            (if dynamic?
+                (require (b/stack-allocate! (mut graph) control count 16))
+                control))
+        (mut failures) 0]
+    (match (calls/create 0
+                         11
+                         [(: 6 u8) 11 11 11 11 11 11 11 10 10 11 10 11]
+                         allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype]
+            (require (calls/function! (mut graph) owned allocator))
+            (calls/release! (mut owned)))))
+    (match (calls/create 0 11 [(: 11 u8) 11] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned-prototype) prototype
+                call
+                  (require (calls/emit! (mut graph)
+                                        owned-prototype
+                                        allocation
+                                        target
+                                        [wide-a c]
+                                        allocator))
+                ; This incoming x1 projection is created after the call node.
+                x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+                sum (require (b/emit! (mut graph) 26 11 [call x]))
+                result (require (b/emit! (mut graph) 26 11 [sum e]))
+                zero (require (b/scalar-constant! (mut graph) 11 0 8))
+                checked
+                  (require (b/emit! (mut graph) 60 11 [frame result zero]))
+                ret
+                  (require (b/emit! (mut graph) 120 11 [call checked (: 0 i32)]))]
+            (match (compile/object graph
+                                   start
+                                   [ret]
+                                   "_stogir_incoming_test"
+                                   allocator)
+              (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+              (Ok [object]
+                  (let [(mut owned) object]
+                    (match (fs/write-file allocator
+                                          "/tmp/coil-stogir-incoming.o"
+                                          (slice owned))
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [_] 0))
+                    (free! (mut owned)))))
+            (match (compile/text graph start [ret] allocator)
+              (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+              (Ok [compiled]
+                  (let [(mut code) compiled]
+                    (match (jit/map-text (slice code))
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [image]
+                          (let [(mut owned) image
+                                f
+                                  (primitive/cast (fnptr (cc/C)
+                                                         [u64 i64 i64 i64 i64
+                                                          i64 i64 i64 i32 i32
+                                                          i64 i32 i64]
+                                                         i64)
+                                                  (.base owned))
+                                target
+                                  (primitive/cast u64
+                                                  (primitive/cast (ptr u8)
+                                                                  (fnptr-of combine)))]
+                            (for a [(: -2147483648 i32)
+                                    -100
+                                    -1
+                                    0
+                                    1
+                                    100
+                                    2147483647]
+                              (for x [(: -100 i64) -1 0 1 100]
+                                (let [c (- (* x 7) 9)
+                                      e (+ (* x 3) 100)
+                                      expected
+                                        (+ (* (cast i64 a) 3) (* c 5) x e)
+                                      actual
+                                        (call-ptr f
+                                                  target
+                                                  x
+                                                  77
+                                                  88
+                                                  99
+                                                  111
+                                                  222
+                                                  333
+                                                  a
+                                                  -123
+                                                  c
+                                                  314
+                                                  e)]
+                                  (when (!= actual expected)
+                                    (when (= failures 0)
+                                      (println "expected={} actual={}"
+                                               expected
+                                               actual))
+                                    (set! failures (+ failures 1))))))
+                            (jit/release! (mut owned)))))
+                    (free! (mut code)))))
+            (calls/release! (mut owned-prototype)))))
+    (g/release! (mut graph))
+    (println "incoming parameter checks: {} failures" failures)
+    (if (= failures 0) 0 1)))
+
+(defn main [] (-> i64)
+  (let [failures
+          (+ (check false false false)
+             (check true false false)
+             (check false true false)
+             (check true true false)
+             (check false false true)
+             (check false true true))]
+    (if (= failures 0) 0 1)))

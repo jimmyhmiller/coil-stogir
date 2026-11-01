@@ -1,0 +1,90 @@
+(module stogir.tests.jit-call-varargs-boundary)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.encode" :as e)
+(import "stogir.bytes" :as bytes)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn word! [(code (mut (ArrayList u8))) (result (Result u32 (slice u8)))]
+  (-> void)
+  (match result
+    (Ok [word] (bytes/append32! (mut code) word))
+    (Err [msg] (println "{}" msg))))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        (mut probe) (ArrayList::new [u8] allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        x (require (b/emit! (mut graph) 71 10 [start (: 0 i32) 1]))
+        y (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        (mut failures) 0]
+    ; Eight named GPR arguments precede a named int32 stack argument at SP.
+    ; The unnamed int32 and int64 values occupy 8-byte slots at SP+8, SP+16.
+    (word! (mut probe) (e/signed-load true 4 9 31 0))
+    (word! (mut probe) (e/signed-load true 4 10 31 8))
+    (word! (mut probe) (e/load-store true 8 11 31 16))
+    (word! (mut probe) (e/add-sub true false false 0 9 10))
+    (word! (mut probe) (e/add-sub true false false 0 0 11))
+    (word! (mut probe) (e/ret 30))
+    (match (calls/create 16 11 [(: 11 u8) 11 11 11 11 11 11 11 10] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned-prototype) prototype
+                call
+                  (require (calls/emit! (mut graph)
+                                        owned-prototype
+                                        start
+                                        target
+                                        [y y y y y y y y x x y]
+                                        allocator))
+                ret (require (b/emit! (mut graph) 120 11 [call call (: 0 i32)]))]
+            (match (compile/text graph start [ret] allocator)
+              (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+              (Ok [compiled]
+                  (let [(mut code) compiled]
+                    (match (jit/map-text (slice code))
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [image]
+                          (let [(mut owned) image]
+                            (match (jit/map-text (slice probe))
+                              (Err [_] (set! failures (+ failures 1)))
+                              (Ok [callee]
+                                  (let [(mut owned-callee) callee
+                                        f
+                                          (primitive/cast (fnptr (cc/C)
+                                                                 [u64 i32 i64]
+                                                                 i64)
+                                                          (.base owned))]
+                                    (for x [(: -2147483648 i32)
+                                            -1
+                                            0
+                                            1
+                                            2147483647]
+                                      (for y [(: -100 i64) -1 0 1 100]
+                                        (when (!= (call-ptr f
+                                                            (primitive/cast u64
+                                                                            (.base owned-callee))
+                                                            x
+                                                            y)
+                                                  (+ (* (cast i64 x) 2) y))
+                                          (set! failures (+ failures 1)))))
+                                    (jit/release! (mut owned-callee)))))
+                            (jit/release! (mut owned)))))
+                    (free! (mut code)))))
+            (calls/release! (mut owned-prototype)))))
+    (free! (mut probe))
+    (g/release! (mut graph))
+    (println "variadic stack boundary checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

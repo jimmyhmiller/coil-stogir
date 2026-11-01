@@ -1,0 +1,169 @@
+;;; Scalar AArch64 call constraints and caller-saved register reservations.
+(module stogir.a64.call-abi)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.calls" :as calls)
+(import "stogir.types" :as types)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.bytes" :as bytes)
+(import "stogir.schedule" :as schedule)
+(import "stogir.allocation" :as allocation)
+(import "stogir.a64.registers" :as registers)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+(import "coil.alloc" :use [Allocator])
+
+;;; Reserve every allocatable caller-saved bank used by this function. The
+;;; result interval itself occupies x0 or v0 according to the return class.
+(defn reserve! [(parts (mut (ArrayList allocation/Part)))
+                (graph g/Graph)
+                (scheduled schedule/Schedule)
+                (floating? bool)
+                (allocator (dyn Allocator))] (-> i32)
+  (let [(mut count) (: 0 i32)
+        (mut i) 0]
+    (while (< i (len (.nodes scheduled)))
+      (let [reference (get (.nodes scheduled) i)
+            node (get (.instructions graph) (cast i64 reference))]
+        (when (= (n/opcode node) 79)
+          (let [(mut reg) (: 0 i32)
+                result
+                  (if (types/floating? (cast i32 (n/type-id node)))
+                      (: 32 i32)
+                      (if (= (n/type-id node) 0) (: -1 i32) (: 0 i32)))
+                mask
+                  (| (registers/gpr-mask)
+                     (if floating? (registers/simd-mask) (: 0 u64)))]
+            (while (< reg (if floating? 64 16))
+              (when (and (!= reg result)
+                         (!= (& mask (<< (: 1 u64) (cast u64 reg))) 0))
+                (allocation/reserve! (mut parts)
+                                     reg
+                                     (+ (* i 2) 1)
+                                     (+ (* i 2) 2)
+                                     allocator))
+              (set! reg (+ reg 1))))
+          (set! count (+ count 1))))
+      (set! i (+ i 1)))
+    count))
+
+;;; Darwin's fixed scalar stack arguments occupy their natural size/alignment.
+;;; Called only after scalar call-type validation; other ABIs need other layouts.
+(defn argument-size [(ty u8)] (-> i64)
+  (cast i64 (types/scalar-size (cast i32 ty) 8)))
+
+(defn align [(offset i64) (alignment i64)] (-> i64)
+  (* (/ (+ offset (- alignment 1)) alignment) alignment))
+
+(defstruct Argument
+  [(value i32) (ty u8) (register i32) (offset i64) (size i32) (promote? bool)])
+
+(defstruct Layout [(arguments (ArrayList Argument)) (stack i64)])
+
+(defn release! [(layout (mut Layout))] (-> void)
+  (free! (mut (.arguments layout))))
+
+;;; Classify every argument in source order. Register banks exhaust independently;
+;;; Darwin unnamed variadic arguments always occupy promoted eight-byte slots.
+(defn layout [(graph g/Graph) (reference i32) (allocator (dyn Allocator))]
+  (-> (Result Layout (slice u8)))
+  (match (calls/validate-call graph reference)
+    (Err [message] (Err message))
+    (Ok [signature]
+        (let [(mut result)
+                (Layout
+                  :arguments (ArrayList::new [Argument] allocator)
+                  :stack 0)
+              (mut gp) (: 0 i32)
+              (mut fp) (: 0 i32)
+              (mut j) (: 3 i32)
+              (mut error) ""
+              count (get (.arities graph) (cast i64 reference))]
+          (while (and (= error "") (<= j count))
+            (match (g/operand graph reference j)
+              (None [] (set! error "missing call argument"))
+              (Some [value]
+                    (match (g/lookup graph value)
+                      (None [] (set! error "invalid call argument"))
+                      (Some [input]
+                            (let [ty (n/type-id input)
+                                  floating? (types/floating? (cast i32 ty))
+                                  unnamed?
+                                    (and (!= (& (.flags signature) 16) 0)
+                                         (>= (- j 3) (.count signature)))
+                                  size
+                                    (if unnamed?
+                                        8
+                                        (types/scalar-size (cast i32 ty) 8))
+                                  available (if floating? fp gp)
+                                  register
+                                    (if (and (not unnamed?) (< available 8))
+                                        (+ available (if floating? 32 0))
+                                        (: -1 i32))]
+                              (if (or (<= size 0)
+                                      (not (or (types/integer? (cast i32 ty))
+                                               floating?)))
+                                  (set! error
+                                        "unsupported scalar call argument type")
+                                  (do
+                                    (when (< register 0)
+                                      (set! (.stack result)
+                                            (align (.stack result)
+                                                   (cast i64 size))))
+                                    (push! (mut (.arguments result))
+                                           (Argument
+                                             :value value
+                                             :ty ty
+                                             :register register
+                                             :offset
+                                               (if (< register 0)
+                                                   (.stack result)
+                                                   -1)
+                                             :size size
+                                             :promote? (and unnamed? (= ty 13))))
+                                    (if (< register 0)
+                                        (set! (.stack result)
+                                              (+ (.stack result)
+                                                 (cast i64 size)))
+                                        (if floating?
+                                            (set! fp (+ fp 1))
+                                            (set! gp (+ gp 1)))))))))))
+            (set! j (+ j 1)))
+          (if (= error "") (Ok result) (do (release! (mut result)) (Err error)))))))
+
+;;; One outgoing area at SP is shared by calls and precedes all spill slots.
+(defn outgoing-size [(graph g/Graph) (scheduled schedule/Schedule)]
+  (-> (Result i64 (slice u8)))
+  (let [(mut maximum) (: 0 i64)
+        (mut error) ""]
+    (for reference (.nodes scheduled)
+      (when (and (= error "")
+                 (= (n/opcode (get (.instructions graph) (cast i64 reference)))
+                    79))
+        (match (layout graph reference (.alc (.nodes scheduled)))
+          (Err [message] (set! error message))
+          (Ok [plan]
+              (let [(mut owned) plan]
+                (when (> (.stack owned) maximum) (set! maximum (.stack owned)))
+                (release! (mut owned)))))))
+    (if (= error "") (Ok (align maximum 16)) (Err error))))
+
+;;; Darwin callers extend sub-32-bit integer register arguments. Canonicalize
+;;; narrow results and generated function returns the same way. No scratch is
+;;; needed, and the operation runs after parallel copies have consumed sources.
+(defn normalize! [(output (mut (ArrayList u8))) (ty u8) (register i32)]
+  (-> (Result i32 (slice u8)))
+  (if (or (= ty 0) (types/floating? (cast i32 ty)))
+      (Ok 0)
+      (if (not (types/integer? (cast i32 ty)))
+          (Err "unsupported scalar ABI normalization")
+          (let [size (types/scalar-size (cast i32 ty) 8)]
+            (if (>= size 4)
+                (Ok 0)
+                (match (encode/extend false
+                                      (types/signed? (cast i32 ty))
+                                      (* size 8)
+                                      register
+                                      register)
+                  (Err [msg] (Err msg))
+                  (Ok [word] (do (bytes/append32! (mut output) word) (Ok 4)))))))))

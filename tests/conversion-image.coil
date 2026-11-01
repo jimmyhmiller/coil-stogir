@@ -1,0 +1,74 @@
+(module stogir.tests.conversion-image)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.symbols" :as symbols)
+(import "stogir.image" :as image)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        named (require (symbols/function! (mut graph) "_labs" 0))
+        integer (require (b/conversion! (mut graph) 36 5 8 named))
+        ret (require (b/emit! (mut graph) 120 5 [start integer (: 0 i32)]))
+        (mut failures) 0]
+    (match (compile/text graph start [ret] allocator)
+      (Ok [text]
+          (let [(mut owned) text]
+            (free! (mut owned))
+            (set! failures (+ failures 1))))
+      (Err [_] 0))
+    (let [compiled
+            (compile/image graph start [ret] "_stogir_bitcast_image" allocator)]
+      (g/release! (mut graph))
+      (match compiled
+        (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+        (Ok [source]
+            (let [(mut owned-source) source]
+              (match (macho/image-object owned-source allocator)
+                (Err [_] (set! failures (+ failures 1)))
+                (Ok [object]
+                    (let [(mut bytes) object]
+                      (match (fs/write-file allocator
+                                            "/tmp/coil-stogir-conversion-image.o"
+                                            (slice bytes))
+                        (Err [_] (set! failures (+ failures 1)))
+                        (Ok [_] 0))
+                      (free! (mut bytes)))))
+              (for resolution [(: 0 u64) 1 0xFEDCBA9876543210]
+                (let [(mut addresses) (ArrayList::new [u64] allocator)
+                      (mut present) (ArrayList::new [bool] allocator)]
+                  (for symbol (.symbols owned-source)
+                    (push! (mut addresses) resolution)
+                    (push! (mut present) true))
+                  (match (jit/map-image-resolved owned-source
+                                                 (slice addresses)
+                                                 (slice present)
+                                                 allocator)
+                    (Err [msg]
+                         (do (println "{}" msg) (set! failures (+ failures 1))))
+                    (Ok [loaded]
+                        (let [(mut owned) loaded
+                              f
+                                (primitive/cast (fnptr (cc/C) [] u64)
+                                                (.base (.memory owned)))]
+                          (when (!= (call-ptr f) resolution)
+                            (set! failures (+ failures 1)))
+                          (jit/release-image! (mut owned)))))
+                  (free! (mut addresses))
+                  (free! (mut present))))
+              (image/release! (mut owned-source))))))
+    (println "conversion image/relocation checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

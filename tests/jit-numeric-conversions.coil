@@ -1,0 +1,383 @@
+(module stogir.tests.jit-numeric-conversions)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.types" :as types)
+(import "stogir.conversion" :as conversion)
+(import "stogir.numeric-conversion" :as numeric)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+(defstruct Pattern [(wide u64) (narrow u64)])
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn mask [(ty i32)] (-> u64)
+  (cast u64 (- (<< (: 1 u128) (cast u128 (* 8 (types/scalar-size ty 8)))) 1)))
+
+(defn canonical [(ty i32) (bits u64)] (-> u64)
+  (let [raw (& bits (mask ty))] (if (= ty 1) (if (= raw 0) (: 0 u64) 1) raw)))
+
+(defn nan? [(ty i32) (bits u64)] (-> bool)
+  (let [exponent (if (= ty 12) (: 0x7FF0000000000000 u64) 0x7F800000)
+        fraction (if (= ty 12) (: 0xFFFFFFFFFFFFF u64) 0x7FFFFF)]
+    (and (= (& bits exponent) exponent) (!= (& bits fraction) 0))))
+
+;;; Only execute a host FP-to-integer cast after the exact integer decoder proves
+;;; the truncated value representable. The numeric oracle then uses native casts,
+;;; independently of the decoder's significand/shift implementation.
+(defn reference [(opcode i32) (src i32) (dst i32) (bits u64)] (-> (Option u64))
+  (if (= opcode 37)
+      (let [raw (canonical src bits)
+            modulus (+ (cast u128 (mask src)) 1)
+            signed-value
+              (cast i64
+                    (if (>= (cast u128 raw) (/ modulus 2))
+                        (- (cast i128 raw) (cast i128 modulus))
+                        (cast i128 raw)))]
+        (if (= dst 12)
+            (let [(mut result)
+                    (if (types/signed? src)
+                        (cast f64 signed-value)
+                        (cast f64 raw))]
+              (Some (load (primitive/cast (ptr u64) (mut result)))))
+            (let [(mut result)
+                    (if (types/signed? src)
+                        (cast f32 signed-value)
+                        (cast f32 raw))]
+              (Some (cast u64 (load (primitive/cast (ptr u32) (mut result))))))))
+      (if (= opcode 38)
+          (match (numeric/evaluate opcode src dst 8 bits)
+            (None [] (None))
+            (Some [_]
+                  (let [(mut d) (: 0.0 f64)
+                        (mut f) (: 0.0 f32)]
+                    (store! (primitive/cast (ptr u64) (mut d)) bits)
+                    (store! (primitive/cast (ptr u32) (mut f)) (cast u32 bits))
+                    (Some (canonical dst
+                                     (if (types/signed? dst)
+                                         (cast u64
+                                               (if (= src 12)
+                                                   (cast i64 d)
+                                                   (cast i64 f)))
+                                         (if (= src 12)
+                                             (cast u64 d)
+                                             (cast u64 f))))))))
+          (if (= src dst)
+              (Some (canonical dst bits))
+              (if (nan? src bits)
+                  (None)
+                  (if (= src 12)
+                      (let [(mut d) (: 0.0 f64)]
+                        (store! (primitive/cast (ptr u64) (mut d)) bits)
+                        (let [(mut result) (cast f32 d)]
+                          (Some (cast u64
+                                      (load (primitive/cast (ptr u32)
+                                                            (mut result)))))))
+                      (let [(mut f) (: 0.0 f32)]
+                        (store! (primitive/cast (ptr u32) (mut f))
+                                (cast u32 bits))
+                        (let [(mut result) (cast f64 f)]
+                          (Some (load (primitive/cast (ptr u64) (mut result))))))))))))
+
+(defn typed! [(graph (mut g/Graph)) (ty i32) (value i32)] (-> i32)
+  (if (= ty 5)
+      value
+      (if (= ty 13)
+          (require (b/conversion! (mut graph)
+                                  36
+                                  13
+                                  8
+                                  (require (b/conversion! (mut graph)
+                                                          35
+                                                          4
+                                                          8
+                                                          value))))
+          (require (b/conversion! (mut graph)
+                                  (if (= (types/scalar-size ty 8) 8) 36 35)
+                                  ty
+                                  8
+                                  value)))))
+
+(defn raw! [(graph (mut g/Graph)) (ty i32) (value i32)] (-> i32)
+  (if (= ty 5)
+      value
+      (if (= ty 13)
+          (require (b/conversion! (mut graph)
+                                  34
+                                  5
+                                  8
+                                  (require (b/conversion! (mut graph)
+                                                          36
+                                                          4
+                                                          8
+                                                          value))))
+          (require (b/conversion! (mut graph)
+                                  (if (= (types/scalar-size ty 8) 8) 36 34)
+                                  5
+                                  8
+                                  value)))))
+
+(defstruct Fixture
+  [(opcode i32) (src i32) (dst i32) (symbol (slice u8)) (path (slice u8))])
+
+(defn save! [(graph g/Graph)
+             (start i32)
+             (ret i32)
+             (opcode i32)
+             (src i32)
+             (dst i32)] (-> i64)
+  (let [(mut failures) 0]
+    (for fixture [(Fixture
+                    :opcode 37
+                    :src 5
+                    :dst 13
+                    :symbol "_stogir_numeric_0"
+                    :path "/tmp/coil-stogir-numeric-0.o")
+                  (Fixture
+                    :opcode 37
+                    :src 8
+                    :dst 12
+                    :symbol "_stogir_numeric_1"
+                    :path "/tmp/coil-stogir-numeric-1.o")
+                  (Fixture
+                    :opcode 38
+                    :src 12
+                    :dst 11
+                    :symbol "_stogir_numeric_2"
+                    :path "/tmp/coil-stogir-numeric-2.o")
+                  (Fixture
+                    :opcode 38
+                    :src 12
+                    :dst 5
+                    :symbol "_stogir_numeric_3"
+                    :path "/tmp/coil-stogir-numeric-3.o")
+                  (Fixture
+                    :opcode 38
+                    :src 13
+                    :dst 8
+                    :symbol "_stogir_numeric_4"
+                    :path "/tmp/coil-stogir-numeric-4.o")
+                  (Fixture
+                    :opcode 38
+                    :src 12
+                    :dst 1
+                    :symbol "_stogir_numeric_5"
+                    :path "/tmp/coil-stogir-numeric-5.o")
+                  (Fixture
+                    :opcode 39
+                    :src 13
+                    :dst 12
+                    :symbol "_stogir_numeric_6"
+                    :path "/tmp/coil-stogir-numeric-6.o")
+                  (Fixture
+                    :opcode 39
+                    :src 12
+                    :dst 13
+                    :symbol "_stogir_numeric_7"
+                    :path "/tmp/coil-stogir-numeric-7.o")]
+      (when (and (= opcode (.opcode fixture))
+                 (= src (.src fixture))
+                 (= dst (.dst fixture)))
+        (match (compile/object graph
+                               start
+                               [ret]
+                               (.symbol fixture)
+                               (malloc-allocator))
+          (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+          (Ok [object]
+              (let [(mut bytes) object]
+                (match (fs/write-file (malloc-allocator)
+                                      (.path fixture)
+                                      (slice bytes))
+                  (Err [_] (set! failures (+ failures 1)))
+                  (Ok [_] 0))
+                (free! (mut bytes)))))))
+    failures))
+
+(defn check [(opcode i32) (src i32) (dst i32) (mode i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        (mut inputs) (ArrayList::new [u64] allocator)
+        (mut cells) (ArrayList::new [u8] allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        param (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        output (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        literal
+          (if (types/integer? src)
+              (canonical src 0x8000008000000001)
+              (if (= src 12) (: 0x3FFC000000000000 u64) 0x3FE00000))
+        input
+          (if (= mode 0)
+              (typed! (mut graph) src param)
+              (require (b/scalar-constant! (mut graph) src literal 8)))
+        converted
+          (require (if (= mode 1)
+                       (b/conversion! (mut graph) opcode dst 8 input)
+                       (b/emit! (mut graph) opcode dst [input])))
+        bits (raw! (mut graph) dst converted)
+        eight (require (b/scalar-constant! (mut graph) 6 8 8))
+        result-address (require (b/emit! (mut graph) 26 6 [output eight]))
+        stored-result
+          (require (b/emit! (mut graph) 93 0 [start result-address bits]))
+        stored-original
+          (require (b/emit! (mut graph) 93 0 [stored-result output input]))
+        ret
+          (require (b/emit! (mut graph) 120 5 [stored-original bits (: 0 i32)]))
+        (mut failures) 0
+        (mut i) (: 0 i64)
+        (mut valid-count) (: 0 i64)]
+    (while (< i 16) (push! (mut cells) 0) (set! i (+ i 1)))
+    (match (calls/create 0 5 [(: 5 u8) 6] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype]
+            (require (calls/function! (mut graph) owned allocator))
+            (calls/release! (mut owned)))))
+    (if (types/integer? src)
+        (for value [(: 0 u64)
+                    1
+                    2
+                    127
+                    128
+                    255
+                    32767
+                    32768
+                    65535
+                    0x7FFFFFFF
+                    0x80000000
+                    0xFFFFFFFF
+                    0x100000000
+                    0x7FFFFFFFFFFFFFFF
+                    0x8000000000000000
+                    0x8000008000000001
+                    0x4000004000000001
+                    0xBFFFFFBFFFFFFFFF
+                    0xFFFFFFFFFFFFFFFF]
+          (push! (mut inputs) (canonical src value)))
+        (for row [(Pattern :wide 0x0 :narrow 0x0)
+                  (Pattern :wide 0x8000000000000000 :narrow 0x80000000)
+                  (Pattern :wide 0x3FE8000000000000 :narrow 0x3F400000)
+                  (Pattern :wide 0xBFE8000000000000 :narrow 0xBF400000)
+                  (Pattern :wide 0x3FFC000000000000 :narrow 0x3FE00000)
+                  (Pattern :wide 0xBFFC000000000000 :narrow 0xBFE00000)
+                  (Pattern :wide 0x405FF9999999999A :narrow 0x42FFCCCD)
+                  (Pattern :wide 0x4060000000000000 :narrow 0x43000000)
+                  (Pattern :wide 0xC0601CCCCCCCCCCD :narrow 0xC300E666)
+                  (Pattern :wide 0xC060200000000000 :narrow 0xC3010000)
+                  (Pattern :wide 0x406FFCCCCCCCCCCD :narrow 0x437FE666)
+                  (Pattern :wide 0x4070000000000000 :narrow 0x43800000)
+                  (Pattern :wide 0x40EFFFFCCCCCCCCD :narrow 0x477FFFE6)
+                  (Pattern :wide 0x40F0000000000000 :narrow 0x47800000)
+                  (Pattern :wide 0x41DFFFFFFFC00000 :narrow 0x4F000000)
+                  (Pattern :wide 0x41E0000000000000 :narrow 0x4F000000)
+                  (Pattern :wide 0xC1E0000000000000 :narrow 0xCF000000)
+                  (Pattern :wide 0xC1E0000000200000 :narrow 0xCF000000)
+                  (Pattern :wide 0x43E0000000000000 :narrow 0x5F000000)
+                  (Pattern :wide 0xC3E0000000000000 :narrow 0xDF000000)
+                  (Pattern :wide 0x43DFFFFFFFFFFFFF :narrow 0x5F000000)
+                  (Pattern :wide 0x43EFFFFFFFFFFFFF :narrow 0x5F800000)
+                  (Pattern :wide 0x43F0000000000000 :narrow 0x5F800000)
+                  (Pattern :wide 0x54B249AD2594C37D :narrow 0x7F800000)
+                  (Pattern :wide 0x2B2BFF2EE48E0530 :narrow 0x0)
+                  (Pattern :wide 0x7FF0000000000000 :narrow 0x7F800000)
+                  (Pattern :wide 0xFFF0000000000000 :narrow 0xFF800000)
+                  (Pattern :wide 0x7FF8000000000000 :narrow 0x7FC00000)
+                  (Pattern :wide 0x3FF0000010000000 :narrow 0x3F800000)
+                  (Pattern :wide 0x3FF0000010000001 :narrow 0x3F800001)
+                  (Pattern :wide 0x3FF000000FFFFFFF :narrow 0x3F800000)
+                  (Pattern :wide 0x3FF0000030000000 :narrow 0x3F800002)
+                  (Pattern :wide 0xBFF0000010000000 :narrow 0xBF800000)
+                  (Pattern :wide 0xBFF0000010000001 :narrow 0xBF800001)
+                  (Pattern :wide 0x3690000000000000 :narrow 0x0)
+                  (Pattern :wide 0x3690000000000001 :narrow 0x1)
+                  (Pattern :wide 0x36A8000000000000 :narrow 0x2)
+                  (Pattern :wide 0x7FF0123456789ABC :narrow 0x7F812345)
+                  (Pattern :wide 0xFFF8123456789ABC :narrow 0xFFC12345)]
+          (push! (mut inputs) (if (= src 12) (.wide row) (.narrow row)))))
+    (when (= mode 0)
+      (set! failures (+ failures (save! graph start ret opcode src dst))))
+    (match (compile/text graph start [ret] allocator)
+      (Err [msg]
+           (do
+             (println "numeric op={} src={} dst={} mode={}: {}"
+                      opcode
+                      src
+                      dst
+                      mode
+                      msg)
+             (set! failures (+ failures 1))))
+      (Ok [text]
+          (let [(mut code) text]
+            (match (jit/map-text (slice code))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [loaded]
+                  (let [(mut image) loaded
+                        fun
+                          (primitive/cast (fnptr (cc/C) [u64 (ptr u8)] u64)
+                                          (.base image))]
+                    (for parameter inputs
+                      (let [source (if (= mode 0) parameter literal)
+                            expected (reference opcode src dst source)
+                            actual (call-ptr fun parameter (.data cells))
+                            stored
+                              (load (primitive/cast (ptr u64)
+                                                    (primitive/index (.data cells)
+                                                                     8)))]
+                        (when (!= actual stored) (set! failures (+ failures 1)))
+                        (match expected
+                          (Some [wanted]
+                                (set! valid-count (+ valid-count 1))
+                                (when (!= actual wanted)
+                                  (when (= failures 0)
+                                    (println "numeric mismatch op={} src={} dst={} mode={} input={} wanted={} actual={}"
+                                             opcode
+                                             src
+                                             dst
+                                             mode
+                                             source
+                                             wanted
+                                             actual))
+                                  (set! failures (+ failures 1))))
+                          (None []
+                                (when (if (= opcode 39)
+                                          (not (nan? dst actual))
+                                          (or (!= (& actual (mask dst)) actual)
+                                              (and (= dst 1) (> actual 1))))
+                                  (set! failures (+ failures 1)))))
+                        (set! i 0)
+                        (while (< i (cast i64 (types/scalar-size src 8)))
+                          (when (!= (get cells i)
+                                    (cast u8 (>> source (cast u64 (* i 8)))))
+                            (set! failures (+ failures 1)))
+                          (set! i (+ i 1)))))
+                    (jit/release! (mut image)))))
+            (free! (mut code)))))
+    (when (= valid-count 0) (set! failures (+ failures 1)))
+    (free! (mut inputs))
+    (free! (mut cells))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0
+        (mut count) 0]
+    (for src [(: 1 i32) 2 3 4 5 6 7 8 9 10 11 12 13]
+      (for dst [(: 1 i32) 2 3 4 5 6 7 8 9 10 11 12 13]
+        (for opcode [(: 37 i32) 38 39]
+          (when (numeric/valid-types? opcode src dst)
+            (for mode [(: 0 i32) 1 2]
+              (set! count (+ count 1))
+              (set! failures (+ failures (check opcode src dst mode))))))))
+    (when (!= count 144) (set! failures (+ failures 1)))
+    (println "native numeric conversions: {} variants, {} failures"
+             count
+             failures)
+    (if (= failures 0) 0 1)))

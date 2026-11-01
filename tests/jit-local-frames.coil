@@ -1,0 +1,242 @@
+(module stogir.tests.jit-local-frames)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn update24 :cc (cc/C) [(a u64)
+                           (b u64)
+                           (c u64)
+                           (d u64)
+                           (e u64)
+                           (f u64)
+                           (g u64)
+                           (h u64)
+                           (i u64)
+                           (j u64)
+                           (k u64)
+                           (l u64)
+                           (m u64)
+                           (n u64)
+                           (o u64)
+                           (p u64)
+                           (q u64)
+                           (r u64)
+                           (s u64)
+                           (t u64)
+                           (u u64)
+                           (v u64)
+                           (w u64)
+                           (x u64)] (-> u64)
+  (let [(mut sum) (: 0 u64)]
+    (for address [a b c d e f g h i j k l m n o p q r s t u v w x]
+      (let [p (primitive/cast (ptr u64) address)
+            value (primitive/load p)]
+        (set! sum (+ sum value))
+        (primitive/store! p (+ value 1000))))
+    sum))
+
+(defn calls-check [(anchored? bool) (dynamic? bool) (padding? bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        frame
+          (if anchored?
+              (require (b/emit! (mut graph) 66 6 []))
+              (require (b/scalar-constant! (mut graph) 6 1 8)))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        (mut addresses) (ArrayList::new [i32] allocator)
+        (mut types) (ArrayList::new [u8] allocator)
+        guard (require (b/variable! (mut graph) 5 start "fixed-guard" 8))
+        sentinel (require (b/scalar-constant! (mut graph) 5 321 8))
+        count (require (b/scalar-constant! (mut graph) 5 17 8))
+        (mut control)
+          (require (b/emit! (mut graph) 87 0 [start guard sentinel]))
+        (mut i) (: 1 i64)
+        (mut failures) 0]
+    (when padding?
+      (let [(mut j) (: 0 i64)
+            zero (require (b/scalar-constant! (mut graph) 5 0 8))]
+        (while (< j 4200)
+          (let [variable
+                  (require (b/variable! (mut graph) 5 start "large-padding" 8))]
+            (set! control
+                  (require (b/emit! (mut graph) 87 0 [control variable zero]))))
+          (set! j (+ j 1)))))
+    (while (<= i 24)
+      (let [variable (require (b/variable! (mut graph) 5 start "call-local" 8))
+            value (require (b/scalar-constant! (mut graph) 5 (cast u64 i) 8))
+            address
+              (if dynamic?
+                  (require (b/stack-allocate! (mut graph) control count 16))
+                  (require (b/variable-address! (mut graph) variable)))]
+        (set! control
+              (if dynamic?
+                  (require (b/emit! (mut graph) 93 0 [address address value]))
+                  (require (b/emit! (mut graph) 87 0 [control variable value]))))
+        (push! (mut addresses) address)
+        (push! (mut types) 6))
+      (set! i (+ i 1)))
+    (match (calls/create 0 5 (slice types) allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype
+                call
+                  (require (calls/emit! (mut graph)
+                                        owned
+                                        control
+                                        target
+                                        (slice addresses)
+                                        allocator))
+                (mut sum) call]
+            (set! control call)
+            ; Every address remains live through the call, forcing spill/reloads.
+            (for address addresses
+              (let [loaded
+                      (require (b/emit! (mut graph) 91 5 [control address]))]
+                (set! sum (require (b/emit! (mut graph) 26 5 [sum loaded])))
+                (set! control loaded)))
+            (let [guard-value
+                    (require (b/emit! (mut graph) 85 5 [control guard]))
+                  guard-ok
+                    (require (b/emit! (mut graph) 14 1 [guard-value sentinel]))
+                  zero (require (b/scalar-constant! (mut graph) 5 0 8))
+                  guarded
+                    (require (b/emit! (mut graph) 60 5 [guard-ok sum zero]))
+                  result
+                    (require (b/emit! (mut graph) 60 5 [frame guarded zero]))
+                  ret
+                    (require (b/emit! (mut graph)
+                                      120
+                                      5
+                                      [guard-value result (: 0 i32)]))]
+              (when (and dynamic? (not anchored?))
+                (match (compile/object graph
+                                       start
+                                       [ret]
+                                       "_stogir_stack_call24"
+                                       allocator)
+                  (Err [message]
+                       (println "{}" message)
+                       (set! failures (+ failures 1)))
+                  (Ok [object]
+                      (let [(mut bytes) object]
+                        (match (fs/write-file allocator
+                                              "/tmp/coil-stogir-stack-call24.o"
+                                              (slice bytes))
+                          (Err [_] (set! failures (+ failures 1)))
+                          (Ok [_] 0))
+                        (free! (mut bytes))))))
+              (match (compile/text graph start [ret] allocator)
+                (Err [message]
+                     (println "{}" message)
+                     (set! failures (+ failures 1)))
+                (Ok [text]
+                    (let [(mut bytes) text]
+                      (match (jit/map-text (slice bytes))
+                        (Err [message]
+                             (println "{}" message)
+                             (set! failures (+ failures 1)))
+                        (Ok [image]
+                            (let [(mut mapped) image
+                                  f
+                                    (primitive/cast (fnptr (cc/C) [u64] u64)
+                                                    (.base mapped))
+                                  address
+                                    (primitive/cast u64
+                                                    (primitive/cast (ptr u8)
+                                                                    (fnptr-of update24)))
+                                  got (call-ptr f address)]
+                              (when (!= got 24600)
+                                (println "local call pressure: expected 24600 got {}"
+                                         got)
+                                (set! failures (+ failures 1)))
+                              (jit/release! (mut mapped)))))
+                      (free! (mut bytes))))))
+            (calls/release! (mut owned)))))
+    (free! (mut types))
+    (free! (mut addresses))
+    (g/release! (mut graph))
+    failures))
+
+(defn large-check [(anchored? bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        frame
+          (if anchored?
+              (require (b/emit! (mut graph) 66 6 []))
+              (require (b/scalar-constant! (mut graph) 6 1 8)))
+        (mut control) start
+        (mut first) (: 0 i32)
+        (mut last) (: 0 i32)
+        (mut i) (: 1 i64)
+        (mut failures) 0]
+    (while (<= i 1100)
+      (let [variable (require (b/variable! (mut graph) 5 start "large-local" 8))
+            value (require (b/scalar-constant! (mut graph) 5 (cast u64 i) 8))]
+        (when (= i 1) (set! first variable))
+        (set! last variable)
+        (set! control
+              (require (b/emit! (mut graph) 87 0 [control variable value]))))
+      (set! i (+ i 1)))
+    (let [address (require (b/variable-address! (mut graph) last))
+          a (require (b/emit! (mut graph) 85 5 [control first]))
+          z (require (b/emit! (mut graph) 91 5 [a address]))
+          sum (require (b/emit! (mut graph) 26 5 [a z]))
+          zero (require (b/scalar-constant! (mut graph) 5 0 8))
+          result (require (b/emit! (mut graph) 60 5 [frame sum zero]))
+          ret (require (b/emit! (mut graph) 120 5 [z result (: 0 i32)]))]
+      (match (compile/object graph start [ret] "_stogir_local_large" allocator)
+        (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+        (Ok [object]
+            (let [(mut bytes) object]
+              (match (fs/write-file allocator
+                                    "/tmp/coil-stogir-local-large.o"
+                                    (slice bytes))
+                (Err [_] (set! failures (+ failures 1)))
+                (Ok [_] 0))
+              (free! (mut bytes)))))
+      (match (compile/text graph start [ret] allocator)
+        (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+        (Ok [text]
+            (let [(mut bytes) text]
+              (match (jit/map-text (slice bytes))
+                (Err [message]
+                     (println "{}" message)
+                     (set! failures (+ failures 1)))
+                (Ok [image]
+                    (let [(mut mapped) image
+                          f
+                            (primitive/cast (fnptr (cc/C) [] u64)
+                                            (.base mapped))]
+                      (when (!= (call-ptr f) 1101)
+                        (set! failures (+ failures 1)))
+                      (jit/release! (mut mapped)))))
+              (free! (mut bytes))))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures
+          (+ (calls-check false false false)
+             (calls-check false true false)
+             (large-check false)
+             (calls-check true false false)
+             (calls-check true true false)
+             (large-check true)
+             (calls-check false false true)
+             (calls-check false true true))]
+    (println "local addresses through calls, spills and 8.8 KB frame: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

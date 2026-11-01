@@ -1,0 +1,54 @@
+(module stogir.tests.compile-validation)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn check [(value i64)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        constant
+          (require (b/scalar-constant! (mut graph) 11 (cast u64 value) 8))
+        ret (require (b/emit! (mut graph) 120 11 [start constant (: 0 i32)]))
+        (mut failures) 0]
+    (match (compile/text graph start [ret] allocator)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [text]
+          (let [(mut bytes) text]
+            (match (jit/map-text (slice bytes))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [image]
+                  (let [(mut owned) image
+                        f (primitive/cast (fnptr (cc/C) [] i64) (.base owned))]
+                    (when (!= (call-ptr f) value)
+                      (set! failures (+ failures 1)))
+                    (jit/release! (mut owned)))))
+            (free! (mut bytes)))))
+    (match (compile/text graph start [(: 999 i32)] allocator)
+      (Err [_] 0)
+      (Ok [text]
+          (let [(mut bytes) text]
+            (set! failures (+ failures 1))
+            (free! (mut bytes)))))
+    (match (compile/text graph ret [ret] allocator)
+      (Err [_] 0)
+      (Ok [text]
+          (let [(mut bytes) text]
+            (set! failures (+ failures 1))
+            (free! (mut bytes)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures
+          (+ (check 0) (check 42) (check -1) (check -9223372036854775808))]
+    (println "compile entry validation checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

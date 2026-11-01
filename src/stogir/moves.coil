@@ -1,0 +1,66 @@
+;;; Parallel-copy resolution over abstract physical locations.
+(module stogir.moves)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err])
+
+(defstruct Move [(source i32) (destination i32)])
+
+;;; Scratch must not alias any participating location; destinations are unique.
+;;; Locations include registers/spill slots, with classes resolved by the caller.
+(defn resolve [(copies (slice Move)) (scratch i32) (allocator (dyn Allocator))]
+  (-> (Result (ArrayList Move) (slice u8)))
+  (let [(mut pending) (ArrayList::new [Move] allocator)
+        (mut active) (ArrayList::new [bool] allocator)
+        (mut result) (ArrayList::new [Move] allocator)
+        (mut remaining) 0
+        (mut error) ""
+        (mut i) 0]
+    (for copy copies
+      (when (or (= (.source copy) scratch) (= (.destination copy) scratch))
+        (set! error "scratch aliases parallel copy"))
+      (let [(mut j) 0]
+        (while (< j (len pending))
+          (when (= (.destination (get pending j)) (.destination copy))
+            (set! error "duplicate parallel-copy destination"))
+          (set! j (+ j 1))))
+      (push! (mut pending) copy)
+      (push! (mut active) (!= (.source copy) (.destination copy)))
+      (when (!= (.source copy) (.destination copy))
+        (set! remaining (+ remaining 1))))
+    (while (and (= error "") (> remaining 0))
+      (let [(mut ready) -1]
+        (set! i 0)
+        (while (and (< i (len pending)) (< ready 0))
+          (when (get active i)
+            (let [copy (get pending i)
+                  (mut used?) false
+                  (mut j) 0]
+              (while (< j (len pending))
+                (when (and (get active j)
+                           (= (.source (get pending j)) (.destination copy)))
+                  (set! used? true))
+                (set! j (+ j 1)))
+              (when (not used?) (set! ready i))))
+          (set! i (+ i 1)))
+        (if (>= ready 0)
+            (do
+              (push! (mut result) (get pending ready))
+              (set! (mut active) ready false)
+              (set! remaining (- remaining 1)))
+            (do
+              (set! i 0)
+              (while (not (get active i)) (set! i (+ i 1)))
+              (let [saved (.destination (get pending i))]
+                (push! (mut result) (Move :source saved :destination scratch))
+                (set! i 0)
+                (while (< i (len pending))
+                  (when (get active i)
+                    (let [(mut copy) (get pending i)]
+                      (when (= (.source copy) saved)
+                        (set! (.source copy) scratch)
+                        (set! (mut pending) i copy))))
+                  (set! i (+ i 1))))))))
+    (free! (mut pending))
+    (free! (mut active))
+    (if (= error "") (Ok result) (do (free! (mut result)) (Err error)))))

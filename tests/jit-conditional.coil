@@ -1,0 +1,185 @@
+(module stogir.tests.jit-conditional)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.types" :as types)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn mask [(ty u8)] (-> u64)
+  (cast u64
+        (- (<< (: 1 u128) (cast u128 (* 8 (types/scalar-size (cast i32 ty) 8))))
+           1)))
+
+(defn canonical [(ty u8) (value u64)] (-> u64)
+  (let [bits (& value (mask ty))
+        modulus (+ (cast u128 (mask ty)) 1)]
+    (if (and (types/signed? (cast i32 ty)) (>= (cast u128 bits) (/ modulus 2)))
+        (cast u64 (- (cast i128 bits) (cast i128 modulus)))
+        bits)))
+
+;;; Modes cover register/literal arms, zero/nonzero literal conditions,
+;;; condition-arm aliases and identical arms. Raw COND keeps folded cases live.
+(defn check [(condition-type u8) (ty u8) (mode i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        c
+          (require (b/emit! (mut graph)
+                            71
+                            (cast i32 condition-type)
+                            [start (: 0 i32) 0]))
+        a (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 1]))
+        b (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 2]))
+        a-literal
+          (if (= ty 1) (: 1 u64) (& (: 0xFEDCBA9876543280 u64) (mask ty)))
+        b-literal
+          (if (= ty 1) (: 0 u64) (& (: 0x123456789ABC7F01 u64) (mask ty)))
+        c-literal
+          (if (= mode 4)
+              (: 0 u64)
+              (if (= condition-type 1) (: 1 u64) (mask condition-type)))
+        condition
+          (if (or (= mode 4) (= mode 5))
+              (require (b/scalar-constant! (mut graph)
+                                           (cast i32 condition-type)
+                                           c-literal
+                                           8))
+              (if (= mode 6) a (if (= mode 7) b c)))
+        yes
+          (if (or (= mode 1) (= mode 3) (= mode 5))
+              (require (b/scalar-constant! (mut graph)
+                                           (cast i32 ty)
+                                           a-literal
+                                           8))
+              a)
+        no
+          (if (= mode 8)
+              a
+              (if (or (= mode 2) (= mode 3) (= mode 5))
+                  (require (b/scalar-constant! (mut graph)
+                                               (cast i32 ty)
+                                               b-literal
+                                               8))
+                  b))
+        selected
+          (require (b/emit! (mut graph) 60 (cast i32 ty) [condition yes no]))
+        extend? (and (< (types/scalar-size (cast i32 ty) 8) 8) (!= ty 1))
+        result-type
+          (if extend? (if (types/signed? (cast i32 ty)) 11 5) (cast i32 ty))
+        result
+          (if extend?
+              (require (b/emit! (mut graph)
+                                (if (types/signed? (cast i32 ty)) 33 34)
+                                result-type
+                                [selected]))
+              selected)
+        ret
+          (require (b/emit! (mut graph)
+                            120
+                            result-type
+                            [start result (: 0 i32)]))
+        (mut failures) 0]
+    (match (calls/create 0
+                         (cast u8 result-type)
+                         [condition-type ty ty]
+                         allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype]
+            (require (calls/function! (mut graph) owned allocator))
+            (calls/release! (mut owned)))))
+    (match (compile/text graph start [ret] allocator)
+      (Err [message]
+           (do
+             (println "COND cty={} ty={} mode={}: {}"
+                      condition-type
+                      ty
+                      mode
+                      message)
+             (set! failures (+ failures 1))))
+      (Ok [compiled]
+          (let [(mut code) compiled]
+            (match (jit/map-text (slice code))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [loaded]
+                  (let [(mut owned) loaded
+                        f
+                          (primitive/cast (fnptr (cc/C) [u64 u64 u64] u64)
+                                          (.base owned))]
+                    (for c [(: 0 u64)
+                            1
+                            2
+                            0x100
+                            0x10000
+                            0x100000000
+                            0x8000000000000000
+                            0xFFFFFFFFFFFFFFFF]
+                      (for a [(: 0 u64)
+                              1
+                              0x80
+                              0x8000
+                              0xFFFFFFFFFFFFFFFF
+                              0xFEDCBA9876543280]
+                        (for b [(: 0 u64) 1 0x7F 0xFFFF 0x123456789ABC7F01]
+                          (when (and (or (!= condition-type 1) (<= c 1))
+                                     (or (!= ty 1) (and (<= a 1) (<= b 1))))
+                            (let [effective-c
+                                    (if (or (= mode 4) (= mode 5))
+                                        c-literal
+                                        (if (= mode 6) a (if (= mode 7) b c)))
+                                  effective-a
+                                    (if (or (= mode 1) (= mode 3) (= mode 5))
+                                        a-literal
+                                        a)
+                                  effective-b
+                                    (if (= mode 8)
+                                        a
+                                        (if (or (= mode 2)
+                                                (= mode 3)
+                                                (= mode 5))
+                                            b-literal
+                                            b))
+                                  wanted
+                                    (canonical ty
+                                               (if (!= (& effective-c
+                                                          (mask condition-type))
+                                                       0)
+                                                   effective-a
+                                                   effective-b))
+                                  actual (call-ptr f c a b)]
+                              (when (!= actual wanted)
+                                (when (= failures 0)
+                                  (println "cty={} ty={} mode={} c={} a={} b={} expected={} actual={}"
+                                           condition-type
+                                           ty
+                                           mode
+                                           effective-c
+                                           effective-a
+                                           effective-b
+                                           wanted
+                                           actual))
+                                (set! failures (+ failures 1))))))))
+                    (jit/release! (mut owned)))))
+            (free! (mut code)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for cty [(: 1 u8) 2 3 4 5 6 7 8 9 10 11]
+      (for ty [(: 1 u8) 2 3 4 5 6 7 8 9 10 11]
+        (let [(mut mode) (: 0 i32)]
+          (while (< mode 9)
+            (when (or (< mode 6) (= mode 8) (= cty ty))
+              (set! failures (+ failures (check cty ty mode))))
+            (set! mode (+ mode 1))))))
+    (println "native conditional selection checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

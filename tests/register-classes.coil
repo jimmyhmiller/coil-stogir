@@ -1,0 +1,150 @@
+(module stogir.tests.register-classes)
+(import "stogir.allocation" :as a)
+(import "stogir.allocation-check" :as check)
+(import "stogir.interval" :as range)
+(import "stogir.constraints" :as c)
+(import "stogir.frame" :as frame)
+(import "stogir.a64.registers" :as registers)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn release! [(parts (mut (ArrayList a/Part)))] (-> void)
+  (let [(mut i) (: 0 i64)]
+    (while (< i (len parts))
+      (a/release! (elem (mut parts) i))
+      (set! i (+ i 1))))
+  (free! (mut parts)))
+
+(defn rejected [(result (Result i32 (slice u8)))] (-> i64)
+  (match result (Ok [_] 1) (Err [_] 0)))
+
+;;; Three values per class compete for two registers. Spare registers belonging
+;;; to the other class are never candidates, including after eviction/splitting.
+(defn pressure [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut parts) (ArrayList::new [a/Part] allocator)
+        (mut layout) (frame/create allocator)
+        (mut failures) 0]
+    (for class [(: 0 i32) 1]
+      (for ordinal [(: 0 i32) 1 2]
+        (let [(mut part) (a/create (+ (* class 3) ordinal) allocator)
+              start (* (cast i64 ordinal) 2)
+              last (+ 20 (* (cast i64 ordinal) 2))]
+          (set! (.allowed part) (if (= class 0) (: 3 u64) 0x300000000))
+          (range/add! (mut (.ranges part)) start (+ last 1))
+          (c/add! (mut (.uses part)) (+ start 1) 1 -1)
+          (c/add! (mut (.uses part)) last 1 -1)
+          (push! (mut parts) part))))
+    (match (a/run! (mut parts) (mut layout) 64 0x300000003 8 8 allocator)
+      (Err [msg]
+           (do
+             (println "class allocation: {}" msg)
+             (set! failures (+ failures 1))))
+      (Ok [_]
+          (match (check/verify parts 64 0x300000003)
+            (Err [msg]
+                 (do
+                   (println "class verification: {}" msg)
+                   (set! failures (+ failures 1))))
+            (Ok [_] 0))))
+    (when (or (<= (len parts) 6) (= (.size layout) 0))
+      (set! failures (+ failures 1)))
+    (for part parts
+      (let [wanted (if (< (.parent part) 3) (: 3 u64) 0x300000000)]
+        (when (!= (.allowed part) wanted) (set! failures (+ failures 1)))
+        (when (and (>= (.register part) 0)
+                   (not (a/register-allowed? (.register part) 64 wanted)))
+          (set! failures (+ failures 1)))))
+    ;; A legal physical ID from the wrong class must fail independent checking.
+    (let [first (elem (mut parts) 0)
+          old (.register first)]
+      (set! (.register first) 32)
+      (set! failures
+            (+ failures (rejected (check/verify parts 64 0x300000003))))
+      (set! (.register first) old))
+    ;; Corrupt a split suffix's mask; checking must reject class widening even
+    ;; when its assigned register remains individually allowed.
+    (let [suffix (elem (mut parts) 6)
+          old (.allowed suffix)]
+      (set! (.allowed suffix) 0x300000003)
+      (set! failures
+            (+ failures (rejected (check/verify parts 64 0x300000003))))
+      (set! (.allowed suffix) old))
+    (release! (mut parts))
+    (frame/release! (mut layout))
+    failures))
+
+(defn invalid-fixed [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut parts) (ArrayList::new [a/Part] allocator)
+        (mut part) (a/create 1 allocator)
+        (mut layout) (frame/create allocator)
+        (mut failures) 0]
+    (set! (.allowed part) 3)
+    (range/add! (mut (.ranges part)) 0 10)
+    (c/add! (mut (.uses part)) 1 2 32)
+    (push! (mut parts) part)
+    (set! failures
+          (+ failures
+             (rejected (a/run! (mut parts)
+                               (mut layout)
+                               64
+                               0x300000003
+                               8
+                               8
+                               allocator))))
+    (when (or (!= (.register (get parts 0)) -1)
+              (!= (len parts) 1)
+              (!= (.size layout) 0))
+      (set! failures (+ failures 1)))
+    (set! failures
+          (+ failures
+             (rejected (a/run! (mut parts)
+                               (mut layout)
+                               65
+                               0xFFFFFFFFFFFFFFFF
+                               8
+                               8
+                               allocator))))
+    (when (a/reserve! (mut parts) 64 0 1 allocator)
+      (set! failures (+ failures 1)))
+    (release! (mut parts))
+    (frame/release! (mut layout))
+    failures))
+
+(defn highest-bit [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut parts) (ArrayList::new [a/Part] allocator)
+        (mut part) (a/create 1 allocator)
+        (mut layout) (frame/create allocator)
+        (mut failures) 0]
+    (set! (.allowed part) 0x8000000000000000)
+    (range/add! (mut (.ranges part)) 0 4)
+    (c/add! (mut (.uses part)) 1 2 63)
+    (push! (mut parts) part)
+    (match (a/run! (mut parts) (mut layout) 64 0x8000000000000000 8 8 allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [_] 0))
+    (match (check/verify parts 64 0x8000000000000000)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [_] 0))
+    (when (!= (.register (get parts 0)) 63) (set! failures (+ failures 1)))
+    (release! (mut parts))
+    (frame/release! (mut layout))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) (+ (pressure) (invalid-fixed) (highest-bit))]
+    (when (or (not (registers/allocatable? 11 0))
+              (registers/allocatable? 11 32)
+              (not (registers/allocatable? 12 32))
+              (not (registers/allocatable? 13 61))
+              (registers/allocatable? 12 40)
+              (registers/allocatable? 12 62)
+              (registers/allocatable? 13 63)
+              (registers/allocatable? 12 0)
+              (!= (registers/physical 61) 29))
+      (set! failures (+ failures 1)))
+    (println "register class allocation/split/validation: {} failures" failures)
+    (if (= failures 0) 0 1)))

@@ -1,0 +1,97 @@
+(module stogir.tests.named-recursion)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.symbols" :as symbols)
+(import "stogir.image" :as image)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.fs" :as fs)
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        condition (require (b/emit! (mut graph) 18 1 [x one]))
+        split (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        base (require (b/emit! (mut graph) 120 11 [yes one (: 0 i32)]))
+        previous (require (b/emit! (mut graph) 27 11 [x one]))
+        target (require (symbols/function! (mut graph) "_stogir_factorial" 0))
+        (mut failures) 0]
+    (match (calls/create 0 11 [(: 11 u8)] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned-prototype) prototype
+                called
+                  (require (calls/emit! (mut graph)
+                                        owned-prototype
+                                        no
+                                        target
+                                        [previous]
+                                        allocator))
+                product (require (b/emit! (mut graph) 28 11 [x called]))
+                recursive
+                  (require (b/emit! (mut graph)
+                                    120
+                                    11
+                                    [called product (: 0 i32)]))]
+            (require (calls/function! (mut graph) owned-prototype allocator))
+            (match (compile/image graph
+                                  start
+                                  [base recursive]
+                                  "_stogir_factorial"
+                                  allocator)
+              (Err [msg]
+                   (do
+                     (println "compile: {}" msg)
+                     (set! failures (+ failures 1))))
+              (Ok [compiled]
+                  (let [(mut source) compiled]
+                    ;; The named self-reference must bind to the defined entry.
+                    (when (!= (len (.symbols source)) 1)
+                      (set! failures (+ failures 1)))
+                    (match (macho/image-object source allocator)
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [object]
+                          (let [(mut bytes) object]
+                            (match (fs/write-file allocator
+                                                  "/tmp/coil-stogir-recursion.o"
+                                                  (slice bytes))
+                              (Err [_] (set! failures (+ failures 1)))
+                              (Ok [_] 0))
+                            (free! (mut bytes)))))
+                    (match (jit/map-image source allocator)
+                      (Err [msg]
+                           (do
+                             (println "map: {}" msg)
+                             (set! failures (+ failures 1))))
+                      (Ok [loaded]
+                          (let [(mut owned) loaded
+                                f
+                                  (primitive/cast (fnptr (cc/C) [i64] i64)
+                                                  (.base (.memory owned)))
+                                (mut x) (: -3 i64)
+                                (mut expected) (: 1 i64)]
+                            (while (<= x 18)
+                              (when (> x 1) (set! expected (* expected x)))
+                              (when (!= (call-ptr f x) expected)
+                                (set! failures (+ failures 1)))
+                              (set! x (+ x 1)))
+                            (jit/release-image! (mut owned)))))
+                    (image/release! (mut source)))))
+            (calls/release! (mut owned-prototype)))))
+    (g/release! (mut graph))
+    (println "named recursive function checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

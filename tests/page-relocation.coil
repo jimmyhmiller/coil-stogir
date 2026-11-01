@@ -1,0 +1,78 @@
+(module stogir.tests.page-relocation)
+(import "stogir.a64.relocation" :as a64)
+(import "stogir.image" :as image)
+(import "stogir.relocate" :as relocation)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn check [(value (Result u32 (slice u8))) (expected u32)] (-> i64)
+  (match value
+    (Err [msg] (do (println "{}" msg) 1))
+    (Ok [word] (if (= word expected) 0 1))))
+
+(defn rejected [(value (Result u32 (slice u8)))] (-> i64)
+  (match value (Err [_] 0) (Ok [_] 1)))
+
+(defn atomic [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut source) (image/create allocator)
+        (mut addresses) (ArrayList::new [u64] allocator)
+        (mut failures) 0]
+    (image/symbol! (mut source) "unaligned" 2 1)
+    (bytes/append32! (mut (.text source)) 0x90000000)
+    (bytes/append32! (mut (.text source)) 0xF9400000)
+    (bytes/append32! (mut (.text source)) 0x90000000)
+    (bytes/append32! (mut (.data source)) 0)
+    (bytes/append32! (mut (.data source)) 0)
+    (image/relocate! (mut source)
+                     (image/Relocation
+                       :section 1
+                       :offset 4
+                       :kind 4
+                       :symbol 0
+                       :addend 0))
+    (image/relocate! (mut source)
+                     (image/Relocation
+                       :section 1
+                       :offset 8
+                       :kind 3
+                       :symbol 0
+                       :addend 0))
+    (push! (mut addresses) 0x2001)
+    ; The valid higher-address page patch is planned before the invalid scaled
+    ; load patch. Failure must leave every input instruction unchanged.
+    (match (relocation/apply! (mut source) addresses 0x1000 0x2000 allocator)
+      (Ok [_] (set! failures (+ failures 1)))
+      (Err [_] 0))
+    (when (or (!= (relocation/read32 (.text source) 8) 0x90000000)
+              (!= (relocation/read32 (.text source) 4) 0xF9400000))
+      (set! failures (+ failures 1)))
+    (free! (mut addresses))
+    (image/release! (mut source))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures
+          (+ (atomic)
+             (check (a64/page21 0x90000003 0x12345678 0x10000000) 0xB0011A23)
+             (check (a64/page21 0x90000003 0x1000 0x2000) 0xF0FFFFE3)
+             (check (a64/page21 0x90000003 0xFFFFF000 0) 0xF07FFFE3)
+             (check (a64/page21 0x90000003 0 0x100000000) 0x90800003)
+             (rejected (a64/page21 0x90000003 0x100000000 0))
+             (rejected (a64/page21 0x90000003 0 0x100001000))
+             (rejected (a64/page21 0x10000003 0 0))
+             (check (a64/pageoff12 0xF9400021 0xFFF8) 0xF947FC21)
+             (check (a64/pageoff12 0xB9800021 0xFFFC) 0xB98FFC21)
+             (check (a64/pageoff12 0xFD400020 0xFFF8) 0xFD47FC20)
+             (check (a64/pageoff12 0x3DC00020 0xFFF0) 0x3DC3FC20)
+             (check (a64/pageoff12 0x91000020 0xFFFF) 0x913FFC20)
+             (check (a64/pageoff12 0x11000020 0xFFFF) 0x113FFC20)
+             (rejected (a64/pageoff12 0xF9400021 7))
+             (rejected (a64/pageoff12 0x91400020 8))
+             (rejected (a64/pageoff12 0xD1000020 8))
+             (rejected (a64/pageoff12 0x7D800020 16))
+             (rejected (a64/pageoff12 0xB9C00020 16)))]
+    (println "page relocation checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

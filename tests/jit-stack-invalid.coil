@@ -1,0 +1,86 @@
+(module stogir.tests.jit-stack-invalid)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(extern fork :cc (cc/C) [] (-> i32))
+
+(extern waitpid :cc (cc/C) [i32 (ptr i32) i32] (-> i32))
+
+(extern exit-child :as "_exit" :cc (cc/C) [i32] (-> void))
+
+(extern signal :cc (cc/C) [i32 u64] (-> u64))
+
+(defn trap-handler :cc (cc/C) [(number i32)] (-> void)
+  (exit-child 77))
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn check [(ty i32) (bits u64) (free? bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        size (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        control
+          (if free?
+              (require (b/stack-free! (mut graph) start size))
+              (require (b/stack-allocate! (mut graph) start size 16)))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        ret (require (b/emit! (mut graph) 120 5 [control zero (: 0 i32)]))
+        (mut failures) 0]
+    (match (compile/text graph start [ret] allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [text]
+          (let [(mut bytes) text]
+            (match (jit/map-text (slice bytes))
+              (Err [message]
+                   (println "{}" message)
+                   (set! failures (+ failures 1)))
+              (Ok [image]
+                  (let [(mut owned) image
+                        f
+                          (primitive/cast (fnptr (cc/C) [u64] u64)
+                                          (.base owned))
+                        child (fork)]
+                    (if (< child 0)
+                        (set! failures (+ failures 1))
+                        (if (= child 0)
+                            (do
+                              ; Darwin SIGTRAP=5; exit avoids a core/crash report.
+                              (signal 5
+                                      (primitive/cast u64
+                                                      (primitive/cast (ptr u8)
+                                                                      (fnptr-of trap-handler))))
+                              (call-ptr f bits)
+                              (exit-child 99))
+                            (let [(mut status) (: 0 i32)]
+                              (when (or (!= (waitpid child (mut status) 0)
+                                            child)
+                                        (!= (& status 127) 0)
+                                        (!= (& (>> status 8) 255) 77))
+                                (set! failures (+ failures 1))))))
+                    (jit/release! (mut owned)))))
+            (free! (mut bytes)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for free? [false true]
+      (set! failures
+            (+ failures
+               (check 8 255 free?)
+               (check 9 65535 free?)
+               (check 10 0xFFFFFFFF free?)
+               (check 11 0xFFFFFFFFFFFFFFFF free?)
+               (check 5 0xFFFFFFFFFFFFFFFF free?)
+               (check 5 0x7FFFFFFFFFFFFFF1 free?))))
+    (println "invalid runtime stack counts trap before SP changes: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

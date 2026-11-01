@@ -1,0 +1,254 @@
+(module stogir.tests.jit-floating-memory)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+;;; Mode 0: FP input -> memory -> integer bits. Mode 1 reverses the ABI banks.
+;;; Modes 2/3 store a floating literal through a dynamic/constant address.
+(defn check [(ty u8) (mode i32) (offset u64) (volatile? bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        (mut cells) (ArrayList::new [u8] allocator)
+        (mut signature) (ArrayList::new [u8] allocator)
+        (mut failures) 0
+        (mut i) (: 0 i64)]
+    (while (< i 16) (push! (mut cells) 0xA5) (set! i (+ i 1)))
+    (let [start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+          base
+            (if (= mode 3)
+                (require (b/scalar-constant! (mut graph)
+                                             6
+                                             (primitive/cast u64 (.data cells))
+                                             8))
+                (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0])))
+          displacement (require (b/scalar-constant! (mut graph) 6 offset 8))
+          address
+            (if (= mode 3)
+                (require (b/scalar-constant! (mut graph)
+                                             6
+                                             (+ (primitive/cast u64
+                                                                (.data cells))
+                                                offset)
+                                             8))
+                (require (b/emit! (mut graph) 26 6 [base displacement])))
+          width (if (= ty 12) (: 8 i32) 4)
+          literal (if (= ty 12) (: 0xFFF8123456789ABC u64) 0xFFC12345)
+          input
+            (if (>= mode 2)
+                (require (b/scalar-constant! (mut graph)
+                                             (cast i32 ty)
+                                             literal
+                                             8))
+                (let [param
+                        (require (b/emit! (mut graph)
+                                          71
+                                          (if (= mode 1) 5 (cast i32 ty))
+                                          [start (: 0 i32) 1]))]
+                  (if (= mode 1)
+                      (let [raw
+                              (if (= width 4)
+                                  (require (b/emit! (mut graph) 35 4 [param]))
+                                  param)]
+                        (require (b/emit! (mut graph) 36 (cast i32 ty) [raw])))
+                      param)))
+          stored
+            (require (b/emit! (mut graph)
+                              (if volatile? 94 93)
+                              0
+                              [start address input]))
+          loaded
+            (require (b/emit! (mut graph)
+                              (if volatile? 92 91)
+                              (cast i32 ty)
+                              [stored address]))
+          same (require (b/emit! (mut graph) 36 (cast i32 ty) [loaded]))
+          bits
+            (if (= mode 1)
+                same
+                (require (b/emit! (mut graph) 36 (if (= width 4) 4 5) [same])))
+          result
+            (if (and (!= mode 1) (= width 4))
+                (require (b/emit! (mut graph) 34 5 [bits]))
+                bits)
+          result-type (if (= mode 1) ty (: 5 u8))
+          ret
+            (require (b/emit! (mut graph)
+                              120
+                              (cast i32 result-type)
+                              [loaded result (: 0 i32)]))]
+      (when (!= mode 3) (push! (mut signature) 6))
+      (when (< mode 2) (push! (mut signature) (if (= mode 1) 5 ty)))
+      (match (calls/create 0 result-type (slice signature) allocator)
+        (Err [_] (set! failures (+ failures 1)))
+        (Ok [prototype]
+            (let [(mut owned) prototype]
+              (require (calls/function! (mut graph) owned allocator))
+              (calls/release! (mut owned)))))
+      (when (and (= mode 1) (= offset 3) (not volatile?))
+        (match (compile/object graph
+                               start
+                               [ret]
+                               (if (= ty 12)
+                                   "_stogir_fp_memory_f64"
+                                   "_stogir_fp_memory_f32")
+                               allocator)
+          (Err [_] (set! failures (+ failures 1)))
+          (Ok [object]
+              (let [(mut bytes) object]
+                (match (fs/write-file allocator
+                                      (if (= ty 12)
+                                          "/tmp/coil-stogir-fp-memory-f64.o"
+                                          "/tmp/coil-stogir-fp-memory-f32.o")
+                                      (slice bytes))
+                  (Err [_] (set! failures (+ failures 1)))
+                  (Ok [_] 0))
+                (free! (mut bytes))))))
+      (match (compile/text graph start [ret] allocator)
+        (Err [msg]
+             (do
+               (println "FP memory ty={} mode={}: {}" ty mode msg)
+               (set! failures (+ failures 1))))
+        (Ok [text]
+            (let [(mut code) text]
+              (match (jit/map-text (slice code))
+                (Err [_] (set! failures (+ failures 1)))
+                (Ok [loaded-image]
+                    (let [(mut image) loaded-image]
+                      (for payload [(: 0 u64)
+                                    1
+                                    0x80000000
+                                    0x7FC12345
+                                    0x7F812345
+                                    0xFFFFFFFF
+                                    0x8000000000000000
+                                    0x7FF8123456789ABC
+                                    0x7FF0123456789ABC
+                                    0xFFFFFFFFFFFFFFFF]
+                        (let [wanted
+                                (if (= width 4)
+                                    (cast u64
+                                          (cast u32
+                                                (if (>= mode 2) literal payload)))
+                                    (if (>= mode 2) literal payload))
+                              (mut actual) (: 0 u64)]
+                          (set! i 0)
+                          (while (< i 16)
+                            (set! (mut cells) i 0xA5)
+                            (set! i (+ i 1)))
+                          (if (= mode 0)
+                              (if (= ty 12)
+                                  (let [(mut input) (: 0.0 f64)
+                                        f
+                                          (primitive/cast (fnptr (cc/C)
+                                                                 [(ptr u8) f64]
+                                                                 u64)
+                                                          (.base image))]
+                                    (store! (primitive/cast (ptr u64)
+                                                            (mut input))
+                                            payload)
+                                    (set! actual
+                                          (call-ptr f (.data cells) input)))
+                                  (let [(mut input) (: 0.0 f32)
+                                        f
+                                          (primitive/cast (fnptr (cc/C)
+                                                                 [(ptr u8) f32]
+                                                                 u64)
+                                                          (.base image))]
+                                    (store! (primitive/cast (ptr u32)
+                                                            (mut input))
+                                            (cast u32 payload))
+                                    (set! actual
+                                          (call-ptr f (.data cells) input))))
+                              (if (= mode 1)
+                                  (if (= ty 12)
+                                      (let [f
+                                              (primitive/cast (fnptr (cc/C)
+                                                                     [(ptr u8)
+                                                                      u64]
+                                                                     f64)
+                                                              (.base image))
+                                            (mut result)
+                                              (call-ptr f (.data cells) payload)]
+                                        (set! actual
+                                              (load (primitive/cast (ptr u64)
+                                                                    (mut result)))))
+                                      (let [f
+                                              (primitive/cast (fnptr (cc/C)
+                                                                     [(ptr u8)
+                                                                      u64]
+                                                                     f32)
+                                                              (.base image))
+                                            (mut result)
+                                              (call-ptr f (.data cells) payload)]
+                                        (set! actual
+                                              (cast u64
+                                                    (load (primitive/cast (ptr u32)
+                                                                          (mut result)))))))
+                                  (if (= mode 2)
+                                      (let [f
+                                              (primitive/cast (fnptr (cc/C)
+                                                                     [(ptr u8)]
+                                                                     u64)
+                                                              (.base image))]
+                                        (set! actual (call-ptr f (.data cells))))
+                                      (let [f
+                                              (primitive/cast (fnptr (cc/C)
+                                                                     []
+                                                                     u64)
+                                                              (.base image))]
+                                        (set! actual (call-ptr f))))))
+                          (when (!= wanted actual)
+                            (when (= failures 0)
+                              (println "FP memory ty={} mode={} offset={} wanted={} actual={}"
+                                       ty
+                                       mode
+                                       offset
+                                       wanted
+                                       actual))
+                            (set! failures (+ failures 1)))
+                          (set! i 0)
+                          (while (< i 16)
+                            (let [expected
+                                    (if (and (>= i (cast i64 offset))
+                                             (< i
+                                                (+ (cast i64 offset)
+                                                   (cast i64 width))))
+                                        (cast u8
+                                              (>> wanted
+                                                  (cast u64
+                                                        (* (- i
+                                                              (cast i64 offset))
+                                                           8))))
+                                        (: 0xA5 u8))]
+                              (when (!= (get cells i) expected)
+                                (set! failures (+ failures 1))))
+                            (set! i (+ i 1)))))
+                      (jit/release! (mut image)))))
+              (free! (mut code))))))
+    (free! (mut signature))
+    (free! (mut cells))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for ty [(: 12 u8) 13]
+      (for mode [(: 0 i32) 1 2 3]
+        (for offset [(: 0 u64) 1 3]
+          (set! failures
+                (+ failures
+                   (check ty mode offset false)
+                   (check ty mode offset true))))))
+    (println "native floating memory and live bitcasts: {} failures" failures)
+    (if (= failures 0) 0 1)))

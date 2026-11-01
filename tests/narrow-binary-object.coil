@@ -1,0 +1,92 @@
+(module stogir.tests.narrow-binary-object)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn write-function [(ty u8) (symbol (slice u8)) (path (slice u8))] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 0]))
+        q (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 1]))
+        (mut result) (require (b/scalar-constant! (mut graph) 5 0 8))
+        result-type (if (= ty 1) (: 1 i32) (: 5 i32))
+        (mut failures) 0]
+    (if (= ty 1)
+        (set! result (require (b/integer-compare! (mut graph) 16 8 p q)))
+        (do
+          (for opcode [(: 26 i32) 27 28 29 30 46 47 48 49 50 51 52 53]
+            (let [value
+                    (require (if (or (= opcode 29) (= opcode 30))
+                                 (b/integer-division! (mut graph)
+                                                      opcode
+                                                      (cast i32 ty)
+                                                      8
+                                                      p
+                                                      q
+                                                      start)
+                                 (b/integer-binary! (mut graph)
+                                                    opcode
+                                                    (cast i32 ty)
+                                                    8
+                                                    p
+                                                    q)))
+                  extended (require (b/emit! (mut graph) 34 5 [value]))]
+              (set! result
+                    (require (b/emit! (mut graph) 48 5 [result extended])))))
+          ;; Both originals remain live through the whole expression graph.
+          (let [p-wide (require (b/emit! (mut graph) 34 5 [p]))
+                q-wide (require (b/emit! (mut graph) 34 5 [q]))
+                sum (require (b/emit! (mut graph) 48 5 [result p-wide]))]
+            (set! result (require (b/emit! (mut graph) 48 5 [sum q-wide]))))))
+    (let [ret
+            (require (b/emit! (mut graph)
+                              120
+                              result-type
+                              [start result (: 0 i32)]))]
+      (match (calls/create 0 (cast u8 result-type) [ty ty] allocator)
+        (Err [_] (set! failures (+ failures 1)))
+        (Ok [prototype]
+            (let [(mut owned) prototype]
+              (require (calls/function! (mut graph) owned allocator))
+              (calls/release! (mut owned)))))
+      (match (compile/object graph start [ret] symbol allocator)
+        (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+        (Ok [object]
+            (let [(mut owned) object]
+              (match (fs/write-file allocator path (slice owned))
+                (Err [_] (set! failures (+ failures 1)))
+                (Ok [_] 0))
+              (free! (mut owned))))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures
+          (+ (write-function 2
+                             "_stogir_binary_u8"
+                             "/tmp/coil-stogir-binary-u8.o")
+             (write-function 3
+                             "_stogir_binary_u16"
+                             "/tmp/coil-stogir-binary-u16.o")
+             (write-function 7
+                             "_stogir_binary_char"
+                             "/tmp/coil-stogir-binary-char.o")
+             (write-function 8
+                             "_stogir_binary_i8"
+                             "/tmp/coil-stogir-binary-i8.o")
+             (write-function 9
+                             "_stogir_binary_i16"
+                             "/tmp/coil-stogir-binary-i16.o")
+             (write-function 1
+                             "_stogir_bool_lt"
+                             "/tmp/coil-stogir-binary-bool.o"))]
+    (println "narrow binary object generation checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

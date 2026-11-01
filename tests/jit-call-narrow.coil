@@ -1,0 +1,210 @@
+(module stogir.tests.jit-call-narrow)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn mix :cc (cc/C) [(a i8)
+                      (b u8)
+                      (c i16)
+                      (d u16)
+                      (e i8)
+                      (f bool)
+                      (g i32)
+                      (h u32)
+                      (i i8)
+                      (j u8)
+                      (k i16)
+                      (l u16)
+                      (m i8)
+                      (n bool)
+                      (o i64)
+                      (p (ptr i64))] (-> i64)
+  (+ (cast i64 a)
+     (* (cast i64 b) 3)
+     (* (cast i64 c) 5)
+     (* (cast i64 d) 7)
+     (* (cast i64 e) 11)
+     (if f (: 13 i64) 0)
+     (* (cast i64 g) 17)
+     (* (cast i64 h) 19)
+     (* (cast i64 i) 23)
+     (* (cast i64 j) 29)
+     (* (cast i64 k) 31)
+     (* (cast i64 l) 37)
+     (* (cast i64 m) 41)
+     (if n (: 43 i64) 0)
+     (* o 47)
+     (* (load p) 53)))
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        types [(: 8 u8) 2 9 3 7 1 10 4 8 2 9 3 7 1 11 6]
+        (mut values) (ArrayList::new [i32] allocator)
+        (mut arguments) (ArrayList::new [i32] allocator)
+        (mut i) 0
+        (mut failures) 0]
+    (while (< i (len types))
+      (push! (mut values)
+             (require (b/emit! (mut graph)
+                               71
+                               (cast i32 (get types i))
+                               [start (: 0 i32) (cast i32 (+ i 1))])))
+      (set! i (+ i 1)))
+    ; Swap matching narrow types between incoming register/stack arguments.
+    (set! i 0)
+    (while (< i (len types))
+      (let [source (if (< i 6) (+ i 8) (if (and (>= i 8) (< i 14)) (- i 8) i))]
+        (push! (mut arguments) (get values source)))
+      (set! i (+ i 1)))
+    (match (calls/create 0
+                         11
+                         [(: 6 u8) 8 2 9 3 7 1 10 4 8 2 9 3 7 1 11 6]
+                         allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype]
+            (require (calls/function! (mut graph) owned allocator))
+            (calls/release! (mut owned)))))
+    (match (calls/create 0 11 types allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned-prototype) prototype
+                call
+                  (require (calls/emit! (mut graph)
+                                        owned-prototype
+                                        start
+                                        target
+                                        (slice arguments)
+                                        allocator))
+                ret (require (b/emit! (mut graph) 120 11 [call call (: 0 i32)]))]
+            (match (compile/object graph
+                                   start
+                                   [ret]
+                                   "_stogir_narrow_calls_test"
+                                   allocator)
+              (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+              (Ok [object]
+                  (let [(mut owned) object]
+                    (match (fs/write-file allocator
+                                          "/tmp/coil-stogir-narrow-calls.o"
+                                          (slice owned))
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [_] 0))
+                    (free! (mut owned)))))
+            (match (compile/text graph start [ret] allocator)
+              (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+              (Ok [compiled]
+                  (let [(mut code) compiled]
+                    (match (jit/map-text (slice code))
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [image]
+                          (let [(mut owned) image
+                                f
+                                  (primitive/cast (fnptr (cc/C)
+                                                         [u64
+                                                          i8
+                                                          u8
+                                                          i16
+                                                          u16
+                                                          i8
+                                                          bool
+                                                          i32
+                                                          u32
+                                                          i8
+                                                          u8
+                                                          i16
+                                                          u16
+                                                          i8
+                                                          bool
+                                                          i64
+                                                          (ptr i64)]
+                                                         i64)
+                                                  (.base owned))
+                                target
+                                  (primitive/cast u64
+                                                  (primitive/cast (ptr u8)
+                                                                  (fnptr-of mix)))
+                                (mut cell) (: 7001 i64)
+                                (mut x) (: -128 i64)]
+                            (while (<= x 127)
+                              (let [a (cast i8 x)
+                                    b (cast u8 (+ x 128))
+                                    c (cast i16 (* x 200))
+                                    d (cast u16 (* (+ x 128) 257))
+                                    e (cast i8 (- 0 x))
+                                    flag (!= x 0)
+                                    g (cast i32 (* x 1234))
+                                    h (cast u32 (* x 1234567))
+                                    i (cast i8 (- 0 x))
+                                    j (cast u8 (- 127 x))
+                                    k (cast i16 (* (- 0 x) 201))
+                                    l (cast u16 (* (- 127 x) 257))
+                                    m (cast i8 (+ x 1))
+                                    n (< x 0)
+                                    o (+ (* x 100000) 99)
+                                    expected
+                                      (mix i
+                                           j
+                                           k
+                                           l
+                                           m
+                                           n
+                                           g
+                                           h
+                                           a
+                                           b
+                                           c
+                                           d
+                                           e
+                                           flag
+                                           o
+                                           (mut cell))
+                                    actual
+                                      (call-ptr f
+                                                target
+                                                a
+                                                b
+                                                c
+                                                d
+                                                e
+                                                flag
+                                                g
+                                                h
+                                                i
+                                                j
+                                                k
+                                                l
+                                                m
+                                                n
+                                                o
+                                                (mut cell))]
+                                (when (!= actual expected)
+                                  (when (= failures 0)
+                                    (println "x={} expected={} actual={}"
+                                             x
+                                             expected
+                                             actual))
+                                  (set! failures (+ failures 1))))
+                              (set! x (+ x 1)))
+                            (jit/release! (mut owned)))))
+                    (free! (mut code)))))
+            (calls/release! (mut owned-prototype)))))
+    (free! (mut values))
+    (free! (mut arguments))
+    (g/release! (mut graph))
+    (println "native narrow call checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

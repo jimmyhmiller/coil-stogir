@@ -1,0 +1,149 @@
+(module stogir.tests.conditional-builder)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.conditional" :as cond)
+(import "stogir.a64.conditional" :as target)
+(import "stogir.verify" :as verify)
+(import "stogir.symbols" :as symbols)
+(import "stogir.calls" :as calls)
+(import "stogir.fold" :as fold)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn invalid [(kind i32)] (-> i64)
+  (let [(mut graph) (g/create (malloc-allocator))
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        c (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        yes (require (b/scalar-constant! (mut graph) 11 1 8))
+        other (require (b/scalar-constant! (mut graph) 5 0 8))
+        raw
+          (require (b/emit! (mut graph)
+                            60
+                            (if (= kind 2) (: 0 i32) (: 11 i32))
+                            [(if (= kind 0) start c)
+                             yes
+                             (if (= kind 1) other yes)]))
+        (mut failures) 0]
+    (match (verify/integer-operations graph)
+      (Ok [_] (set! failures (+ failures 1)))
+      (Err [_] 0))
+    (match (target/width graph raw)
+      (Ok [_] (set! failures (+ failures 1)))
+      (Err [_] 0))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        c (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        other-c (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        fp-c (require (b/emit! (mut graph) 71 12 [start (: 0 i32) 2]))
+        yes (require (b/scalar-constant! (mut graph) 11 101 8))
+        no (require (b/scalar-constant! (mut graph) 11 202 8))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        nonzero
+          (require (b/scalar-constant! (mut graph) 11 0xFFFFFFFFFFFFFFFF 8))
+        wrong (require (b/scalar-constant! (mut graph) 5 0 8))
+        named (require (symbols/symbol! (mut graph) "_condition"))
+        first (require (b/conditional! (mut graph) 11 c yes no))
+        (mut failures) (+ (invalid 0) (invalid 1) (invalid 2))]
+    (when (or (<= first 0)
+              (!= first (require (b/conditional! (mut graph) 11 c yes no)))
+              (= first (require (b/conditional! (mut graph) 11 other-c yes no)))
+              (= first (require (b/conditional! (mut graph) 11 c no yes)))
+              (!= yes (require (b/conditional! (mut graph) 11 c yes yes)))
+              (!= no (require (b/conditional! (mut graph) 11 zero yes no)))
+              (!= yes (require (b/conditional! (mut graph) 11 nonzero yes no)))
+              (<= (require (b/conditional! (mut graph) 11 named yes no)) 0))
+      (set! failures (+ failures 1)))
+    (for bad [start (: 2147483647 i32)]
+      (match (b/conditional! (mut graph) 11 bad yes no)
+        (Ok [_] (set! failures (+ failures 1)))
+        (Err [_] 0)))
+    (match (b/conditional! (mut graph) 11 zero wrong no)
+      (Ok [_] (set! failures (+ failures 1)))
+      (Err [_] 0))
+    (for bits [(: 0 u64)
+               0x8000000000000000
+               0x0000000000000001
+               0x3FF0000000000000
+               0xBFF0000000000000
+               0x7FF8000000000042
+               0xFFF8000000000042]
+      (let [constant (require (b/scalar-constant! (mut graph) 12 bits 8))
+            selected (require (b/conditional! (mut graph) 11 constant yes no))]
+        (when (!= selected (if (= (& bits 0x7FFFFFFFFFFFFFFF) 0) no yes))
+          (set! failures (+ failures 1)))))
+    (for bits [(: 0 u64)
+               0x80000000
+               1
+               0x3F800000
+               0xBF800000
+               0x7FC00042
+               0xFFC00042]
+      (let [constant (require (b/scalar-constant! (mut graph) 13 bits 8))
+            selected (require (b/conditional! (mut graph) 11 constant yes no))]
+        (when (!= selected (if (= (& bits 0x7FFFFFFF) 0) no yes))
+          (set! failures (+ failures 1)))))
+    ;; Floating conditions and results are now accepted by native selection.
+    (let [raw (require (b/emit! (mut graph) 60 11 [fp-c yes no]))]
+      (match (cond/validate graph raw)
+        (Err [_] (set! failures (+ failures 1)))
+        (Ok [_] 0))
+      (match (target/width graph raw)
+        (Ok [bits] (when (!= bits 64) (set! failures (+ failures 1))))
+        (Err [_] (set! failures (+ failures 1)))))
+    (let [fa (require (b/scalar-constant! (mut graph) 12 0x3FF0000000000000 8))
+          fb (require (b/scalar-constant! (mut graph) 12 0x4000000000000000 8))
+          raw (require (b/emit! (mut graph) 60 12 [c fa fb]))]
+      (match (cond/validate graph raw)
+        (Err [_] (set! failures (+ failures 1)))
+        (Ok [_] 0))
+      (match (target/width graph raw)
+        (Ok [bits] (when (!= bits 64) (set! failures (+ failures 1))))
+        (Err [_] (set! failures (+ failures 1)))))
+    (match (fold/binary! (mut graph) 58 11 3 c c)
+      (Some [_] (set! failures (+ failures 1)))
+      (None [] 0))
+    (require (b/patch! (mut graph) first 3 yes))
+    (when (= first (require (b/conditional! (mut graph) 11 c yes no)))
+      (set! failures (+ failures 1)))
+    ;; MIN/MAX preserve the selected address constant's function prototype header.
+    (match (calls/create 0 11 [] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype
+                raw (require (symbols/function-address! (mut graph) 100 0))
+                annotated
+                  (require (calls/attach! (mut graph) owned raw allocator))
+                next (require (b/scalar-constant! (mut graph) 6 101 8))]
+            (when (or (!= annotated
+                          (require (b/integer-binary! (mut graph)
+                                                      58
+                                                      6
+                                                      8
+                                                      annotated
+                                                      next)))
+                      (!= next
+                          (require (b/integer-binary! (mut graph)
+                                                      59
+                                                      6
+                                                      8
+                                                      annotated
+                                                      next)))
+                      (!= c
+                          (require (b/integer-binary! (mut graph) 58 11 8 c c))))
+              (set! failures (+ failures 1)))
+            (calls/release! (mut owned)))))
+    (let [minimum (require (b/integer-binary! (mut graph) 58 11 8 c other-c))]
+      (when (!= minimum
+                (require (b/integer-binary! (mut graph) 58 11 8 other-c c)))
+        (set! failures (+ failures 1))))
+    (g/release! (mut graph))
+    (println "conditional/extrema construction checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

@@ -1,0 +1,217 @@
+(module stogir.tests.jit-floating-incoming)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn clobber :cc (cc/C) [] (-> f64)
+  123.5)
+
+(defn nonleaf! [(graph (mut g/Graph)) (start i32) (target i32)]
+  (-> (Result i32 (slice u8)))
+  (match (calls/create 0 12 [] (malloc-allocator))
+    (Err [message] (Err message))
+    (Ok [prototype]
+        (let [(mut owned) prototype
+              result
+                (calls/emit! (mut graph)
+                             owned
+                             start
+                             target
+                             []
+                             (malloc-allocator))]
+          (calls/release! (mut owned))
+          result))))
+
+(defn check [(ty u8) (selected i32) (constant? bool) (nonleaf? bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        (mut types) (ArrayList::new [u8] allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target
+          (if nonleaf?
+              (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+              0)
+        constant-bits (if (= ty 12) (: 0xFFF8123456789ABC u64) 0xFFC12345)
+        ;; Construct the call first; entry scheduling must still capture PARAM.
+        control
+          (if nonleaf? (require (nonleaf! (mut graph) start target)) start)
+        value
+          (if constant?
+              (require (b/scalar-constant! (mut graph)
+                                           (cast i32 ty)
+                                           constant-bits
+                                           8))
+              (require (b/emit! (mut graph)
+                                71
+                                (cast i32 ty)
+                                [start (: 0 i32) (+ selected 1)])))
+        ret
+          (require (b/emit! (mut graph)
+                            120
+                            (cast i32 ty)
+                            [control value (: 0 i32)]))
+        (mut failures) 0]
+    (push! (mut types) (if nonleaf? 6 11))
+    (let [(mut i) 0] (while (< i 11) (push! (mut types) ty) (set! i (+ i 1))))
+    (match (calls/create 0 ty (slice types) allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype]
+            (require (calls/function! (mut graph) owned allocator))
+            (calls/release! (mut owned)))))
+    (when (and nonleaf? (= selected 10))
+      (match (compile/object graph
+                             start
+                             [ret]
+                             (if (= ty 12)
+                                 "_stogir_fp_incoming_f64"
+                                 "_stogir_fp_incoming_f32")
+                             allocator)
+        (Err [_] (set! failures (+ failures 1)))
+        (Ok [object]
+            (let [(mut bytes) object]
+              (match (fs/write-file allocator
+                                    (if (= ty 12)
+                                        "/tmp/coil-stogir-fp-incoming-f64.o"
+                                        "/tmp/coil-stogir-fp-incoming-f32.o")
+                                    (slice bytes))
+                (Err [_] (set! failures (+ failures 1)))
+                (Ok [_] 0))
+              (free! (mut bytes))))))
+    (match (compile/text graph start [ret] allocator)
+      (Err [msg]
+           (do
+             (println "floating incoming ty={} selected={}: {}" ty selected msg)
+             (set! failures (+ failures 1))))
+      (Ok [text]
+          (let [(mut code) text]
+            (match (jit/map-text (slice code))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [loaded]
+                  (let [(mut image) loaded]
+                    (for bits [(: 0 u64)
+                               1
+                               0x80000000
+                               0x7FC12345
+                               0x3F800000
+                               0x8000000000000000
+                               0x3FF0000000000000
+                               0x7FF8123456789ABC
+                               0xFFF8123456789ABC]
+                      (let [(mut values64) (ArrayList::new [f64] allocator)
+                            (mut values32) (ArrayList::new [f32] allocator)
+                            (mut i) (: 0 i32)]
+                        (while (< i 11)
+                          (let [payload (^ bits (cast u64 i))
+                                (mut d) (: 0.0 f64)
+                                (mut s) (: 0.0 f32)]
+                            (store! (primitive/cast (ptr u64) (mut d)) payload)
+                            (store! (primitive/cast (ptr u32) (mut s))
+                                    (cast u32 payload))
+                            (push! (mut values64) d)
+                            (push! (mut values32) s))
+                          (set! i (+ i 1)))
+                        (let [wanted
+                                (if constant?
+                                    constant-bits
+                                    (^ bits (cast u64 selected)))
+                              (mut actual) (: 0 u64)]
+                          (if (= ty 12)
+                              (let [f
+                                      (primitive/cast (fnptr (cc/C)
+                                                             [i64 f64 f64 f64
+                                                              f64 f64 f64 f64
+                                                              f64 f64 f64 f64]
+                                                             f64)
+                                                      (.base image))
+                                    (mut result)
+                                      (call-ptr f
+                                                (if nonleaf?
+                                                    (primitive/cast i64
+                                                                    (primitive/cast (ptr u8)
+                                                                                    (fnptr-of clobber)))
+                                                    (: 42 i64))
+                                                (get values64 0)
+                                                (get values64 1)
+                                                (get values64 2)
+                                                (get values64 3)
+                                                (get values64 4)
+                                                (get values64 5)
+                                                (get values64 6)
+                                                (get values64 7)
+                                                (get values64 8)
+                                                (get values64 9)
+                                                (get values64 10))]
+                                (set! actual
+                                      (load (primitive/cast (ptr u64)
+                                                            (mut result)))))
+                              (let [f
+                                      (primitive/cast (fnptr (cc/C)
+                                                             [i64 f32 f32 f32
+                                                              f32 f32 f32 f32
+                                                              f32 f32 f32 f32]
+                                                             f32)
+                                                      (.base image))
+                                    (mut result)
+                                      (call-ptr f
+                                                (if nonleaf?
+                                                    (primitive/cast i64
+                                                                    (primitive/cast (ptr u8)
+                                                                                    (fnptr-of clobber)))
+                                                    (: 42 i64))
+                                                (get values32 0)
+                                                (get values32 1)
+                                                (get values32 2)
+                                                (get values32 3)
+                                                (get values32 4)
+                                                (get values32 5)
+                                                (get values32 6)
+                                                (get values32 7)
+                                                (get values32 8)
+                                                (get values32 9)
+                                                (get values32 10))]
+                                (set! actual
+                                      (cast u64
+                                            (load (primitive/cast (ptr u32)
+                                                                  (mut result)))))))
+                          (when (!= actual
+                                    (if (= ty 12)
+                                        wanted
+                                        (cast u64 (cast u32 wanted))))
+                            (when (= failures 0)
+                              (println "floating bits ty={} selected={} wanted={} actual={}"
+                                       ty
+                                       selected
+                                       wanted
+                                       actual))
+                            (set! failures (+ failures 1))))
+                        (free! (mut values64))
+                        (free! (mut values32))))
+                    (jit/release! (mut image)))))
+            (free! (mut code)))))
+    (free! (mut types))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for ty [(: 12 u8) 13]
+      (for selected [(: 0 i32) 1 2 3 4 5 6 7 8 9 10]
+        (set! failures (+ failures (check ty selected false false))))
+      (set! failures (+ failures (check ty 0 true false)))
+      (for selected [(: 7 i32) 8 10]
+        (set! failures (+ failures (check ty selected false true)))))
+    (println "native floating register/stack inputs and returns: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

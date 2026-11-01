@@ -1,0 +1,81 @@
+(module stogir.tests.placement)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.cfg" :as cfg)
+(import "stogir.placement" :as p)
+(import "stogir.adjacency" :as adj)
+(import "stogir.dominators" :as dom)
+(import "stogir.loops" :as loops)
+(import "stogir.liveness" :as liveness)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        param (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        sum (require (b/emit! (mut graph) 26 11 [param param]))
+        end (require (b/emit! (mut graph) 114 0 [start]))
+        later (require (b/emit! (mut graph) 28 11 [param param]))
+        (mut failures) 0]
+    (b/patch! (mut graph) sum 1 later)
+    (match (cfg/build graph a)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [blocks]
+          (let [(mut owned) blocks]
+            (match (p/pinned graph owned a)
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [mapping]
+                  (let [(mut placed) mapping]
+                    (when (!= (get placed (cast i64 param)) start)
+                      (set! failures (+ failures 1)))
+                    (when (!= (get placed (cast i64 end)) start)
+                      (set! failures (+ failures 1)))
+                    (when (!= (get placed (cast i64 sum)) 0)
+                      (set! failures (+ failures 1)))
+                    (let [(mut pred) (adj/build owned true a)
+                          (mut succ) (adj/build owned false a)
+                          (mut order) (adj/reverse-postorder owned succ start a)
+                          (mut idom) (dom/build owned pred order a)]
+                      (match (p/early! graph (mut placed) idom start a)
+                        (Err [msg]
+                             (do
+                               (println "{}" msg)
+                               (set! failures (+ failures 1))))
+                        (Ok [_] 0))
+                      (when (!= (get placed (cast i64 later)) start)
+                        (set! failures (+ failures 1)))
+                      (when (!= (get placed (cast i64 sum)) start)
+                        (set! failures (+ failures 1)))
+                      (let [(mut depth) (loops/depths owned pred idom a)
+                            (mut live) (liveness/mark graph [sum] a)]
+                        (match (p/late! graph (mut placed) idom depth live a)
+                          (Err [msg]
+                               (do
+                                 (println "{}" msg)
+                                 (set! failures (+ failures 1))))
+                          (Ok [_] 0))
+                        (when (!= (get placed (cast i64 later)) start)
+                          (set! failures (+ failures 1)))
+                        (free! (mut depth))
+                        (free! (mut live)))
+                      (free! (mut idom))
+                      (free! (mut order))
+                      (adj/release! (mut pred))
+                      (adj/release! (mut succ)))
+                    (free! (mut placed)))))
+            (b/patch! (mut graph) param 1 end)
+            (match (p/pinned graph owned a)
+              (Err [_] 0)
+              (Ok [mapping]
+                  (let [(mut placed) mapping]
+                    (set! failures (+ failures 1))
+                    (free! (mut placed)))))
+            (cfg/release! (mut owned)))))
+    (g/release! (mut graph))
+    (println "placement checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

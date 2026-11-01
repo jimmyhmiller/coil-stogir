@@ -1,0 +1,295 @@
+(module stogir.tests.jit-checked-pressure)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.types" :as types)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn sum24 :cc (cc/C) [(a i64)
+                        (b i64)
+                        (c i64)
+                        (d i64)
+                        (e i64)
+                        (f i64)
+                        (g i64)
+                        (h i64)
+                        (i i64)
+                        (j i64)
+                        (k i64)
+                        (l i64)
+                        (m i64)
+                        (n i64)
+                        (o i64)
+                        (p i64)
+                        (q i64)
+                        (r i64)
+                        (s i64)
+                        (t i64)
+                        (u i64)
+                        (v i64)
+                        (w i64)
+                        (x i64)] (-> i64)
+  (+ a b c d e f g h i j k l m n o p q r s t u v w x))
+
+(defstruct Expected [(value u64) (overflow? bool)])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn expected [(opcode i32) (ty i32) (a u64) (b u64)] (-> Expected)
+  (let [width (* 8 (types/scalar-size ty 8))
+        modulus (<< (: 1 u128) (cast u128 width))
+        mask (cast u64 (- modulus 1))
+        x (& a mask)
+        y (& b mask)
+        (mut bits) (: 0 u64)
+        (mut overflow?) false]
+    (if (types/signed? ty)
+        (let [limit (cast i128 (/ modulus 2))
+              sx
+                (if (>= (cast u128 x) (/ modulus 2))
+                    (- (cast i128 x) (cast i128 modulus))
+                    (cast i128 x))
+              sy
+                (if (>= (cast u128 y) (/ modulus 2))
+                    (- (cast i128 y) (cast i128 modulus))
+                    (cast i128 y))
+              value
+                (if (= opcode 41)
+                    (+ sx sy)
+                    (if (= opcode 42) (- sx sy) (* sx sy)))]
+          (set! bits (& (cast u64 value) mask))
+          (set! overflow? (or (< value (- 0 limit)) (> value (- limit 1)))))
+        (do
+          (set! overflow?
+                (if (= opcode 41)
+                    (> y (- mask x))
+                    (if (= opcode 42) (< x y) (and (!= x 0) (> y (/ mask x))))))
+          (set! bits
+                (& (cast u64
+                         (if (= opcode 41)
+                             (+ (cast u128 x) (cast u128 y))
+                             (if (= opcode 42)
+                                 (- (+ (cast u128 x) modulus) (cast u128 y))
+                                 (* (cast u128 x) (cast u128 y)))))
+                   mask))))
+    (Expected
+      :overflow? overflow?
+      :value
+        (if (and (types/signed? ty) (>= (cast u128 bits) (/ modulus 2)))
+            (cast u64 (- (cast i128 bits) (cast i128 modulus)))
+            bits))))
+
+;;; Each producer must precede the call because its value is an argument.
+;;; All 24 captured flags and original results are also consumed after the call.
+(defn check [(ty u8) (opcode i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        x (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 1]))
+        address (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        (mut values) (ArrayList::new [i32] allocator)
+        (mut flags) (ArrayList::new [i32] allocator)
+        (mut arguments) (ArrayList::new [i32] allocator)
+        (mut arg-types) (ArrayList::new [u8] allocator)
+        (mut inputs) (ArrayList::new [u64] allocator)
+        (mut cells) (ArrayList::new [u64] allocator)
+        (mut i) (: 1 i64)
+        one (require (b/scalar-constant! (mut graph) 5 1 8))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        (mut failures) 0]
+    (while (<= i 24)
+      (let [constant
+              (require (b/scalar-constant! (mut graph)
+                                           (cast i32 ty)
+                                           (cast u64 i)
+                                           8))
+            value
+              (require (b/emit! (mut graph) opcode (cast i32 ty) [x constant]))
+            flag (require (b/overflow! (mut graph) value))
+            widened
+              (if (= (types/scalar-size (cast i32 ty) 8) 8)
+                  value
+                  (require (b/emit! (mut graph)
+                                    (if (types/signed? (cast i32 ty)) 33 34)
+                                    (if (types/signed? (cast i32 ty)) 11 5)
+                                    [value])))]
+        (push! (mut values) value)
+        (push! (mut flags) flag)
+        (push! (mut arguments) widened)
+        (push! (mut arg-types) (if (types/signed? (cast i32 ty)) 11 5)))
+      (set! i (+ i 1)))
+    (match (calls/create 0 11 (slice arg-types) allocator)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [prototype]
+          (let [(mut owned) prototype
+                call
+                  (require (calls/emit! (mut graph)
+                                        owned
+                                        start
+                                        target
+                                        (slice arguments)
+                                        allocator))
+                (mut control) call]
+            (set! i 0)
+            (while (< i 24)
+              (let [flag64
+                      (require (b/conditional! (mut graph)
+                                               5
+                                               (get flags i)
+                                               one
+                                               zero))
+                    (mut offset) (* i 16)]
+                (for value [(get values i) flag64]
+                  (let [displacement
+                          (require (b/scalar-constant! (mut graph)
+                                                       6
+                                                       (cast u64 offset)
+                                                       8))
+                        destination
+                          (require (b/emit! (mut graph)
+                                            26
+                                            6
+                                            [address displacement]))]
+                    (set! control
+                          (require (b/emit! (mut graph)
+                                            93
+                                            0
+                                            [control destination value])))
+                    (set! offset (+ offset 8)))))
+              (set! i (+ i 1)))
+            (let [ret
+                    (require (b/emit! (mut graph)
+                                      120
+                                      11
+                                      [control call (: 0 i32)]))]
+              (match (calls/create 0 11 [(: 6 u8) ty 6] allocator)
+                (Err [_] (set! failures (+ failures 1)))
+                (Ok [incoming]
+                    (let [(mut owned-incoming) incoming]
+                      (require (calls/function! (mut graph)
+                                                owned-incoming
+                                                allocator))
+                      (calls/release! (mut owned-incoming)))))
+              (match (compile/text graph start [ret] allocator)
+                (Err [msg]
+                     (do (println "{}" msg) (set! failures (+ failures 1))))
+                (Ok [text]
+                    (let [(mut code) text]
+                      (match (jit/map-text (slice code))
+                        (Err [msg]
+                             (do
+                               (println "{}" msg)
+                               (set! failures (+ failures 1))))
+                        (Ok [loaded]
+                            (let [(mut image) loaded
+                                  f
+                                    (primitive/cast (fnptr (cc/C)
+                                                           [u64 u64 (ptr u64)]
+                                                           u64)
+                                                    (.base image))
+                                  callee
+                                    (primitive/cast u64
+                                                    (primitive/cast (ptr u8)
+                                                                    (fnptr-of sum24)))
+                                  bits (* 8 (types/scalar-size (cast i32 ty) 8))
+                                  mask
+                                    (cast u64
+                                          (- (<< (: 1 u128) (cast u128 bits)) 1))]
+                              (for initial [(: 0 u64)
+                                            1
+                                            2
+                                            127
+                                            128
+                                            255
+                                            32767
+                                            32768
+                                            65535
+                                            0x7FFFFFFF
+                                            0x80000000
+                                            0xFFFFFFFF
+                                            0x7FFFFFFFFFFFFFFF
+                                            0x8000000000000000
+                                            0xFFFFFFFFFFFFFFFF]
+                                (push! (mut inputs) initial))
+                              (set! i 0)
+                              (while (< i 48)
+                                (push! (mut cells) 0)
+                                (set! i (+ i 1)))
+                              (for input inputs
+                                (let [(mut sum) (: 0 u64)]
+                                  (set! i 1)
+                                  (while (<= i 24)
+                                    (set! sum
+                                          (+ sum
+                                             (.value (expected opcode
+                                                               (cast i32 ty)
+                                                               input
+                                                               (cast u64 i)))))
+                                    (set! i (+ i 1)))
+                                  (let [actual
+                                          (call-ptr f
+                                                    callee
+                                                    input
+                                                    (.data cells))]
+                                    (when (!= actual sum)
+                                      (when (= failures 0)
+                                        (println "checked pressure call ty={} op={} input={} expected={} actual={}"
+                                                 ty
+                                                 opcode
+                                                 input
+                                                 sum
+                                                 actual))
+                                      (set! failures (+ failures 1)))))
+                                (set! i 0)
+                                (while (< i 24)
+                                  (let [wanted
+                                          (expected opcode
+                                                    (cast i32 ty)
+                                                    input
+                                                    (cast u64 (+ i 1)))
+                                        actual (get cells (* i 2))
+                                        flag (get cells (+ (* i 2) 1))]
+                                    (when (or (!= actual
+                                                  (& (.value wanted) mask))
+                                              (!= flag
+                                                  (if (.overflow? wanted)
+                                                      (: 1 u64)
+                                                      0)))
+                                      (when (= failures 0)
+                                        (println "checked pressure store ty={} op={} input={} index={} expected={} actual={} flag={}"
+                                                 ty
+                                                 opcode
+                                                 input
+                                                 i
+                                                 (& (.value wanted) mask)
+                                                 actual
+                                                 flag))
+                                      (set! failures (+ failures 1))))
+                                  (set! i (+ i 1))))
+                              (jit/release! (mut image)))))
+                      (free! (mut code))))))
+            (calls/release! (mut owned)))))
+    (free! (mut cells))
+    (free! (mut inputs))
+    (free! (mut arg-types))
+    (free! (mut arguments))
+    (free! (mut flags))
+    (free! (mut values))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for ty [(: 2 u8) 3 4 5 8 9 10 11]
+      (for opcode [(: 41 i32) 42 43]
+        (set! failures (+ failures (check ty opcode)))))
+    (println "native checked call pressure: {} failures" failures)
+    (if (= failures 0) 0 1)))

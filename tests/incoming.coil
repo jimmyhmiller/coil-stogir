@@ -1,0 +1,135 @@
+(module stogir.tests.incoming)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.incoming" :as incoming)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [reference] reference) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn invalid [(kind i32) (expected (slice u8))] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        (mut failures) 0]
+    (if (= kind 0)
+        (b/emit! (mut graph) 71 11 [start (: 0 i32) 1])
+        (do
+          (match (calls/create (if (= kind 5) 8 0) 11 [(: 11 u8)] allocator)
+            (Err [_] (set! failures (+ failures 1)))
+            (Ok [prototype]
+                (let [(mut owned) prototype]
+                  (require (calls/function! (mut graph) owned allocator))
+                  (calls/release! (mut owned)))))
+          (b/emit! (mut graph) 71 (if (= kind 2) 10 11) [start (: 0 i32) 0])
+          (when (= kind 1) (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+          (when (or (= kind 3) (= kind 4))
+            (let [value (require (b/scalar-constant! (mut graph) 10 1 8))]
+              (b/emit! (mut graph)
+                       120
+                       (if (= kind 3) 10 11)
+                       [start value (: 0 i32)])))
+          (when (= kind 6) (set! (.function-prototype graph) 99999))))
+    (match (incoming/build graph start allocator)
+      (Err [msg]
+           (when (!= msg expected)
+             (println "kind={} expected={} actual={}" kind expected msg)
+             (set! failures (+ failures 1))))
+      (Ok [parameters]
+          (let [(mut owned) parameters]
+            (free! (mut owned))
+            (set! failures (+ failures 1)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn inferred [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        (mut i) (: 8 i32)
+        (mut failures) 0]
+    ; Include complete parameter metadata, constructed in reverse order. The
+    ; eighth preceding parameter is unused but still determines classification.
+    (while (>= i 0)
+      (b/emit! (mut graph) 71 11 [start (: 0 i32) i])
+      (set! i (- i 1)))
+    (match (incoming/build graph start allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [parameters]
+          (let [(mut owned) parameters]
+            (when (!= (len owned) 9) (set! failures (+ failures 1)))
+            (let [stack (get owned 8)
+                  register (get owned 7)]
+              (when (or (!= (.kind stack) 1)
+                        (!= (.offset stack) 0)
+                        (!= (.size stack) 8)
+                        (!= (.kind register) 0)
+                        (!= (.register register) 7))
+                (set! failures (+ failures 1))))
+            (free! (mut owned)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn declaration [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        parameter (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        (mut signature) (: 0 i32)
+        (mut failures) 0]
+    (match (calls/create 0 11 [(: 12 u8) 11] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype]
+            (set! signature
+                  (require (calls/function! (mut graph) owned allocator)))
+            (when (!= signature
+                      (require (calls/function! (mut graph) owned allocator)))
+              (set! failures (+ failures 1)))
+            (calls/release! (mut owned)))))
+    (match (calls/create 0 11 [(: 11 u8) 11] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype
+                entries (len (.entries (.strings graph)))
+                bytes (len (.bytes (.strings graph)))]
+            (match (calls/function! (mut graph) owned allocator)
+              (Ok [_] (set! failures (+ failures 1)))
+              (Err [_] 0))
+            (when (or (!= entries (len (.entries (.strings graph))))
+                      (!= bytes (len (.bytes (.strings graph)))))
+              (set! failures (+ failures 1)))
+            (calls/release! (mut owned)))))
+    (when (!= signature (.function-prototype graph))
+      (set! failures (+ failures 1)))
+    ; The unused floating parameter consumes d0, so ordinal 1 still arrives x0.
+    (match (incoming/build graph start allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [parameters]
+          (let [(mut owned) parameters]
+            (when (!= (len owned) 1) (set! failures (+ failures 1)))
+            (let [location (get owned 0)]
+              (when (or (!= (.reference location) parameter)
+                        (!= (.kind location) 0)
+                        (!= (.register location) 0))
+                (set! failures (+ failures 1))))
+            (free! (mut owned)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures
+          (+ (inferred)
+             (declaration)
+             (invalid 0
+                      "incomplete parameter types; declare a function prototype")
+             (invalid 1 "duplicate parameter projection")
+             (invalid 2 "parameter type disagrees with function prototype")
+             (invalid 3 "return type disagrees with function prototype")
+             (invalid 4 "return value disagrees with function prototype")
+             (invalid 5 "unsupported AArch64 function convention")
+             (invalid 6 "function prototype string missing"))]
+    (println "incoming ABI metadata checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

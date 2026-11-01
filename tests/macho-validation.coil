@@ -1,0 +1,100 @@
+(module stogir.tests.macho-validation)
+(import "stogir.image" :as image)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.relocate" :as relocation)
+(import "stogir.bytes" :as bytes)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Ok Err])
+
+(defn invalid [(mode i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut source) (image/create allocator)
+        (mut failures) 0]
+    (image/symbol! (mut source) "_target" 2 (if (= mode 4) 9 0))
+    (bytes/append32! (mut (.text source)) (if (= mode 0) 0xD65F03C0 0x14000000))
+    (bytes/append32! (mut (.text source)) 0xD65F03C0)
+    (bytes/append32! (mut (.data source)) 0)
+    (bytes/append32! (mut (.data source)) 0)
+    (when (< mode 4)
+      (image/relocate! (mut source)
+                       (image/Relocation
+                         :section 1
+                         :offset (if (= mode 3) 1 0)
+                         :kind 2
+                         :symbol 0
+                         :addend (if (= mode 2) 8388608 0))))
+    (when (= mode 1)
+      (image/relocate! (mut source)
+                       (image/Relocation
+                         :section 1
+                         :offset 0
+                         :kind 1
+                         :symbol 0
+                         :addend 0)))
+    (when (= mode 5)
+      (push! (mut (.names source)) 0)
+      (let [symbol (elem (mut (.symbols source)) 0)] (set! (.length symbol) 8)))
+    (when (= mode 6)
+      (push! (mut (.relocations source))
+             (image/Relocation
+               :section 1
+               :offset 0
+               :kind 2
+               :symbol 10
+               :addend 0)))
+    (when (= mode 7)
+      (let [symbol (elem (mut (.symbols source)) 0)]
+        (set! (.section symbol) 0)
+        (set! (.global? symbol) false)))
+    (match (macho/image-object source allocator)
+      (Err [_] 0)
+      (Ok [object]
+          (let [(mut owned) object]
+            (free! (mut owned))
+            (set! failures (+ failures 1)))))
+    (image/release! (mut source))
+    failures))
+
+(defn absolute-addends [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut source) (image/create allocator)
+        (mut failures) 0]
+    (image/symbol! (mut source) "_external" 0 0)
+    (bytes/append32! (mut (.text source)) 0xD65F03C0)
+    (bytes/append32! (mut (.data source)) 0)
+    (bytes/append32! (mut (.data source)) 0)
+    (image/relocate! (mut source)
+                     (image/Relocation
+                       :section 2
+                       :offset 0
+                       :kind 1
+                       :symbol 0
+                       :addend 0))
+    (for addend [(: -9223372036854775808 i64)
+                 -8388609
+                 8388608
+                 9223372036854775807]
+      (let [record (elem (mut (.relocations source)) 0)]
+        (set! (.addend record) addend))
+      (match (macho/image-object source allocator)
+        (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+        (Ok [object]
+            (let [(mut owned) object
+                  ; section_64.offset of the second section in LC_SEGMENT_64.
+                  offset (cast i64 (relocation/read32 owned 232))]
+              (when (or (!= (relocation/read32 owned offset) (cast u32 addend))
+                        (!= (relocation/read32 owned (+ offset 4))
+                            (cast u32 (>> (cast u64 addend) 32))))
+                (set! failures (+ failures 1)))
+              (free! (mut owned))))))
+    (when (!= (relocation/read32 (.data source) 0) 0)
+      (set! failures (+ failures 1)))
+    (image/release! (mut source))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) (absolute-addends)]
+    (for mode [(: 0 i32) 1 2 3 4 5 6 7]
+      (set! failures (+ failures (invalid mode))))
+    (println "Mach-O image validation checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

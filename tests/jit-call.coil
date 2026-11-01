@@ -1,0 +1,118 @@
+(module stogir.tests.jit-call)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.fs" :as fs)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn combine :cc (cc/C) [(a i64) (b i64) (c i64) (d i64)] (-> i64)
+  (+ (+ (* a 3) (* b 5)) (+ (* c 7) (* d 11))))
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn check [(graph g/Graph) (start i32) (ret i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut failures) 0]
+    (match (compile/text graph start [ret] allocator)
+      (Err [msg]
+           (do (println "compile: {}" msg) (set! failures (+ failures 1))))
+      (Ok [compiled]
+          (let [(mut code) compiled]
+            (match (jit/map-text (slice code))
+              (Err [msg]
+                   (do (println "map: {}" msg) (set! failures (+ failures 1))))
+              (Ok [image]
+                  (let [(mut owned) image
+                        f
+                          (primitive/cast (fnptr (cc/C) [u64 i64 i64] i64)
+                                          (.base owned))
+                        target
+                          (primitive/cast u64
+                                          (primitive/cast (ptr u8)
+                                                          (fnptr-of combine)))
+                        (mut p) -20]
+                    (while (<= p 20)
+                      (let [(mut q) -10]
+                        (while (<= q 10)
+                          (let [first (combine q p q 7)
+                                second (combine first p q first)
+                                expected (+ (+ second (* p q)) first)
+                                actual (call-ptr f target p q)]
+                            (when (!= actual expected)
+                              (when (= failures 0)
+                                (println "p={} q={} expected={} actual={}"
+                                         p
+                                         q
+                                         expected
+                                         actual))
+                              (set! failures (+ failures 1))))
+                          (set! q (+ q 1))))
+                      (set! p (+ p 1)))
+                    (when (not (jit/release! (mut owned)))
+                      (set! failures (+ failures 1))))))
+            (free! (mut code)))))
+    failures))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        p (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        q (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))
+        (mut failures) 0]
+    (match (calls/create 0 11 [(: 11 u8) 11 11 11] allocator)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [prototype]
+          (let [(mut owned) prototype
+                first
+                  (require (calls/emit! (mut graph)
+                                        owned
+                                        start
+                                        target
+                                        [q p q seven]
+                                        allocator))
+                second
+                  (require (calls/emit! (mut graph)
+                                        owned
+                                        first
+                                        target
+                                        [first p q first]
+                                        allocator))
+                product (require (b/emit! (mut graph) 28 11 [p q]))
+                sum (require (b/emit! (mut graph) 26 11 [second product]))
+                result (require (b/emit! (mut graph) 26 11 [sum first]))
+                ret
+                  (require (b/emit! (mut graph)
+                                    120
+                                    11
+                                    [second result (: 0 i32)]))]
+            (match (compile/object graph
+                                   start
+                                   [ret]
+                                   "_stogir_call_test"
+                                   allocator)
+              (Err [msg]
+                   (do
+                     (println "object: {}" msg)
+                     (set! failures (+ failures 1))))
+              (Ok [object]
+                  (let [(mut owned-object) object]
+                    (match (fs/write-file allocator
+                                          "/tmp/coil-stogir-call.o"
+                                          (slice owned-object))
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [_] 0))
+                    (free! (mut owned-object)))))
+            (set! failures (+ failures (check graph start ret)))
+            (calls/release! (mut owned)))))
+    (g/release! (mut graph))
+    (println "native call checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

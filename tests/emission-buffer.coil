@@ -1,0 +1,85 @@
+(module stogir.tests.emission-buffer)
+(import "stogir.graph" :as g)
+(import "stogir.symbols" :as symbols)
+(import "stogir.bytes" :as bytes)
+(import "stogir.image" :as image)
+(import "stogir.a64.code" :as code)
+(import "stogir.a64.image" :as emitted)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        target (require (symbols/function! (mut graph) "_labs" 0))
+        address (require (symbols/symbol! (mut graph) "_labs"))
+        (mut inner) (code/create allocator)
+        (mut middle) (code/create allocator)
+        (mut outer) (code/create allocator)
+        (mut invalid) (code/create allocator)
+        (mut failures) 0]
+    (require (code/materialize! (mut inner) graph target true 16))
+    (require (code/direct-call! (mut inner) graph target))
+    (bytes/append32! (mut (.text middle)) 0xD503201F)
+    (when (not (code/append! (mut middle) inner))
+      (set! failures (+ failures 1)))
+    (require (code/materialize! (mut middle) graph address true 17))
+    (bytes/append32! (mut (.text outer)) 0xD503201F)
+    (bytes/append32! (mut (.text outer)) 0xD503201F)
+    (when (not (code/append! (mut outer) middle))
+      (set! failures (+ failures 1)))
+    (when (or (!= (.offset (at (.references outer) 0)) 12)
+              (!= (.offset (at (.references outer) 2)) 20)
+              (!= (.offset (at (.references outer) 3)) 24))
+      (set! failures (+ failures 1)))
+    (let [before (len (.text outer))]
+      (when (code/append! (mut outer) outer) (set! failures (+ failures 1)))
+      (when (!= before (len (.text outer))) (set! failures (+ failures 1)))
+      (bytes/append32! (mut (.text invalid)) 0x94000000)
+      (push! (mut (.references invalid))
+             (code/Reference
+               :offset 1
+               :kind 2
+               :target target))
+      (when (code/append! (mut outer) invalid) (set! failures (+ failures 1)))
+      (when (!= before (len (.text outer))) (set! failures (+ failures 1))))
+    ;; Public entry deliberately collides with the first private-name candidate.
+    (match (emitted/finish! (mut outer)
+                            graph
+                            "L_stogir_0000000000000000"
+                            allocator)
+      (Err [msg] (do (println "finish: {}" msg) (set! failures (+ failures 1))))
+      (Ok [source]
+          (let [(mut owned) source]
+            (when (or (!= (len (.data owned)) 8)
+                      (!= (len (.symbols owned)) 3)
+                      (!= (len (.relocations owned)) 6)
+                      (!= (len (.text outer)) 0))
+              (set! failures (+ failures 1)))
+            (match (image/find-symbol owned "L_stogir_0000000000000001")
+              (None [] (set! failures (+ failures 1)))
+              (Some [id]
+                    (when (.global? (at (.symbols owned) (cast i64 id)))
+                      (set! failures (+ failures 1)))))
+            (image/release! (mut owned)))))
+    ;; Numeric and symbolic materializers report the same unit: emitted bytes.
+    (for bits [(: 0 u64) 0xFFFFFFFFFFFFFFFF 0x1234000056780000]
+      (match (g/intern-scalar! (mut graph) 5 bits)
+        (None [] (set! failures (+ failures 1)))
+        (Some [reference]
+              (let [before (len (.text inner))]
+                (match (code/materialize! (mut inner) graph reference true 3)
+                  (Err [_] (set! failures (+ failures 1)))
+                  (Ok [count]
+                      (when (!= (cast i64 count) (- (len (.text inner)) before))
+                        (set! failures (+ failures 1)))))))))
+    (code/release! (mut inner))
+    (code/release! (mut middle))
+    (code/release! (mut outer))
+    (code/release! (mut invalid))
+    (g/release! (mut graph))
+    (println "relocation emission buffer checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

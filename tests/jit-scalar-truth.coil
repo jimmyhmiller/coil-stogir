@@ -1,0 +1,308 @@
+(module stogir.tests.jit-scalar-truth)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.types" :as types)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn mask [(ty u8)] (-> u64)
+  (cast u64
+        (- (<< (: 1 u128) (cast u128 (* 8 (types/scalar-size (cast i32 ty) 8))))
+           1)))
+
+(defn canonical [(ty u8) (bits u64)] (-> u64)
+  (let [raw (& bits (mask ty))] (if (= ty 1) (if (= raw 0) (: 0 u64) 1) raw)))
+
+(defn truth? [(ty u8) (bits u64)] (-> bool)
+  (let [raw (canonical ty bits)]
+    (if (= ty 12)
+        (!= (& raw 0x7FFFFFFFFFFFFFFF) 0)
+        (if (= ty 13) (!= (& raw 0x7FFFFFFF) 0) (!= raw 0)))))
+
+(defn typed! [(graph (mut g/Graph)) (ty u8) (reference i32)] (-> i32)
+  (if (= ty 5)
+      reference
+      (if (= ty 13)
+          (require (b/conversion! (mut graph)
+                                  36
+                                  13
+                                  8
+                                  (require (b/conversion! (mut graph)
+                                                          35
+                                                          4
+                                                          8
+                                                          reference))))
+          (require (b/conversion! (mut graph)
+                                  (if (= (types/scalar-size (cast i32 ty) 8) 8)
+                                      36
+                                      35)
+                                  (cast i32 ty)
+                                  8
+                                  reference)))))
+
+(defn raw! [(graph (mut g/Graph)) (ty u8) (reference i32)] (-> i32)
+  (if (= ty 5)
+      reference
+      (if (= ty 13)
+          (require (b/conversion! (mut graph)
+                                  34
+                                  5
+                                  8
+                                  (require (b/conversion! (mut graph)
+                                                          36
+                                                          4
+                                                          8
+                                                          reference))))
+          (require (b/conversion! (mut graph)
+                                  (if (= (types/scalar-size (cast i32 ty) 8) 8)
+                                      36
+                                      34)
+                                  5
+                                  8
+                                  reference)))))
+
+(defn signature! [(graph (mut g/Graph)) (count i32)] (-> void)
+  (match (calls/create 0
+                       5
+                       (if (= count 1) [(: 5 u8)] [(: 5 u8) 5 5])
+                       (malloc-allocator))
+    (Err [msg] (println "{}" msg))
+    (Ok [prototype]
+        (let [(mut owned) prototype]
+          (require (calls/function! (mut graph) owned (malloc-allocator)))
+          (calls/release! (mut owned))))))
+
+(defn save [(graph g/Graph)
+            (start i32)
+            (roots (slice i32))
+            (symbol (slice u8))
+            (path (slice u8))] (-> i64)
+  (match (compile/object graph start roots symbol (malloc-allocator))
+    (Err [msg] (do (println "{}" msg) 1))
+    (Ok [object]
+        (let [(mut bytes) object
+              result
+                (match (fs/write-file (malloc-allocator) path (slice bytes))
+                  (Err [_] (: 1 i64))
+                  (Ok [_] (: 0 i64)))]
+          (free! (mut bytes))
+          result))))
+
+(defn selection [(cty u8) (ty u8) (mode i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        pc (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        pa (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        pb (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        c (typed! (mut graph) cty pc)
+        a (typed! (mut graph) ty pa)
+        b (typed! (mut graph) ty pb)
+        ca
+          (if (= ty 12)
+              (: 0x7FF0123456789ABC u64)
+              (if (= ty 13)
+                  (: 0x7F812345 u64)
+                  (if (= ty 1) (: 1 u64) (& 0xFEDCBA9876543280 (mask ty)))))
+        cb
+          (if (= ty 12)
+              (: 0x8000000000000000 u64)
+              (if (= ty 13)
+                  (: 0x80000000 u64)
+                  (if (= ty 1) (: 0 u64) (& 0x123456789ABC7F01 (mask ty)))))
+        cc
+          (if (= mode 4)
+              (if (= cty 12)
+                  (: 0x8000000000000000 u64)
+                  (if (= cty 13) (: 0x80000000 u64) (: 0 u64)))
+              (if (= cty 12)
+                  (: 0x7FF0123456789ABC u64)
+                  (if (= cty 13)
+                      (: 0x7F812345 u64)
+                      (if (= cty 1) (: 1 u64) (mask cty)))))
+        condition
+          (if (or (= mode 4) (= mode 5))
+              (require (b/scalar-constant! (mut graph) (cast i32 cty) cc 8))
+              (if (= mode 6) a (if (= mode 7) b c)))
+        yes
+          (if (or (= mode 1) (= mode 3) (= mode 5))
+              (require (b/scalar-constant! (mut graph) (cast i32 ty) ca 8))
+              a)
+        no
+          (if (= mode 8)
+              a
+              (if (or (= mode 2) (= mode 3) (= mode 5))
+                  (require (b/scalar-constant! (mut graph) (cast i32 ty) cb 8))
+                  b))
+        selected
+          (require (b/emit! (mut graph) 60 (cast i32 ty) [condition yes no]))
+        result (raw! (mut graph) ty selected)
+        ret (require (b/emit! (mut graph) 120 5 [start result (: 0 i32)]))
+        (mut failures) 0]
+    (signature! (mut graph) 3)
+    (when (and (= cty ty) (>= ty 12) (= mode 3))
+      (set! failures
+            (+ failures
+               (save graph
+                     start
+                     [ret]
+                     (if (= ty 12)
+                         "_stogir_truth_select_f64"
+                         "_stogir_truth_select_f32")
+                     (if (= ty 12)
+                         "/tmp/coil-stogir-truth-select-f64.o"
+                         "/tmp/coil-stogir-truth-select-f32.o")))))
+    (match (compile/text graph start [ret] allocator)
+      (Err [msg]
+           (do
+             (println "COND cty={} ty={} mode={}: {}" cty ty mode msg)
+             (set! failures (+ failures 1))))
+      (Ok [text]
+          (let [(mut code) text]
+            (match (jit/map-text (slice code))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [loaded]
+                  (let [(mut image) loaded
+                        f
+                          (primitive/cast (fnptr (cc/C) [u64 u64 u64] u64)
+                                          (.base image))]
+                    (for input [(: 0 u64)
+                                1
+                                2
+                                128
+                                255
+                                256
+                                0x80000000
+                                0x100000000
+                                0x8000000000000000
+                                0x7F812345
+                                0x7FF0123456789ABC
+                                0xFFFFFFFFFFFFFFFF]
+                      (for av [(: 0 u64)
+                               0x80000000
+                               0x7FF0123456789ABC
+                               0xFEDCBA9876543280]
+                        (let [bv (^ av (: 0x123456789ABCDEF0 u64))
+                              condition-bits
+                                (if (or (= mode 4) (= mode 5))
+                                    cc
+                                    (if (= mode 6)
+                                        (canonical ty av)
+                                        (if (= mode 7)
+                                            (canonical ty bv)
+                                            (canonical cty input))))
+                              yes-bits
+                                (if (or (= mode 1) (= mode 3) (= mode 5))
+                                    ca
+                                    (canonical ty av))
+                              no-bits
+                                (if (= mode 8)
+                                    (canonical ty av)
+                                    (if (or (= mode 2) (= mode 3) (= mode 5))
+                                        cb
+                                        (canonical ty bv)))
+                              wanted
+                                (canonical ty
+                                           (if (truth? cty condition-bits)
+                                               yes-bits
+                                               no-bits))
+                              actual (call-ptr f input av bv)]
+                          (when (!= actual wanted)
+                            (when (= failures 0)
+                              (println "COND mismatch cty={} ty={} mode={} c={} wanted={} actual={}"
+                                       cty
+                                       ty
+                                       mode
+                                       input
+                                       wanted
+                                       actual))
+                            (set! failures (+ failures 1))))))
+                    (jit/release! (mut image)))))
+            (free! (mut code)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn branch [(ty u8)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        param (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        condition (typed! (mut graph) ty param)
+        split (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        one (require (b/scalar-constant! (mut graph) 5 1 8))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        yes-ret (require (b/emit! (mut graph) 120 5 [yes one (: 0 i32)]))
+        no-ret (require (b/emit! (mut graph) 120 5 [no zero (: 0 i32)]))
+        (mut failures) 0]
+    (signature! (mut graph) 1)
+    (when (or (= ty 5) (= ty 12) (= ty 13))
+      (set! failures
+            (+ failures
+               (save graph
+                     start
+                     [yes-ret no-ret]
+                     (if (= ty 5)
+                         "_stogir_truth_branch_u64"
+                         (if (= ty 12)
+                             "_stogir_truth_branch_f64"
+                             "_stogir_truth_branch_f32"))
+                     (if (= ty 5)
+                         "/tmp/coil-stogir-truth-branch-u64.o"
+                         (if (= ty 12)
+                             "/tmp/coil-stogir-truth-branch-f64.o"
+                             "/tmp/coil-stogir-truth-branch-f32.o"))))))
+    (match (compile/text graph start [yes-ret no-ret] allocator)
+      (Err [msg]
+           (do (println "IF ty={}: {}" ty msg) (set! failures (+ failures 1))))
+      (Ok [text]
+          (let [(mut code) text]
+            (match (jit/map-text (slice code))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [loaded]
+                  (let [(mut image) loaded
+                        f
+                          (primitive/cast (fnptr (cc/C) [u64] u64)
+                                          (.base image))]
+                    (for bits [(: 0 u64)
+                               1
+                               2
+                               255
+                               256
+                               0x80000000
+                               0x100000000
+                               0x8000000000000000
+                               0x7FC12345
+                               0x7FF0123456789ABC
+                               0xFFFFFFFFFFFFFFFF]
+                      (when (!= (call-ptr f bits)
+                                (if (truth? ty bits) (: 1 u64) 0))
+                        (when (= failures 0)
+                          (println "IF mismatch ty={} bits={}" ty bits))
+                        (set! failures (+ failures 1))))
+                    (jit/release! (mut image)))))
+            (free! (mut code)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for cty [(: 1 u8) 2 3 4 5 6 7 8 9 10 11 12 13]
+      (set! failures (+ failures (branch cty)))
+      (for ty [(: 1 u8) 2 3 4 5 6 7 8 9 10 11 12 13]
+        (for mode [(: 0 i32) 1 2 3 4 5 6 7 8]
+          (when (or (< mode 6) (= cty ty))
+            (set! failures (+ failures (selection cty ty mode)))))))
+    (println "native scalar truth/selection: 1066 variants, {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

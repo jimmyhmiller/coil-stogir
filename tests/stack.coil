@@ -1,0 +1,68 @@
+(module stogir.tests.stack)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.stack" :as stack)
+(import "stogir.a64.compile" :as compile)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn rejected [(result (Result i32 (slice u8)))] (-> i64)
+  (match result (Ok [_] 1) (Err [_] 0)))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        count (require (b/scalar-constant! (mut graph) 5 17 8))
+        negative
+          (require (b/scalar-constant! (mut graph) 11 0xFFFFFFFFFFFFFFFF 8))
+        overflow
+          (require (b/scalar-constant! (mut graph) 5 0x7FFFFFFFFFFFFFF1 8))
+        negative-byte (require (b/scalar-constant! (mut graph) 8 255 8))
+        fp (require (b/scalar-constant! (mut graph) 12 0 8))
+        variable (require (b/variable! (mut graph) 5 start "not-count" 8))
+        (mut failures) 0]
+    (match (stack/constant-size graph count)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [amount] (when (!= amount 32) (set! failures (+ failures 1)))))
+    (let [before (len (.instructions graph))]
+      (set! failures
+            (+ failures
+               (rejected (b/stack-allocate! (mut graph) start negative 16))
+               (rejected (b/stack-allocate! (mut graph) start negative-byte 16))
+               (rejected (b/stack-allocate! (mut graph) start overflow 16))
+               (rejected (b/stack-allocate! (mut graph) start fp 16))
+               (rejected (b/stack-allocate! (mut graph) start variable 16))
+               (rejected (b/stack-allocate! (mut graph) count count 16))
+               (rejected (b/stack-allocate! (mut graph) start count 3))
+               (rejected (b/stack-free! (mut graph) start negative))
+               (rejected (b/stack-free! (mut graph) start overflow))))
+      (when (!= (len (.instructions graph)) before)
+        (set! failures (+ failures 1))))
+    (for bad [(require (b/emit! (mut graph) 81 5 [start count (: 16 i32)]))
+              (require (b/emit! (mut graph) 82 6 [start count]))
+              (require (b/emit! (mut graph) 81 6 [start fp (: 16 i32)]))]
+      (set! failures (+ failures (rejected (stack/validate graph bad)))))
+    (g/release! (mut graph))
+    (let [(mut graph) (g/create allocator)
+          start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+          count (require (b/scalar-constant! (mut graph) 5 17 8))
+          allocation (require (b/stack-allocate! (mut graph) start count 32))
+          ret
+            (require (b/emit! (mut graph)
+                              120
+                              6
+                              [allocation allocation (: 0 i32)]))]
+      (match (compile/text graph start [ret] allocator)
+        (Err [_] 0)
+        (Ok [text]
+            (let [(mut bytes) text]
+              (set! failures (+ failures 1))
+              (free! (mut bytes)))))
+      (g/release! (mut graph)))
+    (println "stack byte-count, type, control and alignment checks: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

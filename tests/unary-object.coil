@@ -1,0 +1,69 @@
+(module stogir.tests.unary-object)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn write-function [(ty u8) (symbol (slice u8)) (path (slice u8))] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 0]))
+        wide (or (= ty 5) (= ty 11))
+        result-type (if wide (cast i32 ty) 5)
+        (mut result) (require (b/scalar-constant! (mut graph) result-type 0 8))
+        (mut failures) 0]
+    (for opcode [(: 31 i32) 32 45 54 55 56 57]
+      (when (and (or (!= opcode 32) (= ty 8) (= ty 9) (= ty 10) (= ty 11))
+                 (or (!= opcode 54) (!= ty 8)))
+        (let [value
+                (require (b/integer-unary! (mut graph) opcode (cast i32 ty) 8 p))
+              extended
+                (if wide value (require (b/emit! (mut graph) 34 5 [value])))]
+          (set! result
+                (require (b/emit! (mut graph) 48 result-type [result extended]))))))
+    (let [ret
+            (require (b/emit! (mut graph)
+                              120
+                              result-type
+                              [start result (: 0 i32)]))]
+      (match (calls/create 0 (cast u8 result-type) [ty] allocator)
+        (Err [_] (set! failures (+ failures 1)))
+        (Ok [prototype]
+            (let [(mut owned) prototype]
+              (require (calls/function! (mut graph) owned allocator))
+              (calls/release! (mut owned)))))
+      (match (compile/object graph start [ret] symbol allocator)
+        (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+        (Ok [object]
+            (let [(mut owned) object]
+              (match (fs/write-file allocator path (slice owned))
+                (Err [_] (set! failures (+ failures 1)))
+                (Ok [_] 0))
+              (free! (mut owned))))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures
+          (+ (write-function 8 "_stogir_unary_i8" "/tmp/coil-stogir-unary-i8.o")
+             (write-function 9
+                             "_stogir_unary_i16"
+                             "/tmp/coil-stogir-unary-i16.o")
+             (write-function 10
+                             "_stogir_unary_i32"
+                             "/tmp/coil-stogir-unary-i32.o")
+             (write-function 11
+                             "_stogir_unary_i64"
+                             "/tmp/coil-stogir-unary-i64.o")
+             (write-function 5
+                             "_stogir_unary_u64"
+                             "/tmp/coil-stogir-unary-u64.o"))]
+    (println "integer unary object generation checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

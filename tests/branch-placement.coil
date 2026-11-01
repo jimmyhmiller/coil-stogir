@@ -1,0 +1,199 @@
+(module stogir.tests.branch-placement)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.cfg" :as cfg)
+(import "stogir.adjacency" :as adj)
+(import "stogir.dominators" :as dom)
+(import "stogir.loops" :as loops)
+(import "stogir.liveness" :as liveness)
+(import "stogir.placement" :as p)
+(import "stogir.schedule" :as schedule)
+(import "stogir.register-live" :as reg-live)
+(import "stogir.bitset" :as bits)
+(import "stogir.live-ranges" :as ranges)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        arg (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        cond (require (b/emit! (mut graph) 71 1 [start (: 0 i32) 1]))
+        split (require (b/emit! (mut graph) 116 0 [start cond]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        computation (require (b/emit! (mut graph) 26 11 [arg arg]))
+        yes-return
+          (require (b/emit! (mut graph) 120 11 [yes computation (: 0 i32)]))
+        no-return (require (b/emit! (mut graph) 120 11 [no arg (: 0 i32)]))
+        (mut failures) 0]
+    (match (cfg/build graph a)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [blocks]
+          (let [(mut owned) blocks
+                (mut pred) (adj/build owned true a)
+                (mut succ) (adj/build owned false a)
+                (mut order) (adj/reverse-postorder owned succ start a)
+                (mut idom) (dom/build owned pred order a)
+                (mut depth) (loops/depths owned pred idom a)
+                (mut live) (liveness/mark graph [yes-return no-return] a)]
+            (match (p/pinned graph owned a)
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [mapping]
+                  (let [(mut placed) mapping]
+                    (match (p/early! graph (mut placed) idom start a)
+                      (Ok [_] 0)
+                      (Err [_] (set! failures (+ failures 1))))
+                    (when (!= (get placed (cast i64 computation)) start)
+                      (set! failures (+ failures 1)))
+                    (match (p/late! graph (mut placed) idom depth live a)
+                      (Ok [_] 0)
+                      (Err [_] (set! failures (+ failures 1))))
+                    (when (!= (get placed (cast i64 computation)) yes)
+                      (set! failures (+ failures 1)))
+                    (b/patch! (mut graph) no-return 2 computation)
+                    ; Recompute earliest placement before rerunning late scheduling.
+                    (set! (mut placed) (cast i64 computation) 0)
+                    (match (p/early! graph (mut placed) idom start a)
+                      (Ok [_] 0)
+                      (Err [_] (set! failures (+ failures 1))))
+                    (match (p/late! graph (mut placed) idom depth live a)
+                      (Ok [_] 0)
+                      (Err [_] (set! failures (+ failures 1))))
+                    (when (!= (get placed (cast i64 computation)) start)
+                      (set! failures (+ failures 1)))
+                    (match (schedule/order graph placed live a)
+                      (Err [msg]
+                           (do
+                             (println "{}" msg)
+                             (set! failures (+ failures 1))))
+                      (Ok [ordered]
+                          (let [(mut owned-order) ordered]
+                            (when (!= (len owned-order) 9)
+                              (set! failures (+ failures 1)))
+                            (let [(mut packed)
+                                    (schedule/pack owned-order placed order a)
+                                  entry-range
+                                    (get (.ranges packed) (cast i64 start))
+                                  yes-range
+                                    (get (.ranges packed) (cast i64 yes))
+                                  no-range (get (.ranges packed) (cast i64 no))
+                                  (mut arg-position) -1
+                                  (mut computation-position) -1
+                                  (mut i) 0]
+                              (when (!= (get (.nodes packed)
+                                             (.offset entry-range))
+                                        start)
+                                (set! failures (+ failures 1)))
+                              (when (!= (get (.nodes packed)
+                                             (- (+ (.offset entry-range)
+                                                   (.count entry-range))
+                                                1))
+                                        split)
+                                (set! failures (+ failures 1)))
+                              (when (!= (get (.nodes packed)
+                                             (- (+ (.offset yes-range)
+                                                   (.count yes-range))
+                                                1))
+                                        yes-return)
+                                (set! failures (+ failures 1)))
+                              (when (!= (get (.nodes packed)
+                                             (- (+ (.offset no-range)
+                                                   (.count no-range))
+                                                1))
+                                        no-return)
+                                (set! failures (+ failures 1)))
+                              (while (< i (len (.nodes packed)))
+                                (let [node (get (.nodes packed) i)]
+                                  (when (= node arg) (set! arg-position i))
+                                  (when (= node computation)
+                                    (set! computation-position i)))
+                                (set! i (+ i 1)))
+                              (when (or (< arg-position 0)
+                                        (<= computation-position arg-position))
+                                (set! failures (+ failures 1)))
+                              (let [(mut entry-facts)
+                                      (reg-live/block-facts graph
+                                                            packed
+                                                            start
+                                                            a)
+                                    (mut yes-facts)
+                                      (reg-live/block-facts graph packed yes a)]
+                                (when (bits/contains? (.uses entry-facts)
+                                                      (cast i64 arg))
+                                  (set! failures (+ failures 1)))
+                                (when (not (bits/contains? (.defs entry-facts)
+                                                           (cast i64 arg)))
+                                  (set! failures (+ failures 1)))
+                                (when (not (bits/contains? (.uses yes-facts)
+                                                           (cast i64
+                                                                 computation)))
+                                  (set! failures (+ failures 1)))
+                                (reg-live/release! (mut entry-facts))
+                                (reg-live/release! (mut yes-facts)))
+                              (let [(mut analysis)
+                                      (reg-live/analyze graph
+                                                        owned
+                                                        packed
+                                                        order
+                                                        a)
+                                    state
+                                      (elem (mut (.states analysis))
+                                            (get (.indices analysis)
+                                                 (cast i64 start)))]
+                                (when (not (bits/contains? (.output state)
+                                                           (cast i64
+                                                                 computation)))
+                                  (set! failures (+ failures 1)))
+                                (when (bits/contains? (.input state)
+                                                      (cast i64 arg))
+                                  (set! failures (+ failures 1)))
+                                (let [(mut intervals)
+                                        (ranges/build graph
+                                                      packed
+                                                      analysis
+                                                      order
+                                                      a)
+                                      value
+                                        (at intervals (cast i64 computation))]
+                                  (when (= (len (.ranges value)) 0)
+                                    (set! failures (+ failures 1)))
+                                  (let [(mut definition) -1
+                                        (mut last-use) -1
+                                        (mut k) 0]
+                                    (while (< k (len (.nodes packed)))
+                                      (let [node (get (.nodes packed) k)]
+                                        (when (= node computation)
+                                          (set! definition (+ (* k 2) 1)))
+                                        (when (or (= node yes-return)
+                                                  (= node no-return))
+                                          (set! last-use (+ (* k 2) 1))))
+                                      (set! k (+ k 1)))
+                                    (when (> (len (.ranges value)) 0)
+                                      (when (!= (.start (get (.ranges value) 0))
+                                                definition)
+                                        (set! failures (+ failures 1)))
+                                      (when (!= (.end (get (.ranges value)
+                                                           (- (len (.ranges value))
+                                                              1)))
+                                                last-use)
+                                        (set! failures (+ failures 1)))))
+                                  (ranges/release! (mut intervals)))
+                                (reg-live/release-analysis! (mut analysis)))
+                              (schedule/release! (mut packed)))
+                            (free! (mut owned-order)))))
+                    (free! (mut placed)))))
+            (free! (mut live))
+            (free! (mut depth))
+            (free! (mut idom))
+            (free! (mut order))
+            (adj/release! (mut pred))
+            (adj/release! (mut succ))
+            (cfg/release! (mut owned)))))
+    (g/release! (mut graph))
+    (println "branch placement checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

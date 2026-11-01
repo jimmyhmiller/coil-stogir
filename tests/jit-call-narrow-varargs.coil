@@ -1,0 +1,136 @@
+(module stogir.tests.jit-call-narrow-varargs)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(extern snprintf :cc (cc/C) [(ptr u8) u64 (ptr i8) ...] (-> i32))
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        buffer (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        format (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        x (require (b/emit! (mut graph) 71 10 [start (: 0 i32) 3]))
+        y (require (b/emit! (mut graph) 71 10 [start (: 0 i32) 4]))
+        s8 (require (b/emit! (mut graph) 35 8 [x]))
+        u8 (require (b/emit! (mut graph) 35 2 [x]))
+        s16 (require (b/emit! (mut graph) 35 9 [y]))
+        u16 (require (b/emit! (mut graph) 35 3 [y]))
+        char (require (b/emit! (mut graph) 35 7 [x]))
+        flag (require (b/emit! (mut graph) 14 1 [x y]))
+        size (require (b/scalar-constant! (mut graph) 5 128 8))
+        (mut failures) 0]
+    (match (calls/create 16 10 [(: 6 u8) 5 6] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned-prototype) prototype
+                call
+                  (require (calls/emit! (mut graph)
+                                        owned-prototype
+                                        start
+                                        target
+                                        [buffer size format s8 u8 s16 u16 char
+                                         flag]
+                                        allocator))
+                ret (require (b/emit! (mut graph) 120 10 [call call (: 0 i32)]))]
+            (match (compile/object graph
+                                   start
+                                   [ret]
+                                   "_stogir_narrow_varargs_test"
+                                   allocator)
+              (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+              (Ok [object]
+                  (let [(mut owned) object]
+                    (match (fs/write-file allocator
+                                          "/tmp/coil-stogir-narrow-varargs.o"
+                                          (slice owned))
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [_] 0))
+                    (free! (mut owned)))))
+            (match (compile/text graph start [ret] allocator)
+              (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+              (Ok [compiled]
+                  (let [(mut code) compiled]
+                    (match (jit/map-text (slice code))
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [image]
+                          (let [(mut owned) image
+                                f
+                                  (primitive/cast (fnptr (cc/C)
+                                                         [u64
+                                                          (ptr u8)
+                                                          (ptr i8)
+                                                          i32
+                                                          i32]
+                                                         i32)
+                                                  (.base owned))
+                                address
+                                  (primitive/cast u64
+                                                  (primitive/cast (ptr u8)
+                                                                  (fnptr-of snprintf)))
+                                (mut actual) (ArrayList::new [u8] allocator)
+                                (mut expected) (ArrayList::new [u8] allocator)
+                                (mut i) 0]
+                            (while (< i 128)
+                              (push! (mut actual) 0)
+                              (push! (mut expected) 0)
+                              (set! i (+ i 1)))
+                            (for x [(: -2147483648 i32)
+                                    -100
+                                    -1
+                                    0
+                                    1
+                                    100
+                                    2147483647]
+                              (for y [(: -2147483648 i32)
+                                      -100
+                                      -1
+                                      0
+                                      1
+                                      100
+                                      2147483647]
+                                (let [reference
+                                        (snprintf (elem (mut expected) 0)
+                                                  128
+                                                  c"%d|%d|%d|%d|%d|%d"
+                                                  (cast i32 (cast i8 x))
+                                                  (cast i32 (cast u8 x))
+                                                  (cast i32 (cast i16 y))
+                                                  (cast i32 (cast u16 y))
+                                                  (cast i32 (cast i8 x))
+                                                  (if (= x y) (: 1 i32) 0))
+                                      result
+                                        (call-ptr f
+                                                  address
+                                                  (elem (mut actual) 0)
+                                                  c"%d|%d|%d|%d|%d|%d"
+                                                  x
+                                                  y)]
+                                  (when (!= reference result)
+                                    (set! failures (+ failures 1)))
+                                  (set! i 0)
+                                  (while (< i 128)
+                                    (when (!= (get actual i) (get expected i))
+                                      (set! failures (+ failures 1)))
+                                    (set! i (+ i 1))))))
+                            (free! (mut actual))
+                            (free! (mut expected))
+                            (jit/release! (mut owned)))))
+                    (free! (mut code)))))
+            (calls/release! (mut owned-prototype)))))
+    (g/release! (mut graph))
+    (println "native narrow variadic call checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

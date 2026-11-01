@@ -1,0 +1,247 @@
+(module stogir.tests.jit-floating-arithmetic)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.floating" :as floating)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defstruct Pattern [(wide u64) (narrow u64)])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn nan? [(ty u8) (bits u64)] (-> bool)
+  (let [exponent (if (= ty 12) (: 0x7FF0000000000000 u64) 0x7F800000)
+        fraction (if (= ty 12) (: 0xFFFFFFFFFFFFF u64) 0x7FFFFF)]
+    (and (= (& bits exponent) exponent) (!= (& bits fraction) 0))))
+
+;;; Independent comparison oracle: IEEE bit classification plus monotonic keys,
+;;; with the two signed zeros equal. No floating comparison instructions here.
+(defn predicate [(opcode i32) (ty u8) (a u64) (b u64)] (-> bool)
+  (let [mask (if (= ty 12) (: 0xFFFFFFFFFFFFFFFF u64) 0xFFFFFFFF)
+        sign (if (= ty 12) (: 0x8000000000000000 u64) 0x80000000)
+        unordered? (or (nan? ty a) (nan? ty b))
+        equal?
+          (and (not unordered?)
+               (or (= a b)
+                   (and (= (& a (^ mask sign)) 0) (= (& b (^ mask sign)) 0))))
+        ak (if (= (& a sign) 0) (^ a sign) (^ a mask))
+        bk (if (= (& b sign) 0) (^ b sign) (^ b mask))
+        less? (and (not unordered?) (not equal?) (< ak bk))
+        greater? (and (not unordered?) (not equal?) (> ak bk))]
+    (match opcode
+      (14 equal?)
+      (15 (not equal?))
+      (16 less?)
+      (17 (or greater? equal?))
+      (18 (or less? equal?))
+      (19 greater?)
+      (20 (or unordered? less?))
+      (21 (or unordered? greater? equal?))
+      (22 (or unordered? less? equal?))
+      (23 (or unordered? greater?))
+      (24 (not unordered?))
+      (25 unordered?)
+      (_ false))))
+
+(defn expected [(opcode i32) (ty u8) (a u64) (b u64)] (-> u64)
+  (let [sign (if (= ty 12) (: 0x8000000000000000 u64) 0x80000000)
+        mask (if (= ty 12) (: 0xFFFFFFFFFFFFFFFF u64) 0xFFFFFFFF)]
+    (if (floating/comparison? opcode)
+        (if (predicate opcode ty a b) (: 1 u64) 0)
+        (if (= opcode 31)
+            (^ a sign)
+            (if (= opcode 32)
+                (& a (^ mask sign))
+                (if (or (= opcode 58) (= opcode 59))
+                    (if (predicate (if (= opcode 58) 18 17) ty a b) a b)
+                    (match (floating/evaluate opcode (cast i32 ty) a b)
+                      (None [] (: 0 u64))
+                      (Some [bits] bits))))))))
+
+(defn check [(opcode i32) (ty u8) (mode i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 0]))
+        q (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 1]))
+        literal-a
+          (if (= mode 5)
+              (if (= ty 12) (: 0x4018000000000000 u64) 0x40C00000)
+              (if (= ty 12) (: 0xFFF8123456789ABC u64) 0xFFC12345))
+        literal-b
+          (if (= mode 5)
+              (if (= ty 12) (: 0x4000000000000000 u64) 0x40000000)
+              (if (= ty 12) (: 0x8000000000000000 u64) 0x80000000))
+        left
+          (if (or (= mode 1) (= mode 3) (= mode 5))
+              (require (b/scalar-constant! (mut graph)
+                                           (cast i32 ty)
+                                           literal-a
+                                           8))
+              p)
+        right
+          (if (= mode 4)
+              left
+              (if (or (= mode 2) (= mode 3) (= mode 5))
+                  (require (b/scalar-constant! (mut graph)
+                                               (cast i32 ty)
+                                               literal-b
+                                               8))
+                  q))
+        result-type (if (floating/comparison? opcode) 1 (cast i32 ty))
+        operation
+          (if (= mode 5)
+              (require (b/floating! (mut graph)
+                                    opcode
+                                    (cast i32 ty)
+                                    left
+                                    right
+                                    0))
+              (require (if (floating/unary? opcode)
+                           (b/emit! (mut graph) opcode result-type [left])
+                           (if (= opcode 29)
+                               (b/emit! (mut graph)
+                                        opcode
+                                        result-type
+                                        [left right (: 0 i32)])
+                               (b/emit! (mut graph)
+                                        opcode
+                                        result-type
+                                        [left right])))))
+        bits
+          (if (floating/comparison? opcode)
+              (require (b/emit! (mut graph) 34 5 [operation]))
+              (require (b/emit! (mut graph) 36 (if (= ty 12) 5 4) [operation])))
+        value
+          (if (and (not (floating/comparison? opcode)) (= ty 13))
+              (require (b/emit! (mut graph) 34 5 [bits]))
+              bits)
+        ret (require (b/emit! (mut graph) 120 5 [start value (: 0 i32)]))
+        (mut failures) 0]
+    (match (calls/create 0 5 [ty ty] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype]
+            (require (calls/function! (mut graph) owned allocator))
+            (calls/release! (mut owned)))))
+    (match (compile/text graph start [ret] allocator)
+      (Err [msg]
+           (do
+             (println "FP op={} ty={} mode={}: {}" opcode ty mode msg)
+             (set! failures (+ failures 1))))
+      (Ok [text]
+          (let [(mut code) text]
+            (match (jit/map-text (slice code))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [loaded]
+                  (let [(mut image) loaded
+                        patterns
+                          [(Pattern :wide 0 :narrow 0)
+                           (Pattern :wide 0x8000000000000000 :narrow 0x80000000)
+                           (Pattern :wide 1 :narrow 1)
+                           (Pattern :wide 0x8000000000000001 :narrow 0x80000001)
+                           (Pattern :wide 0x3FF0000000000000 :narrow 0x3F800000)
+                           (Pattern :wide 0xBFF0000000000000 :narrow 0xBF800000)
+                           (Pattern :wide 0x4000000000000000 :narrow 0x40000000)
+                           (Pattern :wide 0x4018000000000000 :narrow 0x40C00000)
+                           (Pattern :wide 0x7FF0000000000000 :narrow 0x7F800000)
+                           (Pattern :wide 0xFFF0000000000000 :narrow 0xFF800000)
+                           (Pattern :wide 0x7FF8123456789ABC :narrow 0x7FC12345)
+                           (Pattern :wide 0xFFF8123456789ABC :narrow 0xFFC12345)
+                           (Pattern :wide 0x7FF0123456789ABC :narrow 0x7F812345)
+                           (Pattern :wide 0x7FEFFFFFFFFFFFFF :narrow 0x7F7FFFFF)]]
+                    (for a patterns
+                      (for b patterns
+                        (let [input-a (if (= ty 12) (.wide a) (.narrow a))
+                              input-b (if (= ty 12) (.wide b) (.narrow b))
+                              x
+                                (if (or (= mode 1) (= mode 3) (= mode 5))
+                                    literal-a
+                                    input-a)
+                              y
+                                (if (= mode 4)
+                                    x
+                                    (if (or (= mode 2) (= mode 3) (= mode 5))
+                                        literal-b
+                                        input-b))
+                              wanted (expected opcode ty x y)
+                              (mut actual) (: 0 u64)]
+                          (if (= ty 12)
+                              (let [f
+                                      (primitive/cast (fnptr (cc/C)
+                                                             [f64 f64]
+                                                             u64)
+                                                      (.base image))
+                                    (mut x) (: 0.0 f64)
+                                    (mut y) (: 0.0 f64)]
+                                (store! (primitive/cast (ptr u64) (mut x))
+                                        input-a)
+                                (store! (primitive/cast (ptr u64) (mut y))
+                                        input-b)
+                                (set! actual (call-ptr f x y)))
+                              (let [f
+                                      (primitive/cast (fnptr (cc/C)
+                                                             [f32 f32]
+                                                             u64)
+                                                      (.base image))
+                                    (mut x) (: 0.0 f32)
+                                    (mut y) (: 0.0 f32)]
+                                (store! (primitive/cast (ptr u32) (mut x))
+                                        (cast u32 input-a))
+                                (store! (primitive/cast (ptr u32) (mut y))
+                                        (cast u32 input-b))
+                                (set! actual (call-ptr f x y))))
+                          (when (if (and (>= opcode 26)
+                                         (<= opcode 29)
+                                         (nan? ty wanted))
+                                    (not (nan? ty actual))
+                                    (!= actual wanted))
+                            (when (= failures 0)
+                              (println "FP mismatch op={} ty={} mode={} x={} y={} wanted={} actual={}"
+                                       opcode
+                                       ty
+                                       mode
+                                       x
+                                       y
+                                       wanted
+                                       actual))
+                            (set! failures (+ failures 1))))))
+                    (jit/release! (mut image)))))
+            (free! (mut code)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for ty [(: 12 u8) 13]
+      (for opcode [(: 14 i32)
+                   15
+                   16
+                   17
+                   18
+                   19
+                   20
+                   21
+                   22
+                   23
+                   24
+                   25
+                   26
+                   27
+                   28
+                   29
+                   31
+                   32
+                   58
+                   59]
+        (for mode [(: 0 i32) 1 2 3 4 5]
+          (set! failures (+ failures (check opcode ty mode))))))
+    (println "native floating arithmetic/predicates/extrema: 240 variants, {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

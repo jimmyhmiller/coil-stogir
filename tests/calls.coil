@@ -1,0 +1,101 @@
+(module stogir.tests.calls)
+(import "stogir.calls" :as calls)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Ok Err])
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        (mut failures) 0]
+    (g/append-inputs! (mut graph) 104 0 [(: 0 i32)])
+    (g/append-constant! (mut graph) (n/constant 6 6 0 0))
+    (g/append-constant! (mut graph) (n/constant 11 11 0 42))
+    (match (calls/create 0 11 [(: 11 u8)] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype
+                (mut bytes) (calls/encode owned allocator)]
+            (when (!= (len bytes) 4) (set! failures (+ failures 1)))
+            (match (calls/emit! (mut graph) owned 1 -1 [(: -2 i32)] allocator)
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [_] 0))
+            (match (calls/emit! (mut graph) owned 1 -1 [(: -1 i32)] allocator)
+              (Err [_] 0)
+              (Ok [_] (set! failures (+ failures 1))))
+            (free! (mut bytes))
+            (calls/release! (mut owned)))))
+    (match (calls/create 16 11 [] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype
+                before (len (.instructions graph))]
+            (match (calls/emit! (mut graph) owned 1 -1 [] allocator)
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [reference]
+                  (match (calls/validate-call graph reference)
+                    (Err [_] (set! failures (+ failures 1)))
+                    (Ok [signature]
+                        (when (or (!= (.flags signature) 16)
+                                  (!= (.count signature) 0)
+                                  (<= (.id signature) 0))
+                          (set! failures (+ failures 1)))))))
+            (when (<= (len (.instructions graph)) before)
+              (set! failures (+ failures 1)))
+            (calls/release! (mut owned)))))
+    ; Fixed prototype parameters occupy a byte, but CALL's complete operand
+    ; count occupies sixteen bits. Variadic arguments use that larger space.
+    (let [(mut arguments) (ArrayList::new [i32] allocator)
+          (mut parameter-types) (ArrayList::new [u8] allocator)
+          (mut i) (: 0 i64)]
+      (while (< i 65533) (push! (mut arguments) -2) (set! i (+ i 1)))
+      (match (calls/create 16 11 [] allocator)
+        (Err [_] (set! failures (+ failures 1)))
+        (Ok [prototype]
+            (let [(mut owned) prototype]
+              (match (calls/emit! (mut graph)
+                                  owned
+                                  1
+                                  -1
+                                  (slice arguments)
+                                  allocator)
+                (Err [_] (set! failures (+ failures 1)))
+                (Ok [reference]
+                    (when (!= (get (.arities graph) (cast i64 reference)) 65535)
+                      (set! failures (+ failures 1)))
+                    (match (calls/validate-call graph reference)
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [_] 0))))
+              (push! (mut arguments) -2)
+              (let [before (len (.instructions graph))]
+                (match (calls/emit! (mut graph)
+                                    owned
+                                    1
+                                    -1
+                                    (slice arguments)
+                                    allocator)
+                  (Err [_] 0)
+                  (Ok [_] (set! failures (+ failures 1))))
+                (when (!= (len (.instructions graph)) before)
+                  (set! failures (+ failures 1))))
+              (calls/release! (mut owned)))))
+      (set! i 0)
+      (while (< i 255) (push! (mut parameter-types) 11) (set! i (+ i 1)))
+      (match (calls/create 0 11 (slice parameter-types) allocator)
+        (Err [_] (set! failures (+ failures 1)))
+        (Ok [prototype]
+            (let [(mut owned) prototype] (calls/release! (mut owned)))))
+      (push! (mut parameter-types) 11)
+      (match (calls/create 0 11 (slice parameter-types) allocator)
+        (Err [_] 0)
+        (Ok [prototype]
+            (let [(mut owned) prototype]
+              (set! failures (+ failures 1))
+              (calls/release! (mut owned)))))
+      (free! (mut parameter-types))
+      (free! (mut arguments)))
+    (g/release! (mut graph))
+    (println "call construction checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

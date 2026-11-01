@@ -1,0 +1,174 @@
+(module stogir.tests.jit-call-narrow-return)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.fs" :as fs)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn ru8 :cc (cc/C) [(x i32)] (-> u8)
+  (cast u8 x))
+
+(defn ru16 :cc (cc/C) [(x i32)] (-> u16)
+  (cast u16 x))
+
+(defn ri8 :cc (cc/C) [(x i32)] (-> i8)
+  (cast i8 x))
+
+(defn ri16 :cc (cc/C) [(x i32)] (-> i16)
+  (cast i16 x))
+
+(defn rbool :cc (cc/C) [(x i32)] (-> bool)
+  (!= (& x 1) 0))
+
+(defn target [(ty u8)] (-> u64)
+  (primitive/cast u64
+                  (match ty
+                    (1 (primitive/cast (ptr u8) (fnptr-of rbool)))
+                    (2 (primitive/cast (ptr u8) (fnptr-of ru8)))
+                    (3 (primitive/cast (ptr u8) (fnptr-of ru16)))
+                    (9 (primitive/cast (ptr u8) (fnptr-of ri16)))
+                    (_ (primitive/cast (ptr u8) (fnptr-of ri8))))))
+
+(defn observe [(base (ptr u8)) (ty u8) (address u64) (x i32)] (-> i64)
+  (match ty
+    (1 (if (call-ptr (primitive/cast (fnptr (cc/C) [u64 i32] bool) base)
+                     address
+                     x)
+           1
+           0))
+    (2 (cast i64
+             (call-ptr (primitive/cast (fnptr (cc/C) [u64 i32] u8) base)
+                       address
+                       x)))
+    (3 (cast i64
+             (call-ptr (primitive/cast (fnptr (cc/C) [u64 i32] u16) base)
+                       address
+                       x)))
+    (9 (cast i64
+             (call-ptr (primitive/cast (fnptr (cc/C) [u64 i32] i16) base)
+                       address
+                       x)))
+    (_ (cast i64
+             (call-ptr (primitive/cast (fnptr (cc/C) [u64 i32] i8) base)
+                       address
+                       x)))))
+
+(defn expected [(ty u8) (x i32)] (-> i64)
+  (match ty
+    (1 (if (!= (& x 1) 0) 1 0))
+    (2 (cast i64 (cast u8 x)))
+    (3 (cast i64 (cast u16 x)))
+    (9 (cast i64 (cast i16 x)))
+    (_ (cast i64 (cast i8 x)))))
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn symbol [(ty u8)] (-> (slice u8))
+  (match ty
+    (1 "_stogir_ret_bool")
+    (2 "_stogir_ret_u8")
+    (3 "_stogir_ret_u16")
+    (7 "_stogir_ret_char")
+    (8 "_stogir_ret_i8")
+    (_ "_stogir_ret_i16")))
+
+(defn object-path [(ty u8)] (-> (slice u8))
+  (match ty
+    (1 "/tmp/coil-stogir-ret-bool.o")
+    (2 "/tmp/coil-stogir-ret-u8.o")
+    (3 "/tmp/coil-stogir-ret-u16.o")
+    (7 "/tmp/coil-stogir-ret-char.o")
+    (8 "/tmp/coil-stogir-ret-i8.o")
+    (_ "/tmp/coil-stogir-ret-i16.o")))
+
+(defn check [(ty u8)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        callee (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        x (require (b/emit! (mut graph) 71 10 [start (: 0 i32) 1]))
+        (mut failures) 0]
+    (match (calls/create 0 ty [(: 10 u8)] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned-prototype) prototype
+                call
+                  (require (calls/emit! (mut graph)
+                                        owned-prototype
+                                        start
+                                        callee
+                                        [x]
+                                        allocator))
+                ret
+                  (require (b/emit! (mut graph)
+                                    120
+                                    (cast i32 ty)
+                                    [call call (: 0 i32)]))]
+            (match (compile/object graph start [ret] (symbol ty) allocator)
+              (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+              (Ok [object]
+                  (let [(mut owned) object]
+                    (match (fs/write-file allocator
+                                          (object-path ty)
+                                          (slice owned))
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [_] 0))
+                    (free! (mut owned)))))
+            (match (compile/text graph start [ret] allocator)
+              (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+              (Ok [compiled]
+                  (let [(mut code) compiled]
+                    (match (jit/map-text (slice code))
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [image]
+                          (let [(mut owned) image
+                                address (target ty)]
+                            (for x [(: -2147483648 i32)
+                                    -65537
+                                    -65536
+                                    -32769
+                                    -32768
+                                    -257
+                                    -256
+                                    -129
+                                    -128
+                                    -1
+                                    0
+                                    1
+                                    127
+                                    128
+                                    255
+                                    256
+                                    257
+                                    32767
+                                    32768
+                                    65535
+                                    65536
+                                    65537
+                                    2147483647]
+                              (let [actual (observe (.base owned) ty address x)
+                                    wanted (expected ty x)]
+                                (when (!= actual wanted)
+                                  (println "type={} x={} expected={} actual={}"
+                                           ty
+                                           x
+                                           wanted
+                                           actual)
+                                  (set! failures (+ failures 1)))))
+                            (jit/release! (mut owned)))))
+                    (free! (mut code)))))
+            (calls/release! (mut owned-prototype)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for ty [(: 1 u8) 2 3 7 8 9] (set! failures (+ failures (check ty))))
+    (println "narrow call result checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

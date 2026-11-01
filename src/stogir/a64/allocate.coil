@@ -1,0 +1,134 @@
+;;; Bridge selected typed constraints and live ranges into allocation parts.
+(module stogir.a64.allocate)
+(import "stogir.live-ranges" :as ranges)
+(import "stogir.a64.constraints" :as constraints)
+(import "stogir.allocation" :as allocation)
+(import "stogir.allocation-check" :as check)
+(import "stogir.frame" :as frame)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.a64.registers" :as registers)
+(import "stogir.types" :as types)
+(import "stogir.locals" :as locals)
+(import "stogir.stack" :as stack)
+(import "stogir.a64.frame-address" :as address)
+(import "stogir.schedule" :as schedule)
+(import "stogir.a64.call-abi" :as call-abi)
+(import "coil.alloc" :use [Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err])
+
+(defstruct Assigned
+  [(parts (ArrayList allocation/Part))
+   (frame frame/Frame)
+   (link-slot i64)
+   (base address/Base)
+   (outgoing-size i64)])
+
+(defn release! [(assigned (mut Assigned))] (-> void)
+  (let [(mut i) 0]
+    (while (< i (len (.parts assigned)))
+      (allocation/release! (elem (mut (.parts assigned)) i))
+      (set! i (+ i 1))))
+  (free! (mut (.parts assigned)))
+  (frame/release! (mut (.frame assigned))))
+
+;;; Explicit per-value GPR/SIMD masks; GPR-only graphs retain 16-register scans.
+;;; x16/x17 and v30/v31 are reserved for emission/resolution.
+;;; Calls reserve caller-saved registers and a link-register frame slot.
+(defn build [(intervals (ArrayList ranges/Value))
+             (requirements (ArrayList constraints/Value))
+             (graph g/Graph)
+             (scheduled schedule/Schedule)
+             (allocator (dyn Allocator))]
+  (-> (Result Assigned (slice u8)))
+  (let [(mut assigned)
+          (Assigned
+            :parts (ArrayList::new [allocation/Part] allocator)
+            :frame (frame/create allocator)
+            :link-slot -1
+            :base (address/stack-base)
+            :outgoing-size 0)
+        (mut i) 1
+        (mut frame-error) ""
+        (mut anchored?) false
+        (mut register-count) (: 16 i32)
+        (mut allowed) (registers/gpr-mask)]
+    (while (< i (len intervals))
+      (let [interval (at intervals i)
+            uses (at requirements i)
+            (mut part) (allocation/create (cast i32 i) allocator)]
+        (let [ty (cast i32 (n/type-id (get (.instructions graph) i)))]
+          (set! (.allowed part) (registers/class-mask ty))
+          (when (and (types/floating? ty) (> (len (.ranges interval)) 0))
+            (set! register-count 64)
+            (set! allowed (| (registers/gpr-mask) (registers/simd-mask)))))
+        (for range (.ranges interval) (push! (mut (.ranges part)) range))
+        (for use (.uses uses) (push! (mut (.uses part)) use))
+        (push! (mut (.parts assigned)) part))
+      (set! i (+ i 1)))
+    ; Incoming GPRs are already live at entry. Reserve each until its PARAM
+    ; definition so earlier stack-parameter loads cannot destroy that value.
+    (set! i 0)
+    (while (< i (len (.nodes scheduled)))
+      (let [reference (get (.nodes scheduled) i)
+            node (get (.instructions graph) (cast i64 reference))]
+        (when (= (n/opcode node) 71)
+          (let [parameter (.parameter (at requirements (cast i64 reference)))]
+            (when (or (= (.kind parameter) 0) (= (.kind parameter) 2))
+              (allocation/reserve! (mut (.parts assigned))
+                                   (+ (.register parameter)
+                                      (if (= (.kind parameter) 2) 32 0))
+                                   0
+                                   (+ (* i 2) 1)
+                                   allocator)))))
+      (set! i (+ i 1)))
+    (for reference (.nodes scheduled)
+      (when (stack/operation? (cast i32
+                                    (n/opcode (get (.instructions graph)
+                                                   (cast i64 reference)))))
+        (set! anchored? true)))
+    (match (call-abi/outgoing-size graph scheduled)
+      (Err [msg] (set! frame-error msg))
+      (Ok [size]
+          (set! (.size (.frame assigned)) size)
+          (set! (.outgoing-size assigned) size)))
+    (let [calls
+            (call-abi/reserve! (mut (.parts assigned))
+                               graph
+                               scheduled
+                               (= register-count 64)
+                               allocator)]
+      (when (or anchored? (> calls 0))
+        (match (frame/spill-slot! (mut (.frame assigned)) 0 16 16)
+          (Err [msg] (set! frame-error msg))
+          (Ok [offset]
+              (set! (.link-slot assigned) (+ offset 8))
+              (when anchored?
+                (set! (.base assigned) (address/Base :reg 29 :bias offset)))))))
+    (for reference (.nodes scheduled)
+      (let [node (get (.instructions graph) (cast i64 reference))]
+        (when (= (n/opcode node) 72)
+          (match (locals/shape graph reference 8)
+            (Err [message] (set! frame-error message))
+            (Ok [shape]
+                (match (frame/local-slot! (mut (.frame assigned))
+                                          reference
+                                          (.size shape)
+                                          (.alignment shape))
+                  (Err [message] (set! frame-error message))
+                  (Ok [_] 0)))))))
+    (if (!= frame-error "")
+        (do (release! (mut assigned)) (Err frame-error))
+        (match (allocation/run! (mut (.parts assigned))
+                                (mut (.frame assigned))
+                                register-count
+                                allowed
+                                8
+                                8
+                                allocator)
+          (Err [msg] (do (release! (mut assigned)) (Err msg)))
+          (Ok [_]
+              (match (check/verify (.parts assigned) register-count allowed)
+                (Err [msg] (do (release! (mut assigned)) (Err msg)))
+                (Ok [_] (Ok assigned))))))))

@@ -1,0 +1,65 @@
+(module stogir.tests.division-fold)
+(import "stogir.fold" :as fold)
+(import "stogir.types" :as types)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn check [(opcode i32) (ty i32) (a u64) (b u64) (expected u64)] (-> i64)
+  (match (fold/integer-binary opcode ty 8 a b)
+    (None [] 1)
+    (Some [value] (if (= value expected) 0 1))))
+
+(defn refused [(opcode i32) (ty i32) (a u64) (b u64)] (-> i64)
+  (match (fold/integer-binary opcode ty 8 a b) (None [] 0) (Some [_] 1)))
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0
+        (mut ty) (: 2 i32)]
+    (while (<= ty 11)
+      (let [width (* 8 (types/scalar-size ty 8))
+            mask (cast u64 (- (<< (: 1 u128) (cast u128 width)) 1))
+            sign (<< (: 1 u64) (cast u64 (- width 1)))]
+        (set! failures (+ failures (refused 29 ty 7 0) (refused 30 ty 7 0)))
+        (if (types/signed? ty)
+            (set! failures
+                  (+ failures
+                     (check 29 ty (- mask 6) 3 (- mask 1))
+                     (check 30 ty (- mask 6) 3 mask)
+                     (check 29 ty 7 (- mask 2) (- mask 1))
+                     (check 30 ty 7 (- mask 2) 1)
+                     (check 29 ty sign 2 (+ sign (/ sign 2)))
+                     (check 30 ty sign 3 (- mask 1))
+                     (refused 29 ty sign mask)
+                     (refused 30 ty sign mask)))
+            (set! failures
+                  (+ failures
+                     (check 29 ty mask 3 (/ mask 3))
+                     (check 30 ty mask 3 (% mask 3))
+                     (check 29 ty mask mask 1)
+                     (check 30 ty mask mask 0)))))
+      (set! ty (+ ty 1)))
+    (let [(mut graph) (g/create (malloc-allocator))
+          seven (require (b/scalar-constant! (mut graph) 11 7 8))
+          zero (require (b/scalar-constant! (mut graph) 11 0 8))
+          three (require (b/scalar-constant! (mut graph) 11 3 8))
+          quotient (require (b/integer-binary! (mut graph) 29 11 8 seven three))
+          division-zero
+            (require (b/integer-binary! (mut graph) 29 11 8 seven zero))
+          remainder-zero
+            (require (b/integer-binary! (mut graph) 30 11 8 seven zero))]
+      (when (or (>= quotient 0) (<= division-zero 0) (<= remainder-zero 0))
+        (set! failures (+ failures 1)))
+      (match (g/lookup graph quotient)
+        (None [] (set! failures (+ failures 1)))
+        (Some [node]
+              (when (!= (n/constant-bits node) 2)
+                (set! failures (+ failures 1)))))
+      (g/release! (mut graph)))
+    (println "integer division folding checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

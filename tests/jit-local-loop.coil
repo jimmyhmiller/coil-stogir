@@ -1,0 +1,93 @@
+(module stogir.tests.jit-local-loop)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.fs" :as fs)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn check [(ty i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        limit (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        variable (require (b/variable! (mut graph) ty start "loop-sum" 16))
+        initial (require (b/scalar-constant! (mut graph) ty 0 8))
+        initialized
+          (require (b/emit! (mut graph) 87 0 [start variable initial]))
+        entry (require (b/emit! (mut graph) 114 0 [initialized]))
+        loop (require (b/loop-begin! (mut graph) entry))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        index (require (b/loop-phi! (mut graph) loop zero))
+        condition (require (b/emit! (mut graph) 16 1 [index limit]))
+        split (require (b/emit! (mut graph) 116 0 [loop condition]))
+        body (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        exit (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        next-index (require (b/emit! (mut graph) 26 11 [index one]))
+        previous (require (b/emit! (mut graph) 85 ty [body variable]))
+        increment
+          (if (= ty 11) index (require (b/emit! (mut graph) 37 ty [index])))
+        next-sum (require (b/emit! (mut graph) 26 ty [previous increment]))
+        stored (require (b/emit! (mut graph) 87 0 [previous variable next-sum]))
+        back (require (b/emit! (mut graph) 115 0 [stored]))
+        sum (require (b/emit! (mut graph) 85 ty [exit variable]))
+        ret (require (b/emit! (mut graph) 120 ty [sum sum (: 0 i32)]))
+        (mut failures) 0]
+    (b/patch! (mut graph) loop 2 back)
+    (b/patch! (mut graph) index 3 next-index)
+    (match (compile/text graph start [ret] allocator)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [text]
+          (let [(mut bytes) text]
+            (match (jit/map-text (slice bytes))
+              (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+              (Ok [image]
+                  (let [(mut owned) image
+                        f
+                          (primitive/cast (fnptr (cc/C) [i64] i64)
+                                          (.base owned))
+                        fp
+                          (primitive/cast (fnptr (cc/C) [i64] f64)
+                                          (.base owned))
+                        (mut n) -5]
+                    (while (<= n 100)
+                      (let [expected (if (< n 0) 0 (/ (* n (- n 1)) 2))]
+                        (when (if (= ty 11)
+                                  (!= (call-ptr f n) expected)
+                                  (!= (call-ptr fp n) (cast f64 expected)))
+                          (set! failures (+ failures 1))))
+                      (set! n (+ n 1)))
+                    (jit/release! (mut owned)))))
+            (free! (mut bytes)))))
+    (match (compile/object graph
+                           start
+                           [ret]
+                           (if (= ty 11)
+                               "_stogir_local_loop_i64"
+                               "_stogir_local_loop_f64")
+                           allocator)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [object]
+          (let [(mut owned-object) object]
+            (match (fs/write-file allocator
+                                  (if (= ty 11)
+                                      "/tmp/coil-stogir-local-loop-i64.o"
+                                      "/tmp/coil-stogir-local-loop-f64.o")
+                                  (slice owned-object))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [_] 0))
+            (free! (mut owned-object)))))
+    (g/release! (mut graph))
+    (println "local loop type {}: {} failures" ty failures)
+    (if (= failures 0) 0 1)))
+
+(defn main [] (-> i64)
+  (let [failures (+ (check 11) (check 12))]
+    (if (= failures 0) 0 1)))

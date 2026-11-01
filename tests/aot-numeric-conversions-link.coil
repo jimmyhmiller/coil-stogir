@@ -1,0 +1,206 @@
+(module stogir.tests.aot-numeric-conversions-link)
+(import "stogir.numeric-conversion" :as numeric)
+(import "stogir.types" :as types)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Some None Option])
+
+(extern entry0 :as "stogir_numeric_0" :cc (cc/C) [u64 (ptr u8)] (-> u64))
+
+(extern entry1 :as "stogir_numeric_1" :cc (cc/C) [u64 (ptr u8)] (-> u64))
+
+(extern entry2 :as "stogir_numeric_2" :cc (cc/C) [u64 (ptr u8)] (-> u64))
+
+(extern entry3 :as "stogir_numeric_3" :cc (cc/C) [u64 (ptr u8)] (-> u64))
+
+(extern entry4 :as "stogir_numeric_4" :cc (cc/C) [u64 (ptr u8)] (-> u64))
+
+(extern entry5 :as "stogir_numeric_5" :cc (cc/C) [u64 (ptr u8)] (-> u64))
+
+(extern entry6 :as "stogir_numeric_6" :cc (cc/C) [u64 (ptr u8)] (-> u64))
+
+(extern entry7 :as "stogir_numeric_7" :cc (cc/C) [u64 (ptr u8)] (-> u64))
+
+(defn mask [(ty i32)] (-> u64)
+  (cast u64 (- (<< (: 1 u128) (cast u128 (* 8 (types/scalar-size ty 8)))) 1)))
+
+(defn canonical [(ty i32) (bits u64)] (-> u64)
+  (let [raw (& bits (mask ty))] (if (= ty 1) (if (= raw 0) (: 0 u64) 1) raw)))
+
+(defn nan? [(ty i32) (bits u64)] (-> bool)
+  (let [exponent (if (= ty 12) (: 0x7FF0000000000000 u64) 0x7F800000)
+        fraction (if (= ty 12) (: 0xFFFFFFFFFFFFF u64) 0x7FFFFF)]
+    (and (= (& bits exponent) exponent) (!= (& bits fraction) 0))))
+
+;;; Only execute a host FP-to-integer cast after the exact integer decoder proves
+;;; the truncated value representable. The numeric oracle then uses native casts,
+;;; independently of the decoder's significand/shift implementation.
+(defn reference [(opcode i32) (src i32) (dst i32) (bits u64)] (-> (Option u64))
+  (if (= opcode 37)
+      (let [raw (canonical src bits)
+            modulus (+ (cast u128 (mask src)) 1)
+            signed-value
+              (cast i64
+                    (if (>= (cast u128 raw) (/ modulus 2))
+                        (- (cast i128 raw) (cast i128 modulus))
+                        (cast i128 raw)))]
+        (if (= dst 12)
+            (let [(mut result)
+                    (if (types/signed? src)
+                        (cast f64 signed-value)
+                        (cast f64 raw))]
+              (Some (load (primitive/cast (ptr u64) (mut result)))))
+            (let [(mut result)
+                    (if (types/signed? src)
+                        (cast f32 signed-value)
+                        (cast f32 raw))]
+              (Some (cast u64 (load (primitive/cast (ptr u32) (mut result))))))))
+      (if (= opcode 38)
+          (match (numeric/evaluate opcode src dst 8 bits)
+            (None [] (None))
+            (Some [_]
+                  (let [(mut d) (: 0.0 f64)
+                        (mut f) (: 0.0 f32)]
+                    (store! (primitive/cast (ptr u64) (mut d)) bits)
+                    (store! (primitive/cast (ptr u32) (mut f)) (cast u32 bits))
+                    (Some (canonical dst
+                                     (if (types/signed? dst)
+                                         (cast u64
+                                               (if (= src 12)
+                                                   (cast i64 d)
+                                                   (cast i64 f)))
+                                         (if (= src 12)
+                                             (cast u64 d)
+                                             (cast u64 f))))))))
+          (if (= src dst)
+              (Some (canonical dst bits))
+              (if (nan? src bits)
+                  (None)
+                  (if (= src 12)
+                      (let [(mut d) (: 0.0 f64)]
+                        (store! (primitive/cast (ptr u64) (mut d)) bits)
+                        (let [(mut result) (cast f32 d)]
+                          (Some (cast u64
+                                      (load (primitive/cast (ptr u32)
+                                                            (mut result)))))))
+                      (let [(mut f) (: 0.0 f32)]
+                        (store! (primitive/cast (ptr u32) (mut f))
+                                (cast u32 bits))
+                        (let [(mut result) (cast f64 f)]
+                          (Some (load (primitive/cast (ptr u64) (mut result))))))))))))
+
+(defstruct Case [(id i32) (opcode i32) (src i32) (dst i32)])
+
+(defn main [] (-> i64)
+  (let [(mut cells) (ArrayList::new [u8] (malloc-allocator))
+        (mut failures) 0
+        (mut i) (: 0 i64)]
+    (while (< i 16) (push! (mut cells) 0) (set! i (+ i 1)))
+    (for row [(Case
+                :id 0
+                :opcode 37
+                :src 5
+                :dst 13)
+              (Case
+                :id 1
+                :opcode 37
+                :src 8
+                :dst 12)
+              (Case
+                :id 2
+                :opcode 38
+                :src 12
+                :dst 11)
+              (Case
+                :id 3
+                :opcode 38
+                :src 12
+                :dst 5)
+              (Case
+                :id 4
+                :opcode 38
+                :src 13
+                :dst 8)
+              (Case
+                :id 5
+                :opcode 38
+                :src 12
+                :dst 1)
+              (Case
+                :id 6
+                :opcode 39
+                :src 13
+                :dst 12)
+              (Case
+                :id 7
+                :opcode 39
+                :src 12
+                :dst 13)]
+      (for raw [(: 0 u64)
+                1
+                127
+                128
+                255
+                0x8000008000000001
+                0xFFFFFFFFFFFFFFFF
+                0x3F400000
+                0xBF400000
+                0x3FE00000
+                0xC300E666
+                0x7F800000
+                0x7F812345
+                0x3FE8000000000000
+                0xBFE8000000000000
+                0x3FFC000000000000
+                0xC0601CCCCCCCCCCD
+                0x43DFFFFFFFFFFFFF
+                0x43E0000000000000
+                0xC3E0000000000000
+                0x43EFFFFFFFFFFFFF
+                0x43F0000000000000
+                0x7FF0000000000000
+                0x7FF0123456789ABC
+                0x8000000000000000]
+        (let [source (canonical (.src row) raw)
+              expected (reference (.opcode row) (.src row) (.dst row) source)
+              actual
+                (match (.id row)
+                  (0 (entry0 source (.data cells)))
+                  (1 (entry1 source (.data cells)))
+                  (2 (entry2 source (.data cells)))
+                  (3 (entry3 source (.data cells)))
+                  (4 (entry4 source (.data cells)))
+                  (5 (entry5 source (.data cells)))
+                  (6 (entry6 source (.data cells)))
+                  (_ (entry7 source (.data cells))))
+              stored
+                (load (primitive/cast (ptr u64)
+                                      (primitive/index (.data cells) 8)))]
+          (when (!= actual stored) (set! failures (+ failures 1)))
+          (match expected
+            (Some [wanted]
+                  (when (!= actual wanted)
+                    (when (= failures 0)
+                      (println "linked numeric id={} input={} wanted={} actual={}"
+                               (.id row)
+                               source
+                               wanted
+                               actual))
+                    (set! failures (+ failures 1))))
+            (None []
+                  (when (if (= (.opcode row) 39)
+                            (not (nan? (.dst row) actual))
+                            (or (!= (& actual (mask (.dst row))) actual)
+                                (and (= (.dst row) 1) (> actual 1))))
+                    (set! failures (+ failures 1)))))
+          (set! i 0)
+          (while (< i (cast i64 (types/scalar-size (.src row) 8)))
+            (when (!= (get cells i) (cast u8 (>> source (cast u64 (* i 8)))))
+              (set! failures (+ failures 1)))
+            (set! i (+ i 1))))))
+    (free! (mut cells))
+    (println "linked numeric conversions and source preservation: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

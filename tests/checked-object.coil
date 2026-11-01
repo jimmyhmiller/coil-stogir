@@ -1,0 +1,126 @@
+(module stogir.tests.checked-object)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.types" :as types)
+(import "stogir.a64.compile" :as compile)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+;;; Store each wrapped result and its independently captured overflow flag.
+(defn write-function [(ty u8) (symbol (slice u8)) (path (slice u8))] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 0]))
+        q (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 1]))
+        output (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        (mut control) start
+        (mut offset) (: 0 u64)
+        (mut failures) 0]
+    (for opcode [(: 41 i32) 42 43]
+      (let [value (require (b/emit! (mut graph) opcode (cast i32 ty) [p q]))
+            flag (require (b/overflow! (mut graph) value))
+            extended
+              (if (= (types/scalar-size (cast i32 ty) 8) 8)
+                  value
+                  (require (b/emit! (mut graph)
+                                    (if (types/signed? (cast i32 ty)) 33 34)
+                                    (if (types/signed? (cast i32 ty)) 11 5)
+                                    [value])))
+            flag64
+              (require (b/conditional! (mut graph)
+                                       5
+                                       flag
+                                       (require (b/scalar-constant! (mut graph)
+                                                                    5
+                                                                    1
+                                                                    8))
+                                       (require (b/scalar-constant! (mut graph)
+                                                                    5
+                                                                    0
+                                                                    8))))]
+        (for item [extended flag64]
+          (let [displacement
+                  (require (b/scalar-constant! (mut graph) 6 offset 8))
+                address
+                  (require (b/emit! (mut graph) 26 6 [output displacement]))]
+            (set! control
+                  (require (b/emit! (mut graph) 93 0 [control address item])))
+            (set! offset (+ offset 8))))))
+    (let [ret (require (b/emit! (mut graph) 120 0 [control (: 0 i32) 0]))]
+      (match (calls/create 0 0 [ty ty (: 6 u8)] allocator)
+        (Err [_] (set! failures (+ failures 1)))
+        (Ok [prototype]
+            (let [(mut owned) prototype]
+              (require (calls/function! (mut graph) owned allocator))
+              (calls/release! (mut owned)))))
+      (match (compile/object graph start [ret] symbol allocator)
+        (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+        (Ok [object]
+            (let [(mut owned) object]
+              (match (fs/write-file allocator path (slice owned))
+                (Err [_] (set! failures (+ failures 1)))
+                (Ok [_] 0))
+              (free! (mut owned))))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (set! failures
+          (+ failures
+             (write-function 2
+                             "_stogir_checked_u8"
+                             "/tmp/coil-stogir-checked-u8.o")))
+    (set! failures
+          (+ failures
+             (write-function 3
+                             "_stogir_checked_u16"
+                             "/tmp/coil-stogir-checked-u16.o")))
+    (set! failures
+          (+ failures
+             (write-function 4
+                             "_stogir_checked_u32"
+                             "/tmp/coil-stogir-checked-u32.o")))
+    (set! failures
+          (+ failures
+             (write-function 5
+                             "_stogir_checked_u64"
+                             "/tmp/coil-stogir-checked-u64.o")))
+    (set! failures
+          (+ failures
+             (write-function 6
+                             "_stogir_checked_addr"
+                             "/tmp/coil-stogir-checked-addr.o")))
+    (set! failures
+          (+ failures
+             (write-function 7
+                             "_stogir_checked_char"
+                             "/tmp/coil-stogir-checked-char.o")))
+    (set! failures
+          (+ failures
+             (write-function 8
+                             "_stogir_checked_i8"
+                             "/tmp/coil-stogir-checked-i8.o")))
+    (set! failures
+          (+ failures
+             (write-function 9
+                             "_stogir_checked_i16"
+                             "/tmp/coil-stogir-checked-i16.o")))
+    (set! failures
+          (+ failures
+             (write-function 10
+                             "_stogir_checked_i32"
+                             "/tmp/coil-stogir-checked-i32.o")))
+    (set! failures
+          (+ failures
+             (write-function 11
+                             "_stogir_checked_i64"
+                             "/tmp/coil-stogir-checked-i64.o")))
+    (println "checked object generation: {} failures" failures)
+    (if (= failures 0) 0 1)))
