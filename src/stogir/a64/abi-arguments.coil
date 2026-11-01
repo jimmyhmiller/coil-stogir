@@ -1,6 +1,7 @@
 ;;; Shared Darwin scalar/group argument placement for callers and callees.
 (module stogir.a64.abi-arguments)
 (import "stogir.call-groups" :as groups)
+(import "stogir.call-results" :as results)
 (import "stogir.types" :as types)
 (import "stogir.alignment" :as alignment)
 (import "coil.slice" :use [subslice])
@@ -46,13 +47,16 @@
 
 ;;; Group members are classified/coerced scalar pieces, not independent source
 ;;; arguments. A group exhausts its bank when it cannot fit there in full.
-(defn plan [(parameters (slice u8))
-            (fixed i64)
-            (variadic? bool)
-            (descriptors (slice groups/Group))
-            (allocator (dyn Allocator))]
+(defn plan-result [(parameters (slice u8))
+                   (fixed i64)
+                   (variadic? bool)
+                   (descriptors (slice groups/Group))
+                   (result-spec results/Spec)
+                   (allocator (dyn Allocator))]
   (-> (Result Layout (slice u8)))
-  (if (not (validate parameters fixed variadic? descriptors))
+  (if (or (not (validate parameters fixed variadic? descriptors))
+          (not (results/valid? 0 parameters result-spec))
+          (and (!= (.kind result-spec) 0) (< fixed 1)))
       (Err "invalid scalar or grouped ABI arguments")
       (let [(mut result)
               (Layout :parts (ArrayList::new [Part] allocator) :stack 0)
@@ -61,6 +65,14 @@
             (mut i) (: 0 i64)
             (mut next-group) (: 0 i64)
             (mut error) ""]
+        (when (!= (.kind result-spec) 0)
+          (push! (mut (.parts result))
+                 (Part
+                   :register (if (= (.kind result-spec) 2) 8 (: -2 i32))
+                   :offset -1
+                   :size 8
+                   :promote? false))
+          (set! i 1))
         (while (and (= error "") (< i (len parameters)))
           (let [ty (get parameters i)
                 width (types/scalar-size (cast i32 ty) 8)
@@ -115,3 +127,16 @@
             (set! i (+ i (cast i64 count)))
             (when grouped? (set! next-group (+ next-group 1)))))
         (if (= error "") (Ok result) (do (release! (mut result)) (Err error))))))
+
+(defn plan [(parameters (slice u8))
+            (fixed i64)
+            (variadic? bool)
+            (descriptors (slice groups/Group))
+            (allocator (dyn Allocator))]
+  (-> (Result Layout (slice u8)))
+  (plan-result parameters
+               fixed
+               variadic?
+               descriptors
+               (results/ordinary)
+               allocator))

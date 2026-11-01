@@ -1,0 +1,140 @@
+(module stogir.tests.result-abi)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.call-groups" :as groups)
+(import "stogir.call-results" :as results)
+(import "stogir.a64.call-abi" :as abi)
+(import "stogir.a64.abi-arguments" :as arguments)
+(import "stogir.a64.result-emission" :as emit)
+(import "stogir.a64.frame-address" :as frame)
+(import "stogir.a64.compile" :as compile)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [message] (println "{}" message) 0)))
+
+(defn rejected [(r (Result i32 (slice u8)))] (-> i64)
+  (match r (Err [_] 0) (Ok [_] 1)))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut failures) 0]
+    (for spec [(results/pieces 5 2) (results/pieces 13 3) (results/indirect)]
+      (let [(mut graph) (g/create allocator)
+            start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+            target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+            place (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+            variable
+              (require (b/variable! (mut graph)
+                                    6
+                                    start
+                                    "not-a-result-address"
+                                    8))
+            wrapped (require (b/argument-value! (mut graph) place 16 8))
+            number (require (b/scalar-constant! (mut graph) 5 7 8))]
+        (match (calls/create-result 9
+                                    [(: 6 u8) 5 5 5 5 5 5 5 5 5]
+                                    []
+                                    spec
+                                    allocator)
+          (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+          (Ok [prototype]
+              (let [(mut prototype) prototype
+                    before (len (.instructions graph))]
+                (set! failures
+                      (+ failures
+                         (rejected (calls/emit! (mut graph)
+                                                prototype
+                                                start
+                                                target
+                                                [variable number number number
+                                                 number number number number
+                                                 number number]
+                                                allocator))
+                         (rejected (calls/emit! (mut graph)
+                                                prototype
+                                                start
+                                                target
+                                                [wrapped number number number
+                                                 number number number number
+                                                 number number]
+                                                allocator))))
+                (when (!= before (len (.instructions graph)))
+                  (set! failures (+ failures 1)))
+                (let [called
+                        (require (calls/emit! (mut graph)
+                                              prototype
+                                              start
+                                              target
+                                              [place number number number number
+                                               number number number number
+                                               number]
+                                              allocator))
+                      ret
+                        (require (b/emit! (mut graph)
+                                          120
+                                          0
+                                          [called (: 0 i32) 0]))]
+                  (match (abi/layout graph called allocator)
+                    (Err [message]
+                         (println "{}" message)
+                         (set! failures (+ failures 1)))
+                    (Ok [layout]
+                        (let [(mut layout) layout
+                              (mut i) (: 1 i64)]
+                          (when (!= (.register (get (.arguments layout) 0))
+                                    (if (= (.kind spec) 2) 8 (: -2 i32)))
+                            (set! failures (+ failures 1)))
+                          (while (< i 9)
+                            (when (!= (.register (get (.arguments layout) i))
+                                      (cast i32 (- i 1)))
+                              (set! failures (+ failures 1)))
+                            (set! i (+ i 1)))
+                          (when (or (!= (.offset (get (.arguments layout) 9)) 0)
+                                    (!= (.result-save layout)
+                                        (if (= (.kind spec) 1) 8 -1))
+                                    (!= (.stack layout)
+                                        (if (= (.kind spec) 1) 16 8)))
+                            (set! failures (+ failures 1)))
+                          (abi/release! (mut layout)))))
+                  (match (compile/text graph start [ret] allocator)
+                    (Err [message]
+                         (println "{}" message)
+                         (set! failures (+ failures 1)))
+                    (Ok [text] (let [(mut text) text] (free! (mut text)))))
+                  (b/patch! (mut graph) called 3 wrapped)
+                  (match (calls/validate-call graph called)
+                    (Err [_] 0)
+                    (Ok [_] (set! failures (+ failures 1))))
+                  (b/patch! (mut graph) called 3 place))
+                (calls/release! (mut prototype)))))
+        (g/release! (mut graph))))
+    (let [(mut code) (ArrayList::new [u8] allocator)]
+      (for bad [(results/Spec
+                  :kind 7
+                  :ty 0
+                  :count 0)
+                (results/Spec
+                  :kind 0
+                  :ty 5
+                  :count 0)
+                (results/Spec
+                  :kind 2
+                  :ty 13
+                  :count 4)
+                (results/pieces 5 3)]
+        (set! failures
+              (+ failures
+                 (rejected (emit/capture! (mut code) bad 0))
+                 (rejected (emit/return! (mut code) bad (frame/stack-base) 0)))))
+      (set! failures
+            (+ failures
+               (rejected (emit/capture! (mut code) (results/pieces 5 2) -1))))
+      (when (!= (len code) 0) (set! failures (+ failures 1)))
+      (free! (mut code)))
+    (println "result place contracts, x8 independence and capture layout: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

@@ -5,6 +5,7 @@
 (import "stogir.calls" :as calls)
 (import "stogir.a64.abi-arguments" :as arguments)
 (import "stogir.call-groups" :as groups)
+(import "stogir.call-results" :as results)
 (import "stogir.strings" :as strings)
 (import "stogir.argument-value" :as argval)
 (import "stogir.alignment" :as alignment)
@@ -69,7 +70,11 @@
    (promote? bool)
    (copy-offset i64)])
 
-(defstruct Layout [(arguments (ArrayList Argument)) (stack i64)])
+(defstruct Layout
+  [(arguments (ArrayList Argument))
+   (stack i64)
+   (result results/Spec)
+   (result-save i64)])
 
 (defn release! [(layout (mut Layout))] (-> void)
   (free! (mut (.arguments layout))))
@@ -85,7 +90,9 @@
         (let [(mut result)
                 (Layout
                   :arguments (ArrayList::new [Argument] allocator)
-                  :stack 0)
+                  :stack 0
+                  :result (results/ordinary)
+                  :result-save -1)
               (mut types) (ArrayList::new [u8] allocator)
               (mut references) (ArrayList::new [i32] allocator)
               (mut descriptors) (ArrayList::new [groups/Group] allocator)
@@ -106,16 +113,18 @@
             (match (strings/lookup (.strings graph) (.id signature))
               (None [] (set! error "prototype string missing"))
               (Some [bytes]
+                    (set! (.result result) (results/decode bytes))
                     (let [(mut i) (: 0 i64)]
                       (while (< i (groups/count bytes))
                         (push! (mut descriptors) (groups/at bytes i))
                         (set! i (+ i 1)))))))
           (when (= error "")
-            (match (arguments/plan (slice types)
-                                   (cast i64 (.count signature))
-                                   (!= (& (.flags signature) 16) 0)
-                                   (slice descriptors)
-                                   allocator)
+            (match (arguments/plan-result (slice types)
+                                          (cast i64 (.count signature))
+                                          (!= (& (.flags signature) 16) 0)
+                                          (slice descriptors)
+                                          (.result result)
+                                          allocator)
               (Err [message] (set! error message))
               (Ok [layout]
                   (let [(mut layout) layout
@@ -165,6 +174,15 @@
                                               (set! (.stack result)
                                                     (+ offset size)))))))))))))
               (set! i (+ i 1))))
+          (when (and (= error "") (= (.kind (.result result)) 1))
+            (match (alignment/up (.stack result) 8)
+              (Err [message] (set! error message))
+              (Ok [offset]
+                  (if (> offset (- 0x7FFFFFFFFFFFFFFF 8))
+                      (set! error "result pointer save area overflow")
+                      (do
+                        (set! (.result-save result) offset)
+                        (set! (.stack result) (+ offset 8)))))))
           (if (= error "") (Ok result) (do (release! (mut result)) (Err error)))))))
 
 ;;; One outgoing area at SP is shared by calls and precedes all spill slots.

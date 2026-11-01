@@ -9,6 +9,7 @@
 (import "stogir.types" :as types)
 (import "stogir.prototype-bytes" :as prototype-bytes)
 (import "stogir.call-groups" :as groups)
+(import "stogir.call-results" :as results)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [Allocator])
 (import "coil.result" :use [Result Ok Err Some None])
@@ -17,7 +18,8 @@
   [(flags u8)
    (result u8)
    (parameters (ArrayList u8))
-   (groups (ArrayList groups/Group))])
+   (groups (ArrayList groups/Group))
+   (aggregate-result results/Spec)])
 
 (defn create [(flags u8)
               (result u8)
@@ -38,7 +40,8 @@
                 :flags flags
                 :result result
                 :parameters owned
-                :groups (ArrayList::new [groups/Group] allocator)))))))
+                :groups (ArrayList::new [groups/Group] allocator)
+                :aggregate-result (results/ordinary)))))))
 
 (defn create-grouped [(flags u8)
                       (result u8)
@@ -62,10 +65,28 @@
                 (for group descriptors (push! (mut (.groups prototype)) group))
                 (Ok prototype)))))))
 
+(defn create-result [(flags u8)
+                     (parameters (slice u8))
+                     (descriptors (slice groups/Group))
+                     (result results/Spec)
+                     (allocator (dyn Allocator))]
+  (-> (Result Prototype (slice u8)))
+  (if (or (= (.kind result) 0) (not (results/valid? 0 parameters result)))
+      (Err "invalid aggregate result prototype")
+      (match (create-grouped flags 0 parameters descriptors allocator)
+        (Err [message] (Err message))
+        (Ok [prototype]
+            (let [(mut prototype) prototype]
+              (set! (.aggregate-result prototype) result)
+              (Ok prototype))))))
+
 (defn valid-prototype? [(prototype Prototype) (function? bool)] (-> bool)
   (let [(mut good?)
           (and (<= (len (.parameters prototype)) 255)
                (types/valid-scalar? (cast i32 (.result prototype)))
+               (results/valid? (.result prototype)
+                               (slice (.parameters prototype))
+                               (.aggregate-result prototype))
                (groups/valid? (slice (.parameters prototype))
                               (slice (.groups prototype))))]
     (for ty (.parameters prototype)
@@ -87,7 +108,9 @@
     (push! (mut bytes) (.result prototype))
     (push! (mut bytes) (cast u8 (len (.parameters prototype))))
     (for ty (.parameters prototype) (push! (mut bytes) ty))
-    (groups/append! (mut bytes) (slice (.groups prototype)))
+    (groups/append-result! (mut bytes)
+                           (slice (.groups prototype))
+                           (.aggregate-result prototype))
     bytes))
 
 (defn group-arguments? [(graph g/Graph)
@@ -150,6 +173,16 @@
                 (set! error "call argument type mismatch"))))
       (push! (mut inputs) argument)
       (set! i (+ i 1)))
+    (when (and (= error "") (!= (.kind (.aggregate-result prototype)) 0))
+      (if (= (len arguments) 0)
+          (set! error "aggregate result place missing")
+          (match (g/lookup graph (get arguments 0))
+            (None [] (set! error "aggregate result place missing"))
+            (Some [place]
+                  (when (or (!= (n/type-id place) 6)
+                            (= (n/opcode place) 72)
+                            (= (n/opcode place) 70))
+                    (set! error "aggregate result place requires an ADDR value"))))))
     (for group (.groups prototype)
       (when (and (= error "") (not (group-arguments? graph arguments group)))
         (set! error "call group member type or count mismatch")))
@@ -305,6 +338,18 @@
   (let [(mut error) ""
         (mut i) (: 0 i64)
         actual (- (get (.arities graph) (cast i64 reference)) 2)]
+    (when (!= (.kind (results/decode bytes)) 0)
+      (match (g/operand graph reference 3)
+        (None [] (set! error "aggregate result place missing"))
+        (Some [value]
+              (match (g/lookup graph value)
+                (None [] (set! error "aggregate result place missing"))
+                (Some [node]
+                      (when (or (!= (n/type-id node) 6)
+                                (= (n/opcode node) 72)
+                                (= (n/opcode node) 70))
+                        (set! error
+                              "aggregate result place requires an ADDR value")))))))
     (while (and (= error "") (< i (groups/count bytes)))
       (let [group (groups/at bytes i)
             (mut j) (: 0 i32)
@@ -427,3 +472,13 @@
             (Ok [_] (set! checked (+ checked 1)))))
         (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
     (if (= error "") (Ok checked) (Err error))))
+
+(defn function-result [(graph g/Graph)] (-> (Result results/Spec (slice u8)))
+  (if (= (.function-prototype graph) 0)
+      (Ok (results/ordinary))
+      (match (strings/lookup (.strings graph) (.function-prototype graph))
+        (None [] (Err "function prototype string missing"))
+        (Some [bytes]
+              (if (not (valid-bytes? bytes))
+                  (Err "malformed function prototype")
+                  (Ok (results/decode bytes)))))))
