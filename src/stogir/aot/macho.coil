@@ -4,6 +4,7 @@
 (export image-object text-object)
 
 (import "stogir.image" :as image)
+(import "stogir.text-data" :as text-data)
 (import "stogir.image-order" :as order)
 (import "stogir.aot.macho-symbols" :as symbols)
 (import "stogir.a64.relocation" :as a64)
@@ -84,7 +85,8 @@
   (let [text-size (len (.text source))
         data-size (len (.data source))
         data-address (align text-size 8)
-        text-offset (: 392 i64)
+        entries (text-data/entry-count (.text-data source))
+        text-offset (if (= entries 0) (: 392 i64) (: 408 i64))
         data-offset (+ text-offset data-address)
         text-relocations (align (+ data-offset data-size) 4)
         (mut text-count) (: 0 i64)
@@ -106,7 +108,10 @@
     (let [data-relocations (+ text-relocations (* text-count 8))
           symbol-offset (align (+ data-relocations (* data-count 8)) 8)
           string-offset (+ symbol-offset (* (len (.symbols source)) 16))
-          file-size (+ string-offset (.string-size table))]
+          strings-end (+ string-offset (.string-size table))
+          entries-offset (align strings-end 4)
+          file-size
+            (if (= entries 0) strings-end (+ entries-offset (* entries 8)))]
       (if (or (!= error "")
               (> file-size 4294967295)
               (> text-count 4294967295)
@@ -114,8 +119,15 @@
           (Err (if (!= error "") error "Mach-O file exceeds 32-bit offsets"))
           (let [(mut out) (ArrayList::new [u8] allocator)]
             (reserve! (mut out) file-size)
-            ; mach_header_64; four commands totaling 360 bytes.
-            (for word [(: 0xFEEDFACF u32) 0x0100000C 0 1 4 360 0 0]
+            ; Data-in-code adds one 16-byte load command only when needed.
+            (for word [(: 0xFEEDFACF u32)
+                       0x0100000C
+                       0
+                       1
+                       (if (= entries 0) (: 4 u32) (: 5 u32))
+                       (if (= entries 0) (: 360 u32) (: 376 u32))
+                       0
+                       0]
               (b/append32! (mut out) word))
             (b/append32! (mut out) 0x19)
             (b/append32! (mut out) 232)
@@ -169,6 +181,12 @@
               (while (< i 12) (b/append32! (mut out) 0) (set! i (+ i 1))))
             (for word [(: 0x32 u32) 24 1 0x000B0000 0 0]
               (b/append32! (mut out) word))
+            (when (> entries 0)
+              (for word [(: 0x29 u32)
+                         16
+                         (cast u32 entries-offset)
+                         (cast u32 (* entries 8))]
+                (b/append32! (mut out) word)))
             (extend! (mut out) (.data (.text source)) (len (.text source)))
             (while (< (len out) data-offset) (push! (mut out) 0))
             (extend! (mut out) (.data (.data source)) (len (.data source)))
@@ -239,6 +257,23 @@
                   (push! (mut out) (get (.names source) (+ (.name symbol) i)))
                   (set! i (+ i 1)))
                 (push! (mut out) 0)))
+            (when (> entries 0)
+              (while (< (len out) entries-offset) (push! (mut out) 0))
+              ; MH_OBJECT entries use section VM offsets, not file offsets.
+              ; __text starts at VM address zero; LLVM MC emits the same form.
+              (for range (.text-data source)
+                (let [width (text-data/width (.kind range))
+                      limit (* (/ 65535 width) width)
+                      (mut offset) (.offset range)
+                      (mut remaining) (.length range)]
+                  (while (> remaining 0)
+                    (let [size (if (< remaining limit) remaining limit)]
+                      (b/append32! (mut out) (cast u32 offset))
+                      (b/append32! (mut out)
+                                   (| (cast u32 size)
+                                      (<< (cast u32 (.kind range)) 16)))
+                      (set! offset (+ offset size))
+                      (set! remaining (- remaining size)))))))
             (when (and (= error "") (!= (len out) file-size))
               (set! error "Mach-O serialization size mismatch"))
             (if (= error "") (Ok out) (do (free! (mut out)) (Err error))))))))

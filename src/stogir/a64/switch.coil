@@ -1,6 +1,7 @@
-;;; Balanced integer/range dispatch; edge copies run only in terminal stubs.
+;;; Integer/range dispatch; edge copies run only in terminal stubs.
 (module stogir.a64.switch)
 (import "stogir.switch" :as switch)
+(import "stogir.text-data" :as text-data)
 (import "stogir.a64.code" :as code)
 (import "stogir.a64.encode" :as encode)
 (import "stogir.a64.emit" :as emit)
@@ -82,3 +83,103 @@
                    (mut labels)
                    (mut branches)
                    (mut error)))))))
+
+;;; Requires sorted, disjoint cases from switch/collect.
+;;; Match the pinned upstream density rule: >2 singleton cases, span<count*8.
+;;; Return zero for comparisons; arithmetic never wraps at full-width limits.
+(defn table-length [(dispatch switch/Dispatch)] (-> i64)
+  (let [count (len (.cases dispatch))
+        (mut singleton?) true]
+    (for item (.cases dispatch)
+      (when (!= (.low item) (.high item)) (set! singleton? false)))
+    (if (or (not singleton?) (<= count 2) (> count 1152921504606846975))
+        0
+        (let [first (.low (get (.cases dispatch) 0))
+              last (.high (get (.cases dispatch) (- count 1)))]
+          (if (or (< last first) (>= (- last first) (* (cast u64 count) 8)))
+              0
+              (cast i64 (+ (- last first) 1)))))))
+
+;;; The inline table holds signed displacements relative to its first byte.
+;;; ADR is adjacent, so its displacement is always 16, independently of size.
+(defn table! [(output (mut code/Buffer))
+              (dispatch switch/Dispatch)
+              (stubs (ArrayList i32))
+              (fallback i32)
+              (length i64)
+              (branches (mut (ArrayList fixups/Branch)))
+              (relatives (mut (ArrayList fixups/Relative)))
+              (error (mut (slice u8)))] (-> void)
+  (let [first (.low (get (.cases dispatch) 0))]
+    (when (!= first 0)
+      (match (encode/add-sub-immediate true true false 16 16 (cast i64 first))
+        (Ok [word] (emit/word! (mut (.text output)) (mut error) (Ok word)))
+        (Err [_]
+             (match (constants/emit! (mut (.text output)) true 17 first)
+               (Err [message] (set! error message))
+               (Ok [_] 0))
+             (emit/word! (mut (.text output))
+                         (mut error)
+                         (encode/add-sub true true false 16 16 17)))))
+    (compare! (mut output) (mut error) (cast u64 (- length 1)))
+    (branch! (mut output) (mut branches) fallback 8)
+    (let [base (+ (len (.text output)) 16)
+          (mut slot) (: 0 i64)
+          (mut case-index) (: 0 i64)]
+      (emit/word! (mut (.text output))
+                  (mut error)
+                  (encode/address-relative 17 16))
+      (emit/word! (mut (.text output))
+                  (mut error)
+                  (encode/load-signed-word-indexed 16 17 16))
+      (emit/word! (mut (.text output))
+                  (mut error)
+                  (encode/add-sub true false false 16 17 16))
+      (emit/word! (mut (.text output)) (mut error) (encode/branch-register 16))
+      (while (< slot length)
+        (let [key (+ first (cast u64 slot))
+              hit?
+                (and (< case-index (len (.cases dispatch)))
+                     (= key (.low (get (.cases dispatch) case-index))))
+              target (if hit? (get stubs case-index) fallback)]
+          (push! (mut relatives)
+                 (fixups/Relative
+                   :offset (len (.text output))
+                   :base base
+                   :label target))
+          (bytes/append32! (mut (.text output)) 0)
+          (when hit? (set! case-index (+ case-index 1))))
+        (set! slot (+ slot 1)))
+      (push! (mut (.text-data output))
+             (text-data/Range
+               :offset base
+               :length (* length 4)
+               :kind 4)))))
+
+(defn dispatch! [(output (mut code/Buffer))
+                 (dispatch switch/Dispatch)
+                 (stubs (ArrayList i32))
+                 (fallback i32)
+                 (labels (mut (ArrayList i64)))
+                 (branches (mut (ArrayList fixups/Branch)))
+                 (relatives (mut (ArrayList fixups/Relative)))
+                 (error (mut (slice u8)))] (-> void)
+  (let [length (table-length dispatch)]
+    (if (= length 0)
+        (tree! (mut output)
+               dispatch
+               stubs
+               fallback
+               0
+               (len (.cases dispatch))
+               (mut labels)
+               (mut branches)
+               (mut error))
+        (table! (mut output)
+                dispatch
+                stubs
+                fallback
+                length
+                (mut branches)
+                (mut relatives)
+                (mut error)))))

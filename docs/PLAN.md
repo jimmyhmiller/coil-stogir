@@ -575,3 +575,38 @@ standalone run. Formatting checks and `git diff --check` pass. All 273
 implementation/test files remain Coil source. Dense jump tables are the next
 dispatch task before strategy measurements; compiler integration and whole-backend
 LLVM/TPDE runtime/compile-time benchmarks remain required.
+
+### Dense switch jump tables
+
+Dense singleton cases now use the pinned upstream `count>2` and `span<count*8`
+selection rule. The target subtracts the normalized minimum, bounds-checks with
+one unsigned comparison, and dispatches through ADR/indexed LDRSW/ADD/BR. Holes
+use the default edge stub; sparse/range cases keep balanced comparisons. Table
+entries are signed 32-bit offsets from their own base, so JIT movement and AOT
+linking require no absolute target relocation per entry. All targets still pass
+through the existing case-specific edge reconciliation.
+
+Checked ADR, indexed signed-word load and indirect branch encoders match LLVM MC
+and landed independently as 4d423fa. Relative-entry fixups validate the complete
+patch set before mutation. Native checks include negative/backward entries,
+tables near full-width extrema, signed cross-zero intervals, holes, two tables in
+one function and simultaneous independently relocated shared-image mappings.
+Existing GP/SIMD pressure/call fixtures now take the table path.
+
+Shared code/image data-in-code metadata is validated and rebased through buffer
+composition. Mach-O emits LC_DATA_IN_CODE/JUMP_TABLE32, splitting ranges beyond
+the u16 length limit. A reference LLVM MC object and a linker warning exposed an
+initial file-offset error in the writer: MH_OBJECT entries need section VM
+offsets. This was corrected and the focused linked checks now run without those
+warnings. Repeat serialization and metadata split validation pass. Full regression
+and the final checkpoint are recorded in the project pad. Strategy measurement,
+long-branch relaxation, remaining library semantics/optimization/scaling, compiler
+integration and LLVM/TPDE comparisons remain open.
+
+The dense-table regression passes all 155 standalone files and all 37 linked AOT
+consumers with debug checks and regenerated objects; the linked log has no
+warnings. The original-image metadata guard landed during the standalone run,
+so jit-image, text-data and jit-switch-tables were also rerun afterward; later
+full-run cases used the final source. Formatting and git diff checks pass. All
+277 implementation/test files are Coil. UNREACHABLE/TRAP control lowering is a
+remaining compiler-facing gap, including defaults for exhaustive sum matching.

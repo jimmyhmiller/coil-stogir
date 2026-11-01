@@ -1,0 +1,226 @@
+(module stogir.tests.text-data)
+(import "stogir.text-data" :as td)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.relocate" :as read)
+(import "stogir.a64.code" :as code)
+(import "stogir.a64.image" :as emitted)
+(import "stogir.graph" :as g)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn rejected [(result (Result i32 (slice u8)))] (-> i64)
+  (match result (Err [_] 0) (Ok [_] 1)))
+
+(defn ranges-check [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut ranges) (ArrayList::new [td/Range] allocator)
+        (mut failures) 0]
+    (set! failures (+ failures (rejected (td/validate ranges -1))))
+    (for bad [(td/Range
+                :offset -1
+                :length 4
+                :kind 4)
+              (td/Range
+                :offset 0
+                :length 0
+                :kind 4)
+              (td/Range
+                :offset 0
+                :length 4
+                :kind 6)
+              (td/Range
+                :offset 1
+                :length 4
+                :kind 4)
+              (td/Range
+                :offset 0
+                :length 3
+                :kind 4)
+              (td/Range
+                :offset 8
+                :length 0x7FFFFFFFFFFFFFFF
+                :kind 4)]
+      (push! (mut ranges) bad)
+      (set! failures (+ failures (rejected (td/validate ranges 16))))
+      (clear! (mut ranges)))
+    (push! (mut ranges)
+           (td/Range
+             :offset 0
+             :length 8
+             :kind 4))
+    (push! (mut ranges)
+           (td/Range
+             :offset 4
+             :length 4
+             :kind 4))
+    (set! failures (+ failures (rejected (td/validate ranges 16))))
+    (clear! (mut ranges))
+    (push! (mut ranges)
+           (td/Range
+             :offset 0
+             :length 0x7FFFFFFFFFFFFFFF
+             :kind 1))
+    (match (td/validate ranges 0x7FFFFFFFFFFFFFFF)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [_] 0))
+    (when (!= (td/entry-count ranges)
+              (+ (/ (: 0x7FFFFFFFFFFFFFFF i64) 65535) 1))
+      (set! failures (+ failures 1)))
+    (free! (mut ranges))
+    failures))
+
+(defn buffer-check [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut inner) (code/create allocator)
+        (mut outer) (code/create allocator)
+        (mut graph) (g/create allocator)
+        (mut failures) 0]
+    (bytes/append32! (mut (.text inner)) 0)
+    (push! (mut (.text-data inner))
+           (td/Range
+             :offset 0
+             :length 4
+             :kind 4))
+    (bytes/append32! (mut (.text outer)) 0xD65F03C0)
+    (when (not (code/append! (mut outer) inner)) (set! failures (+ failures 1)))
+    (when (not (code/append! (mut outer) inner)) (set! failures (+ failures 1)))
+    (when (or (!= (len (.text-data outer)) 2)
+              (!= (.offset (get (.text-data outer) 0)) 4)
+              (!= (.offset (get (.text-data outer) 1)) 8))
+      (set! failures (+ failures 1)))
+    (let [before (len (.text outer))]
+      (when (code/append! (mut outer) outer) (set! failures (+ failures 1)))
+      (when (!= before (len (.text outer))) (set! failures (+ failures 1))))
+    (let [before (len (.text outer))]
+      (set! (mut (.text-data inner))
+            0
+            (td/Range
+              :offset 1
+              :length 4
+              :kind 4))
+      (when (code/append! (mut outer) inner) (set! failures (+ failures 1)))
+      (when (!= before (len (.text outer))) (set! failures (+ failures 1))))
+    (match (emitted/finish! (mut outer) graph "_text_data_buffer" allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [source]
+          (let [(mut owned) source]
+            (when (!= (len (.text-data owned)) 2)
+              (set! failures (+ failures 1)))
+            (image/release! (mut owned)))))
+    (code/release! (mut inner))
+    (code/release! (mut outer))
+    (g/release! (mut graph))
+    failures))
+
+(defn object-check [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut source) (image/create allocator)
+        (mut failures) 0
+        (mut i) (: 0 i64)]
+    (image/symbol! (mut source) "_text_data_object" 1 0)
+    (bytes/append32! (mut (.text source)) 0xD65F03C0)
+    (while (< i 65536) (push! (mut (.text source)) 0) (set! i (+ i 1)))
+    (push! (mut (.text-data source))
+           (td/Range
+             :offset 4
+             :length 65536
+             :kind 4))
+    (match (macho/image-object source allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [object]
+          (let [(mut bytes) object
+                (mut cursor) (: 32 i64)
+                (mut found?) false]
+            (when (!= (read/read32 bytes 16) 5) (set! failures (+ failures 1)))
+            (while (< cursor (+ 32 (cast i64 (read/read32 bytes 20))))
+              (when (= (read/read32 bytes cursor) 0x29)
+                (set! found? true)
+                (let [offset (cast i64 (read/read32 bytes (+ cursor 8)))
+                      text-offset (read/read32 bytes 152)]
+                  (when (or (!= (read/read32 bytes (+ cursor 12)) 16)
+                            (!= (read/read32 bytes offset) 4)
+                            (!= (read/read32 bytes (+ offset 4)) 0x0004FFFC)
+                            (!= (read/read32 bytes (+ offset 8))
+                                65536)
+                            (!= (read/read32 bytes (+ offset 12)) 0x00040004))
+                    (set! failures (+ failures 1)))))
+              (set! cursor
+                    (+ cursor (cast i64 (read/read32 bytes (+ cursor 4))))))
+            (when (not found?) (set! failures (+ failures 1)))
+            (match (macho/image-object source allocator)
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [again]
+                  (let [(mut copy) again
+                        (mut j) (: 0 i64)]
+                    (when (!= (len bytes) (len copy))
+                      (set! failures (+ failures 1)))
+                    (while (< j (len bytes))
+                      (when (!= (get bytes j) (get copy j))
+                        (set! failures (+ failures 1)))
+                      (set! j (+ j 1)))
+                    (free! (mut copy)))))
+            (match (fs/write-file allocator
+                                  "/tmp/coil-stogir-data-in-code.o"
+                                  (slice bytes))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [_] 0))
+            (free! (mut bytes)))))
+    (push! (mut (.text-data source))
+           (td/Range
+             :offset 4
+             :length 4
+             :kind 4))
+    (match (macho/image-object source allocator)
+      (Err [_] 0)
+      (Ok [object]
+          (let [(mut bytes) object]
+            (free! (mut bytes))
+            (set! failures (+ failures 1)))))
+    (image/release! (mut source))
+    failures))
+
+(defn veneer-bounds-check [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut source) (image/create allocator)
+        (mut failures) 0]
+    (image/symbol! (mut source) "_bad_data_entry" 1 0)
+    (image/symbol! (mut source) "_far" 0 0)
+    (bytes/append32! (mut (.text source)) 0x94000000)
+    (bytes/append32! (mut (.text source)) 0xD65F03C0)
+    (image/relocate! (mut source)
+                     (image/Relocation
+                       :section 1
+                       :offset 0
+                       :kind 2
+                       :symbol 1
+                       :addend 0))
+    ; A far-call veneer can grow the private text, but cannot legitimize a range
+    ; that was beyond the caller's original eight-byte section.
+    (push! (mut (.text-data source))
+           (td/Range
+             :offset 8
+             :length 4
+             :kind 4))
+    (match (jit/map-image-resolved source
+                                   [(: 0 u64) 256]
+                                   [false true]
+                                   allocator)
+      (Err [_] 0)
+      (Ok [loaded]
+          (let [(mut owned) loaded]
+            (set! failures 1)
+            (jit/release-image! (mut owned)))))
+    (image/release! (mut source))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures
+          (+ (ranges-check) (buffer-check) (object-check) (veneer-bounds-check))]
+    (println "text data validation, rebasing and Mach-O split metadata: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

@@ -8,7 +8,7 @@ The standalone library currently compiles a subset of scalar graphs to
 native macOS AArch64 code. It includes graph construction and local folding,
 CFG/dominance analysis, placement, scheduling, split-interval register allocation,
 spill handling, phi transfers, arithmetic, comparisons, branches, typed
-singleton/range/default switches, loops, memory
+singleton/range/default switches with dense jump tables, loops, memory
 accesses, integer/address conversions and bitcasts, scalar integer binary arithmetic/logic/shifts/rotates, MIN/MAX and conditional
 selection, checked ADD/SUB/MUL with overflow projections, scalar unary operations
 (negation, complement, absolute value, byte swap and bit counts), and direct/indirect calls with register and stack arguments.

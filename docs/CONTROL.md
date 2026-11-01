@@ -45,7 +45,25 @@ edge copy can overwrite a scratch register. The usual parallel-copy machinery
 handles GPR/SIMD/spill values and subsequent merged-result phis. Fixed and dynamic
 stack storage keep the same anchored-frame semantics as other branches.
 
-Dense jump tables and dispatch-strategy measurements remain unfinished. Internal
-branches currently use the existing checked AArch64 immediate fixups; general
-long-branch relaxation is also unfinished. These limitations are not performance
-claims. Full compiler integration and LLVM/TPDE comparisons remain delivery gates.
+Dense singleton switches use the pinned upstream density rule: more than two
+cases and `(maximum-minimum) < case-count*8`. Ranges, sparse cases and smaller
+switches retain balanced comparisons. The normalized selector subtracts the
+minimum and uses one unsigned bounds check, which also rejects values below the
+minimum. Holes in the table point to the default edge stub.
+
+Tables contain signed 32-bit displacements relative to the table base. ADR,
+indexed LDRSW, ADD and BR form the destination without an absolute pointer or a
+per-entry image relocation. Each table is adjacent to its dispatch sequence, so
+ADR has a fixed, checked displacement independent of the function size. The same
+patched text works in raw JIT mappings, shared images and linked Mach-O objects.
+Signed relative fixups validate every record before writing any entries.
+
+The shared image retains ordered data-in-code ranges. Mach-O serialization emits
+LC_DATA_IN_CODE with JUMP_TABLE32 entries, splitting lengths above the u16 limit
+at element boundaries. In MH_OBJECT these entries use section VM offsets,
+matching LLVM MC, rather than text file offsets. Ordinary functions retain the
+previous object layout without an extra command.
+
+Dispatch-strategy measurements and general long-branch relaxation remain
+unfinished. These implementation details are not performance claims. Full compiler
+integration and LLVM/TPDE comparisons remain delivery gates.

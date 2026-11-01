@@ -1,0 +1,231 @@
+(module stogir.tests.jit-switch-tables)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.switch" :as switch)
+(import "stogir.types" :as types)
+(import "stogir.image" :as image)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.a64.fixups" :as fixups)
+(import "stogir.bytes" :as bytes)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defstruct Joined [(control i32) (value i32)])
+
+(defn join! [(graph (mut g/Graph))
+             (control i32)
+             (selector i32)
+             (ty i32)
+             (low u64)]
+  (-> Joined)
+  (let [allocator (malloc-allocator)
+        split (require (b/switch! (mut graph) control selector))
+        (mut ends) (ArrayList::new [i32] allocator)
+        (mut values) (ArrayList::new [i32] allocator)]
+    (for delta [(: 7 u64) 2 0 4]
+      (let [key (+ low delta)
+            constant
+              (require (b/scalar-constant! (mut graph)
+                                           ty
+                                           (^ key (switch/sign-mask ty))
+                                           8))
+            projection (require (b/case-value! (mut graph) split constant))
+            end (require (b/emit! (mut graph) 114 0 [projection]))
+            result (require (b/scalar-constant! (mut graph) 5 (+ 101 delta) 8))]
+        (push! (mut ends) end)
+        (push! (mut values) result)))
+    (let [fallback (require (b/case-default! (mut graph) split))]
+      (push! (mut ends) (require (b/emit! (mut graph) 114 0 [fallback])))
+      (push! (mut values) (require (b/scalar-constant! (mut graph) 5 999 8))))
+    (let [merge (require (b/emit! (mut graph) 112 0 (slice ends)))
+          (mut inputs) (ArrayList::new [i32] allocator)]
+      (push! (mut inputs) merge)
+      (for value values (push! (mut inputs) value))
+      (let [result
+              (Joined
+                :control merge
+                :value (require (b/emit! (mut graph) 67 5 (slice inputs))))]
+        (free! (mut inputs))
+        (free! (mut ends))
+        (free! (mut values))
+        result))))
+
+(defn expected [(key u64) (low u64)] (-> u64)
+  (if (< key low)
+      999
+      (let [d (- key low)]
+        (if (or (= d 0) (= d 2) (= d 4) (= d 7)) (+ 101 d) 999))))
+
+(defn check [(ty i32) (low u64) (top u64) (twice? bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        raw (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        selector
+          (if (= ty 5)
+              raw
+              (require (b/conversion! (mut graph)
+                                      (if (= (types/scalar-size ty 8) 8) 36 35)
+                                      ty
+                                      8
+                                      raw)))
+        first (join! (mut graph) start selector ty low)
+        second
+          (if twice? (join! (mut graph) (.control first) selector ty low) first)
+        answer
+          (if twice?
+              (require (b/emit! (mut graph)
+                                26
+                                5
+                                [(.value first) (.value second)]))
+              (.value first))
+        ret
+          (require (b/emit! (mut graph)
+                            120
+                            5
+                            [(.control second) answer (: 0 i32)]))
+        (mut failures) 0]
+    (match (compile/image graph
+                          start
+                          [ret]
+                          (if (= ty 11)
+                              "_stogir_tables_i64"
+                              "_stogir_tables_u64")
+                          allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [source]
+          (let [(mut owned) source]
+            (when (or (!= (len (.text-data owned)) (if twice? 2 1))
+                      (!= (.length (get (.text-data owned) 0)) 32)
+                      (!= (len (.relocations owned)) 0))
+              (set! failures (+ failures 1)))
+            (when (and twice? (or (= ty 5) (= ty 11)))
+              (match (macho/image-object owned allocator)
+                (Err [message]
+                     (println "{}" message)
+                     (set! failures (+ failures 1)))
+                (Ok [object]
+                    (let [(mut bytes) object]
+                      (match (fs/write-file allocator
+                                            (if (= ty 11)
+                                                "/tmp/coil-stogir-tables-i64.o"
+                                                "/tmp/coil-stogir-tables-u64.o")
+                                            (slice bytes))
+                        (Err [_] (set! failures (+ failures 1)))
+                        (Ok [_] 0))
+                      (free! (mut bytes))))))
+            ; Both images are live together: relative tables must not depend on
+            ; their absolute mapping address or on mutations during image loading.
+            (match (jit/map-image owned allocator)
+              (Err [message]
+                   (println "{}" message)
+                   (set! failures (+ failures 1)))
+              (Ok [loaded]
+                  (let [(mut a) loaded]
+                    (match (jit/map-image owned allocator)
+                      (Err [message]
+                           (println "{}" message)
+                           (set! failures (+ failures 1)))
+                      (Ok [another]
+                          (let [(mut c) another
+                                f
+                                  (primitive/cast (fnptr (cc/C) [u64] u64)
+                                                  (.base (.memory a)))
+                                h
+                                  (primitive/cast (fnptr (cc/C) [u64] u64)
+                                                  (.base (.memory c)))
+                                (mut probes) (ArrayList::new [u64] allocator)]
+                            (push! (mut probes) 0)
+                            (push! (mut probes) top)
+                            (when (> low 0) (push! (mut probes) (- low 1)))
+                            (when (< (+ low 7) top)
+                              (push! (mut probes) (+ low 8)))
+                            (for d [(: 0 u64) 1 2 3 4 5 6 7]
+                              (push! (mut probes) (+ low d)))
+                            (for key probes
+                              (let [bits (^ key (switch/sign-mask ty))
+                                    want
+                                      (* (if twice? (: 2 u64) 1)
+                                         (expected key low))]
+                                (when (or (!= (call-ptr f bits) want)
+                                          (!= (call-ptr h bits) want))
+                                  (println "dense table ty={} low={} key={}"
+                                           ty
+                                           low
+                                           key)
+                                  (set! failures (+ failures 1)))))
+                            (free! (mut probes))
+                            (jit/release-image! (mut c)))))
+                    (jit/release-image! (mut a)))))
+            (image/release! (mut owned)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn word [(result (Result u32 (slice u8)))] (-> u32)
+  (match result (Ok [value] value) (Err [message] (println "{}" message) 0)))
+
+;;; Exercise a negative table displacement through actual LDRSW, ADD and BR.
+(defn backward-check [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut text) (ArrayList::new [u8] allocator)
+        (mut labels) (ArrayList::new [i64] allocator)
+        (mut records) (ArrayList::new [fixups/Relative] allocator)
+        (mut failures) 0]
+    (bytes/append32! (mut text) (word (encode/branch false 12)))
+    (bytes/append32! (mut text) (word (encode/move-wide true 2 0 42 0)))
+    (bytes/append32! (mut text) (word (encode/ret 30)))
+    (bytes/append32! (mut text) (word (encode/extend true false 64 16 0)))
+    (bytes/append32! (mut text) (word (encode/address-relative 17 16)))
+    (bytes/append32! (mut text)
+                     (word (encode/load-signed-word-indexed 16 17 16)))
+    (bytes/append32! (mut text)
+                     (word (encode/add-sub true false false 16 17 16)))
+    (bytes/append32! (mut text) (word (encode/branch-register 16)))
+    (bytes/append32! (mut text) 0)
+    (push! (mut labels) 4)
+    (push! (mut records)
+           (fixups/Relative
+             :offset 32
+             :base 32
+             :label 0))
+    (match (fixups/apply-relative! (mut text) labels records)
+      (Err [message] (println "{}" message) (set! failures 1))
+      (Ok [_] 0))
+    (match (jit/map-text (slice text))
+      (Err [message] (println "{}" message) (set! failures 1))
+      (Ok [loaded]
+          (let [(mut owned) loaded
+                f (primitive/cast (fnptr (cc/C) [u64] u64) (.base owned))]
+            (when (!= (call-ptr f 0) 42) (set! failures 1))
+            (jit/release! (mut owned)))))
+    (free! (mut text))
+    (free! (mut labels))
+    (free! (mut records))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) (backward-check)]
+    (for ty [(: 2 i32) 3 4 5 6 7 8 9 10 11]
+      (let [top
+              (cast u64
+                    (- (<< (: 1 u128)
+                           (cast u128 (* 8 (types/scalar-size ty 8))))
+                       1))]
+        (set! failures
+              (+ failures
+                 (check ty 0 top false)
+                 (check ty (- top 7) top false)
+                 (check ty (- (/ top 2) 3) top (or (= ty 5) (= ty 11)))))))
+    (println "dense tables with holes, wide boundaries and relocated images: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

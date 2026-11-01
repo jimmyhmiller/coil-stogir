@@ -149,3 +149,23 @@ LLVM/TPDE runtime and compile-time comparisons also remain open.
 Format references are Apple's SDK `mach-o/loader.h`, `mach-o/nlist.h`, and
 `mach-o/arm64/reloc.h`; no SDK source is vendored. The writer is Coil code under
 the project license, with upstream port attribution retained in LICENSE/NOTICE.
+
+## Data embedded in text
+
+Images and AArch64 emission buffers retain a `text-data` array of
+`stogir.text-data/Range` values: text-relative `offset`, byte `length` and Mach-O
+DICE `kind`. Ranges are ordered, disjoint, within the text section and aligned to
+their element width. Buffer appending validates both sides and rebases range
+positions. Image finalization retains them; JIT's private copy retains them too.
+
+Dense switches emit JUMP_TABLE32 ranges whose entries are signed offsets from
+the table base to local edge stubs. These entries need no address-dependent image
+relocations. Moving the whole text keeps them valid. Raw byte-only output also
+remains directly JIT-able, though it carries no separate object metadata.
+
+Mach-O objects with ranges gain LC_DATA_IN_CODE. Entries describe text VM offsets
+for MH_OBJECT, as emitted by LLVM MC; they are not file offsets into the object.
+The writer splits large ranges at element boundaries to fit each u16 length and
+keeps serialization immutable and repeatable. Objects without embedded data keep
+their previous load-command and section layout. Manually constructed ranges are
+subject to the same bounds/order validation as generated tables.
