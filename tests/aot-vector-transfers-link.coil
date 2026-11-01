@@ -1,0 +1,40 @@
+(module stogir.tests.aot-vector-transfers-link)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as p)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+
+(extern transfer :as "stogir_vector_transfers" :cc (cc/C) [(ptr u8)] (-> u64))
+
+(defn pattern [(index i64)] (-> u8)
+  (cast u8 (% (+ (* index 37) (/ index 7) 19) 251)))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut cells) (ArrayList::new [u8] allocator)
+        (mut failures) 0
+        (mut i) (: 0 i64)]
+    (while (< i 65635)
+      (push! (mut cells) (pattern i))
+      (set! i (+ i 1)))
+    (when (!= (transfer (.data cells)) 1) (set! failures (+ failures 1)))
+    ; One simultaneous cycle: v0 -> A -> B -> v1 -> v0.
+    ; A and B are unaligned slots beyond the Q immediate range, addressed
+    ; through a frame anchor with logical bias4096. Other bytes must survive.
+    (set! i 0)
+    (while (< i (len cells))
+      (let [source
+              (cond (and (>= i 64) (< i 80)) (+ 16 (- i 64))
+                    (and (>= i 80) (< i 96)) (+ 65571 (- i 80))
+                    (and (>= i 96) (< i 112)) (+ 32 (- i 96))
+                    (and (>= i 112) (< i 128)) (+ 48 (- i 112))
+                    (and (>= i 65539) (< i 65555)) (- i 65539)
+                    (and (>= i 65571) (< i 65587)) (+ 65539 (- i 65571))
+                    :else i)]
+        (when (!= (get cells i) (pattern source))
+          (set! failures (+ failures 1))))
+      (set! i (+ i 1)))
+    (free! (mut cells))
+    (println "linked complete Q-register mixed cycle, frame offsets and flags: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))
