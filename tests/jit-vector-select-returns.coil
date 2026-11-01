@@ -1,0 +1,400 @@
+(module stogir.tests.jit-vector-select-returns)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.simd" :as v)
+(import "stogir.types" :as types)
+
+(defstruct Select8 [(bits (vec u64 1))])
+
+(defstruct Select16 [(bits (vec u64 2))])
+
+(defn pattern [(base i32) (lane i64) (seed i64) (right? bool)] (-> u64)
+  (let [i (% (+ lane seed (if right? (: 3 i64) 0)) 11)
+        fp? (types/floating? base)
+        wide? (= base 12)]
+    (if fp?
+        (if wide?
+            (match i
+              (0 (: 0 u64))
+              (1 0x8000000000000000)
+              (2 0x3FF0000000000000)
+              (3 0xBFF0000000000000)
+              (4 1)
+              (5 0x000FFFFFFFFFFFFF)
+              (6 0x7FEFFFFFFFFFFFFF)
+              (7 0x7FF0000000000000)
+              (8 0xFFF0000000000000)
+              (9 0x7FF8123456789ABC)
+              (_ 0x7FF0123456789ABC))
+            (match i
+              (0 (: 0 u64))
+              (1 0x80000000)
+              (2 0x3F800000)
+              (3 0xBF800000)
+              (4 1)
+              (5 0x007FFFFF)
+              (6 0x7F7FFFFF)
+              (7 0x7F800000)
+              (8 0xFF800000)
+              (9 0x7FC12345)
+              (_ 0x7F812345)))
+        (match i
+          (0 (: 0 u64))
+          (1 1)
+          (2 0xFFFFFFFFFFFFFFFF)
+          (3 (<< (: 1 u64) (cast u64 (- (* 8 (types/scalar-size base 8)) 1))))
+          (4 (- (<< (: 1 u64) (cast u64 (- (* 8 (types/scalar-size base 8)) 1)))
+                1))
+          (5 0x8080808080808080)
+          (6 0x7F7F7F7F7F7F7F7F)
+          (7 0xFFFF0000FFFF0000)
+          (8 0x123456789ABCDEF0)
+          (9 0xFFFFFFFFFFFFFFFE)
+          (_ 0x0102030405060708)))))
+
+(defn input-byte [(base i32) (index i64) (seed i64) (right? bool)] (-> u8)
+  (let [width (cast i64 (types/scalar-size base 8))]
+    (cast u8
+          (>> (pattern base (/ index width) seed right?)
+              (cast u64 (* (% index width) 8))))))
+
+(defn arm-literal? [(mode i32) (right? bool)] (-> bool)
+  (or (= mode 10)
+      (= mode 11)
+      (= mode 3)
+      (= mode 6)
+      (= mode 7)
+      (= mode (if right? 2 1))))
+
+(defn arm-byte [(base i32) (i i64) (seed i64) (mode i32) (right? bool)] (-> u8)
+  (let [right? (and right? (!= mode 4) (!= mode 9))
+        chosen-seed (if (arm-literal? mode right?) (if right? (: 7 i64) 9) seed)]
+    (input-byte base i chosen-seed right?)))
+
+(defn condition-bits [(ty i32) (seed i64) (mode i32)] (-> u64)
+  (if (or (= mode 6) (= mode 10))
+      (if (= ty 12) (: 0x8000000000000000 u64) (if (= ty 13) 0x80000000 0))
+      (if (or (= mode 7) (= mode 11))
+          (if (= ty 12) (: 0x7FF0123456789ABC u64) (if (= ty 13) 0x7F812345 1))
+          (& (pattern ty 0 seed false)
+             (cast u64
+                   (- (<< (: 1 u128) (cast u128 (* 8 (types/scalar-size ty 8))))
+                      1))))))
+
+(defn truth? [(ty i32) (bits u64)] (-> bool)
+  (!= (if (= ty 12)
+          (& bits 0x7FFFFFFFFFFFFFFF)
+          (if (= ty 13) (& bits 0x7FFFFFFF) bits))
+      0))
+
+(defn read-word [(buffer (slice u8)) (offset i64) (width i32)] (-> u64)
+  (let [(mut result) (: 0 u64)
+        (mut i) (: 0 i32)]
+    (while (< i width)
+      (set! result
+            (| result
+               (<< (cast u64 (get buffer (+ offset (cast i64 i))))
+                   (cast u64 (* i 8)))))
+      (set! i (+ i 1)))
+    result))
+
+(defn returned-call [(ty i32)
+                     (cty i32)
+                     (mode i32)
+                     (address (ptr u8))
+                     (yes (slice u8))
+                     (no (slice u8))
+                     (bits u64)
+                     (output (ptr u64))] (-> void)
+  (let [(mut scalar32) (: 0.0 f32)
+        (mut scalar64) (: 0.0 f64)
+        yes-d (Select8 :bits (v/vsplat [u64 1] (read-word yes 0 8)))
+        no-d (Select8 :bits (v/vsplat [u64 1] (read-word no 0 8)))
+        yes-q
+          (Select16
+            :bits
+              (v/vinsert (v/vsplat [u64 2] (read-word yes 0 8))
+                         1
+                         (read-word yes 8 8)))
+        no-q
+          (Select16
+            :bits
+              (v/vinsert (v/vsplat [u64 2] (read-word no 0 8))
+                         1
+                         (read-word no 8 8)))]
+    (p/store! (p/cast (ptr u32) (mut scalar32)) (cast u32 bits))
+    (p/store! (p/cast (ptr u64) (mut scalar64)) bits)
+    (when (and (= cty 5) (= (types/size ty 8) 8) (= mode 0))
+      (let [f (p/cast (fnptr (cc/C) [u64 Select8 Select8] Select8) address)
+            result (call-ptr f bits yes-d no-d)]
+        (p/store! output (v/vextract (.bits result) 0))))
+    (when (and (= cty 5) (= (types/size ty 8) 8) (= mode 3))
+      (let [f (p/cast (fnptr (cc/C) [u64] Select8) address)
+            result (call-ptr f bits)]
+        (p/store! output (v/vextract (.bits result) 0))))
+    (when (and (= cty 5) (= (types/size ty 8) 16) (= mode 0))
+      (let [f (p/cast (fnptr (cc/C) [u64 Select16 Select16] Select16) address)
+            result (call-ptr f bits yes-q no-q)]
+        (p/store! output (v/vextract (.bits result) 0))
+        (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
+    (when (and (= cty 5) (= (types/size ty 8) 16) (= mode 3))
+      (let [f (p/cast (fnptr (cc/C) [u64] Select16) address)
+            result (call-ptr f bits)]
+        (p/store! output (v/vextract (.bits result) 0))
+        (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
+    (when (and (= cty 12) (= (types/size ty 8) 8) (= mode 0))
+      (let [f (p/cast (fnptr (cc/C) [f64 Select8 Select8] Select8) address)
+            result (call-ptr f scalar64 yes-d no-d)]
+        (p/store! output (v/vextract (.bits result) 0))))
+    (when (and (= cty 12) (= (types/size ty 8) 8) (= mode 3))
+      (let [f (p/cast (fnptr (cc/C) [f64] Select8) address)
+            result (call-ptr f scalar64)]
+        (p/store! output (v/vextract (.bits result) 0))))
+    (when (and (= cty 12) (= (types/size ty 8) 16) (= mode 0))
+      (let [f (p/cast (fnptr (cc/C) [f64 Select16 Select16] Select16) address)
+            result (call-ptr f scalar64 yes-q no-q)]
+        (p/store! output (v/vextract (.bits result) 0))
+        (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
+    (when (and (= cty 12) (= (types/size ty 8) 16) (= mode 3))
+      (let [f (p/cast (fnptr (cc/C) [f64] Select16) address)
+            result (call-ptr f scalar64)]
+        (p/store! output (v/vextract (.bits result) 0))
+        (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
+    (when (and (= cty 13) (= (types/size ty 8) 8) (= mode 0))
+      (let [f (p/cast (fnptr (cc/C) [f32 Select8 Select8] Select8) address)
+            result (call-ptr f scalar32 yes-d no-d)]
+        (p/store! output (v/vextract (.bits result) 0))))
+    (when (and (= cty 13) (= (types/size ty 8) 8) (= mode 3))
+      (let [f (p/cast (fnptr (cc/C) [f32] Select8) address)
+            result (call-ptr f scalar32)]
+        (p/store! output (v/vextract (.bits result) 0))))
+    (when (and (= cty 13) (= (types/size ty 8) 16) (= mode 0))
+      (let [f (p/cast (fnptr (cc/C) [f32 Select16 Select16] Select16) address)
+            result (call-ptr f scalar32 yes-q no-q)]
+        (p/store! output (v/vextract (.bits result) 0))
+        (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
+    (when (and (= cty 13) (= (types/size ty 8) 16) (= mode 3))
+      (let [f (p/cast (fnptr (cc/C) [f32] Select16) address)
+            result (call-ptr f scalar32)]
+        (p/store! output (v/vextract (.bits result) 0))
+        (p/store! (p/index output 1) (v/vextract (.bits result) 1))))))
+
+(defn exercise [(ty i32) (cty i32) (mode i32) (address (ptr u8))] (-> i64)
+  (let [width (types/size ty 8)
+        base (types/base-type ty)
+        (mut yes) (ArrayList::new [u8] (malloc-allocator))
+        (mut no) (ArrayList::new [u8] (malloc-allocator))
+        (mut failures) 0
+        (mut seed) (: 0 i64)]
+    (while (< seed 11)
+      (clear! (mut yes))
+      (clear! (mut no))
+      (let [(mut byte) (: 0 i64)]
+        (while (< byte 16)
+          (push! (mut yes) (arm-byte base byte seed mode false))
+          (push! (mut no) (arm-byte base byte seed mode true))
+          (set! byte (+ byte 1))))
+      (let [(mut test) (: 0 i64)]
+        (while (< test 11)
+          (let [bits (condition-bits cty test 0)
+                chosen? (truth? cty bits)
+                (mut got) [(: 0 u64) 0]
+                (mut byte) (: 0 i64)]
+            (returned-call ty
+                           cty
+                           mode
+                           address
+                           (slice yes)
+                           (slice no)
+                           bits
+                           (data got))
+            (while (< byte 16)
+              (let [expected
+                      (if (< byte (cast i64 width))
+                          (if chosen? (get yes byte) (get no byte))
+                          (: 0 u8))
+                    actual (p/load (p/index (p/cast (ptr u8) (data got)) byte))]
+                (when (!= actual expected)
+                  (when (< failures 6)
+                    (println "select return ty{} cty{} mode{} seed{} test{} byte{} got{} expected{}"
+                             ty
+                             cty
+                             mode
+                             seed
+                             test
+                             byte
+                             actual
+                             expected))
+                  (set! failures (+ failures 1))))
+              (set! byte (+ byte 1))))
+          (set! test (+ test 1))))
+      (set! seed (+ seed 1)))
+    (free! (mut yes))
+    (free! (mut no))
+    failures))
+
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn fixture-name [(id i32)] (-> (slice u8))
+  (match id
+    (0 "_stogir_vector_select_return_0")
+    (1 "_stogir_vector_select_return_1")
+    (2 "_stogir_vector_select_return_2")
+    (3 "_stogir_vector_select_return_3")
+    (4 "_stogir_vector_select_return_4")
+    (5 "_stogir_vector_select_return_5")
+    (6 "_stogir_vector_select_return_6")
+    (7 "_stogir_vector_select_return_7")
+    (8 "_stogir_vector_select_return_8")
+    (9 "_stogir_vector_select_return_9")
+    (10 "_stogir_vector_select_return_10")
+    (11 "_stogir_vector_select_return_11")
+    (12 "_stogir_vector_select_return_12")
+    (13 "_stogir_vector_select_return_13")
+    (14 "_stogir_vector_select_return_14")
+    (15 "_stogir_vector_select_return_15")
+    (16 "_stogir_vector_select_return_16")
+    (17 "_stogir_vector_select_return_17")
+    (18 "_stogir_vector_select_return_18")
+    (19 "_stogir_vector_select_return_19")
+    (20 "_stogir_vector_select_return_20")
+    (21 "_stogir_vector_select_return_21")
+    (22 "_stogir_vector_select_return_22")
+    (23 "_stogir_vector_select_return_23")
+    (_ "invalid")))
+
+(defn fixture-path [(id i32)] (-> (slice u8))
+  (match id
+    (0 "/tmp/coil-stogir-vector-select-return-0.o")
+    (1 "/tmp/coil-stogir-vector-select-return-1.o")
+    (2 "/tmp/coil-stogir-vector-select-return-2.o")
+    (3 "/tmp/coil-stogir-vector-select-return-3.o")
+    (4 "/tmp/coil-stogir-vector-select-return-4.o")
+    (5 "/tmp/coil-stogir-vector-select-return-5.o")
+    (6 "/tmp/coil-stogir-vector-select-return-6.o")
+    (7 "/tmp/coil-stogir-vector-select-return-7.o")
+    (8 "/tmp/coil-stogir-vector-select-return-8.o")
+    (9 "/tmp/coil-stogir-vector-select-return-9.o")
+    (10 "/tmp/coil-stogir-vector-select-return-10.o")
+    (11 "/tmp/coil-stogir-vector-select-return-11.o")
+    (12 "/tmp/coil-stogir-vector-select-return-12.o")
+    (13 "/tmp/coil-stogir-vector-select-return-13.o")
+    (14 "/tmp/coil-stogir-vector-select-return-14.o")
+    (15 "/tmp/coil-stogir-vector-select-return-15.o")
+    (16 "/tmp/coil-stogir-vector-select-return-16.o")
+    (17 "/tmp/coil-stogir-vector-select-return-17.o")
+    (18 "/tmp/coil-stogir-vector-select-return-18.o")
+    (19 "/tmp/coil-stogir-vector-select-return-19.o")
+    (20 "/tmp/coil-stogir-vector-select-return-20.o")
+    (21 "/tmp/coil-stogir-vector-select-return-21.o")
+    (22 "/tmp/coil-stogir-vector-select-return-22.o")
+    (23 "/tmp/coil-stogir-vector-select-return-23.o")
+    (_ "invalid")))
+
+(defn generate [(ty i32) (cty i32) (mode i32) (id i32)] (-> i64)
+  (let [alc (malloc-allocator)
+        (mut graph) (g/create alc)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        condition (require (b/emit! (mut graph) 71 cty [start (: 0 i32) 0]))
+        (mut yes) (: 0 i32)
+        (mut no) (: 0 i32)
+        (mut parameters) (ArrayList::new [u8] alc)
+        (mut yes-bytes) (ArrayList::new [u8] alc)
+        (mut no-bytes) (ArrayList::new [u8] alc)
+        (mut failures) 0
+        (mut i) (: 0 i32)]
+    (push! (mut parameters) (cast u8 cty))
+    (if (= mode 0)
+        (do
+          (set! yes (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 1])))
+          (set! no (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 2])))
+          (push! (mut parameters) (cast u8 ty))
+          (push! (mut parameters) (cast u8 ty)))
+        (do
+          (while (< i (types/size ty 8))
+            (push! (mut yes-bytes)
+                   (arm-byte (types/base-type ty) (cast i64 i) 0 mode false))
+            (push! (mut no-bytes)
+                   (arm-byte (types/base-type ty) (cast i64 i) 0 mode true))
+            (set! i (+ i 1)))
+          (set! yes
+                (require (b/vector-constant! (mut graph) ty 8 (slice yes-bytes))))
+          (set! no
+                (require (b/vector-constant! (mut graph) ty 8 (slice no-bytes))))))
+    (match (calls/create 9 (cast u8 ty) (slice parameters) alc)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut prototype) prototype]
+            (require (calls/function! (mut graph) prototype alc))
+            (calls/release! (mut prototype)))))
+    (let [result (require (b/conditional! (mut graph) ty condition yes no))
+          ret (require (b/emit! (mut graph) 120 ty [start result (: 0 i32)]))]
+      (match (compile/object graph start [ret] (fixture-name id) alc)
+        (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+        (Ok [object]
+            (let [(mut object) object]
+              (match (fs/write-file alc (fixture-path id) (slice object))
+                (Err [_] (set! failures (+ failures 1)))
+                (Ok [_] 0))
+              (free! (mut object)))))
+      (match (compile/image graph start [ret] "_vector_select_return_jit" alc)
+        (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+        (Ok [source]
+            (let [(mut source) source]
+              (match (jit/map-image source alc)
+                (Err [message]
+                     (println "{}" message)
+                     (set! failures (+ failures 1)))
+                (Ok [loaded]
+                    (let [(mut loaded) loaded]
+                      (set! failures
+                            (+ failures
+                               (exercise ty cty mode (.base (.memory loaded)))))
+                      (jit/release-image! (mut loaded)))))
+              (image/release! (mut source))))))
+    (free! (mut parameters))
+    (free! (mut yes-bytes))
+    (free! (mut no-bytes))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (set! failures (+ failures (generate 81 5 0 0)))
+    (set! failures (+ failures (generate 81 5 3 1)))
+    (set! failures (+ failures (generate 81 12 0 2)))
+    (set! failures (+ failures (generate 81 12 3 3)))
+    (set! failures (+ failures (generate 81 13 0 4)))
+    (set! failures (+ failures (generate 81 13 3 5)))
+    (set! failures (+ failures (generate 22 5 0 6)))
+    (set! failures (+ failures (generate 22 5 3 7)))
+    (set! failures (+ failures (generate 22 12 0 8)))
+    (set! failures (+ failures (generate 22 12 3 9)))
+    (set! failures (+ failures (generate 22 13 0 10)))
+    (set! failures (+ failures (generate 22 13 3 11)))
+    (set! failures (+ failures (generate 45 5 0 12)))
+    (set! failures (+ failures (generate 45 5 3 13)))
+    (set! failures (+ failures (generate 45 12 0 14)))
+    (set! failures (+ failures (generate 45 12 3 15)))
+    (set! failures (+ failures (generate 45 13 0 16)))
+    (set! failures (+ failures (generate 45 13 3 17)))
+    (set! failures (+ failures (generate 44 5 0 18)))
+    (set! failures (+ failures (generate 44 5 3 19)))
+    (set! failures (+ failures (generate 44 12 0 20)))
+    (set! failures (+ failures (generate 44 12 3 21)))
+    (set! failures (+ failures (generate 44 13 0 22)))
+    (set! failures (+ failures (generate 44 13 3 23)))
+    (println "typed vector selection returns: 24 graphs; failures {}" failures)
+    failures))

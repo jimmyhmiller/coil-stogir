@@ -1377,3 +1377,13 @@ spill/dynamic-frame pressure graphs; and 964 linked objects. Complete selected
 bits, original arms/conditions, input memory and padding are compared. Remaining
 shuffle/vector-conversion families and broader standalone/compiler/backend/
 benchmark work remain required.
+
+
+Additional checks cover 24 folded literal-vector graphs (including signed-zero
+and NaN conditions), requiring a negative selected constant reference and checking
+the full payload in JIT/AOT, plus 24 typed vector-return graphs for integer/f32/f64
+conditions and loaded/literal arms. Single-member vector records supply the native
+short-vector C ABI entirely from Coil. An inspected Q-return object captures
+`fcmp s0, #0.0` before loading v30/v31 literals and overwriting v0 with its mask.
+Final focused coverage is 2,728 matrix graphs, 80 pressure graphs, 1,014 forced
+register cases, 24 typed returns, 988 ordinary/pressure objects and 24 return objects.
