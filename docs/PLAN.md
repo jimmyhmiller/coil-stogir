@@ -1249,3 +1249,10 @@ bits, original operands, input memory and surrounding padding are checked.
 Comparisons, lane/shuffle/conversion families, the remaining independent-library
 work, actual compiler integration and LLVM/TPDE performance comparisons remain
 open.
+
+
+The final unchanged-source regression passes all 199 standalone checks and all
+58 linked consumers with debug checks. The standalone pass regenerates fixtures
+before linked validation; exact file/consumer pass sets match, and linked output
+has no warnings. All 362 implementation/test files are Coil. Formatting and diff
+checks pass. Current evidence is indexed in the coil-stogir project pad.
