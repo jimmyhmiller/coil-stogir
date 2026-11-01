@@ -1576,8 +1576,10 @@ Focused checks pass for simple, nested, floating and stack loops, switches,
 pressure, image/module composition, long branches and alignment. The 59-case
 pinned-C differential checks match both block order and loop alignment, including
 weighted diamonds, switches/ranges, 256/257-block policy, cold stops, nested
-loops, empty cycles and irreducibility. Full regressions and compiler integration
-are pending. Optional empty-entry merging is disabled; optimizer-mode policy,
+loops, empty cycles and irreducibility. All 212 standalone tests and all 65 linked AOT consumers pass against
+the final 8c0cab3 source. The linked run verifies freshly generated object
+fixtures, and both runs check frozen compiler/SDK and project input hashes.
+Compiler integration validation is pending. Optional empty-entry merging is disabled; optimizer-mode policy,
 SCCP, mem2ssa, full target reuse/coalescing and allocator/loop-analysis parity
 remain open. This is not completion of the performance goal.
 
