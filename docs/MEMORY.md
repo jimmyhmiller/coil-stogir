@@ -15,7 +15,7 @@ other library graphs. No native bulk-memory runtime routine is required.
 
 All builders return `Result i32 (slice u8)`. Thread the returned control reference
 into the next effect or terminal. Addresses are ADDR value references, rather
-than VAR storage identities. Use VADDR when addressing a scalar local. Control
+than VAR storage identities. Use VADDR when addressing a scalar or vector local. Control
 must be an existing open control chain.
 
 Runtime counts are U64 value references. Fixed sizes are nonnegative i64 byte

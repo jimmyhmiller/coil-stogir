@@ -167,12 +167,12 @@ to the result bank. Typed arm materialization preserves flags and raw payloads.
 LLVM i1 casts and signedness-specific LLVM conversion opcodes require explicit
 frontend lowering rather than blindly using the IR Boolean storage byte.
 
-## Scalar local storage
+## Typed local storage
 
-`builder/variable!` creates a named VAR in a block-start region. Its scalar type
-sets the object size. Alignment zero means natural scalar alignment; explicit
+`builder/variable!` creates a named VAR in a block-start region. Its scalar or
+vector type sets the object size. Alignment zero means natural type alignment; explicit
 power-of-two alignment is in bytes. The AArch64 target selects a frame alignment
-A equal to the maximum of sixteen and selected VAR/ALLOCA requests, then aligns
+A equal to the maximum of sixteen, resolved VAR alignments and ALLOCA requests, then aligns
 the actual SP to A. Relative slot alignment therefore establishes actual address
 alignment even when the caller guarantees only sixteen bytes.
 
@@ -180,7 +180,7 @@ alignment even when the caller guarantees only sixteen bytes.
 storage and cannot serve as an ordinary register-value operand. It contributes
 graph dependencies without creating a register interval. VLOAD/VLOAD_v use
 `[control variable]`; VSTORE/VSTORE_v use `[control variable value]`. Access types
-may differ from the declared storage type when their scalar size fits the object.
+may differ from the declared storage type when their complete size fits the object.
 Volatile variants remain explicit control-chain operations. Objects are not
 automatically initialized.
 
@@ -557,8 +557,8 @@ including dead invalid uses. Phi incoming types must agree exactly.
 AArch64 supports memory/Phi transport for eight- and sixteen-byte vector extents.
 They use SIMD register classes, correctly sized/aligned spills and mixed-width
 split/edge copies. Larger vector shapes remain representable but target emission
-rejects their unsupported extent. Vector arithmetic and vector local objects
-are not yet implemented. Short-vector signatures have initial native coverage
+rejects their unsupported value extent. Vector local storage supports the paths
+described below; vector arithmetic remains unfinished. Short-vector signatures have native coverage
 as described below. Vector constants use the path below.
 Scalar arguments/results may surround internal vector computations and calls.
 
@@ -701,3 +701,49 @@ linked consumers with debug checks, exact test-set equality and regenerated
 objects. Linked output contains no warnings. All shipped implementation/test
 sources remain Coil. Correctness coverage does not establish code generation
 speed, runtime performance or readiness of the unfinished Coil backend.
+
+
+## Vector local objects and views
+
+VAR, VADDR and both ordinary/volatile VLOAD/VSTORE families accept valid vector
+storage types. Type size and natural alignment are derived with the explicit
+target pointer width. Explicit power-of-two alignment may override the natural
+alignment, including weaker alignment for unaligned views. The local validator
+checks the complete access extent and rejects storage identities used as data.
+The vector validator delegates these operations to the same local contracts.
+
+AArch64 uses full D/Q register accesses for eight-/sixteen-byte values. Constants
+materialize through the shared image before the store. Vector objects wider than
+a register remain storage: narrower fitting scalar/vector views and VADDR are
+supported, while unsupported wide register-valued accesses reject explicitly.
+A VAR with default alignment now contributes its resolved natural alignment to
+the function's frame requirement. This is necessary for naturally aligned objects
+wider than sixteen bytes, even when every actual access is narrower.
+
+`tests/vector-locals.coil` checks all 91 vector encodings at both pointer widths,
+each with natural, one-byte, exact-size and doubled alignment. It checks both local
+and vector validators, invalid types/control/extent, narrower views and rejected
+native wide accesses. `tests/jit-vector-locals.coil` runs 280 native graphs:
+
+- all 26 native shapes, four local/addressed/volatile combinations and both loaded
+  and complete literal values;
+- floating vector views of integer vector storage, naturally aligned 32–512-byte
+  objects accessed through 128-bit views, and explicitly weakly aligned objects;
+- eight loop-pressure graphs with forty vector locals, forty independent scalar
+  values live across calls, forty simultaneously live vector reloads across a
+  callback that clobbers all allocatable caller-saved banks, pair swaps, disjoint
+  spill/local ownership, fixed guards and live dynamic storage.
+
+Pressure cases use both 16-byte and 4096-byte frames, five loop counts and three
+payload seeds. Basic cases also use three seeds and compare every output byte,
+untouched buffer padding, guard values and unchanged input. The fixed-object
+address mask is checked against the selected alignment, including 512-byte natural
+alignment. `tests/aot-vector-locals-link.coil` repeats representative paths through
+27 separate Mach-O objects, including all eight pressure cases and wider objects.
+
+The vector-local checkpoint passes all 191 standalone tests and all 54 linked
+consumers with debug checks, exact source/pass-set equality, regenerated objects
+and no linked warnings. The 344 implementation/test source files remain Coil.
+Formatting and diff checks pass. Vector arithmetic, remaining semantics and ABI
+cases, full optimization/scaling, compiler integration and LLVM/TPDE runtime and
+compile-time comparisons remain unfinished.

@@ -1104,3 +1104,25 @@ the complete run. Formatting and git diff checks pass. All 334 implementation/te
 files remain Coil. Validation used installed Coil d2a49bf21376 on the local arm64
 Mac. Evidence and the remaining full-goal requirements are indexed in the project
 pad. These checks establish constant correctness, not performance parity.
+
+
+### Vector local storage checkpoint
+
+Vector VAR/VADDR/VLOAD/VSTORE now use complete target-aware type extents, with
+ordinary and volatile D/Q accesses, literal materialization and mixed scalar/vector
+views. Wider objects may be addressed through narrower views. Natural VAR
+alignment propagates to actual SP alignment. Unit geometry checks cover all 91
+vector types at both pointer widths; native tests cover 280 graphs and 27 linked
+objects, including forty vector locals plus simultaneous GP/SIMD call pressure
+and dynamic storage in ordinary/4096-byte frames.
+
+Vector arithmetic remains unfinished. Short-vector/HVA ABI transport has separate
+incoming, outgoing, literal and Darwin variadic JIT/AOT checks; omitted parameters,
+named/recursive vector calls, mixed widths and pressure across vector results
+remain. Full optimization/verification/scaling, remaining scalar/intrinsic/atomic
+semantics, targets, actual compiler integration and equivalent LLVM/TPDE compile
+and runtime measurements remain open.
+
+Vector-local regression: all 191 standalone and 54 linked consumers pass with
+debug checks, exact coverage, regenerated objects and no linked warnings. All
+344 implementation/test files remain Coil. Formatting/diff checks pass.
