@@ -1,0 +1,2471 @@
+(module stogir.tests.jit-vector-extrema)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "stogir.types" :as types)
+
+(defn pattern [(base i32) (lane i64) (seed i64) (right? bool)] (-> u64)
+  (let [i (% (+ lane (if right? (/ seed 11) (% seed 11))) 11)
+        fp? (types/floating? base)
+        wide? (= base 12)]
+    (if fp?
+        (if wide?
+            (match i
+              (0 (: 0 u64))
+              (1 0x8000000000000000)
+              (2 0x3FF0000000000000)
+              (3 0xBFF0000000000000)
+              (4 1)
+              (5 0x000FFFFFFFFFFFFF)
+              (6 0x7FEFFFFFFFFFFFFF)
+              (7 0x7FF0000000000000)
+              (8 0xFFF0000000000000)
+              (9 0x7FF8123456789ABC)
+              (_ 0x7FF0123456789ABC))
+            (match i
+              (0 (: 0 u64))
+              (1 0x80000000)
+              (2 0x3F800000)
+              (3 0xBF800000)
+              (4 1)
+              (5 0x007FFFFF)
+              (6 0x7F7FFFFF)
+              (7 0x7F800000)
+              (8 0xFF800000)
+              (9 0x7FC12345)
+              (_ 0x7F812345)))
+        (match i
+          (0 (: 0 u64))
+          (1 1)
+          (2 0xFFFFFFFFFFFFFFFF)
+          (3 (<< (: 1 u64) (cast u64 (- (* 8 (types/scalar-size base 8)) 1))))
+          (4 (- (<< (: 1 u64) (cast u64 (- (* 8 (types/scalar-size base 8)) 1)))
+                1))
+          (5 0x8080808080808080)
+          (6 0x7F7F7F7F7F7F7F7F)
+          (7 0xFFFF0000FFFF0000)
+          (8 0x123456789ABCDEF0)
+          (9 0xFFFFFFFFFFFFFFFE)
+          (_ 0x0102030405060708)))))
+
+(defn input-byte [(base i32) (index i64) (seed i64) (right? bool)] (-> u8)
+  (let [width (cast i64 (types/scalar-size base 8))]
+    (cast u8
+          (>> (pattern base (/ index width) seed right?)
+              (cast u64 (* (% index width) 8))))))
+
+(defn literal-word [(base i32) (lane i64) (right? bool) (mode i32)] (-> u64)
+  (let [bits (* 8 (types/scalar-size base 8))
+        mask (cast u64 (- (<< (: 1 u128) (cast u128 bits)) 1))]
+    (if (= mode 5)
+        (if right? mask (cast u64 (<< (: 1 u128) (cast u128 (- bits 1)))))
+        (if (and (= mode 6) right?)
+            (: 0 u64)
+            (pattern base lane (if right? 99 10) right?)))))
+
+(defn literal-byte [(base i32) (index i64) (right? bool) (mode i32)] (-> u8)
+  (let [width (cast i64 (types/scalar-size base 8))]
+    (cast u8
+          (>> (literal-word base (/ index width) right? mode)
+              (cast u64 (* (% index width) 8))))))
+
+(defn nan? [(base i32) (bits u64)] (-> bool)
+  (let [exponent (if (= base 12) (: 0x7FF0000000000000 u64) 0x7F800000)
+        fraction (if (= base 12) (: 0x000FFFFFFFFFFFFF u64) 0x007FFFFF)]
+    (and (= (& bits exponent) exponent) (!= (& bits fraction) 0))))
+
+(defn expected [(opcode i32) (base i32) (a u64) (b u64)] (-> u64)
+  (let [bits (* 8 (types/scalar-size base 8))
+        range (<< (: 1 u128) (cast u128 bits))
+        mask (- range 1)
+        x (& (cast u128 a) mask)
+        y (& (cast u128 b) mask)
+        minimum? (= opcode 58)
+        left?
+          (if (types/floating? base)
+              (if (or (nan? base a) (nan? base b))
+                  false
+                  (if (= base 12)
+                      (let [(mut l) (: 0.0 f64)
+                            (mut r) (: 0.0 f64)]
+                        (p/store! (p/cast (ptr u64) (mut l)) a)
+                        (p/store! (p/cast (ptr u64) (mut r)) b)
+                        (if minimum? (<= l r) (>= l r)))
+                      (let [(mut l) (: 0.0 f32)
+                            (mut r) (: 0.0 f32)]
+                        (p/store! (p/cast (ptr u32) (mut l)) (cast u32 a))
+                        (p/store! (p/cast (ptr u32) (mut r)) (cast u32 b))
+                        (if minimum? (<= l r) (>= l r)))))
+              (if (types/signed? base)
+                  (let [sign (>> range 1)
+                        l
+                          (if (>= x sign)
+                              (- (cast i128 x) (cast i128 range))
+                              (cast i128 x))
+                        r
+                          (if (>= y sign)
+                              (- (cast i128 y) (cast i128 range))
+                              (cast i128 y))]
+                    (if minimum? (<= l r) (>= l r)))
+                  (if minimum? (<= x y) (>= x y))))]
+    (cast u64 (if left? x y))))
+
+(defn exercise [(ty i32) (opcode i32) (mode i32) (address (ptr u8))] (-> i64)
+  (let [allocator (malloc-allocator)
+        base (types/base-type ty)
+        width (types/size ty 8)
+        lane-width (types/scalar-size base 8)
+        lanes (/ width lane-width)
+        f (p/cast (fnptr (cc/C) [u64 u64 u64] void) address)
+        (mut a) (ArrayList::new [u8] allocator)
+        (mut b) (ArrayList::new [u8] allocator)
+        (mut output) (ArrayList::new [u8] allocator)
+        (mut failures) 0
+        (mut seed) (: 0 i64)]
+    (while (< seed 121)
+      (clear! (mut a))
+      (clear! (mut b))
+      (clear! (mut output))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 32)
+          (push! (mut a) (input-byte base i seed false))
+          (push! (mut b) (input-byte base i seed true))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 80) (push! (mut output) 165) (set! i (+ i 1))))
+      (call-ptr f
+                (p/cast u64 (.data output))
+                (p/cast u64 (.data a))
+                (p/cast u64 (.data b)))
+      (let [(mut lane) (: 0 i32)]
+        (while (< lane lanes)
+          (let [x
+                  (if (or (= mode 1) (= mode 3) (>= mode 5))
+                      (literal-word base (cast i64 lane) false mode)
+                      (pattern base (cast i64 lane) seed false))
+                y
+                  (if (= mode 4)
+                      x
+                      (if (or (= mode 2) (= mode 3) (>= mode 5))
+                          (literal-word base (cast i64 lane) true mode)
+                          (pattern base (cast i64 lane) seed true)))
+                result (expected opcode base x y)
+                (mut got) (: 0 u64)
+                (mut byte) (: 0 i32)]
+            (while (< byte lane-width)
+              (set! got
+                    (| got
+                       (<< (cast u64
+                                 (get output
+                                      (cast i64 (+ (* lane lane-width) byte))))
+                           (cast u64 (* byte 8)))))
+              (set! byte (+ byte 1)))
+            (when (!= got result)
+              (println "vector binary ty{} op{} mode{} seed{} lane{} got{} expected{}"
+                       ty
+                       opcode
+                       mode
+                       seed
+                       lane
+                       got
+                       result)
+              (set! failures (+ failures 1))))
+          (set! lane (+ lane 1))))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 80)
+          (when (>= i (cast i64 width))
+            (let [left?
+                    (and (>= mode 0)
+                         (!= mode 4)
+                         (>= i 24)
+                         (< i (+ 24 (cast i64 width))))
+                  right?
+                    (and (>= mode 0)
+                         (!= mode 4)
+                         (>= i 48)
+                         (< i (+ 48 (cast i64 width))))
+                  wanted
+                    (if left?
+                        (if (or (= mode 1) (= mode 3) (>= mode 5))
+                            (literal-byte base (- i 24) false mode)
+                            (input-byte base (- i 24) seed false))
+                        (if right?
+                            (if (or (= mode 2) (= mode 3) (>= mode 5))
+                                (literal-byte base (- i 48) true mode)
+                                (input-byte base (- i 48) seed true))
+                            (: 165 u8)))]
+              (when (!= (get output i) wanted) (set! failures (+ failures 1)))))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 32)
+          (when (or (!= (get a i) (input-byte base i seed false))
+                    (!= (get b i) (input-byte base i seed true)))
+            (set! failures (+ failures 1)))
+          (set! i (+ i 1))))
+      (set! seed (+ seed 1)))
+    (free! (mut a))
+    (free! (mut b))
+    (free! (mut output))
+    failures))
+
+(defn probe :cc (cc/C) [(input (ptr u8))] (-> u64)
+  (p/machine-code (Aarch64)
+                  0xf1
+                  0x03
+                  0x00
+                  0xaa
+                  0x20
+                  0x02
+                  0xc0
+                  0x3d
+                  0x21
+                  0x02
+                  0xc0
+                  0x3d
+                  0x22
+                  0x02
+                  0xc0
+                  0x3d
+                  0x23
+                  0x02
+                  0xc0
+                  0x3d
+                  0x24
+                  0x02
+                  0xc0
+                  0x3d
+                  0x25
+                  0x02
+                  0xc0
+                  0x3d
+                  0x26
+                  0x02
+                  0xc0
+                  0x3d
+                  0x27
+                  0x02
+                  0xc0
+                  0x3d
+                  0x30
+                  0x02
+                  0xc0
+                  0x3d
+                  0x31
+                  0x02
+                  0xc0
+                  0x3d
+                  0x32
+                  0x02
+                  0xc0
+                  0x3d
+                  0x33
+                  0x02
+                  0xc0
+                  0x3d
+                  0x34
+                  0x02
+                  0xc0
+                  0x3d
+                  0x35
+                  0x02
+                  0xc0
+                  0x3d
+                  0x36
+                  0x02
+                  0xc0
+                  0x3d
+                  0x37
+                  0x02
+                  0xc0
+                  0x3d
+                  0x38
+                  0x02
+                  0xc0
+                  0x3d
+                  0x39
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3a
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3b
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3c
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3d
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3e
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3f
+                  0x02
+                  0xc0
+                  0x3d
+                  0xa0
+                  0x15
+                  0x80
+                  0xd2
+                  0xc1
+                  0x15
+                  0x80
+                  0xd2
+                  0xe2
+                  0x15
+                  0x80
+                  0xd2
+                  0x03
+                  0x16
+                  0x80
+                  0xd2
+                  0x24
+                  0x16
+                  0x80
+                  0xd2
+                  0x45
+                  0x16
+                  0x80
+                  0xd2
+                  0x66
+                  0x16
+                  0x80
+                  0xd2
+                  0x87
+                  0x16
+                  0x80
+                  0xd2
+                  0xa8
+                  0x16
+                  0x80
+                  0xd2
+                  0xc9
+                  0x16
+                  0x80
+                  0xd2
+                  0xea
+                  0x16
+                  0x80
+                  0xd2
+                  0x0b
+                  0x17
+                  0x80
+                  0xd2
+                  0x2c
+                  0x17
+                  0x80
+                  0xd2
+                  0x4d
+                  0x17
+                  0x80
+                  0xd2
+                  0x6e
+                  0x17
+                  0x80
+                  0xd2
+                  0x8f
+                  0x17
+                  0x80
+                  0xd2
+                  0xc0
+                  0x03
+                  0x5f
+                  0xd6))
+
+(defn read-word [(buffer (slice u8)) (offset i64) (width i32)] (-> u64)
+  (let [(mut result) (: 0 u64)
+        (mut i) (: 0 i32)]
+    (while (< i width)
+      (set! result
+            (| result
+               (<< (cast u64 (get buffer (+ offset (cast i64 i))))
+                   (cast u64 (* i 8)))))
+      (set! i (+ i 1)))
+    result))
+
+(defn pressure-exercise [(ty i32) (opcode i32) (address (ptr u8))] (-> i64)
+  (let [allocator (malloc-allocator)
+        base (types/base-type ty)
+        width (types/size ty 8)
+        element (types/scalar-size base 8)
+        lanes (/ width element)
+        f (p/cast (fnptr (cc/C) [u64 u64 u64] u64) address)
+        target
+          (p/cast u64
+                  (p/cast (ptr u8)
+                          (: (fnptr-of probe) (fnptr (cc/C) [(ptr u8)] u64))))
+        (mut input) (ArrayList::new [u8] allocator)
+        (mut output) (ArrayList::new [u8] allocator)
+        (mut failures) 0
+        (mut seed) (: 0 i64)]
+    (while (< seed 11)
+      (clear! (mut input))
+      (clear! (mut output))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 2048)
+          (push! (mut input) (input-byte base i seed false))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 2064) (push! (mut output) 165) (set! i (+ i 1))))
+      (when (!= (call-ptr f
+                          (p/cast u64 (p/index (.data output) 3))
+                          (p/cast u64 (.data input))
+                          target)
+                811)
+        (println "vector pressure guard/result ty{} op{} seed{}" ty opcode seed)
+        (set! failures (+ failures 1)))
+      (let [(mut lane) (: 0 i32)]
+        (while (< lane (* 40 lanes))
+          (let [a (pattern base (cast i64 lane) seed false)
+                b (pattern base (cast i64 lane) 0 true)
+                wanted (expected opcode base a b)
+                got
+                  (read-word (slice output)
+                             (+ 3 (* (cast i64 lane) (cast i64 element)))
+                             element)]
+            (when (if (and (types/floating? base) (nan? base wanted))
+                      (not (nan? base got))
+                      (!= wanted got))
+              (println "vector pressure ty{} op{} seed{} lane{} got{} expected{}"
+                       ty
+                       opcode
+                       seed
+                       lane
+                       got
+                       wanted)
+              (set! failures (+ failures 1))))
+          (set! lane (+ lane 1))))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 2064)
+          (let [pos (- i 3)]
+            (when (not (and (>= pos 0) (< pos (* 40 (cast i64 width)))))
+              (let [wanted
+                      (if (and (>= pos 1024)
+                               (< pos (+ 1024 (* 40 (cast i64 width)))))
+                          (input-byte base (- pos 1024) seed false)
+                          (: 165 u8))]
+                (when (!= (get output i) wanted) (set! failures (+ failures 1))))))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 2048)
+          (when (!= (get input i) (input-byte base i seed false))
+            (set! failures (+ failures 1)))
+          (set! i (+ i 1))))
+      (set! seed (+ seed 1)))
+    (free! (mut input))
+    (free! (mut output))
+    failures))
+
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.vector-arithmetic" :as va)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn address! [(graph (mut g/Graph)) (base i32) (offset i32)] (-> i32)
+  (require (b/emit! (mut graph)
+                    26
+                    6
+                    [base
+                     (require (b/scalar-constant! (mut graph)
+                                                  5
+                                                  (cast u64 offset)
+                                                  8))])))
+
+(defn fixture-id [(ty i32) (opcode i32) (mode i32)] (-> i32)
+  (cond (and (= ty 66) (= opcode 58) (= mode 0)) 0
+        (and (= ty 66) (= opcode 58) (= mode 1)) 1
+        (and (= ty 66) (= opcode 58) (= mode 2)) 2
+        (and (= ty 66) (= opcode 58) (= mode 3)) 3
+        (and (= ty 66) (= opcode 58) (= mode 4)) 4
+        (and (= ty 66) (= opcode 59) (= mode 0)) 5
+        (and (= ty 66) (= opcode 59) (= mode 1)) 6
+        (and (= ty 66) (= opcode 59) (= mode 2)) 7
+        (and (= ty 66) (= opcode 59) (= mode 3)) 8
+        (and (= ty 66) (= opcode 59) (= mode 4)) 9
+        (and (= ty 82) (= opcode 58) (= mode 0)) 10
+        (and (= ty 82) (= opcode 58) (= mode 1)) 11
+        (and (= ty 82) (= opcode 58) (= mode 2)) 12
+        (and (= ty 82) (= opcode 58) (= mode 3)) 13
+        (and (= ty 82) (= opcode 58) (= mode 4)) 14
+        (and (= ty 82) (= opcode 59) (= mode 0)) 15
+        (and (= ty 82) (= opcode 59) (= mode 1)) 16
+        (and (= ty 82) (= opcode 59) (= mode 2)) 17
+        (and (= ty 82) (= opcode 59) (= mode 3)) 18
+        (and (= ty 82) (= opcode 59) (= mode 4)) 19
+        (and (= ty 51) (= opcode 58) (= mode 0)) 20
+        (and (= ty 51) (= opcode 58) (= mode 1)) 21
+        (and (= ty 51) (= opcode 58) (= mode 2)) 22
+        (and (= ty 51) (= opcode 58) (= mode 3)) 23
+        (and (= ty 51) (= opcode 58) (= mode 4)) 24
+        (and (= ty 51) (= opcode 59) (= mode 0)) 25
+        (and (= ty 51) (= opcode 59) (= mode 1)) 26
+        (and (= ty 51) (= opcode 59) (= mode 2)) 27
+        (and (= ty 51) (= opcode 59) (= mode 3)) 28
+        (and (= ty 51) (= opcode 59) (= mode 4)) 29
+        (and (= ty 67) (= opcode 58) (= mode 0)) 30
+        (and (= ty 67) (= opcode 58) (= mode 1)) 31
+        (and (= ty 67) (= opcode 58) (= mode 2)) 32
+        (and (= ty 67) (= opcode 58) (= mode 3)) 33
+        (and (= ty 67) (= opcode 58) (= mode 4)) 34
+        (and (= ty 67) (= opcode 59) (= mode 0)) 35
+        (and (= ty 67) (= opcode 59) (= mode 1)) 36
+        (and (= ty 67) (= opcode 59) (= mode 2)) 37
+        (and (= ty 67) (= opcode 59) (= mode 3)) 38
+        (and (= ty 67) (= opcode 59) (= mode 4)) 39
+        (and (= ty 36) (= opcode 58) (= mode 0)) 40
+        (and (= ty 36) (= opcode 58) (= mode 1)) 41
+        (and (= ty 36) (= opcode 58) (= mode 2)) 42
+        (and (= ty 36) (= opcode 58) (= mode 3)) 43
+        (and (= ty 36) (= opcode 58) (= mode 4)) 44
+        (and (= ty 36) (= opcode 59) (= mode 0)) 45
+        (and (= ty 36) (= opcode 59) (= mode 1)) 46
+        (and (= ty 36) (= opcode 59) (= mode 2)) 47
+        (and (= ty 36) (= opcode 59) (= mode 3)) 48
+        (and (= ty 36) (= opcode 59) (= mode 4)) 49
+        (and (= ty 52) (= opcode 58) (= mode 0)) 50
+        (and (= ty 52) (= opcode 58) (= mode 1)) 51
+        (and (= ty 52) (= opcode 58) (= mode 2)) 52
+        (and (= ty 52) (= opcode 58) (= mode 3)) 53
+        (and (= ty 52) (= opcode 58) (= mode 4)) 54
+        (and (= ty 52) (= opcode 59) (= mode 0)) 55
+        (and (= ty 52) (= opcode 59) (= mode 1)) 56
+        (and (= ty 52) (= opcode 59) (= mode 2)) 57
+        (and (= ty 52) (= opcode 59) (= mode 3)) 58
+        (and (= ty 52) (= opcode 59) (= mode 4)) 59
+        (and (= ty 21) (= opcode 58) (= mode 0)) 60
+        (and (= ty 21) (= opcode 58) (= mode 1)) 61
+        (and (= ty 21) (= opcode 58) (= mode 2)) 62
+        (and (= ty 21) (= opcode 58) (= mode 3)) 63
+        (and (= ty 21) (= opcode 58) (= mode 4)) 64
+        (and (= ty 21) (= opcode 59) (= mode 0)) 65
+        (and (= ty 21) (= opcode 59) (= mode 1)) 66
+        (and (= ty 21) (= opcode 59) (= mode 2)) 67
+        (and (= ty 21) (= opcode 59) (= mode 3)) 68
+        (and (= ty 21) (= opcode 59) (= mode 4)) 69
+        (and (= ty 37) (= opcode 58) (= mode 0)) 70
+        (and (= ty 37) (= opcode 58) (= mode 1)) 71
+        (and (= ty 37) (= opcode 58) (= mode 2)) 72
+        (and (= ty 37) (= opcode 58) (= mode 3)) 73
+        (and (= ty 37) (= opcode 58) (= mode 4)) 74
+        (and (= ty 37) (= opcode 59) (= mode 0)) 75
+        (and (= ty 37) (= opcode 59) (= mode 1)) 76
+        (and (= ty 37) (= opcode 59) (= mode 2)) 77
+        (and (= ty 37) (= opcode 59) (= mode 3)) 78
+        (and (= ty 37) (= opcode 59) (= mode 4)) 79
+        (and (= ty 22) (= opcode 58) (= mode 0)) 80
+        (and (= ty 22) (= opcode 58) (= mode 1)) 81
+        (and (= ty 22) (= opcode 58) (= mode 2)) 82
+        (and (= ty 22) (= opcode 58) (= mode 3)) 83
+        (and (= ty 22) (= opcode 58) (= mode 4)) 84
+        (and (= ty 22) (= opcode 59) (= mode 0)) 85
+        (and (= ty 22) (= opcode 59) (= mode 1)) 86
+        (and (= ty 22) (= opcode 59) (= mode 2)) 87
+        (and (= ty 22) (= opcode 59) (= mode 3)) 88
+        (and (= ty 22) (= opcode 59) (= mode 4)) 89
+        (and (= ty 38) (= opcode 58) (= mode 0)) 90
+        (and (= ty 38) (= opcode 58) (= mode 1)) 91
+        (and (= ty 38) (= opcode 58) (= mode 2)) 92
+        (and (= ty 38) (= opcode 58) (= mode 3)) 93
+        (and (= ty 38) (= opcode 58) (= mode 4)) 94
+        (and (= ty 38) (= opcode 59) (= mode 0)) 95
+        (and (= ty 38) (= opcode 59) (= mode 1)) 96
+        (and (= ty 38) (= opcode 59) (= mode 2)) 97
+        (and (= ty 38) (= opcode 59) (= mode 3)) 98
+        (and (= ty 38) (= opcode 59) (= mode 4)) 99
+        (and (= ty 71) (= opcode 58) (= mode 0)) 100
+        (and (= ty 71) (= opcode 58) (= mode 1)) 101
+        (and (= ty 71) (= opcode 58) (= mode 2)) 102
+        (and (= ty 71) (= opcode 58) (= mode 3)) 103
+        (and (= ty 71) (= opcode 58) (= mode 4)) 104
+        (and (= ty 71) (= opcode 59) (= mode 0)) 105
+        (and (= ty 71) (= opcode 59) (= mode 1)) 106
+        (and (= ty 71) (= opcode 59) (= mode 2)) 107
+        (and (= ty 71) (= opcode 59) (= mode 3)) 108
+        (and (= ty 71) (= opcode 59) (= mode 4)) 109
+        (and (= ty 87) (= opcode 58) (= mode 0)) 110
+        (and (= ty 87) (= opcode 58) (= mode 1)) 111
+        (and (= ty 87) (= opcode 58) (= mode 2)) 112
+        (and (= ty 87) (= opcode 58) (= mode 3)) 113
+        (and (= ty 87) (= opcode 58) (= mode 4)) 114
+        (and (= ty 87) (= opcode 59) (= mode 0)) 115
+        (and (= ty 87) (= opcode 59) (= mode 1)) 116
+        (and (= ty 87) (= opcode 59) (= mode 2)) 117
+        (and (= ty 87) (= opcode 59) (= mode 3)) 118
+        (and (= ty 87) (= opcode 59) (= mode 4)) 119
+        (and (= ty 72) (= opcode 58) (= mode 0)) 120
+        (and (= ty 72) (= opcode 58) (= mode 1)) 121
+        (and (= ty 72) (= opcode 58) (= mode 2)) 122
+        (and (= ty 72) (= opcode 58) (= mode 3)) 123
+        (and (= ty 72) (= opcode 58) (= mode 4)) 124
+        (and (= ty 72) (= opcode 59) (= mode 0)) 125
+        (and (= ty 72) (= opcode 59) (= mode 1)) 126
+        (and (= ty 72) (= opcode 59) (= mode 2)) 127
+        (and (= ty 72) (= opcode 59) (= mode 3)) 128
+        (and (= ty 72) (= opcode 59) (= mode 4)) 129
+        (and (= ty 88) (= opcode 58) (= mode 0)) 130
+        (and (= ty 88) (= opcode 58) (= mode 1)) 131
+        (and (= ty 88) (= opcode 58) (= mode 2)) 132
+        (and (= ty 88) (= opcode 58) (= mode 3)) 133
+        (and (= ty 88) (= opcode 58) (= mode 4)) 134
+        (and (= ty 88) (= opcode 59) (= mode 0)) 135
+        (and (= ty 88) (= opcode 59) (= mode 1)) 136
+        (and (= ty 88) (= opcode 59) (= mode 2)) 137
+        (and (= ty 88) (= opcode 59) (= mode 3)) 138
+        (and (= ty 88) (= opcode 59) (= mode 4)) 139
+        (and (= ty 57) (= opcode 58) (= mode 0)) 140
+        (and (= ty 57) (= opcode 58) (= mode 1)) 141
+        (and (= ty 57) (= opcode 58) (= mode 2)) 142
+        (and (= ty 57) (= opcode 58) (= mode 3)) 143
+        (and (= ty 57) (= opcode 58) (= mode 4)) 144
+        (and (= ty 57) (= opcode 59) (= mode 0)) 145
+        (and (= ty 57) (= opcode 59) (= mode 1)) 146
+        (and (= ty 57) (= opcode 59) (= mode 2)) 147
+        (and (= ty 57) (= opcode 59) (= mode 3)) 148
+        (and (= ty 57) (= opcode 59) (= mode 4)) 149
+        (and (= ty 73) (= opcode 58) (= mode 0)) 150
+        (and (= ty 73) (= opcode 58) (= mode 1)) 151
+        (and (= ty 73) (= opcode 58) (= mode 2)) 152
+        (and (= ty 73) (= opcode 58) (= mode 3)) 153
+        (and (= ty 73) (= opcode 58) (= mode 4)) 154
+        (and (= ty 73) (= opcode 59) (= mode 0)) 155
+        (and (= ty 73) (= opcode 59) (= mode 1)) 156
+        (and (= ty 73) (= opcode 59) (= mode 2)) 157
+        (and (= ty 73) (= opcode 59) (= mode 3)) 158
+        (and (= ty 73) (= opcode 59) (= mode 4)) 159
+        (and (= ty 42) (= opcode 58) (= mode 0)) 160
+        (and (= ty 42) (= opcode 58) (= mode 1)) 161
+        (and (= ty 42) (= opcode 58) (= mode 2)) 162
+        (and (= ty 42) (= opcode 58) (= mode 3)) 163
+        (and (= ty 42) (= opcode 58) (= mode 4)) 164
+        (and (= ty 42) (= opcode 59) (= mode 0)) 165
+        (and (= ty 42) (= opcode 59) (= mode 1)) 166
+        (and (= ty 42) (= opcode 59) (= mode 2)) 167
+        (and (= ty 42) (= opcode 59) (= mode 3)) 168
+        (and (= ty 42) (= opcode 59) (= mode 4)) 169
+        (and (= ty 58) (= opcode 58) (= mode 0)) 170
+        (and (= ty 58) (= opcode 58) (= mode 1)) 171
+        (and (= ty 58) (= opcode 58) (= mode 2)) 172
+        (and (= ty 58) (= opcode 58) (= mode 3)) 173
+        (and (= ty 58) (= opcode 58) (= mode 4)) 174
+        (and (= ty 58) (= opcode 59) (= mode 0)) 175
+        (and (= ty 58) (= opcode 59) (= mode 1)) 176
+        (and (= ty 58) (= opcode 59) (= mode 2)) 177
+        (and (= ty 58) (= opcode 59) (= mode 3)) 178
+        (and (= ty 58) (= opcode 59) (= mode 4)) 179
+        (and (= ty 27) (= opcode 58) (= mode 0)) 180
+        (and (= ty 27) (= opcode 58) (= mode 1)) 181
+        (and (= ty 27) (= opcode 58) (= mode 2)) 182
+        (and (= ty 27) (= opcode 58) (= mode 3)) 183
+        (and (= ty 27) (= opcode 58) (= mode 4)) 184
+        (and (= ty 27) (= opcode 59) (= mode 0)) 185
+        (and (= ty 27) (= opcode 59) (= mode 1)) 186
+        (and (= ty 27) (= opcode 59) (= mode 2)) 187
+        (and (= ty 27) (= opcode 59) (= mode 3)) 188
+        (and (= ty 27) (= opcode 59) (= mode 4)) 189
+        (and (= ty 43) (= opcode 58) (= mode 0)) 190
+        (and (= ty 43) (= opcode 58) (= mode 1)) 191
+        (and (= ty 43) (= opcode 58) (= mode 2)) 192
+        (and (= ty 43) (= opcode 58) (= mode 3)) 193
+        (and (= ty 43) (= opcode 58) (= mode 4)) 194
+        (and (= ty 43) (= opcode 59) (= mode 0)) 195
+        (and (= ty 43) (= opcode 59) (= mode 1)) 196
+        (and (= ty 43) (= opcode 59) (= mode 2)) 197
+        (and (= ty 43) (= opcode 59) (= mode 3)) 198
+        (and (= ty 43) (= opcode 59) (= mode 4)) 199
+        (and (= ty 28) (= opcode 58) (= mode 0)) 200
+        (and (= ty 28) (= opcode 58) (= mode 1)) 201
+        (and (= ty 28) (= opcode 58) (= mode 2)) 202
+        (and (= ty 28) (= opcode 58) (= mode 3)) 203
+        (and (= ty 28) (= opcode 58) (= mode 4)) 204
+        (and (= ty 28) (= opcode 59) (= mode 0)) 205
+        (and (= ty 28) (= opcode 59) (= mode 1)) 206
+        (and (= ty 28) (= opcode 59) (= mode 2)) 207
+        (and (= ty 28) (= opcode 59) (= mode 3)) 208
+        (and (= ty 28) (= opcode 59) (= mode 4)) 209
+        (and (= ty 44) (= opcode 58) (= mode 0)) 210
+        (and (= ty 44) (= opcode 58) (= mode 1)) 211
+        (and (= ty 44) (= opcode 58) (= mode 2)) 212
+        (and (= ty 44) (= opcode 58) (= mode 3)) 213
+        (and (= ty 44) (= opcode 58) (= mode 4)) 214
+        (and (= ty 44) (= opcode 59) (= mode 0)) 215
+        (and (= ty 44) (= opcode 59) (= mode 1)) 216
+        (and (= ty 44) (= opcode 59) (= mode 2)) 217
+        (and (= ty 44) (= opcode 59) (= mode 3)) 218
+        (and (= ty 44) (= opcode 59) (= mode 4)) 219
+        (and (= ty 45) (= opcode 58) (= mode 0)) 220
+        (and (= ty 45) (= opcode 58) (= mode 1)) 221
+        (and (= ty 45) (= opcode 58) (= mode 2)) 222
+        (and (= ty 45) (= opcode 58) (= mode 3)) 223
+        (and (= ty 45) (= opcode 58) (= mode 4)) 224
+        (and (= ty 45) (= opcode 59) (= mode 0)) 225
+        (and (= ty 45) (= opcode 59) (= mode 1)) 226
+        (and (= ty 45) (= opcode 59) (= mode 2)) 227
+        (and (= ty 45) (= opcode 59) (= mode 3)) 228
+        (and (= ty 45) (= opcode 59) (= mode 4)) 229
+        (and (= ty 61) (= opcode 58) (= mode 0)) 230
+        (and (= ty 61) (= opcode 58) (= mode 1)) 231
+        (and (= ty 61) (= opcode 58) (= mode 2)) 232
+        (and (= ty 61) (= opcode 58) (= mode 3)) 233
+        (and (= ty 61) (= opcode 58) (= mode 4)) 234
+        (and (= ty 61) (= opcode 59) (= mode 0)) 235
+        (and (= ty 61) (= opcode 59) (= mode 1)) 236
+        (and (= ty 61) (= opcode 59) (= mode 2)) 237
+        (and (= ty 61) (= opcode 59) (= mode 3)) 238
+        (and (= ty 61) (= opcode 59) (= mode 4)) 239
+        :else -1))
+
+(defn fixture-name [(id i32)] (-> (slice u8))
+  (match id
+    (0 "_stogir_vector_extrema_0")
+    (1 "_stogir_vector_extrema_1")
+    (2 "_stogir_vector_extrema_2")
+    (3 "_stogir_vector_extrema_3")
+    (4 "_stogir_vector_extrema_4")
+    (5 "_stogir_vector_extrema_5")
+    (6 "_stogir_vector_extrema_6")
+    (7 "_stogir_vector_extrema_7")
+    (8 "_stogir_vector_extrema_8")
+    (9 "_stogir_vector_extrema_9")
+    (10 "_stogir_vector_extrema_10")
+    (11 "_stogir_vector_extrema_11")
+    (12 "_stogir_vector_extrema_12")
+    (13 "_stogir_vector_extrema_13")
+    (14 "_stogir_vector_extrema_14")
+    (15 "_stogir_vector_extrema_15")
+    (16 "_stogir_vector_extrema_16")
+    (17 "_stogir_vector_extrema_17")
+    (18 "_stogir_vector_extrema_18")
+    (19 "_stogir_vector_extrema_19")
+    (20 "_stogir_vector_extrema_20")
+    (21 "_stogir_vector_extrema_21")
+    (22 "_stogir_vector_extrema_22")
+    (23 "_stogir_vector_extrema_23")
+    (24 "_stogir_vector_extrema_24")
+    (25 "_stogir_vector_extrema_25")
+    (26 "_stogir_vector_extrema_26")
+    (27 "_stogir_vector_extrema_27")
+    (28 "_stogir_vector_extrema_28")
+    (29 "_stogir_vector_extrema_29")
+    (30 "_stogir_vector_extrema_30")
+    (31 "_stogir_vector_extrema_31")
+    (32 "_stogir_vector_extrema_32")
+    (33 "_stogir_vector_extrema_33")
+    (34 "_stogir_vector_extrema_34")
+    (35 "_stogir_vector_extrema_35")
+    (36 "_stogir_vector_extrema_36")
+    (37 "_stogir_vector_extrema_37")
+    (38 "_stogir_vector_extrema_38")
+    (39 "_stogir_vector_extrema_39")
+    (40 "_stogir_vector_extrema_40")
+    (41 "_stogir_vector_extrema_41")
+    (42 "_stogir_vector_extrema_42")
+    (43 "_stogir_vector_extrema_43")
+    (44 "_stogir_vector_extrema_44")
+    (45 "_stogir_vector_extrema_45")
+    (46 "_stogir_vector_extrema_46")
+    (47 "_stogir_vector_extrema_47")
+    (48 "_stogir_vector_extrema_48")
+    (49 "_stogir_vector_extrema_49")
+    (50 "_stogir_vector_extrema_50")
+    (51 "_stogir_vector_extrema_51")
+    (52 "_stogir_vector_extrema_52")
+    (53 "_stogir_vector_extrema_53")
+    (54 "_stogir_vector_extrema_54")
+    (55 "_stogir_vector_extrema_55")
+    (56 "_stogir_vector_extrema_56")
+    (57 "_stogir_vector_extrema_57")
+    (58 "_stogir_vector_extrema_58")
+    (59 "_stogir_vector_extrema_59")
+    (60 "_stogir_vector_extrema_60")
+    (61 "_stogir_vector_extrema_61")
+    (62 "_stogir_vector_extrema_62")
+    (63 "_stogir_vector_extrema_63")
+    (64 "_stogir_vector_extrema_64")
+    (65 "_stogir_vector_extrema_65")
+    (66 "_stogir_vector_extrema_66")
+    (67 "_stogir_vector_extrema_67")
+    (68 "_stogir_vector_extrema_68")
+    (69 "_stogir_vector_extrema_69")
+    (70 "_stogir_vector_extrema_70")
+    (71 "_stogir_vector_extrema_71")
+    (72 "_stogir_vector_extrema_72")
+    (73 "_stogir_vector_extrema_73")
+    (74 "_stogir_vector_extrema_74")
+    (75 "_stogir_vector_extrema_75")
+    (76 "_stogir_vector_extrema_76")
+    (77 "_stogir_vector_extrema_77")
+    (78 "_stogir_vector_extrema_78")
+    (79 "_stogir_vector_extrema_79")
+    (80 "_stogir_vector_extrema_80")
+    (81 "_stogir_vector_extrema_81")
+    (82 "_stogir_vector_extrema_82")
+    (83 "_stogir_vector_extrema_83")
+    (84 "_stogir_vector_extrema_84")
+    (85 "_stogir_vector_extrema_85")
+    (86 "_stogir_vector_extrema_86")
+    (87 "_stogir_vector_extrema_87")
+    (88 "_stogir_vector_extrema_88")
+    (89 "_stogir_vector_extrema_89")
+    (90 "_stogir_vector_extrema_90")
+    (91 "_stogir_vector_extrema_91")
+    (92 "_stogir_vector_extrema_92")
+    (93 "_stogir_vector_extrema_93")
+    (94 "_stogir_vector_extrema_94")
+    (95 "_stogir_vector_extrema_95")
+    (96 "_stogir_vector_extrema_96")
+    (97 "_stogir_vector_extrema_97")
+    (98 "_stogir_vector_extrema_98")
+    (99 "_stogir_vector_extrema_99")
+    (100 "_stogir_vector_extrema_100")
+    (101 "_stogir_vector_extrema_101")
+    (102 "_stogir_vector_extrema_102")
+    (103 "_stogir_vector_extrema_103")
+    (104 "_stogir_vector_extrema_104")
+    (105 "_stogir_vector_extrema_105")
+    (106 "_stogir_vector_extrema_106")
+    (107 "_stogir_vector_extrema_107")
+    (108 "_stogir_vector_extrema_108")
+    (109 "_stogir_vector_extrema_109")
+    (110 "_stogir_vector_extrema_110")
+    (111 "_stogir_vector_extrema_111")
+    (112 "_stogir_vector_extrema_112")
+    (113 "_stogir_vector_extrema_113")
+    (114 "_stogir_vector_extrema_114")
+    (115 "_stogir_vector_extrema_115")
+    (116 "_stogir_vector_extrema_116")
+    (117 "_stogir_vector_extrema_117")
+    (118 "_stogir_vector_extrema_118")
+    (119 "_stogir_vector_extrema_119")
+    (120 "_stogir_vector_extrema_120")
+    (121 "_stogir_vector_extrema_121")
+    (122 "_stogir_vector_extrema_122")
+    (123 "_stogir_vector_extrema_123")
+    (124 "_stogir_vector_extrema_124")
+    (125 "_stogir_vector_extrema_125")
+    (126 "_stogir_vector_extrema_126")
+    (127 "_stogir_vector_extrema_127")
+    (128 "_stogir_vector_extrema_128")
+    (129 "_stogir_vector_extrema_129")
+    (130 "_stogir_vector_extrema_130")
+    (131 "_stogir_vector_extrema_131")
+    (132 "_stogir_vector_extrema_132")
+    (133 "_stogir_vector_extrema_133")
+    (134 "_stogir_vector_extrema_134")
+    (135 "_stogir_vector_extrema_135")
+    (136 "_stogir_vector_extrema_136")
+    (137 "_stogir_vector_extrema_137")
+    (138 "_stogir_vector_extrema_138")
+    (139 "_stogir_vector_extrema_139")
+    (140 "_stogir_vector_extrema_140")
+    (141 "_stogir_vector_extrema_141")
+    (142 "_stogir_vector_extrema_142")
+    (143 "_stogir_vector_extrema_143")
+    (144 "_stogir_vector_extrema_144")
+    (145 "_stogir_vector_extrema_145")
+    (146 "_stogir_vector_extrema_146")
+    (147 "_stogir_vector_extrema_147")
+    (148 "_stogir_vector_extrema_148")
+    (149 "_stogir_vector_extrema_149")
+    (150 "_stogir_vector_extrema_150")
+    (151 "_stogir_vector_extrema_151")
+    (152 "_stogir_vector_extrema_152")
+    (153 "_stogir_vector_extrema_153")
+    (154 "_stogir_vector_extrema_154")
+    (155 "_stogir_vector_extrema_155")
+    (156 "_stogir_vector_extrema_156")
+    (157 "_stogir_vector_extrema_157")
+    (158 "_stogir_vector_extrema_158")
+    (159 "_stogir_vector_extrema_159")
+    (160 "_stogir_vector_extrema_160")
+    (161 "_stogir_vector_extrema_161")
+    (162 "_stogir_vector_extrema_162")
+    (163 "_stogir_vector_extrema_163")
+    (164 "_stogir_vector_extrema_164")
+    (165 "_stogir_vector_extrema_165")
+    (166 "_stogir_vector_extrema_166")
+    (167 "_stogir_vector_extrema_167")
+    (168 "_stogir_vector_extrema_168")
+    (169 "_stogir_vector_extrema_169")
+    (170 "_stogir_vector_extrema_170")
+    (171 "_stogir_vector_extrema_171")
+    (172 "_stogir_vector_extrema_172")
+    (173 "_stogir_vector_extrema_173")
+    (174 "_stogir_vector_extrema_174")
+    (175 "_stogir_vector_extrema_175")
+    (176 "_stogir_vector_extrema_176")
+    (177 "_stogir_vector_extrema_177")
+    (178 "_stogir_vector_extrema_178")
+    (179 "_stogir_vector_extrema_179")
+    (180 "_stogir_vector_extrema_180")
+    (181 "_stogir_vector_extrema_181")
+    (182 "_stogir_vector_extrema_182")
+    (183 "_stogir_vector_extrema_183")
+    (184 "_stogir_vector_extrema_184")
+    (185 "_stogir_vector_extrema_185")
+    (186 "_stogir_vector_extrema_186")
+    (187 "_stogir_vector_extrema_187")
+    (188 "_stogir_vector_extrema_188")
+    (189 "_stogir_vector_extrema_189")
+    (190 "_stogir_vector_extrema_190")
+    (191 "_stogir_vector_extrema_191")
+    (192 "_stogir_vector_extrema_192")
+    (193 "_stogir_vector_extrema_193")
+    (194 "_stogir_vector_extrema_194")
+    (195 "_stogir_vector_extrema_195")
+    (196 "_stogir_vector_extrema_196")
+    (197 "_stogir_vector_extrema_197")
+    (198 "_stogir_vector_extrema_198")
+    (199 "_stogir_vector_extrema_199")
+    (200 "_stogir_vector_extrema_200")
+    (201 "_stogir_vector_extrema_201")
+    (202 "_stogir_vector_extrema_202")
+    (203 "_stogir_vector_extrema_203")
+    (204 "_stogir_vector_extrema_204")
+    (205 "_stogir_vector_extrema_205")
+    (206 "_stogir_vector_extrema_206")
+    (207 "_stogir_vector_extrema_207")
+    (208 "_stogir_vector_extrema_208")
+    (209 "_stogir_vector_extrema_209")
+    (210 "_stogir_vector_extrema_210")
+    (211 "_stogir_vector_extrema_211")
+    (212 "_stogir_vector_extrema_212")
+    (213 "_stogir_vector_extrema_213")
+    (214 "_stogir_vector_extrema_214")
+    (215 "_stogir_vector_extrema_215")
+    (216 "_stogir_vector_extrema_216")
+    (217 "_stogir_vector_extrema_217")
+    (218 "_stogir_vector_extrema_218")
+    (219 "_stogir_vector_extrema_219")
+    (220 "_stogir_vector_extrema_220")
+    (221 "_stogir_vector_extrema_221")
+    (222 "_stogir_vector_extrema_222")
+    (223 "_stogir_vector_extrema_223")
+    (224 "_stogir_vector_extrema_224")
+    (225 "_stogir_vector_extrema_225")
+    (226 "_stogir_vector_extrema_226")
+    (227 "_stogir_vector_extrema_227")
+    (228 "_stogir_vector_extrema_228")
+    (229 "_stogir_vector_extrema_229")
+    (230 "_stogir_vector_extrema_230")
+    (231 "_stogir_vector_extrema_231")
+    (232 "_stogir_vector_extrema_232")
+    (233 "_stogir_vector_extrema_233")
+    (234 "_stogir_vector_extrema_234")
+    (235 "_stogir_vector_extrema_235")
+    (236 "_stogir_vector_extrema_236")
+    (237 "_stogir_vector_extrema_237")
+    (238 "_stogir_vector_extrema_238")
+    (239 "_stogir_vector_extrema_239")
+    (240 "_stogir_vector_extrema_240")
+    (241 "_stogir_vector_extrema_241")
+    (242 "_stogir_vector_extrema_242")
+    (243 "_stogir_vector_extrema_243")
+    (244 "_stogir_vector_extrema_244")
+    (245 "_stogir_vector_extrema_245")
+    (246 "_stogir_vector_extrema_246")
+    (247 "_stogir_vector_extrema_247")
+    (248 "_stogir_vector_extrema_248")
+    (249 "_stogir_vector_extrema_249")
+    (250 "_stogir_vector_extrema_250")
+    (251 "_stogir_vector_extrema_251")
+    (252 "_stogir_vector_extrema_252")
+    (253 "_stogir_vector_extrema_253")
+    (254 "_stogir_vector_extrema_254")
+    (255 "_stogir_vector_extrema_255")
+    (256 "_stogir_vector_extrema_256")
+    (257 "_stogir_vector_extrema_257")
+    (258 "_stogir_vector_extrema_258")
+    (259 "_stogir_vector_extrema_259")
+    (260 "_stogir_vector_extrema_260")
+    (261 "_stogir_vector_extrema_261")
+    (262 "_stogir_vector_extrema_262")
+    (263 "_stogir_vector_extrema_263")
+    (264 "_stogir_vector_extrema_264")
+    (265 "_stogir_vector_extrema_265")
+    (266 "_stogir_vector_extrema_266")
+    (267 "_stogir_vector_extrema_267")
+    (268 "_stogir_vector_extrema_268")
+    (269 "_stogir_vector_extrema_269")
+    (270 "_stogir_vector_extrema_270")
+    (271 "_stogir_vector_extrema_271")
+    (_ "invalid")))
+
+(defn fixture-path [(id i32)] (-> (slice u8))
+  (match id
+    (0 "/tmp/coil-stogir-vector-extrema-0.o")
+    (1 "/tmp/coil-stogir-vector-extrema-1.o")
+    (2 "/tmp/coil-stogir-vector-extrema-2.o")
+    (3 "/tmp/coil-stogir-vector-extrema-3.o")
+    (4 "/tmp/coil-stogir-vector-extrema-4.o")
+    (5 "/tmp/coil-stogir-vector-extrema-5.o")
+    (6 "/tmp/coil-stogir-vector-extrema-6.o")
+    (7 "/tmp/coil-stogir-vector-extrema-7.o")
+    (8 "/tmp/coil-stogir-vector-extrema-8.o")
+    (9 "/tmp/coil-stogir-vector-extrema-9.o")
+    (10 "/tmp/coil-stogir-vector-extrema-10.o")
+    (11 "/tmp/coil-stogir-vector-extrema-11.o")
+    (12 "/tmp/coil-stogir-vector-extrema-12.o")
+    (13 "/tmp/coil-stogir-vector-extrema-13.o")
+    (14 "/tmp/coil-stogir-vector-extrema-14.o")
+    (15 "/tmp/coil-stogir-vector-extrema-15.o")
+    (16 "/tmp/coil-stogir-vector-extrema-16.o")
+    (17 "/tmp/coil-stogir-vector-extrema-17.o")
+    (18 "/tmp/coil-stogir-vector-extrema-18.o")
+    (19 "/tmp/coil-stogir-vector-extrema-19.o")
+    (20 "/tmp/coil-stogir-vector-extrema-20.o")
+    (21 "/tmp/coil-stogir-vector-extrema-21.o")
+    (22 "/tmp/coil-stogir-vector-extrema-22.o")
+    (23 "/tmp/coil-stogir-vector-extrema-23.o")
+    (24 "/tmp/coil-stogir-vector-extrema-24.o")
+    (25 "/tmp/coil-stogir-vector-extrema-25.o")
+    (26 "/tmp/coil-stogir-vector-extrema-26.o")
+    (27 "/tmp/coil-stogir-vector-extrema-27.o")
+    (28 "/tmp/coil-stogir-vector-extrema-28.o")
+    (29 "/tmp/coil-stogir-vector-extrema-29.o")
+    (30 "/tmp/coil-stogir-vector-extrema-30.o")
+    (31 "/tmp/coil-stogir-vector-extrema-31.o")
+    (32 "/tmp/coil-stogir-vector-extrema-32.o")
+    (33 "/tmp/coil-stogir-vector-extrema-33.o")
+    (34 "/tmp/coil-stogir-vector-extrema-34.o")
+    (35 "/tmp/coil-stogir-vector-extrema-35.o")
+    (36 "/tmp/coil-stogir-vector-extrema-36.o")
+    (37 "/tmp/coil-stogir-vector-extrema-37.o")
+    (38 "/tmp/coil-stogir-vector-extrema-38.o")
+    (39 "/tmp/coil-stogir-vector-extrema-39.o")
+    (40 "/tmp/coil-stogir-vector-extrema-40.o")
+    (41 "/tmp/coil-stogir-vector-extrema-41.o")
+    (42 "/tmp/coil-stogir-vector-extrema-42.o")
+    (43 "/tmp/coil-stogir-vector-extrema-43.o")
+    (44 "/tmp/coil-stogir-vector-extrema-44.o")
+    (45 "/tmp/coil-stogir-vector-extrema-45.o")
+    (46 "/tmp/coil-stogir-vector-extrema-46.o")
+    (47 "/tmp/coil-stogir-vector-extrema-47.o")
+    (48 "/tmp/coil-stogir-vector-extrema-48.o")
+    (49 "/tmp/coil-stogir-vector-extrema-49.o")
+    (50 "/tmp/coil-stogir-vector-extrema-50.o")
+    (51 "/tmp/coil-stogir-vector-extrema-51.o")
+    (52 "/tmp/coil-stogir-vector-extrema-52.o")
+    (53 "/tmp/coil-stogir-vector-extrema-53.o")
+    (54 "/tmp/coil-stogir-vector-extrema-54.o")
+    (55 "/tmp/coil-stogir-vector-extrema-55.o")
+    (56 "/tmp/coil-stogir-vector-extrema-56.o")
+    (57 "/tmp/coil-stogir-vector-extrema-57.o")
+    (58 "/tmp/coil-stogir-vector-extrema-58.o")
+    (59 "/tmp/coil-stogir-vector-extrema-59.o")
+    (60 "/tmp/coil-stogir-vector-extrema-60.o")
+    (61 "/tmp/coil-stogir-vector-extrema-61.o")
+    (62 "/tmp/coil-stogir-vector-extrema-62.o")
+    (63 "/tmp/coil-stogir-vector-extrema-63.o")
+    (64 "/tmp/coil-stogir-vector-extrema-64.o")
+    (65 "/tmp/coil-stogir-vector-extrema-65.o")
+    (66 "/tmp/coil-stogir-vector-extrema-66.o")
+    (67 "/tmp/coil-stogir-vector-extrema-67.o")
+    (68 "/tmp/coil-stogir-vector-extrema-68.o")
+    (69 "/tmp/coil-stogir-vector-extrema-69.o")
+    (70 "/tmp/coil-stogir-vector-extrema-70.o")
+    (71 "/tmp/coil-stogir-vector-extrema-71.o")
+    (72 "/tmp/coil-stogir-vector-extrema-72.o")
+    (73 "/tmp/coil-stogir-vector-extrema-73.o")
+    (74 "/tmp/coil-stogir-vector-extrema-74.o")
+    (75 "/tmp/coil-stogir-vector-extrema-75.o")
+    (76 "/tmp/coil-stogir-vector-extrema-76.o")
+    (77 "/tmp/coil-stogir-vector-extrema-77.o")
+    (78 "/tmp/coil-stogir-vector-extrema-78.o")
+    (79 "/tmp/coil-stogir-vector-extrema-79.o")
+    (80 "/tmp/coil-stogir-vector-extrema-80.o")
+    (81 "/tmp/coil-stogir-vector-extrema-81.o")
+    (82 "/tmp/coil-stogir-vector-extrema-82.o")
+    (83 "/tmp/coil-stogir-vector-extrema-83.o")
+    (84 "/tmp/coil-stogir-vector-extrema-84.o")
+    (85 "/tmp/coil-stogir-vector-extrema-85.o")
+    (86 "/tmp/coil-stogir-vector-extrema-86.o")
+    (87 "/tmp/coil-stogir-vector-extrema-87.o")
+    (88 "/tmp/coil-stogir-vector-extrema-88.o")
+    (89 "/tmp/coil-stogir-vector-extrema-89.o")
+    (90 "/tmp/coil-stogir-vector-extrema-90.o")
+    (91 "/tmp/coil-stogir-vector-extrema-91.o")
+    (92 "/tmp/coil-stogir-vector-extrema-92.o")
+    (93 "/tmp/coil-stogir-vector-extrema-93.o")
+    (94 "/tmp/coil-stogir-vector-extrema-94.o")
+    (95 "/tmp/coil-stogir-vector-extrema-95.o")
+    (96 "/tmp/coil-stogir-vector-extrema-96.o")
+    (97 "/tmp/coil-stogir-vector-extrema-97.o")
+    (98 "/tmp/coil-stogir-vector-extrema-98.o")
+    (99 "/tmp/coil-stogir-vector-extrema-99.o")
+    (100 "/tmp/coil-stogir-vector-extrema-100.o")
+    (101 "/tmp/coil-stogir-vector-extrema-101.o")
+    (102 "/tmp/coil-stogir-vector-extrema-102.o")
+    (103 "/tmp/coil-stogir-vector-extrema-103.o")
+    (104 "/tmp/coil-stogir-vector-extrema-104.o")
+    (105 "/tmp/coil-stogir-vector-extrema-105.o")
+    (106 "/tmp/coil-stogir-vector-extrema-106.o")
+    (107 "/tmp/coil-stogir-vector-extrema-107.o")
+    (108 "/tmp/coil-stogir-vector-extrema-108.o")
+    (109 "/tmp/coil-stogir-vector-extrema-109.o")
+    (110 "/tmp/coil-stogir-vector-extrema-110.o")
+    (111 "/tmp/coil-stogir-vector-extrema-111.o")
+    (112 "/tmp/coil-stogir-vector-extrema-112.o")
+    (113 "/tmp/coil-stogir-vector-extrema-113.o")
+    (114 "/tmp/coil-stogir-vector-extrema-114.o")
+    (115 "/tmp/coil-stogir-vector-extrema-115.o")
+    (116 "/tmp/coil-stogir-vector-extrema-116.o")
+    (117 "/tmp/coil-stogir-vector-extrema-117.o")
+    (118 "/tmp/coil-stogir-vector-extrema-118.o")
+    (119 "/tmp/coil-stogir-vector-extrema-119.o")
+    (120 "/tmp/coil-stogir-vector-extrema-120.o")
+    (121 "/tmp/coil-stogir-vector-extrema-121.o")
+    (122 "/tmp/coil-stogir-vector-extrema-122.o")
+    (123 "/tmp/coil-stogir-vector-extrema-123.o")
+    (124 "/tmp/coil-stogir-vector-extrema-124.o")
+    (125 "/tmp/coil-stogir-vector-extrema-125.o")
+    (126 "/tmp/coil-stogir-vector-extrema-126.o")
+    (127 "/tmp/coil-stogir-vector-extrema-127.o")
+    (128 "/tmp/coil-stogir-vector-extrema-128.o")
+    (129 "/tmp/coil-stogir-vector-extrema-129.o")
+    (130 "/tmp/coil-stogir-vector-extrema-130.o")
+    (131 "/tmp/coil-stogir-vector-extrema-131.o")
+    (132 "/tmp/coil-stogir-vector-extrema-132.o")
+    (133 "/tmp/coil-stogir-vector-extrema-133.o")
+    (134 "/tmp/coil-stogir-vector-extrema-134.o")
+    (135 "/tmp/coil-stogir-vector-extrema-135.o")
+    (136 "/tmp/coil-stogir-vector-extrema-136.o")
+    (137 "/tmp/coil-stogir-vector-extrema-137.o")
+    (138 "/tmp/coil-stogir-vector-extrema-138.o")
+    (139 "/tmp/coil-stogir-vector-extrema-139.o")
+    (140 "/tmp/coil-stogir-vector-extrema-140.o")
+    (141 "/tmp/coil-stogir-vector-extrema-141.o")
+    (142 "/tmp/coil-stogir-vector-extrema-142.o")
+    (143 "/tmp/coil-stogir-vector-extrema-143.o")
+    (144 "/tmp/coil-stogir-vector-extrema-144.o")
+    (145 "/tmp/coil-stogir-vector-extrema-145.o")
+    (146 "/tmp/coil-stogir-vector-extrema-146.o")
+    (147 "/tmp/coil-stogir-vector-extrema-147.o")
+    (148 "/tmp/coil-stogir-vector-extrema-148.o")
+    (149 "/tmp/coil-stogir-vector-extrema-149.o")
+    (150 "/tmp/coil-stogir-vector-extrema-150.o")
+    (151 "/tmp/coil-stogir-vector-extrema-151.o")
+    (152 "/tmp/coil-stogir-vector-extrema-152.o")
+    (153 "/tmp/coil-stogir-vector-extrema-153.o")
+    (154 "/tmp/coil-stogir-vector-extrema-154.o")
+    (155 "/tmp/coil-stogir-vector-extrema-155.o")
+    (156 "/tmp/coil-stogir-vector-extrema-156.o")
+    (157 "/tmp/coil-stogir-vector-extrema-157.o")
+    (158 "/tmp/coil-stogir-vector-extrema-158.o")
+    (159 "/tmp/coil-stogir-vector-extrema-159.o")
+    (160 "/tmp/coil-stogir-vector-extrema-160.o")
+    (161 "/tmp/coil-stogir-vector-extrema-161.o")
+    (162 "/tmp/coil-stogir-vector-extrema-162.o")
+    (163 "/tmp/coil-stogir-vector-extrema-163.o")
+    (164 "/tmp/coil-stogir-vector-extrema-164.o")
+    (165 "/tmp/coil-stogir-vector-extrema-165.o")
+    (166 "/tmp/coil-stogir-vector-extrema-166.o")
+    (167 "/tmp/coil-stogir-vector-extrema-167.o")
+    (168 "/tmp/coil-stogir-vector-extrema-168.o")
+    (169 "/tmp/coil-stogir-vector-extrema-169.o")
+    (170 "/tmp/coil-stogir-vector-extrema-170.o")
+    (171 "/tmp/coil-stogir-vector-extrema-171.o")
+    (172 "/tmp/coil-stogir-vector-extrema-172.o")
+    (173 "/tmp/coil-stogir-vector-extrema-173.o")
+    (174 "/tmp/coil-stogir-vector-extrema-174.o")
+    (175 "/tmp/coil-stogir-vector-extrema-175.o")
+    (176 "/tmp/coil-stogir-vector-extrema-176.o")
+    (177 "/tmp/coil-stogir-vector-extrema-177.o")
+    (178 "/tmp/coil-stogir-vector-extrema-178.o")
+    (179 "/tmp/coil-stogir-vector-extrema-179.o")
+    (180 "/tmp/coil-stogir-vector-extrema-180.o")
+    (181 "/tmp/coil-stogir-vector-extrema-181.o")
+    (182 "/tmp/coil-stogir-vector-extrema-182.o")
+    (183 "/tmp/coil-stogir-vector-extrema-183.o")
+    (184 "/tmp/coil-stogir-vector-extrema-184.o")
+    (185 "/tmp/coil-stogir-vector-extrema-185.o")
+    (186 "/tmp/coil-stogir-vector-extrema-186.o")
+    (187 "/tmp/coil-stogir-vector-extrema-187.o")
+    (188 "/tmp/coil-stogir-vector-extrema-188.o")
+    (189 "/tmp/coil-stogir-vector-extrema-189.o")
+    (190 "/tmp/coil-stogir-vector-extrema-190.o")
+    (191 "/tmp/coil-stogir-vector-extrema-191.o")
+    (192 "/tmp/coil-stogir-vector-extrema-192.o")
+    (193 "/tmp/coil-stogir-vector-extrema-193.o")
+    (194 "/tmp/coil-stogir-vector-extrema-194.o")
+    (195 "/tmp/coil-stogir-vector-extrema-195.o")
+    (196 "/tmp/coil-stogir-vector-extrema-196.o")
+    (197 "/tmp/coil-stogir-vector-extrema-197.o")
+    (198 "/tmp/coil-stogir-vector-extrema-198.o")
+    (199 "/tmp/coil-stogir-vector-extrema-199.o")
+    (200 "/tmp/coil-stogir-vector-extrema-200.o")
+    (201 "/tmp/coil-stogir-vector-extrema-201.o")
+    (202 "/tmp/coil-stogir-vector-extrema-202.o")
+    (203 "/tmp/coil-stogir-vector-extrema-203.o")
+    (204 "/tmp/coil-stogir-vector-extrema-204.o")
+    (205 "/tmp/coil-stogir-vector-extrema-205.o")
+    (206 "/tmp/coil-stogir-vector-extrema-206.o")
+    (207 "/tmp/coil-stogir-vector-extrema-207.o")
+    (208 "/tmp/coil-stogir-vector-extrema-208.o")
+    (209 "/tmp/coil-stogir-vector-extrema-209.o")
+    (210 "/tmp/coil-stogir-vector-extrema-210.o")
+    (211 "/tmp/coil-stogir-vector-extrema-211.o")
+    (212 "/tmp/coil-stogir-vector-extrema-212.o")
+    (213 "/tmp/coil-stogir-vector-extrema-213.o")
+    (214 "/tmp/coil-stogir-vector-extrema-214.o")
+    (215 "/tmp/coil-stogir-vector-extrema-215.o")
+    (216 "/tmp/coil-stogir-vector-extrema-216.o")
+    (217 "/tmp/coil-stogir-vector-extrema-217.o")
+    (218 "/tmp/coil-stogir-vector-extrema-218.o")
+    (219 "/tmp/coil-stogir-vector-extrema-219.o")
+    (220 "/tmp/coil-stogir-vector-extrema-220.o")
+    (221 "/tmp/coil-stogir-vector-extrema-221.o")
+    (222 "/tmp/coil-stogir-vector-extrema-222.o")
+    (223 "/tmp/coil-stogir-vector-extrema-223.o")
+    (224 "/tmp/coil-stogir-vector-extrema-224.o")
+    (225 "/tmp/coil-stogir-vector-extrema-225.o")
+    (226 "/tmp/coil-stogir-vector-extrema-226.o")
+    (227 "/tmp/coil-stogir-vector-extrema-227.o")
+    (228 "/tmp/coil-stogir-vector-extrema-228.o")
+    (229 "/tmp/coil-stogir-vector-extrema-229.o")
+    (230 "/tmp/coil-stogir-vector-extrema-230.o")
+    (231 "/tmp/coil-stogir-vector-extrema-231.o")
+    (232 "/tmp/coil-stogir-vector-extrema-232.o")
+    (233 "/tmp/coil-stogir-vector-extrema-233.o")
+    (234 "/tmp/coil-stogir-vector-extrema-234.o")
+    (235 "/tmp/coil-stogir-vector-extrema-235.o")
+    (236 "/tmp/coil-stogir-vector-extrema-236.o")
+    (237 "/tmp/coil-stogir-vector-extrema-237.o")
+    (238 "/tmp/coil-stogir-vector-extrema-238.o")
+    (239 "/tmp/coil-stogir-vector-extrema-239.o")
+    (240 "/tmp/coil-stogir-vector-extrema-240.o")
+    (241 "/tmp/coil-stogir-vector-extrema-241.o")
+    (242 "/tmp/coil-stogir-vector-extrema-242.o")
+    (243 "/tmp/coil-stogir-vector-extrema-243.o")
+    (244 "/tmp/coil-stogir-vector-extrema-244.o")
+    (245 "/tmp/coil-stogir-vector-extrema-245.o")
+    (246 "/tmp/coil-stogir-vector-extrema-246.o")
+    (247 "/tmp/coil-stogir-vector-extrema-247.o")
+    (248 "/tmp/coil-stogir-vector-extrema-248.o")
+    (249 "/tmp/coil-stogir-vector-extrema-249.o")
+    (250 "/tmp/coil-stogir-vector-extrema-250.o")
+    (251 "/tmp/coil-stogir-vector-extrema-251.o")
+    (252 "/tmp/coil-stogir-vector-extrema-252.o")
+    (253 "/tmp/coil-stogir-vector-extrema-253.o")
+    (254 "/tmp/coil-stogir-vector-extrema-254.o")
+    (255 "/tmp/coil-stogir-vector-extrema-255.o")
+    (256 "/tmp/coil-stogir-vector-extrema-256.o")
+    (257 "/tmp/coil-stogir-vector-extrema-257.o")
+    (258 "/tmp/coil-stogir-vector-extrema-258.o")
+    (259 "/tmp/coil-stogir-vector-extrema-259.o")
+    (260 "/tmp/coil-stogir-vector-extrema-260.o")
+    (261 "/tmp/coil-stogir-vector-extrema-261.o")
+    (262 "/tmp/coil-stogir-vector-extrema-262.o")
+    (263 "/tmp/coil-stogir-vector-extrema-263.o")
+    (264 "/tmp/coil-stogir-vector-extrema-264.o")
+    (265 "/tmp/coil-stogir-vector-extrema-265.o")
+    (266 "/tmp/coil-stogir-vector-extrema-266.o")
+    (267 "/tmp/coil-stogir-vector-extrema-267.o")
+    (268 "/tmp/coil-stogir-vector-extrema-268.o")
+    (269 "/tmp/coil-stogir-vector-extrema-269.o")
+    (270 "/tmp/coil-stogir-vector-extrema-270.o")
+    (271 "/tmp/coil-stogir-vector-extrema-271.o")
+    (_ "invalid")))
+
+(defn generate [(ty i32) (opcode i32) (mode i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        output (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        a (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        b (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        p (require (b/vector-load! (mut graph) ty 8 start a true))
+        q (require (b/vector-load! (mut graph) ty 8 p b true))
+        (mut left-bytes) (ArrayList::new [u8] allocator)
+        (mut right-bytes) (ArrayList::new [u8] allocator)
+        (mut i) (: 0 i32)
+        (mut failures) 0
+        width (types/size ty 8)
+        base (types/base-type ty)]
+    (while (< i width)
+      (push! (mut left-bytes) (literal-byte base (cast i64 i) false mode))
+      (push! (mut right-bytes) (literal-byte base (cast i64 i) true mode))
+      (set! i (+ i 1)))
+    (let [left
+            (if (or (= mode 1) (= mode 3) (>= mode 5))
+                (require (b/vector-constant! (mut graph)
+                                             ty
+                                             8
+                                             (slice left-bytes)))
+                p)
+          right
+            (if (= mode 4)
+                left
+                (if (or (= mode 2) (= mode 3) (>= mode 5))
+                    (require (b/vector-constant! (mut graph)
+                                                 ty
+                                                 8
+                                                 (slice right-bytes)))
+                    q))
+          result
+            (require (b/vector-binary! (mut graph)
+                                       opcode
+                                       ty
+                                       left
+                                       right
+                                       (if (or (= opcode 29) (= opcode 30))
+                                           start
+                                           (: 0 i32))))
+          (mut control)
+            (require (b/vector-store! (mut graph) 8 q output result true))]
+      (when (!= mode 4)
+        (set! control
+              (require (b/vector-store! (mut graph)
+                                        8
+                                        control
+                                        (address! (mut graph) output 24)
+                                        left
+                                        true)))
+        (set! control
+              (require (b/vector-store! (mut graph)
+                                        8
+                                        control
+                                        (address! (mut graph) output 48)
+                                        right
+                                        true))))
+      (let [ret (require (b/emit! (mut graph) 120 0 [control (: 0 i32) 0]))
+            id (fixture-id ty opcode mode)]
+        (when (>= id 0)
+          (match (compile/object graph start [ret] (fixture-name id) allocator)
+            (Err [message]
+                 (println "{}" message)
+                 (set! failures (+ failures 1)))
+            (Ok [object]
+                (let [(mut object) object]
+                  (match (fs/write-file allocator
+                                        (fixture-path id)
+                                        (slice object))
+                    (Err [_] (set! failures (+ failures 1)))
+                    (Ok [_] 0))
+                  (free! (mut object))))))
+        (match (compile/image graph
+                              start
+                              [ret]
+                              "_vector_arithmetic_jit"
+                              allocator)
+          (Err [message]
+               (println "ty{} op{} mode{}: {}" ty opcode mode message)
+               (set! failures (+ failures 1)))
+          (Ok [source]
+              (let [(mut source) source]
+                (match (jit/map-image source allocator)
+                  (Err [message]
+                       (println "{}" message)
+                       (set! failures (+ failures 1)))
+                  (Ok [loaded]
+                      (let [(mut loaded) loaded]
+                        (set! failures
+                              (+ failures
+                                 (exercise ty
+                                           opcode
+                                           mode
+                                           (.base (.memory loaded)))))
+                        (jit/release-image! (mut loaded)))))
+                (image/release! (mut source)))))))
+    (free! (mut left-bytes))
+    (free! (mut right-bytes))
+    (g/release! (mut graph))
+    failures))
+
+(import "stogir.calls" :as calls)
+
+(defn pressure [(ty i32) (opcode i32) (alignment i32) (id i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        output (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        input (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        guard (require (b/variable! (mut graph) 5 start "guard" alignment))
+        sentinel (require (b/scalar-constant! (mut graph) 5 321 8))
+        moving (require (b/scalar-constant! (mut graph) 5 317 8))
+        size (require (b/scalar-constant! (mut graph) 5 73 8))
+        guarded (require (b/emit! (mut graph) 87 0 [start guard sentinel]))
+        dynamic (require (b/stack-allocate! (mut graph) guarded size alignment))
+        (mut control)
+          (require (b/emit! (mut graph) 93 0 [dynamic dynamic moving]))
+        width (types/size ty 8)
+        base (types/base-type ty)
+        (mut inputs) (ArrayList::new [i32] allocator)
+        (mut results) (ArrayList::new [i32] allocator)
+        (mut payload) (ArrayList::new [u8] allocator)
+        (mut i) (: 0 i32)
+        (mut failures) 0]
+    (while (< i 40)
+      (clear! (mut payload))
+      (let [(mut j) (: 0 i32)]
+        (while (< j width)
+          (push! (mut payload)
+                 (input-byte base (cast i64 (+ (* i width) j)) 0 true))
+          (set! j (+ j 1))))
+      (let [loaded
+              (require (b/vector-load! (mut graph)
+                                       ty
+                                       8
+                                       control
+                                       (address! (mut graph) input (* i width))
+                                       true))
+            constant
+              (require (b/vector-constant! (mut graph) ty 8 (slice payload)))
+            result
+              (require (b/vector-binary! (mut graph)
+                                         opcode
+                                         ty
+                                         loaded
+                                         constant
+                                         (if (or (= opcode 29) (= opcode 30))
+                                             start
+                                             (: 0 i32))))
+            storage (require (b/variable! (mut graph) ty start "computed" 0))]
+        (push! (mut inputs) loaded)
+        (push! (mut results) result)
+        ; The volatile store keeps the arithmetic before the clobbering call.
+        (set! control
+              (require (b/emit! (mut graph) 88 0 [loaded storage result]))))
+      (set! i (+ i 1)))
+    (match (calls/create 9 5 [(: 6 u8)] allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut prototype) prototype]
+            (set! control
+                  (require (calls/emit! (mut graph)
+                                        prototype
+                                        control
+                                        target
+                                        [input]
+                                        allocator)))
+            (calls/release! (mut prototype)))))
+    (let [called control]
+      (set! i 0)
+      (while (< i 40)
+        (set! control
+              (require (b/vector-store! (mut graph)
+                                        8
+                                        control
+                                        (address! (mut graph)
+                                                  output
+                                                  (* i width))
+                                        (get results (cast i64 i))
+                                        true)))
+        (set! control
+              (require (b/vector-store! (mut graph)
+                                        8
+                                        control
+                                        (address! (mut graph)
+                                                  output
+                                                  (+ 1024 (* i width)))
+                                        (get inputs (cast i64 i))
+                                        true)))
+        (set! i (+ i 1)))
+      (let [fixed (require (b/emit! (mut graph) 86 5 [control guard]))
+            live-dynamic (require (b/emit! (mut graph) 91 5 [fixed dynamic]))
+            sum (require (b/emit! (mut graph) 26 5 [fixed live-dynamic]))
+            answer (require (b/emit! (mut graph) 26 5 [sum called]))
+            freed (require (b/stack-free! (mut graph) live-dynamic size))
+            ret (require (b/emit! (mut graph) 120 5 [freed answer (: 0 i32)]))]
+        (match (compile/object graph start [ret] (fixture-name id) allocator)
+          (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+          (Ok [object]
+              (let [(mut object) object]
+                (match (fs/write-file allocator
+                                      (fixture-path id)
+                                      (slice object))
+                  (Err [_] (set! failures (+ failures 1)))
+                  (Ok [_] 0))
+                (free! (mut object)))))
+        (match (compile/image graph
+                              start
+                              [ret]
+                              "_vector_arithmetic_pressure"
+                              allocator)
+          (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+          (Ok [source]
+              (let [(mut source) source]
+                (match (jit/map-image source allocator)
+                  (Err [message]
+                       (println "{}" message)
+                       (set! failures (+ failures 1)))
+                  (Ok [loaded]
+                      (let [(mut loaded) loaded]
+                        (set! failures
+                              (+ failures
+                                 (pressure-exercise ty
+                                                    opcode
+                                                    (.base (.memory loaded)))))
+                        (jit/release-image! (mut loaded)))))
+                (image/release! (mut source)))))))
+    (free! (mut inputs))
+    (free! (mut results))
+    (free! (mut payload))
+    (g/release! (mut graph))
+    failures))
+
+(import "stogir.a64.encode" :as encode)
+(import "stogir.a64.vector-extrema" :as native)
+(import "stogir.bytes" :as bytes)
+
+(defn word! [(out (mut (ArrayList u8)))
+             (error (mut (slice u8)))
+             (word (Result u32 (slice u8)))] (-> void)
+  (match word
+    (Err [message] (set! error message))
+    (Ok [bits] (bytes/append32! (mut out) bits))))
+
+; A leaf C-ABI harness forces physical register aliases, independently of allocator choices.
+(defn alias-check [(ty i32) (opcode i32) (rd i32) (rn i32) (rm i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut text) (ArrayList::new [u8] allocator)
+        width (types/size ty 8)
+        (mut error) ""
+        (mut failures) 0]
+    (word! (mut text)
+           (mut error)
+           (encode/floating-load-store true width rn 1 0))
+    (when (!= rn rm)
+      (word! (mut text)
+             (mut error)
+             (encode/floating-load-store true width rm 2 0)))
+    (match (native/emit-registers! (mut text) opcode ty rd rn rm)
+      (Err [message] (set! error message))
+      (Ok [_] 0))
+    (word! (mut text)
+           (mut error)
+           (encode/floating-load-store false width rd 0 0))
+    (bytes/append32! (mut text) 0xD65F03C0)
+    (if (!= error "")
+        (do (println "{}" error) (set! failures (+ failures 1)))
+        (match (jit/map-text (slice text))
+          (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+          (Ok [loaded]
+              (let [(mut loaded) loaded]
+                (set! failures
+                      (+ failures
+                         (exercise ty opcode (if (= rn rm) 4 -1) (.base loaded))))
+                (jit/release! (mut loaded))))))
+    (free! (mut text))
+    failures))
+
+(defn forced-aliases [] (-> i64)
+  (let [(mut failures) 0]
+    (set! failures (+ failures (alias-check 66 58 0 1 2)))
+    (set! failures (+ failures (alias-check 66 58 1 1 2)))
+    (set! failures (+ failures (alias-check 66 58 2 1 2)))
+    (set! failures (+ failures (alias-check 66 58 1 1 1)))
+    (set! failures (+ failures (alias-check 66 58 0 1 1)))
+    (set! failures (+ failures (alias-check 66 58 0 30 31)))
+    (set! failures (+ failures (alias-check 66 58 0 31 30)))
+    (set! failures (+ failures (alias-check 66 58 1 1 30)))
+    (set! failures (+ failures (alias-check 66 58 1 30 1)))
+    (set! failures (+ failures (alias-check 66 58 1 1 31)))
+    (set! failures (+ failures (alias-check 66 58 1 31 1)))
+    (set! failures (+ failures (alias-check 66 58 0 30 30)))
+    (set! failures (+ failures (alias-check 66 58 0 31 31)))
+    (set! failures (+ failures (alias-check 66 59 0 1 2)))
+    (set! failures (+ failures (alias-check 66 59 1 1 2)))
+    (set! failures (+ failures (alias-check 66 59 2 1 2)))
+    (set! failures (+ failures (alias-check 66 59 1 1 1)))
+    (set! failures (+ failures (alias-check 66 59 0 1 1)))
+    (set! failures (+ failures (alias-check 66 59 0 30 31)))
+    (set! failures (+ failures (alias-check 66 59 0 31 30)))
+    (set! failures (+ failures (alias-check 66 59 1 1 30)))
+    (set! failures (+ failures (alias-check 66 59 1 30 1)))
+    (set! failures (+ failures (alias-check 66 59 1 1 31)))
+    (set! failures (+ failures (alias-check 66 59 1 31 1)))
+    (set! failures (+ failures (alias-check 66 59 0 30 30)))
+    (set! failures (+ failures (alias-check 66 59 0 31 31)))
+    (set! failures (+ failures (alias-check 82 58 0 1 2)))
+    (set! failures (+ failures (alias-check 82 58 1 1 2)))
+    (set! failures (+ failures (alias-check 82 58 2 1 2)))
+    (set! failures (+ failures (alias-check 82 58 1 1 1)))
+    (set! failures (+ failures (alias-check 82 58 0 1 1)))
+    (set! failures (+ failures (alias-check 82 58 0 30 31)))
+    (set! failures (+ failures (alias-check 82 58 0 31 30)))
+    (set! failures (+ failures (alias-check 82 58 1 1 30)))
+    (set! failures (+ failures (alias-check 82 58 1 30 1)))
+    (set! failures (+ failures (alias-check 82 58 1 1 31)))
+    (set! failures (+ failures (alias-check 82 58 1 31 1)))
+    (set! failures (+ failures (alias-check 82 58 0 30 30)))
+    (set! failures (+ failures (alias-check 82 58 0 31 31)))
+    (set! failures (+ failures (alias-check 82 59 0 1 2)))
+    (set! failures (+ failures (alias-check 82 59 1 1 2)))
+    (set! failures (+ failures (alias-check 82 59 2 1 2)))
+    (set! failures (+ failures (alias-check 82 59 1 1 1)))
+    (set! failures (+ failures (alias-check 82 59 0 1 1)))
+    (set! failures (+ failures (alias-check 82 59 0 30 31)))
+    (set! failures (+ failures (alias-check 82 59 0 31 30)))
+    (set! failures (+ failures (alias-check 82 59 1 1 30)))
+    (set! failures (+ failures (alias-check 82 59 1 30 1)))
+    (set! failures (+ failures (alias-check 82 59 1 1 31)))
+    (set! failures (+ failures (alias-check 82 59 1 31 1)))
+    (set! failures (+ failures (alias-check 82 59 0 30 30)))
+    (set! failures (+ failures (alias-check 82 59 0 31 31)))
+    (set! failures (+ failures (alias-check 51 58 0 1 2)))
+    (set! failures (+ failures (alias-check 51 58 1 1 2)))
+    (set! failures (+ failures (alias-check 51 58 2 1 2)))
+    (set! failures (+ failures (alias-check 51 58 1 1 1)))
+    (set! failures (+ failures (alias-check 51 58 0 1 1)))
+    (set! failures (+ failures (alias-check 51 58 0 30 31)))
+    (set! failures (+ failures (alias-check 51 58 0 31 30)))
+    (set! failures (+ failures (alias-check 51 58 1 1 30)))
+    (set! failures (+ failures (alias-check 51 58 1 30 1)))
+    (set! failures (+ failures (alias-check 51 58 1 1 31)))
+    (set! failures (+ failures (alias-check 51 58 1 31 1)))
+    (set! failures (+ failures (alias-check 51 58 0 30 30)))
+    (set! failures (+ failures (alias-check 51 58 0 31 31)))
+    (set! failures (+ failures (alias-check 51 59 0 1 2)))
+    (set! failures (+ failures (alias-check 51 59 1 1 2)))
+    (set! failures (+ failures (alias-check 51 59 2 1 2)))
+    (set! failures (+ failures (alias-check 51 59 1 1 1)))
+    (set! failures (+ failures (alias-check 51 59 0 1 1)))
+    (set! failures (+ failures (alias-check 51 59 0 30 31)))
+    (set! failures (+ failures (alias-check 51 59 0 31 30)))
+    (set! failures (+ failures (alias-check 51 59 1 1 30)))
+    (set! failures (+ failures (alias-check 51 59 1 30 1)))
+    (set! failures (+ failures (alias-check 51 59 1 1 31)))
+    (set! failures (+ failures (alias-check 51 59 1 31 1)))
+    (set! failures (+ failures (alias-check 51 59 0 30 30)))
+    (set! failures (+ failures (alias-check 51 59 0 31 31)))
+    (set! failures (+ failures (alias-check 67 58 0 1 2)))
+    (set! failures (+ failures (alias-check 67 58 1 1 2)))
+    (set! failures (+ failures (alias-check 67 58 2 1 2)))
+    (set! failures (+ failures (alias-check 67 58 1 1 1)))
+    (set! failures (+ failures (alias-check 67 58 0 1 1)))
+    (set! failures (+ failures (alias-check 67 58 0 30 31)))
+    (set! failures (+ failures (alias-check 67 58 0 31 30)))
+    (set! failures (+ failures (alias-check 67 58 1 1 30)))
+    (set! failures (+ failures (alias-check 67 58 1 30 1)))
+    (set! failures (+ failures (alias-check 67 58 1 1 31)))
+    (set! failures (+ failures (alias-check 67 58 1 31 1)))
+    (set! failures (+ failures (alias-check 67 58 0 30 30)))
+    (set! failures (+ failures (alias-check 67 58 0 31 31)))
+    (set! failures (+ failures (alias-check 67 59 0 1 2)))
+    (set! failures (+ failures (alias-check 67 59 1 1 2)))
+    (set! failures (+ failures (alias-check 67 59 2 1 2)))
+    (set! failures (+ failures (alias-check 67 59 1 1 1)))
+    (set! failures (+ failures (alias-check 67 59 0 1 1)))
+    (set! failures (+ failures (alias-check 67 59 0 30 31)))
+    (set! failures (+ failures (alias-check 67 59 0 31 30)))
+    (set! failures (+ failures (alias-check 67 59 1 1 30)))
+    (set! failures (+ failures (alias-check 67 59 1 30 1)))
+    (set! failures (+ failures (alias-check 67 59 1 1 31)))
+    (set! failures (+ failures (alias-check 67 59 1 31 1)))
+    (set! failures (+ failures (alias-check 67 59 0 30 30)))
+    (set! failures (+ failures (alias-check 67 59 0 31 31)))
+    (set! failures (+ failures (alias-check 36 58 0 1 2)))
+    (set! failures (+ failures (alias-check 36 58 1 1 2)))
+    (set! failures (+ failures (alias-check 36 58 2 1 2)))
+    (set! failures (+ failures (alias-check 36 58 1 1 1)))
+    (set! failures (+ failures (alias-check 36 58 0 1 1)))
+    (set! failures (+ failures (alias-check 36 58 0 30 31)))
+    (set! failures (+ failures (alias-check 36 58 0 31 30)))
+    (set! failures (+ failures (alias-check 36 58 1 1 30)))
+    (set! failures (+ failures (alias-check 36 58 1 30 1)))
+    (set! failures (+ failures (alias-check 36 58 1 1 31)))
+    (set! failures (+ failures (alias-check 36 58 1 31 1)))
+    (set! failures (+ failures (alias-check 36 58 0 30 30)))
+    (set! failures (+ failures (alias-check 36 58 0 31 31)))
+    (set! failures (+ failures (alias-check 36 59 0 1 2)))
+    (set! failures (+ failures (alias-check 36 59 1 1 2)))
+    (set! failures (+ failures (alias-check 36 59 2 1 2)))
+    (set! failures (+ failures (alias-check 36 59 1 1 1)))
+    (set! failures (+ failures (alias-check 36 59 0 1 1)))
+    (set! failures (+ failures (alias-check 36 59 0 30 31)))
+    (set! failures (+ failures (alias-check 36 59 0 31 30)))
+    (set! failures (+ failures (alias-check 36 59 1 1 30)))
+    (set! failures (+ failures (alias-check 36 59 1 30 1)))
+    (set! failures (+ failures (alias-check 36 59 1 1 31)))
+    (set! failures (+ failures (alias-check 36 59 1 31 1)))
+    (set! failures (+ failures (alias-check 36 59 0 30 30)))
+    (set! failures (+ failures (alias-check 36 59 0 31 31)))
+    (set! failures (+ failures (alias-check 52 58 0 1 2)))
+    (set! failures (+ failures (alias-check 52 58 1 1 2)))
+    (set! failures (+ failures (alias-check 52 58 2 1 2)))
+    (set! failures (+ failures (alias-check 52 58 1 1 1)))
+    (set! failures (+ failures (alias-check 52 58 0 1 1)))
+    (set! failures (+ failures (alias-check 52 58 0 30 31)))
+    (set! failures (+ failures (alias-check 52 58 0 31 30)))
+    (set! failures (+ failures (alias-check 52 58 1 1 30)))
+    (set! failures (+ failures (alias-check 52 58 1 30 1)))
+    (set! failures (+ failures (alias-check 52 58 1 1 31)))
+    (set! failures (+ failures (alias-check 52 58 1 31 1)))
+    (set! failures (+ failures (alias-check 52 58 0 30 30)))
+    (set! failures (+ failures (alias-check 52 58 0 31 31)))
+    (set! failures (+ failures (alias-check 52 59 0 1 2)))
+    (set! failures (+ failures (alias-check 52 59 1 1 2)))
+    (set! failures (+ failures (alias-check 52 59 2 1 2)))
+    (set! failures (+ failures (alias-check 52 59 1 1 1)))
+    (set! failures (+ failures (alias-check 52 59 0 1 1)))
+    (set! failures (+ failures (alias-check 52 59 0 30 31)))
+    (set! failures (+ failures (alias-check 52 59 0 31 30)))
+    (set! failures (+ failures (alias-check 52 59 1 1 30)))
+    (set! failures (+ failures (alias-check 52 59 1 30 1)))
+    (set! failures (+ failures (alias-check 52 59 1 1 31)))
+    (set! failures (+ failures (alias-check 52 59 1 31 1)))
+    (set! failures (+ failures (alias-check 52 59 0 30 30)))
+    (set! failures (+ failures (alias-check 52 59 0 31 31)))
+    (set! failures (+ failures (alias-check 21 58 0 1 2)))
+    (set! failures (+ failures (alias-check 21 58 1 1 2)))
+    (set! failures (+ failures (alias-check 21 58 2 1 2)))
+    (set! failures (+ failures (alias-check 21 58 1 1 1)))
+    (set! failures (+ failures (alias-check 21 58 0 1 1)))
+    (set! failures (+ failures (alias-check 21 58 0 30 31)))
+    (set! failures (+ failures (alias-check 21 58 0 31 30)))
+    (set! failures (+ failures (alias-check 21 58 1 1 30)))
+    (set! failures (+ failures (alias-check 21 58 1 30 1)))
+    (set! failures (+ failures (alias-check 21 58 1 1 31)))
+    (set! failures (+ failures (alias-check 21 58 1 31 1)))
+    (set! failures (+ failures (alias-check 21 58 0 30 30)))
+    (set! failures (+ failures (alias-check 21 58 0 31 31)))
+    (set! failures (+ failures (alias-check 21 59 0 1 2)))
+    (set! failures (+ failures (alias-check 21 59 1 1 2)))
+    (set! failures (+ failures (alias-check 21 59 2 1 2)))
+    (set! failures (+ failures (alias-check 21 59 1 1 1)))
+    (set! failures (+ failures (alias-check 21 59 0 1 1)))
+    (set! failures (+ failures (alias-check 21 59 0 30 31)))
+    (set! failures (+ failures (alias-check 21 59 0 31 30)))
+    (set! failures (+ failures (alias-check 21 59 1 1 30)))
+    (set! failures (+ failures (alias-check 21 59 1 30 1)))
+    (set! failures (+ failures (alias-check 21 59 1 1 31)))
+    (set! failures (+ failures (alias-check 21 59 1 31 1)))
+    (set! failures (+ failures (alias-check 21 59 0 30 30)))
+    (set! failures (+ failures (alias-check 21 59 0 31 31)))
+    (set! failures (+ failures (alias-check 37 58 0 1 2)))
+    (set! failures (+ failures (alias-check 37 58 1 1 2)))
+    (set! failures (+ failures (alias-check 37 58 2 1 2)))
+    (set! failures (+ failures (alias-check 37 58 1 1 1)))
+    (set! failures (+ failures (alias-check 37 58 0 1 1)))
+    (set! failures (+ failures (alias-check 37 58 0 30 31)))
+    (set! failures (+ failures (alias-check 37 58 0 31 30)))
+    (set! failures (+ failures (alias-check 37 58 1 1 30)))
+    (set! failures (+ failures (alias-check 37 58 1 30 1)))
+    (set! failures (+ failures (alias-check 37 58 1 1 31)))
+    (set! failures (+ failures (alias-check 37 58 1 31 1)))
+    (set! failures (+ failures (alias-check 37 58 0 30 30)))
+    (set! failures (+ failures (alias-check 37 58 0 31 31)))
+    (set! failures (+ failures (alias-check 37 59 0 1 2)))
+    (set! failures (+ failures (alias-check 37 59 1 1 2)))
+    (set! failures (+ failures (alias-check 37 59 2 1 2)))
+    (set! failures (+ failures (alias-check 37 59 1 1 1)))
+    (set! failures (+ failures (alias-check 37 59 0 1 1)))
+    (set! failures (+ failures (alias-check 37 59 0 30 31)))
+    (set! failures (+ failures (alias-check 37 59 0 31 30)))
+    (set! failures (+ failures (alias-check 37 59 1 1 30)))
+    (set! failures (+ failures (alias-check 37 59 1 30 1)))
+    (set! failures (+ failures (alias-check 37 59 1 1 31)))
+    (set! failures (+ failures (alias-check 37 59 1 31 1)))
+    (set! failures (+ failures (alias-check 37 59 0 30 30)))
+    (set! failures (+ failures (alias-check 37 59 0 31 31)))
+    (set! failures (+ failures (alias-check 22 58 0 1 2)))
+    (set! failures (+ failures (alias-check 22 58 1 1 2)))
+    (set! failures (+ failures (alias-check 22 58 2 1 2)))
+    (set! failures (+ failures (alias-check 22 58 1 1 1)))
+    (set! failures (+ failures (alias-check 22 58 0 1 1)))
+    (set! failures (+ failures (alias-check 22 58 0 30 31)))
+    (set! failures (+ failures (alias-check 22 58 0 31 30)))
+    (set! failures (+ failures (alias-check 22 58 1 1 30)))
+    (set! failures (+ failures (alias-check 22 58 1 30 1)))
+    (set! failures (+ failures (alias-check 22 58 1 1 31)))
+    (set! failures (+ failures (alias-check 22 58 1 31 1)))
+    (set! failures (+ failures (alias-check 22 58 0 30 30)))
+    (set! failures (+ failures (alias-check 22 58 0 31 31)))
+    (set! failures (+ failures (alias-check 22 59 0 1 2)))
+    (set! failures (+ failures (alias-check 22 59 1 1 2)))
+    (set! failures (+ failures (alias-check 22 59 2 1 2)))
+    (set! failures (+ failures (alias-check 22 59 1 1 1)))
+    (set! failures (+ failures (alias-check 22 59 0 1 1)))
+    (set! failures (+ failures (alias-check 22 59 0 30 31)))
+    (set! failures (+ failures (alias-check 22 59 0 31 30)))
+    (set! failures (+ failures (alias-check 22 59 1 1 30)))
+    (set! failures (+ failures (alias-check 22 59 1 30 1)))
+    (set! failures (+ failures (alias-check 22 59 1 1 31)))
+    (set! failures (+ failures (alias-check 22 59 1 31 1)))
+    (set! failures (+ failures (alias-check 22 59 0 30 30)))
+    (set! failures (+ failures (alias-check 22 59 0 31 31)))
+    (set! failures (+ failures (alias-check 38 58 0 1 2)))
+    (set! failures (+ failures (alias-check 38 58 1 1 2)))
+    (set! failures (+ failures (alias-check 38 58 2 1 2)))
+    (set! failures (+ failures (alias-check 38 58 1 1 1)))
+    (set! failures (+ failures (alias-check 38 58 0 1 1)))
+    (set! failures (+ failures (alias-check 38 58 0 30 31)))
+    (set! failures (+ failures (alias-check 38 58 0 31 30)))
+    (set! failures (+ failures (alias-check 38 58 1 1 30)))
+    (set! failures (+ failures (alias-check 38 58 1 30 1)))
+    (set! failures (+ failures (alias-check 38 58 1 1 31)))
+    (set! failures (+ failures (alias-check 38 58 1 31 1)))
+    (set! failures (+ failures (alias-check 38 58 0 30 30)))
+    (set! failures (+ failures (alias-check 38 58 0 31 31)))
+    (set! failures (+ failures (alias-check 38 59 0 1 2)))
+    (set! failures (+ failures (alias-check 38 59 1 1 2)))
+    (set! failures (+ failures (alias-check 38 59 2 1 2)))
+    (set! failures (+ failures (alias-check 38 59 1 1 1)))
+    (set! failures (+ failures (alias-check 38 59 0 1 1)))
+    (set! failures (+ failures (alias-check 38 59 0 30 31)))
+    (set! failures (+ failures (alias-check 38 59 0 31 30)))
+    (set! failures (+ failures (alias-check 38 59 1 1 30)))
+    (set! failures (+ failures (alias-check 38 59 1 30 1)))
+    (set! failures (+ failures (alias-check 38 59 1 1 31)))
+    (set! failures (+ failures (alias-check 38 59 1 31 1)))
+    (set! failures (+ failures (alias-check 38 59 0 30 30)))
+    (set! failures (+ failures (alias-check 38 59 0 31 31)))
+    (set! failures (+ failures (alias-check 71 58 0 1 2)))
+    (set! failures (+ failures (alias-check 71 58 1 1 2)))
+    (set! failures (+ failures (alias-check 71 58 2 1 2)))
+    (set! failures (+ failures (alias-check 71 58 1 1 1)))
+    (set! failures (+ failures (alias-check 71 58 0 1 1)))
+    (set! failures (+ failures (alias-check 71 58 0 30 31)))
+    (set! failures (+ failures (alias-check 71 58 0 31 30)))
+    (set! failures (+ failures (alias-check 71 58 1 1 30)))
+    (set! failures (+ failures (alias-check 71 58 1 30 1)))
+    (set! failures (+ failures (alias-check 71 58 1 1 31)))
+    (set! failures (+ failures (alias-check 71 58 1 31 1)))
+    (set! failures (+ failures (alias-check 71 58 0 30 30)))
+    (set! failures (+ failures (alias-check 71 58 0 31 31)))
+    (set! failures (+ failures (alias-check 71 59 0 1 2)))
+    (set! failures (+ failures (alias-check 71 59 1 1 2)))
+    (set! failures (+ failures (alias-check 71 59 2 1 2)))
+    (set! failures (+ failures (alias-check 71 59 1 1 1)))
+    (set! failures (+ failures (alias-check 71 59 0 1 1)))
+    (set! failures (+ failures (alias-check 71 59 0 30 31)))
+    (set! failures (+ failures (alias-check 71 59 0 31 30)))
+    (set! failures (+ failures (alias-check 71 59 1 1 30)))
+    (set! failures (+ failures (alias-check 71 59 1 30 1)))
+    (set! failures (+ failures (alias-check 71 59 1 1 31)))
+    (set! failures (+ failures (alias-check 71 59 1 31 1)))
+    (set! failures (+ failures (alias-check 71 59 0 30 30)))
+    (set! failures (+ failures (alias-check 71 59 0 31 31)))
+    (set! failures (+ failures (alias-check 87 58 0 1 2)))
+    (set! failures (+ failures (alias-check 87 58 1 1 2)))
+    (set! failures (+ failures (alias-check 87 58 2 1 2)))
+    (set! failures (+ failures (alias-check 87 58 1 1 1)))
+    (set! failures (+ failures (alias-check 87 58 0 1 1)))
+    (set! failures (+ failures (alias-check 87 58 0 30 31)))
+    (set! failures (+ failures (alias-check 87 58 0 31 30)))
+    (set! failures (+ failures (alias-check 87 58 1 1 30)))
+    (set! failures (+ failures (alias-check 87 58 1 30 1)))
+    (set! failures (+ failures (alias-check 87 58 1 1 31)))
+    (set! failures (+ failures (alias-check 87 58 1 31 1)))
+    (set! failures (+ failures (alias-check 87 58 0 30 30)))
+    (set! failures (+ failures (alias-check 87 58 0 31 31)))
+    (set! failures (+ failures (alias-check 87 59 0 1 2)))
+    (set! failures (+ failures (alias-check 87 59 1 1 2)))
+    (set! failures (+ failures (alias-check 87 59 2 1 2)))
+    (set! failures (+ failures (alias-check 87 59 1 1 1)))
+    (set! failures (+ failures (alias-check 87 59 0 1 1)))
+    (set! failures (+ failures (alias-check 87 59 0 30 31)))
+    (set! failures (+ failures (alias-check 87 59 0 31 30)))
+    (set! failures (+ failures (alias-check 87 59 1 1 30)))
+    (set! failures (+ failures (alias-check 87 59 1 30 1)))
+    (set! failures (+ failures (alias-check 87 59 1 1 31)))
+    (set! failures (+ failures (alias-check 87 59 1 31 1)))
+    (set! failures (+ failures (alias-check 87 59 0 30 30)))
+    (set! failures (+ failures (alias-check 87 59 0 31 31)))
+    (set! failures (+ failures (alias-check 72 58 0 1 2)))
+    (set! failures (+ failures (alias-check 72 58 1 1 2)))
+    (set! failures (+ failures (alias-check 72 58 2 1 2)))
+    (set! failures (+ failures (alias-check 72 58 1 1 1)))
+    (set! failures (+ failures (alias-check 72 58 0 1 1)))
+    (set! failures (+ failures (alias-check 72 58 0 30 31)))
+    (set! failures (+ failures (alias-check 72 58 0 31 30)))
+    (set! failures (+ failures (alias-check 72 58 1 1 30)))
+    (set! failures (+ failures (alias-check 72 58 1 30 1)))
+    (set! failures (+ failures (alias-check 72 58 1 1 31)))
+    (set! failures (+ failures (alias-check 72 58 1 31 1)))
+    (set! failures (+ failures (alias-check 72 58 0 30 30)))
+    (set! failures (+ failures (alias-check 72 58 0 31 31)))
+    (set! failures (+ failures (alias-check 72 59 0 1 2)))
+    (set! failures (+ failures (alias-check 72 59 1 1 2)))
+    (set! failures (+ failures (alias-check 72 59 2 1 2)))
+    (set! failures (+ failures (alias-check 72 59 1 1 1)))
+    (set! failures (+ failures (alias-check 72 59 0 1 1)))
+    (set! failures (+ failures (alias-check 72 59 0 30 31)))
+    (set! failures (+ failures (alias-check 72 59 0 31 30)))
+    (set! failures (+ failures (alias-check 72 59 1 1 30)))
+    (set! failures (+ failures (alias-check 72 59 1 30 1)))
+    (set! failures (+ failures (alias-check 72 59 1 1 31)))
+    (set! failures (+ failures (alias-check 72 59 1 31 1)))
+    (set! failures (+ failures (alias-check 72 59 0 30 30)))
+    (set! failures (+ failures (alias-check 72 59 0 31 31)))
+    (set! failures (+ failures (alias-check 88 58 0 1 2)))
+    (set! failures (+ failures (alias-check 88 58 1 1 2)))
+    (set! failures (+ failures (alias-check 88 58 2 1 2)))
+    (set! failures (+ failures (alias-check 88 58 1 1 1)))
+    (set! failures (+ failures (alias-check 88 58 0 1 1)))
+    (set! failures (+ failures (alias-check 88 58 0 30 31)))
+    (set! failures (+ failures (alias-check 88 58 0 31 30)))
+    (set! failures (+ failures (alias-check 88 58 1 1 30)))
+    (set! failures (+ failures (alias-check 88 58 1 30 1)))
+    (set! failures (+ failures (alias-check 88 58 1 1 31)))
+    (set! failures (+ failures (alias-check 88 58 1 31 1)))
+    (set! failures (+ failures (alias-check 88 58 0 30 30)))
+    (set! failures (+ failures (alias-check 88 58 0 31 31)))
+    (set! failures (+ failures (alias-check 88 59 0 1 2)))
+    (set! failures (+ failures (alias-check 88 59 1 1 2)))
+    (set! failures (+ failures (alias-check 88 59 2 1 2)))
+    (set! failures (+ failures (alias-check 88 59 1 1 1)))
+    (set! failures (+ failures (alias-check 88 59 0 1 1)))
+    (set! failures (+ failures (alias-check 88 59 0 30 31)))
+    (set! failures (+ failures (alias-check 88 59 0 31 30)))
+    (set! failures (+ failures (alias-check 88 59 1 1 30)))
+    (set! failures (+ failures (alias-check 88 59 1 30 1)))
+    (set! failures (+ failures (alias-check 88 59 1 1 31)))
+    (set! failures (+ failures (alias-check 88 59 1 31 1)))
+    (set! failures (+ failures (alias-check 88 59 0 30 30)))
+    (set! failures (+ failures (alias-check 88 59 0 31 31)))
+    (set! failures (+ failures (alias-check 57 58 0 1 2)))
+    (set! failures (+ failures (alias-check 57 58 1 1 2)))
+    (set! failures (+ failures (alias-check 57 58 2 1 2)))
+    (set! failures (+ failures (alias-check 57 58 1 1 1)))
+    (set! failures (+ failures (alias-check 57 58 0 1 1)))
+    (set! failures (+ failures (alias-check 57 58 0 30 31)))
+    (set! failures (+ failures (alias-check 57 58 0 31 30)))
+    (set! failures (+ failures (alias-check 57 58 1 1 30)))
+    (set! failures (+ failures (alias-check 57 58 1 30 1)))
+    (set! failures (+ failures (alias-check 57 58 1 1 31)))
+    (set! failures (+ failures (alias-check 57 58 1 31 1)))
+    (set! failures (+ failures (alias-check 57 58 0 30 30)))
+    (set! failures (+ failures (alias-check 57 58 0 31 31)))
+    (set! failures (+ failures (alias-check 57 59 0 1 2)))
+    (set! failures (+ failures (alias-check 57 59 1 1 2)))
+    (set! failures (+ failures (alias-check 57 59 2 1 2)))
+    (set! failures (+ failures (alias-check 57 59 1 1 1)))
+    (set! failures (+ failures (alias-check 57 59 0 1 1)))
+    (set! failures (+ failures (alias-check 57 59 0 30 31)))
+    (set! failures (+ failures (alias-check 57 59 0 31 30)))
+    (set! failures (+ failures (alias-check 57 59 1 1 30)))
+    (set! failures (+ failures (alias-check 57 59 1 30 1)))
+    (set! failures (+ failures (alias-check 57 59 1 1 31)))
+    (set! failures (+ failures (alias-check 57 59 1 31 1)))
+    (set! failures (+ failures (alias-check 57 59 0 30 30)))
+    (set! failures (+ failures (alias-check 57 59 0 31 31)))
+    (set! failures (+ failures (alias-check 73 58 0 1 2)))
+    (set! failures (+ failures (alias-check 73 58 1 1 2)))
+    (set! failures (+ failures (alias-check 73 58 2 1 2)))
+    (set! failures (+ failures (alias-check 73 58 1 1 1)))
+    (set! failures (+ failures (alias-check 73 58 0 1 1)))
+    (set! failures (+ failures (alias-check 73 58 0 30 31)))
+    (set! failures (+ failures (alias-check 73 58 0 31 30)))
+    (set! failures (+ failures (alias-check 73 58 1 1 30)))
+    (set! failures (+ failures (alias-check 73 58 1 30 1)))
+    (set! failures (+ failures (alias-check 73 58 1 1 31)))
+    (set! failures (+ failures (alias-check 73 58 1 31 1)))
+    (set! failures (+ failures (alias-check 73 58 0 30 30)))
+    (set! failures (+ failures (alias-check 73 58 0 31 31)))
+    (set! failures (+ failures (alias-check 73 59 0 1 2)))
+    (set! failures (+ failures (alias-check 73 59 1 1 2)))
+    (set! failures (+ failures (alias-check 73 59 2 1 2)))
+    (set! failures (+ failures (alias-check 73 59 1 1 1)))
+    (set! failures (+ failures (alias-check 73 59 0 1 1)))
+    (set! failures (+ failures (alias-check 73 59 0 30 31)))
+    (set! failures (+ failures (alias-check 73 59 0 31 30)))
+    (set! failures (+ failures (alias-check 73 59 1 1 30)))
+    (set! failures (+ failures (alias-check 73 59 1 30 1)))
+    (set! failures (+ failures (alias-check 73 59 1 1 31)))
+    (set! failures (+ failures (alias-check 73 59 1 31 1)))
+    (set! failures (+ failures (alias-check 73 59 0 30 30)))
+    (set! failures (+ failures (alias-check 73 59 0 31 31)))
+    (set! failures (+ failures (alias-check 42 58 0 1 2)))
+    (set! failures (+ failures (alias-check 42 58 1 1 2)))
+    (set! failures (+ failures (alias-check 42 58 2 1 2)))
+    (set! failures (+ failures (alias-check 42 58 1 1 1)))
+    (set! failures (+ failures (alias-check 42 58 0 1 1)))
+    (set! failures (+ failures (alias-check 42 58 0 30 31)))
+    (set! failures (+ failures (alias-check 42 58 0 31 30)))
+    (set! failures (+ failures (alias-check 42 58 1 1 30)))
+    (set! failures (+ failures (alias-check 42 58 1 30 1)))
+    (set! failures (+ failures (alias-check 42 58 1 1 31)))
+    (set! failures (+ failures (alias-check 42 58 1 31 1)))
+    (set! failures (+ failures (alias-check 42 58 0 30 30)))
+    (set! failures (+ failures (alias-check 42 58 0 31 31)))
+    (set! failures (+ failures (alias-check 42 59 0 1 2)))
+    (set! failures (+ failures (alias-check 42 59 1 1 2)))
+    (set! failures (+ failures (alias-check 42 59 2 1 2)))
+    (set! failures (+ failures (alias-check 42 59 1 1 1)))
+    (set! failures (+ failures (alias-check 42 59 0 1 1)))
+    (set! failures (+ failures (alias-check 42 59 0 30 31)))
+    (set! failures (+ failures (alias-check 42 59 0 31 30)))
+    (set! failures (+ failures (alias-check 42 59 1 1 30)))
+    (set! failures (+ failures (alias-check 42 59 1 30 1)))
+    (set! failures (+ failures (alias-check 42 59 1 1 31)))
+    (set! failures (+ failures (alias-check 42 59 1 31 1)))
+    (set! failures (+ failures (alias-check 42 59 0 30 30)))
+    (set! failures (+ failures (alias-check 42 59 0 31 31)))
+    (set! failures (+ failures (alias-check 58 58 0 1 2)))
+    (set! failures (+ failures (alias-check 58 58 1 1 2)))
+    (set! failures (+ failures (alias-check 58 58 2 1 2)))
+    (set! failures (+ failures (alias-check 58 58 1 1 1)))
+    (set! failures (+ failures (alias-check 58 58 0 1 1)))
+    (set! failures (+ failures (alias-check 58 58 0 30 31)))
+    (set! failures (+ failures (alias-check 58 58 0 31 30)))
+    (set! failures (+ failures (alias-check 58 58 1 1 30)))
+    (set! failures (+ failures (alias-check 58 58 1 30 1)))
+    (set! failures (+ failures (alias-check 58 58 1 1 31)))
+    (set! failures (+ failures (alias-check 58 58 1 31 1)))
+    (set! failures (+ failures (alias-check 58 58 0 30 30)))
+    (set! failures (+ failures (alias-check 58 58 0 31 31)))
+    (set! failures (+ failures (alias-check 58 59 0 1 2)))
+    (set! failures (+ failures (alias-check 58 59 1 1 2)))
+    (set! failures (+ failures (alias-check 58 59 2 1 2)))
+    (set! failures (+ failures (alias-check 58 59 1 1 1)))
+    (set! failures (+ failures (alias-check 58 59 0 1 1)))
+    (set! failures (+ failures (alias-check 58 59 0 30 31)))
+    (set! failures (+ failures (alias-check 58 59 0 31 30)))
+    (set! failures (+ failures (alias-check 58 59 1 1 30)))
+    (set! failures (+ failures (alias-check 58 59 1 30 1)))
+    (set! failures (+ failures (alias-check 58 59 1 1 31)))
+    (set! failures (+ failures (alias-check 58 59 1 31 1)))
+    (set! failures (+ failures (alias-check 58 59 0 30 30)))
+    (set! failures (+ failures (alias-check 58 59 0 31 31)))
+    (set! failures (+ failures (alias-check 27 58 0 1 2)))
+    (set! failures (+ failures (alias-check 27 58 1 1 2)))
+    (set! failures (+ failures (alias-check 27 58 2 1 2)))
+    (set! failures (+ failures (alias-check 27 58 1 1 1)))
+    (set! failures (+ failures (alias-check 27 58 0 1 1)))
+    (set! failures (+ failures (alias-check 27 58 0 30 31)))
+    (set! failures (+ failures (alias-check 27 58 0 31 30)))
+    (set! failures (+ failures (alias-check 27 58 1 1 30)))
+    (set! failures (+ failures (alias-check 27 58 1 30 1)))
+    (set! failures (+ failures (alias-check 27 58 1 1 31)))
+    (set! failures (+ failures (alias-check 27 58 1 31 1)))
+    (set! failures (+ failures (alias-check 27 58 0 30 30)))
+    (set! failures (+ failures (alias-check 27 58 0 31 31)))
+    (set! failures (+ failures (alias-check 27 59 0 1 2)))
+    (set! failures (+ failures (alias-check 27 59 1 1 2)))
+    (set! failures (+ failures (alias-check 27 59 2 1 2)))
+    (set! failures (+ failures (alias-check 27 59 1 1 1)))
+    (set! failures (+ failures (alias-check 27 59 0 1 1)))
+    (set! failures (+ failures (alias-check 27 59 0 30 31)))
+    (set! failures (+ failures (alias-check 27 59 0 31 30)))
+    (set! failures (+ failures (alias-check 27 59 1 1 30)))
+    (set! failures (+ failures (alias-check 27 59 1 30 1)))
+    (set! failures (+ failures (alias-check 27 59 1 1 31)))
+    (set! failures (+ failures (alias-check 27 59 1 31 1)))
+    (set! failures (+ failures (alias-check 27 59 0 30 30)))
+    (set! failures (+ failures (alias-check 27 59 0 31 31)))
+    (set! failures (+ failures (alias-check 43 58 0 1 2)))
+    (set! failures (+ failures (alias-check 43 58 1 1 2)))
+    (set! failures (+ failures (alias-check 43 58 2 1 2)))
+    (set! failures (+ failures (alias-check 43 58 1 1 1)))
+    (set! failures (+ failures (alias-check 43 58 0 1 1)))
+    (set! failures (+ failures (alias-check 43 58 0 30 31)))
+    (set! failures (+ failures (alias-check 43 58 0 31 30)))
+    (set! failures (+ failures (alias-check 43 58 1 1 30)))
+    (set! failures (+ failures (alias-check 43 58 1 30 1)))
+    (set! failures (+ failures (alias-check 43 58 1 1 31)))
+    (set! failures (+ failures (alias-check 43 58 1 31 1)))
+    (set! failures (+ failures (alias-check 43 58 0 30 30)))
+    (set! failures (+ failures (alias-check 43 58 0 31 31)))
+    (set! failures (+ failures (alias-check 43 59 0 1 2)))
+    (set! failures (+ failures (alias-check 43 59 1 1 2)))
+    (set! failures (+ failures (alias-check 43 59 2 1 2)))
+    (set! failures (+ failures (alias-check 43 59 1 1 1)))
+    (set! failures (+ failures (alias-check 43 59 0 1 1)))
+    (set! failures (+ failures (alias-check 43 59 0 30 31)))
+    (set! failures (+ failures (alias-check 43 59 0 31 30)))
+    (set! failures (+ failures (alias-check 43 59 1 1 30)))
+    (set! failures (+ failures (alias-check 43 59 1 30 1)))
+    (set! failures (+ failures (alias-check 43 59 1 1 31)))
+    (set! failures (+ failures (alias-check 43 59 1 31 1)))
+    (set! failures (+ failures (alias-check 43 59 0 30 30)))
+    (set! failures (+ failures (alias-check 43 59 0 31 31)))
+    (set! failures (+ failures (alias-check 28 58 0 1 2)))
+    (set! failures (+ failures (alias-check 28 58 1 1 2)))
+    (set! failures (+ failures (alias-check 28 58 2 1 2)))
+    (set! failures (+ failures (alias-check 28 58 1 1 1)))
+    (set! failures (+ failures (alias-check 28 58 0 1 1)))
+    (set! failures (+ failures (alias-check 28 58 0 30 31)))
+    (set! failures (+ failures (alias-check 28 58 0 31 30)))
+    (set! failures (+ failures (alias-check 28 58 1 1 30)))
+    (set! failures (+ failures (alias-check 28 58 1 30 1)))
+    (set! failures (+ failures (alias-check 28 58 1 1 31)))
+    (set! failures (+ failures (alias-check 28 58 1 31 1)))
+    (set! failures (+ failures (alias-check 28 58 0 30 30)))
+    (set! failures (+ failures (alias-check 28 58 0 31 31)))
+    (set! failures (+ failures (alias-check 28 59 0 1 2)))
+    (set! failures (+ failures (alias-check 28 59 1 1 2)))
+    (set! failures (+ failures (alias-check 28 59 2 1 2)))
+    (set! failures (+ failures (alias-check 28 59 1 1 1)))
+    (set! failures (+ failures (alias-check 28 59 0 1 1)))
+    (set! failures (+ failures (alias-check 28 59 0 30 31)))
+    (set! failures (+ failures (alias-check 28 59 0 31 30)))
+    (set! failures (+ failures (alias-check 28 59 1 1 30)))
+    (set! failures (+ failures (alias-check 28 59 1 30 1)))
+    (set! failures (+ failures (alias-check 28 59 1 1 31)))
+    (set! failures (+ failures (alias-check 28 59 1 31 1)))
+    (set! failures (+ failures (alias-check 28 59 0 30 30)))
+    (set! failures (+ failures (alias-check 28 59 0 31 31)))
+    (set! failures (+ failures (alias-check 44 58 0 1 2)))
+    (set! failures (+ failures (alias-check 44 58 1 1 2)))
+    (set! failures (+ failures (alias-check 44 58 2 1 2)))
+    (set! failures (+ failures (alias-check 44 58 1 1 1)))
+    (set! failures (+ failures (alias-check 44 58 0 1 1)))
+    (set! failures (+ failures (alias-check 44 58 0 30 31)))
+    (set! failures (+ failures (alias-check 44 58 0 31 30)))
+    (set! failures (+ failures (alias-check 44 58 1 1 30)))
+    (set! failures (+ failures (alias-check 44 58 1 30 1)))
+    (set! failures (+ failures (alias-check 44 58 1 1 31)))
+    (set! failures (+ failures (alias-check 44 58 1 31 1)))
+    (set! failures (+ failures (alias-check 44 58 0 30 30)))
+    (set! failures (+ failures (alias-check 44 58 0 31 31)))
+    (set! failures (+ failures (alias-check 44 59 0 1 2)))
+    (set! failures (+ failures (alias-check 44 59 1 1 2)))
+    (set! failures (+ failures (alias-check 44 59 2 1 2)))
+    (set! failures (+ failures (alias-check 44 59 1 1 1)))
+    (set! failures (+ failures (alias-check 44 59 0 1 1)))
+    (set! failures (+ failures (alias-check 44 59 0 30 31)))
+    (set! failures (+ failures (alias-check 44 59 0 31 30)))
+    (set! failures (+ failures (alias-check 44 59 1 1 30)))
+    (set! failures (+ failures (alias-check 44 59 1 30 1)))
+    (set! failures (+ failures (alias-check 44 59 1 1 31)))
+    (set! failures (+ failures (alias-check 44 59 1 31 1)))
+    (set! failures (+ failures (alias-check 44 59 0 30 30)))
+    (set! failures (+ failures (alias-check 44 59 0 31 31)))
+    (set! failures (+ failures (alias-check 45 58 0 1 2)))
+    (set! failures (+ failures (alias-check 45 58 1 1 2)))
+    (set! failures (+ failures (alias-check 45 58 2 1 2)))
+    (set! failures (+ failures (alias-check 45 58 1 1 1)))
+    (set! failures (+ failures (alias-check 45 58 0 1 1)))
+    (set! failures (+ failures (alias-check 45 58 0 30 31)))
+    (set! failures (+ failures (alias-check 45 58 0 31 30)))
+    (set! failures (+ failures (alias-check 45 58 1 1 30)))
+    (set! failures (+ failures (alias-check 45 58 1 30 1)))
+    (set! failures (+ failures (alias-check 45 58 1 1 31)))
+    (set! failures (+ failures (alias-check 45 58 1 31 1)))
+    (set! failures (+ failures (alias-check 45 58 0 30 30)))
+    (set! failures (+ failures (alias-check 45 58 0 31 31)))
+    (set! failures (+ failures (alias-check 45 59 0 1 2)))
+    (set! failures (+ failures (alias-check 45 59 1 1 2)))
+    (set! failures (+ failures (alias-check 45 59 2 1 2)))
+    (set! failures (+ failures (alias-check 45 59 1 1 1)))
+    (set! failures (+ failures (alias-check 45 59 0 1 1)))
+    (set! failures (+ failures (alias-check 45 59 0 30 31)))
+    (set! failures (+ failures (alias-check 45 59 0 31 30)))
+    (set! failures (+ failures (alias-check 45 59 1 1 30)))
+    (set! failures (+ failures (alias-check 45 59 1 30 1)))
+    (set! failures (+ failures (alias-check 45 59 1 1 31)))
+    (set! failures (+ failures (alias-check 45 59 1 31 1)))
+    (set! failures (+ failures (alias-check 45 59 0 30 30)))
+    (set! failures (+ failures (alias-check 45 59 0 31 31)))
+    (set! failures (+ failures (alias-check 61 58 0 1 2)))
+    (set! failures (+ failures (alias-check 61 58 1 1 2)))
+    (set! failures (+ failures (alias-check 61 58 2 1 2)))
+    (set! failures (+ failures (alias-check 61 58 1 1 1)))
+    (set! failures (+ failures (alias-check 61 58 0 1 1)))
+    (set! failures (+ failures (alias-check 61 58 0 30 31)))
+    (set! failures (+ failures (alias-check 61 58 0 31 30)))
+    (set! failures (+ failures (alias-check 61 58 1 1 30)))
+    (set! failures (+ failures (alias-check 61 58 1 30 1)))
+    (set! failures (+ failures (alias-check 61 58 1 1 31)))
+    (set! failures (+ failures (alias-check 61 58 1 31 1)))
+    (set! failures (+ failures (alias-check 61 58 0 30 30)))
+    (set! failures (+ failures (alias-check 61 58 0 31 31)))
+    (set! failures (+ failures (alias-check 61 59 0 1 2)))
+    (set! failures (+ failures (alias-check 61 59 1 1 2)))
+    (set! failures (+ failures (alias-check 61 59 2 1 2)))
+    (set! failures (+ failures (alias-check 61 59 1 1 1)))
+    (set! failures (+ failures (alias-check 61 59 0 1 1)))
+    (set! failures (+ failures (alias-check 61 59 0 30 31)))
+    (set! failures (+ failures (alias-check 61 59 0 31 30)))
+    (set! failures (+ failures (alias-check 61 59 1 1 30)))
+    (set! failures (+ failures (alias-check 61 59 1 30 1)))
+    (set! failures (+ failures (alias-check 61 59 1 1 31)))
+    (set! failures (+ failures (alias-check 61 59 1 31 1)))
+    (set! failures (+ failures (alias-check 61 59 0 30 30)))
+    (set! failures (+ failures (alias-check 61 59 0 31 31)))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) (forced-aliases)]
+    (set! failures (+ failures (generate 66 58 0)))
+    (set! failures (+ failures (generate 66 58 1)))
+    (set! failures (+ failures (generate 66 58 2)))
+    (set! failures (+ failures (generate 66 58 3)))
+    (set! failures (+ failures (generate 66 58 4)))
+    (set! failures (+ failures (generate 66 59 0)))
+    (set! failures (+ failures (generate 66 59 1)))
+    (set! failures (+ failures (generate 66 59 2)))
+    (set! failures (+ failures (generate 66 59 3)))
+    (set! failures (+ failures (generate 66 59 4)))
+    (set! failures (+ failures (generate 82 58 0)))
+    (set! failures (+ failures (generate 82 58 1)))
+    (set! failures (+ failures (generate 82 58 2)))
+    (set! failures (+ failures (generate 82 58 3)))
+    (set! failures (+ failures (generate 82 58 4)))
+    (set! failures (+ failures (generate 82 59 0)))
+    (set! failures (+ failures (generate 82 59 1)))
+    (set! failures (+ failures (generate 82 59 2)))
+    (set! failures (+ failures (generate 82 59 3)))
+    (set! failures (+ failures (generate 82 59 4)))
+    (set! failures (+ failures (generate 51 58 0)))
+    (set! failures (+ failures (generate 51 58 1)))
+    (set! failures (+ failures (generate 51 58 2)))
+    (set! failures (+ failures (generate 51 58 3)))
+    (set! failures (+ failures (generate 51 58 4)))
+    (set! failures (+ failures (generate 51 59 0)))
+    (set! failures (+ failures (generate 51 59 1)))
+    (set! failures (+ failures (generate 51 59 2)))
+    (set! failures (+ failures (generate 51 59 3)))
+    (set! failures (+ failures (generate 51 59 4)))
+    (set! failures (+ failures (generate 67 58 0)))
+    (set! failures (+ failures (generate 67 58 1)))
+    (set! failures (+ failures (generate 67 58 2)))
+    (set! failures (+ failures (generate 67 58 3)))
+    (set! failures (+ failures (generate 67 58 4)))
+    (set! failures (+ failures (generate 67 59 0)))
+    (set! failures (+ failures (generate 67 59 1)))
+    (set! failures (+ failures (generate 67 59 2)))
+    (set! failures (+ failures (generate 67 59 3)))
+    (set! failures (+ failures (generate 67 59 4)))
+    (set! failures (+ failures (generate 36 58 0)))
+    (set! failures (+ failures (generate 36 58 1)))
+    (set! failures (+ failures (generate 36 58 2)))
+    (set! failures (+ failures (generate 36 58 3)))
+    (set! failures (+ failures (generate 36 58 4)))
+    (set! failures (+ failures (generate 36 59 0)))
+    (set! failures (+ failures (generate 36 59 1)))
+    (set! failures (+ failures (generate 36 59 2)))
+    (set! failures (+ failures (generate 36 59 3)))
+    (set! failures (+ failures (generate 36 59 4)))
+    (set! failures (+ failures (generate 52 58 0)))
+    (set! failures (+ failures (generate 52 58 1)))
+    (set! failures (+ failures (generate 52 58 2)))
+    (set! failures (+ failures (generate 52 58 3)))
+    (set! failures (+ failures (generate 52 58 4)))
+    (set! failures (+ failures (generate 52 59 0)))
+    (set! failures (+ failures (generate 52 59 1)))
+    (set! failures (+ failures (generate 52 59 2)))
+    (set! failures (+ failures (generate 52 59 3)))
+    (set! failures (+ failures (generate 52 59 4)))
+    (set! failures (+ failures (generate 21 58 0)))
+    (set! failures (+ failures (generate 21 58 1)))
+    (set! failures (+ failures (generate 21 58 2)))
+    (set! failures (+ failures (generate 21 58 3)))
+    (set! failures (+ failures (generate 21 58 4)))
+    (set! failures (+ failures (generate 21 59 0)))
+    (set! failures (+ failures (generate 21 59 1)))
+    (set! failures (+ failures (generate 21 59 2)))
+    (set! failures (+ failures (generate 21 59 3)))
+    (set! failures (+ failures (generate 21 59 4)))
+    (set! failures (+ failures (generate 37 58 0)))
+    (set! failures (+ failures (generate 37 58 1)))
+    (set! failures (+ failures (generate 37 58 2)))
+    (set! failures (+ failures (generate 37 58 3)))
+    (set! failures (+ failures (generate 37 58 4)))
+    (set! failures (+ failures (generate 37 59 0)))
+    (set! failures (+ failures (generate 37 59 1)))
+    (set! failures (+ failures (generate 37 59 2)))
+    (set! failures (+ failures (generate 37 59 3)))
+    (set! failures (+ failures (generate 37 59 4)))
+    (set! failures (+ failures (generate 22 58 0)))
+    (set! failures (+ failures (generate 22 58 1)))
+    (set! failures (+ failures (generate 22 58 2)))
+    (set! failures (+ failures (generate 22 58 3)))
+    (set! failures (+ failures (generate 22 58 4)))
+    (set! failures (+ failures (generate 22 59 0)))
+    (set! failures (+ failures (generate 22 59 1)))
+    (set! failures (+ failures (generate 22 59 2)))
+    (set! failures (+ failures (generate 22 59 3)))
+    (set! failures (+ failures (generate 22 59 4)))
+    (set! failures (+ failures (generate 38 58 0)))
+    (set! failures (+ failures (generate 38 58 1)))
+    (set! failures (+ failures (generate 38 58 2)))
+    (set! failures (+ failures (generate 38 58 3)))
+    (set! failures (+ failures (generate 38 58 4)))
+    (set! failures (+ failures (generate 38 59 0)))
+    (set! failures (+ failures (generate 38 59 1)))
+    (set! failures (+ failures (generate 38 59 2)))
+    (set! failures (+ failures (generate 38 59 3)))
+    (set! failures (+ failures (generate 38 59 4)))
+    (set! failures (+ failures (generate 71 58 0)))
+    (set! failures (+ failures (generate 71 58 1)))
+    (set! failures (+ failures (generate 71 58 2)))
+    (set! failures (+ failures (generate 71 58 3)))
+    (set! failures (+ failures (generate 71 58 4)))
+    (set! failures (+ failures (generate 71 59 0)))
+    (set! failures (+ failures (generate 71 59 1)))
+    (set! failures (+ failures (generate 71 59 2)))
+    (set! failures (+ failures (generate 71 59 3)))
+    (set! failures (+ failures (generate 71 59 4)))
+    (set! failures (+ failures (generate 87 58 0)))
+    (set! failures (+ failures (generate 87 58 1)))
+    (set! failures (+ failures (generate 87 58 2)))
+    (set! failures (+ failures (generate 87 58 3)))
+    (set! failures (+ failures (generate 87 58 4)))
+    (set! failures (+ failures (generate 87 59 0)))
+    (set! failures (+ failures (generate 87 59 1)))
+    (set! failures (+ failures (generate 87 59 2)))
+    (set! failures (+ failures (generate 87 59 3)))
+    (set! failures (+ failures (generate 87 59 4)))
+    (set! failures (+ failures (generate 72 58 0)))
+    (set! failures (+ failures (generate 72 58 1)))
+    (set! failures (+ failures (generate 72 58 2)))
+    (set! failures (+ failures (generate 72 58 3)))
+    (set! failures (+ failures (generate 72 58 4)))
+    (set! failures (+ failures (generate 72 59 0)))
+    (set! failures (+ failures (generate 72 59 1)))
+    (set! failures (+ failures (generate 72 59 2)))
+    (set! failures (+ failures (generate 72 59 3)))
+    (set! failures (+ failures (generate 72 59 4)))
+    (set! failures (+ failures (generate 88 58 0)))
+    (set! failures (+ failures (generate 88 58 1)))
+    (set! failures (+ failures (generate 88 58 2)))
+    (set! failures (+ failures (generate 88 58 3)))
+    (set! failures (+ failures (generate 88 58 4)))
+    (set! failures (+ failures (generate 88 59 0)))
+    (set! failures (+ failures (generate 88 59 1)))
+    (set! failures (+ failures (generate 88 59 2)))
+    (set! failures (+ failures (generate 88 59 3)))
+    (set! failures (+ failures (generate 88 59 4)))
+    (set! failures (+ failures (generate 57 58 0)))
+    (set! failures (+ failures (generate 57 58 1)))
+    (set! failures (+ failures (generate 57 58 2)))
+    (set! failures (+ failures (generate 57 58 3)))
+    (set! failures (+ failures (generate 57 58 4)))
+    (set! failures (+ failures (generate 57 59 0)))
+    (set! failures (+ failures (generate 57 59 1)))
+    (set! failures (+ failures (generate 57 59 2)))
+    (set! failures (+ failures (generate 57 59 3)))
+    (set! failures (+ failures (generate 57 59 4)))
+    (set! failures (+ failures (generate 73 58 0)))
+    (set! failures (+ failures (generate 73 58 1)))
+    (set! failures (+ failures (generate 73 58 2)))
+    (set! failures (+ failures (generate 73 58 3)))
+    (set! failures (+ failures (generate 73 58 4)))
+    (set! failures (+ failures (generate 73 59 0)))
+    (set! failures (+ failures (generate 73 59 1)))
+    (set! failures (+ failures (generate 73 59 2)))
+    (set! failures (+ failures (generate 73 59 3)))
+    (set! failures (+ failures (generate 73 59 4)))
+    (set! failures (+ failures (generate 42 58 0)))
+    (set! failures (+ failures (generate 42 58 1)))
+    (set! failures (+ failures (generate 42 58 2)))
+    (set! failures (+ failures (generate 42 58 3)))
+    (set! failures (+ failures (generate 42 58 4)))
+    (set! failures (+ failures (generate 42 59 0)))
+    (set! failures (+ failures (generate 42 59 1)))
+    (set! failures (+ failures (generate 42 59 2)))
+    (set! failures (+ failures (generate 42 59 3)))
+    (set! failures (+ failures (generate 42 59 4)))
+    (set! failures (+ failures (generate 58 58 0)))
+    (set! failures (+ failures (generate 58 58 1)))
+    (set! failures (+ failures (generate 58 58 2)))
+    (set! failures (+ failures (generate 58 58 3)))
+    (set! failures (+ failures (generate 58 58 4)))
+    (set! failures (+ failures (generate 58 59 0)))
+    (set! failures (+ failures (generate 58 59 1)))
+    (set! failures (+ failures (generate 58 59 2)))
+    (set! failures (+ failures (generate 58 59 3)))
+    (set! failures (+ failures (generate 58 59 4)))
+    (set! failures (+ failures (generate 27 58 0)))
+    (set! failures (+ failures (generate 27 58 1)))
+    (set! failures (+ failures (generate 27 58 2)))
+    (set! failures (+ failures (generate 27 58 3)))
+    (set! failures (+ failures (generate 27 58 4)))
+    (set! failures (+ failures (generate 27 59 0)))
+    (set! failures (+ failures (generate 27 59 1)))
+    (set! failures (+ failures (generate 27 59 2)))
+    (set! failures (+ failures (generate 27 59 3)))
+    (set! failures (+ failures (generate 27 59 4)))
+    (set! failures (+ failures (generate 43 58 0)))
+    (set! failures (+ failures (generate 43 58 1)))
+    (set! failures (+ failures (generate 43 58 2)))
+    (set! failures (+ failures (generate 43 58 3)))
+    (set! failures (+ failures (generate 43 58 4)))
+    (set! failures (+ failures (generate 43 59 0)))
+    (set! failures (+ failures (generate 43 59 1)))
+    (set! failures (+ failures (generate 43 59 2)))
+    (set! failures (+ failures (generate 43 59 3)))
+    (set! failures (+ failures (generate 43 59 4)))
+    (set! failures (+ failures (generate 28 58 0)))
+    (set! failures (+ failures (generate 28 58 1)))
+    (set! failures (+ failures (generate 28 58 2)))
+    (set! failures (+ failures (generate 28 58 3)))
+    (set! failures (+ failures (generate 28 58 4)))
+    (set! failures (+ failures (generate 28 59 0)))
+    (set! failures (+ failures (generate 28 59 1)))
+    (set! failures (+ failures (generate 28 59 2)))
+    (set! failures (+ failures (generate 28 59 3)))
+    (set! failures (+ failures (generate 28 59 4)))
+    (set! failures (+ failures (generate 44 58 0)))
+    (set! failures (+ failures (generate 44 58 1)))
+    (set! failures (+ failures (generate 44 58 2)))
+    (set! failures (+ failures (generate 44 58 3)))
+    (set! failures (+ failures (generate 44 58 4)))
+    (set! failures (+ failures (generate 44 59 0)))
+    (set! failures (+ failures (generate 44 59 1)))
+    (set! failures (+ failures (generate 44 59 2)))
+    (set! failures (+ failures (generate 44 59 3)))
+    (set! failures (+ failures (generate 44 59 4)))
+    (set! failures (+ failures (generate 45 58 0)))
+    (set! failures (+ failures (generate 45 58 1)))
+    (set! failures (+ failures (generate 45 58 2)))
+    (set! failures (+ failures (generate 45 58 3)))
+    (set! failures (+ failures (generate 45 58 4)))
+    (set! failures (+ failures (generate 45 59 0)))
+    (set! failures (+ failures (generate 45 59 1)))
+    (set! failures (+ failures (generate 45 59 2)))
+    (set! failures (+ failures (generate 45 59 3)))
+    (set! failures (+ failures (generate 45 59 4)))
+    (set! failures (+ failures (generate 61 58 0)))
+    (set! failures (+ failures (generate 61 58 1)))
+    (set! failures (+ failures (generate 61 58 2)))
+    (set! failures (+ failures (generate 61 58 3)))
+    (set! failures (+ failures (generate 61 58 4)))
+    (set! failures (+ failures (generate 61 59 0)))
+    (set! failures (+ failures (generate 61 59 1)))
+    (set! failures (+ failures (generate 61 59 2)))
+    (set! failures (+ failures (generate 61 59 3)))
+    (set! failures (+ failures (generate 61 59 4)))
+    (set! failures (+ failures (pressure 82 58 16 240)))
+    (set! failures (+ failures (pressure 82 58 4096 241)))
+    (set! failures (+ failures (pressure 82 59 16 242)))
+    (set! failures (+ failures (pressure 82 59 4096 243)))
+    (set! failures (+ failures (pressure 88 58 16 244)))
+    (set! failures (+ failures (pressure 88 58 4096 245)))
+    (set! failures (+ failures (pressure 88 59 16 246)))
+    (set! failures (+ failures (pressure 88 59 4096 247)))
+    (set! failures (+ failures (pressure 67 58 16 248)))
+    (set! failures (+ failures (pressure 67 58 4096 249)))
+    (set! failures (+ failures (pressure 67 59 16 250)))
+    (set! failures (+ failures (pressure 67 59 4096 251)))
+    (set! failures (+ failures (pressure 52 58 16 252)))
+    (set! failures (+ failures (pressure 52 58 4096 253)))
+    (set! failures (+ failures (pressure 52 59 16 254)))
+    (set! failures (+ failures (pressure 52 59 4096 255)))
+    (set! failures (+ failures (pressure 37 58 16 256)))
+    (set! failures (+ failures (pressure 37 58 4096 257)))
+    (set! failures (+ failures (pressure 37 59 16 258)))
+    (set! failures (+ failures (pressure 37 59 4096 259)))
+    (set! failures (+ failures (pressure 43 58 16 260)))
+    (set! failures (+ failures (pressure 43 58 4096 261)))
+    (set! failures (+ failures (pressure 43 59 16 262)))
+    (set! failures (+ failures (pressure 43 59 4096 263)))
+    (set! failures (+ failures (pressure 45 58 16 264)))
+    (set! failures (+ failures (pressure 45 58 4096 265)))
+    (set! failures (+ failures (pressure 45 59 16 266)))
+    (set! failures (+ failures (pressure 45 59 4096 267)))
+    (set! failures (+ failures (pressure 44 58 16 268)))
+    (set! failures (+ failures (pressure 44 58 4096 269)))
+    (set! failures (+ failures (pressure 44 59 16 270)))
+    (set! failures (+ failures (pressure 44 59 4096 271)))
+    (println "vector extrema: 240 matrix graphs, 32 pressure graphs, 624 forced aliases; failures {}"
+             failures)
+    failures))

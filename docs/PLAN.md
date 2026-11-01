@@ -1221,3 +1221,30 @@ still open. Full regression passes all 197 standalone checks and 57 linked
 consumers with debug checks, exact coverage, regenerated objects and no linked
 warnings. All 358 implementation/test sources remain Coil; formatting/diff checks
 pass.
+
+
+### Vector extrema checkpoint
+
+MIN/MAX now use the shared typed vector builder/validation path for all non-BOOL
+integer/address and floating element types. Native D/Q emission uses signed or
+unsigned SIMD min/max for 8/16/32-bit integer lanes and lane-wise CMP/CSEL for
+64-bit integer lanes. Floating lanes follow the existing scalar library contract:
+choose left for ordered <= (MIN) or >= (MAX), otherwise right. This preserves
+selected NaN payloads, including signaling bits, and the left zero sign on a tie.
+The pinned reference AArch64 backend instead uses FMINNM/FMAXNM; those exceptional
+semantics differ. No full exceptional-input equivalence is claimed.
+
+FP vectors use FCMGE/BSL with a mask register distinct from both sources, including
+when literals occupy both reserved SIMD registers. Single f64 lanes use FCMP/FCSEL.
+All emission is staged before append; no helper calls or additional allocated
+registers are needed. Native result registers exclude reserved v30/v31.
+
+Focused validation covers 624 register cases / 1,808 independently assembled LLVM
+MC words; 240 graph variants across all 24 D/Q types, both operations and five
+loaded/literal/identical-input forms; 121 input-pattern pairs per matrix graph;
+624 forced-register JIT harnesses; 32 call/spill pressure graphs with 16/4096-byte
+frames and live dynamic storage; and 272 linked Mach-O objects. Selected result
+bits, original operands, input memory and surrounding padding are checked.
+Comparisons, lane/shuffle/conversion families, the remaining independent-library
+work, actual compiler integration and LLVM/TPDE performance comparisons remain
+open.

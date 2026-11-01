@@ -1,0 +1,3027 @@
+(module stogir.tests.vector-extrema)
+(import "stogir.a64.vector-extrema" :as native)
+(import "stogir.vector-arithmetic" :as va)
+(import "stogir.types" :as types)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err])
+
+(defn check [(ty i32) (op i32) (rd i32) (rn i32) (rm i32) (words (slice u32))]
+  (-> i64)
+  (let [(mut output) (ArrayList::new [u8] (malloc-allocator))
+        (mut failures) 0]
+    (push! (mut output) 165)
+    (match (native/emit-registers! (mut output) op ty rd rn rm)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [size]
+          (when (!= (cast i64 size) (* 4 (len words)))
+            (set! failures (+ failures 1)))))
+    (when (!= (len output) (+ 1 (* 4 (len words))))
+      (set! failures (+ failures 1)))
+    (let [(mut i) (: 0 i64)]
+      (while (< i (len output))
+        (when (or (= i 0) (< (/ (- i 1) 4) (len words)))
+          (let [wanted
+                  (if (= i 0)
+                      (: 165 u8)
+                      (cast u8
+                            (>> (get words (/ (- i 1) 4))
+                                (cast u32 (* (% (- i 1) 4) 8)))))]
+            (when (!= (get output i) wanted)
+              (println "extrema MC ty{} op{} rd{} rn{} rm{} byte{}"
+                       ty
+                       op
+                       rd
+                       rn
+                       rm
+                       i)
+              (set! failures (+ failures 1)))))
+        (set! i (+ i 1))))
+    (free! (mut output))
+    failures))
+
+(defn invalid [(ty i32) (op i32) (rd i32) (rn i32) (rm i32)] (-> i64)
+  (let [(mut output) (ArrayList::new [u8] (malloc-allocator))
+        (mut failures) 0]
+    (push! (mut output) 165)
+    (match (native/emit-registers! (mut output) op ty rd rn rm)
+      (Ok [_] (set! failures (+ failures 1)))
+      (Err [_] 0))
+    (when (or (!= (len output) 1) (!= (get output 0) 165))
+      (set! failures (+ failures 1)))
+    (free! (mut output))
+    failures))
+
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.verify" :as verify)
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn contracts [] (-> i64)
+  (let [(mut graph) (g/create (malloc-allocator))
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        value (require (b/emit! (mut graph) 71 37 [start (: 0 i32) 0]))
+        wrong (require (b/emit! (mut graph) 71 21 [start (: 0 i32) 1]))
+        scalar (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        storage (require (b/variable! (mut graph) 37 start "storage" 0))
+        (mut failures) 0
+        (mut ordinal) (: 3 i32)]
+    (for base [(: 2 i32) 3 4 5 6 7 8 9 10 11 12 13]
+      (for lanes [(: 1 i32) 2 4 8 16 32 64]
+        (let [ty (types/vector-type base lanes)
+              input
+                (require (b/emit! (mut graph) 71 ty [start (: 0 i32) ordinal]))]
+          (set! ordinal (+ ordinal 1))
+          (for opcode [(: 58 i32) 59]
+            (let [result
+                    (require (b/vector-binary! (mut graph)
+                                               opcode
+                                               ty
+                                               input
+                                               input
+                                               0))]
+              (match (va/validate graph result)
+                (Err [_] (set! failures (+ failures 1)))
+                (Ok [_] 0)))))))
+    (let [before (len (.instructions graph))]
+      (for rejected [(b/vector-binary! (mut graph) 58 37 value wrong 0)
+                     (b/vector-binary! (mut graph) 59 37 scalar value 0)
+                     (b/vector-binary! (mut graph) 58 37 value storage 0)
+                     (b/vector-binary! (mut graph) 59 37 value 0 0)
+                     (b/vector-binary! (mut graph) 58 37 value value start)
+                     (b/vector-binary! (mut graph) 59 5 scalar scalar 0)]
+        (match rejected (Err [_] 0) (Ok [_] (set! failures (+ failures 1)))))
+      (when (!= (len (.instructions graph)) before)
+        (set! failures (+ failures 1))))
+    (match (verify/integer-operations graph)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [_] 0))
+    (let [bad (require (b/emit! (mut graph) 58 37 [value scalar]))]
+      (match (verify/integer-operations graph)
+        (Err [_] 0)
+        (Ok [_] (set! failures (+ failures 1)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) (contracts)]
+    (set! failures (+ failures (check 66 58 0 1 2 [(: 0x2E226C20 u32)])))
+    (set! failures (+ failures (check 66 58 1 1 2 [(: 0x2E226C21 u32)])))
+    (set! failures (+ failures (check 66 58 2 1 2 [(: 0x2E226C22 u32)])))
+    (set! failures (+ failures (check 66 58 1 1 1 [(: 0x2E216C21 u32)])))
+    (set! failures (+ failures (check 66 58 0 1 1 [(: 0x2E216C20 u32)])))
+    (set! failures (+ failures (check 66 58 0 30 31 [(: 0x2E3F6FC0 u32)])))
+    (set! failures (+ failures (check 66 58 0 31 30 [(: 0x2E3E6FE0 u32)])))
+    (set! failures (+ failures (check 66 58 1 1 30 [(: 0x2E3E6C21 u32)])))
+    (set! failures (+ failures (check 66 58 1 30 1 [(: 0x2E216FC1 u32)])))
+    (set! failures (+ failures (check 66 58 1 1 31 [(: 0x2E3F6C21 u32)])))
+    (set! failures (+ failures (check 66 58 1 31 1 [(: 0x2E216FE1 u32)])))
+    (set! failures (+ failures (check 66 58 0 30 30 [(: 0x2E3E6FC0 u32)])))
+    (set! failures (+ failures (check 66 58 0 31 31 [(: 0x2E3F6FE0 u32)])))
+    (set! failures (+ failures (check 66 59 0 1 2 [(: 0x2E226420 u32)])))
+    (set! failures (+ failures (check 66 59 1 1 2 [(: 0x2E226421 u32)])))
+    (set! failures (+ failures (check 66 59 2 1 2 [(: 0x2E226422 u32)])))
+    (set! failures (+ failures (check 66 59 1 1 1 [(: 0x2E216421 u32)])))
+    (set! failures (+ failures (check 66 59 0 1 1 [(: 0x2E216420 u32)])))
+    (set! failures (+ failures (check 66 59 0 30 31 [(: 0x2E3F67C0 u32)])))
+    (set! failures (+ failures (check 66 59 0 31 30 [(: 0x2E3E67E0 u32)])))
+    (set! failures (+ failures (check 66 59 1 1 30 [(: 0x2E3E6421 u32)])))
+    (set! failures (+ failures (check 66 59 1 30 1 [(: 0x2E2167C1 u32)])))
+    (set! failures (+ failures (check 66 59 1 1 31 [(: 0x2E3F6421 u32)])))
+    (set! failures (+ failures (check 66 59 1 31 1 [(: 0x2E2167E1 u32)])))
+    (set! failures (+ failures (check 66 59 0 30 30 [(: 0x2E3E67C0 u32)])))
+    (set! failures (+ failures (check 66 59 0 31 31 [(: 0x2E3F67E0 u32)])))
+    (set! failures (+ failures (check 82 58 0 1 2 [(: 0x6E226C20 u32)])))
+    (set! failures (+ failures (check 82 58 1 1 2 [(: 0x6E226C21 u32)])))
+    (set! failures (+ failures (check 82 58 2 1 2 [(: 0x6E226C22 u32)])))
+    (set! failures (+ failures (check 82 58 1 1 1 [(: 0x6E216C21 u32)])))
+    (set! failures (+ failures (check 82 58 0 1 1 [(: 0x6E216C20 u32)])))
+    (set! failures (+ failures (check 82 58 0 30 31 [(: 0x6E3F6FC0 u32)])))
+    (set! failures (+ failures (check 82 58 0 31 30 [(: 0x6E3E6FE0 u32)])))
+    (set! failures (+ failures (check 82 58 1 1 30 [(: 0x6E3E6C21 u32)])))
+    (set! failures (+ failures (check 82 58 1 30 1 [(: 0x6E216FC1 u32)])))
+    (set! failures (+ failures (check 82 58 1 1 31 [(: 0x6E3F6C21 u32)])))
+    (set! failures (+ failures (check 82 58 1 31 1 [(: 0x6E216FE1 u32)])))
+    (set! failures (+ failures (check 82 58 0 30 30 [(: 0x6E3E6FC0 u32)])))
+    (set! failures (+ failures (check 82 58 0 31 31 [(: 0x6E3F6FE0 u32)])))
+    (set! failures (+ failures (check 82 59 0 1 2 [(: 0x6E226420 u32)])))
+    (set! failures (+ failures (check 82 59 1 1 2 [(: 0x6E226421 u32)])))
+    (set! failures (+ failures (check 82 59 2 1 2 [(: 0x6E226422 u32)])))
+    (set! failures (+ failures (check 82 59 1 1 1 [(: 0x6E216421 u32)])))
+    (set! failures (+ failures (check 82 59 0 1 1 [(: 0x6E216420 u32)])))
+    (set! failures (+ failures (check 82 59 0 30 31 [(: 0x6E3F67C0 u32)])))
+    (set! failures (+ failures (check 82 59 0 31 30 [(: 0x6E3E67E0 u32)])))
+    (set! failures (+ failures (check 82 59 1 1 30 [(: 0x6E3E6421 u32)])))
+    (set! failures (+ failures (check 82 59 1 30 1 [(: 0x6E2167C1 u32)])))
+    (set! failures (+ failures (check 82 59 1 1 31 [(: 0x6E3F6421 u32)])))
+    (set! failures (+ failures (check 82 59 1 31 1 [(: 0x6E2167E1 u32)])))
+    (set! failures (+ failures (check 82 59 0 30 30 [(: 0x6E3E67C0 u32)])))
+    (set! failures (+ failures (check 82 59 0 31 31 [(: 0x6E3F67E0 u32)])))
+    (set! failures (+ failures (check 51 58 0 1 2 [(: 0x2E626C20 u32)])))
+    (set! failures (+ failures (check 51 58 1 1 2 [(: 0x2E626C21 u32)])))
+    (set! failures (+ failures (check 51 58 2 1 2 [(: 0x2E626C22 u32)])))
+    (set! failures (+ failures (check 51 58 1 1 1 [(: 0x2E616C21 u32)])))
+    (set! failures (+ failures (check 51 58 0 1 1 [(: 0x2E616C20 u32)])))
+    (set! failures (+ failures (check 51 58 0 30 31 [(: 0x2E7F6FC0 u32)])))
+    (set! failures (+ failures (check 51 58 0 31 30 [(: 0x2E7E6FE0 u32)])))
+    (set! failures (+ failures (check 51 58 1 1 30 [(: 0x2E7E6C21 u32)])))
+    (set! failures (+ failures (check 51 58 1 30 1 [(: 0x2E616FC1 u32)])))
+    (set! failures (+ failures (check 51 58 1 1 31 [(: 0x2E7F6C21 u32)])))
+    (set! failures (+ failures (check 51 58 1 31 1 [(: 0x2E616FE1 u32)])))
+    (set! failures (+ failures (check 51 58 0 30 30 [(: 0x2E7E6FC0 u32)])))
+    (set! failures (+ failures (check 51 58 0 31 31 [(: 0x2E7F6FE0 u32)])))
+    (set! failures (+ failures (check 51 59 0 1 2 [(: 0x2E626420 u32)])))
+    (set! failures (+ failures (check 51 59 1 1 2 [(: 0x2E626421 u32)])))
+    (set! failures (+ failures (check 51 59 2 1 2 [(: 0x2E626422 u32)])))
+    (set! failures (+ failures (check 51 59 1 1 1 [(: 0x2E616421 u32)])))
+    (set! failures (+ failures (check 51 59 0 1 1 [(: 0x2E616420 u32)])))
+    (set! failures (+ failures (check 51 59 0 30 31 [(: 0x2E7F67C0 u32)])))
+    (set! failures (+ failures (check 51 59 0 31 30 [(: 0x2E7E67E0 u32)])))
+    (set! failures (+ failures (check 51 59 1 1 30 [(: 0x2E7E6421 u32)])))
+    (set! failures (+ failures (check 51 59 1 30 1 [(: 0x2E6167C1 u32)])))
+    (set! failures (+ failures (check 51 59 1 1 31 [(: 0x2E7F6421 u32)])))
+    (set! failures (+ failures (check 51 59 1 31 1 [(: 0x2E6167E1 u32)])))
+    (set! failures (+ failures (check 51 59 0 30 30 [(: 0x2E7E67C0 u32)])))
+    (set! failures (+ failures (check 51 59 0 31 31 [(: 0x2E7F67E0 u32)])))
+    (set! failures (+ failures (check 67 58 0 1 2 [(: 0x6E626C20 u32)])))
+    (set! failures (+ failures (check 67 58 1 1 2 [(: 0x6E626C21 u32)])))
+    (set! failures (+ failures (check 67 58 2 1 2 [(: 0x6E626C22 u32)])))
+    (set! failures (+ failures (check 67 58 1 1 1 [(: 0x6E616C21 u32)])))
+    (set! failures (+ failures (check 67 58 0 1 1 [(: 0x6E616C20 u32)])))
+    (set! failures (+ failures (check 67 58 0 30 31 [(: 0x6E7F6FC0 u32)])))
+    (set! failures (+ failures (check 67 58 0 31 30 [(: 0x6E7E6FE0 u32)])))
+    (set! failures (+ failures (check 67 58 1 1 30 [(: 0x6E7E6C21 u32)])))
+    (set! failures (+ failures (check 67 58 1 30 1 [(: 0x6E616FC1 u32)])))
+    (set! failures (+ failures (check 67 58 1 1 31 [(: 0x6E7F6C21 u32)])))
+    (set! failures (+ failures (check 67 58 1 31 1 [(: 0x6E616FE1 u32)])))
+    (set! failures (+ failures (check 67 58 0 30 30 [(: 0x6E7E6FC0 u32)])))
+    (set! failures (+ failures (check 67 58 0 31 31 [(: 0x6E7F6FE0 u32)])))
+    (set! failures (+ failures (check 67 59 0 1 2 [(: 0x6E626420 u32)])))
+    (set! failures (+ failures (check 67 59 1 1 2 [(: 0x6E626421 u32)])))
+    (set! failures (+ failures (check 67 59 2 1 2 [(: 0x6E626422 u32)])))
+    (set! failures (+ failures (check 67 59 1 1 1 [(: 0x6E616421 u32)])))
+    (set! failures (+ failures (check 67 59 0 1 1 [(: 0x6E616420 u32)])))
+    (set! failures (+ failures (check 67 59 0 30 31 [(: 0x6E7F67C0 u32)])))
+    (set! failures (+ failures (check 67 59 0 31 30 [(: 0x6E7E67E0 u32)])))
+    (set! failures (+ failures (check 67 59 1 1 30 [(: 0x6E7E6421 u32)])))
+    (set! failures (+ failures (check 67 59 1 30 1 [(: 0x6E6167C1 u32)])))
+    (set! failures (+ failures (check 67 59 1 1 31 [(: 0x6E7F6421 u32)])))
+    (set! failures (+ failures (check 67 59 1 31 1 [(: 0x6E6167E1 u32)])))
+    (set! failures (+ failures (check 67 59 0 30 30 [(: 0x6E7E67C0 u32)])))
+    (set! failures (+ failures (check 67 59 0 31 31 [(: 0x6E7F67E0 u32)])))
+    (set! failures (+ failures (check 36 58 0 1 2 [(: 0x2EA26C20 u32)])))
+    (set! failures (+ failures (check 36 58 1 1 2 [(: 0x2EA26C21 u32)])))
+    (set! failures (+ failures (check 36 58 2 1 2 [(: 0x2EA26C22 u32)])))
+    (set! failures (+ failures (check 36 58 1 1 1 [(: 0x2EA16C21 u32)])))
+    (set! failures (+ failures (check 36 58 0 1 1 [(: 0x2EA16C20 u32)])))
+    (set! failures (+ failures (check 36 58 0 30 31 [(: 0x2EBF6FC0 u32)])))
+    (set! failures (+ failures (check 36 58 0 31 30 [(: 0x2EBE6FE0 u32)])))
+    (set! failures (+ failures (check 36 58 1 1 30 [(: 0x2EBE6C21 u32)])))
+    (set! failures (+ failures (check 36 58 1 30 1 [(: 0x2EA16FC1 u32)])))
+    (set! failures (+ failures (check 36 58 1 1 31 [(: 0x2EBF6C21 u32)])))
+    (set! failures (+ failures (check 36 58 1 31 1 [(: 0x2EA16FE1 u32)])))
+    (set! failures (+ failures (check 36 58 0 30 30 [(: 0x2EBE6FC0 u32)])))
+    (set! failures (+ failures (check 36 58 0 31 31 [(: 0x2EBF6FE0 u32)])))
+    (set! failures (+ failures (check 36 59 0 1 2 [(: 0x2EA26420 u32)])))
+    (set! failures (+ failures (check 36 59 1 1 2 [(: 0x2EA26421 u32)])))
+    (set! failures (+ failures (check 36 59 2 1 2 [(: 0x2EA26422 u32)])))
+    (set! failures (+ failures (check 36 59 1 1 1 [(: 0x2EA16421 u32)])))
+    (set! failures (+ failures (check 36 59 0 1 1 [(: 0x2EA16420 u32)])))
+    (set! failures (+ failures (check 36 59 0 30 31 [(: 0x2EBF67C0 u32)])))
+    (set! failures (+ failures (check 36 59 0 31 30 [(: 0x2EBE67E0 u32)])))
+    (set! failures (+ failures (check 36 59 1 1 30 [(: 0x2EBE6421 u32)])))
+    (set! failures (+ failures (check 36 59 1 30 1 [(: 0x2EA167C1 u32)])))
+    (set! failures (+ failures (check 36 59 1 1 31 [(: 0x2EBF6421 u32)])))
+    (set! failures (+ failures (check 36 59 1 31 1 [(: 0x2EA167E1 u32)])))
+    (set! failures (+ failures (check 36 59 0 30 30 [(: 0x2EBE67C0 u32)])))
+    (set! failures (+ failures (check 36 59 0 31 31 [(: 0x2EBF67E0 u32)])))
+    (set! failures (+ failures (check 52 58 0 1 2 [(: 0x6EA26C20 u32)])))
+    (set! failures (+ failures (check 52 58 1 1 2 [(: 0x6EA26C21 u32)])))
+    (set! failures (+ failures (check 52 58 2 1 2 [(: 0x6EA26C22 u32)])))
+    (set! failures (+ failures (check 52 58 1 1 1 [(: 0x6EA16C21 u32)])))
+    (set! failures (+ failures (check 52 58 0 1 1 [(: 0x6EA16C20 u32)])))
+    (set! failures (+ failures (check 52 58 0 30 31 [(: 0x6EBF6FC0 u32)])))
+    (set! failures (+ failures (check 52 58 0 31 30 [(: 0x6EBE6FE0 u32)])))
+    (set! failures (+ failures (check 52 58 1 1 30 [(: 0x6EBE6C21 u32)])))
+    (set! failures (+ failures (check 52 58 1 30 1 [(: 0x6EA16FC1 u32)])))
+    (set! failures (+ failures (check 52 58 1 1 31 [(: 0x6EBF6C21 u32)])))
+    (set! failures (+ failures (check 52 58 1 31 1 [(: 0x6EA16FE1 u32)])))
+    (set! failures (+ failures (check 52 58 0 30 30 [(: 0x6EBE6FC0 u32)])))
+    (set! failures (+ failures (check 52 58 0 31 31 [(: 0x6EBF6FE0 u32)])))
+    (set! failures (+ failures (check 52 59 0 1 2 [(: 0x6EA26420 u32)])))
+    (set! failures (+ failures (check 52 59 1 1 2 [(: 0x6EA26421 u32)])))
+    (set! failures (+ failures (check 52 59 2 1 2 [(: 0x6EA26422 u32)])))
+    (set! failures (+ failures (check 52 59 1 1 1 [(: 0x6EA16421 u32)])))
+    (set! failures (+ failures (check 52 59 0 1 1 [(: 0x6EA16420 u32)])))
+    (set! failures (+ failures (check 52 59 0 30 31 [(: 0x6EBF67C0 u32)])))
+    (set! failures (+ failures (check 52 59 0 31 30 [(: 0x6EBE67E0 u32)])))
+    (set! failures (+ failures (check 52 59 1 1 30 [(: 0x6EBE6421 u32)])))
+    (set! failures (+ failures (check 52 59 1 30 1 [(: 0x6EA167C1 u32)])))
+    (set! failures (+ failures (check 52 59 1 1 31 [(: 0x6EBF6421 u32)])))
+    (set! failures (+ failures (check 52 59 1 31 1 [(: 0x6EA167E1 u32)])))
+    (set! failures (+ failures (check 52 59 0 30 30 [(: 0x6EBE67C0 u32)])))
+    (set! failures (+ failures (check 52 59 0 31 31 [(: 0x6EBF67E0 u32)])))
+    (set! failures
+          (+ failures
+             (check 21
+                    58
+                    0
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 21
+                    58
+                    1
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 21
+                    58
+                    2
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E02])))
+    (set! failures
+          (+ failures
+             (check 21
+                    58
+                    1
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 21
+                    58
+                    0
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 21
+                    58
+                    0
+                    30
+                    31
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 21
+                    58
+                    0
+                    31
+                    30
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 21
+                    58
+                    1
+                    1
+                    30
+                    [(: 0x4E083C30 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 21
+                    58
+                    1
+                    30
+                    1
+                    [(: 0x4E083FD0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 21
+                    58
+                    1
+                    1
+                    31
+                    [(: 0x4E083C30 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 21
+                    58
+                    1
+                    31
+                    1
+                    [(: 0x4E083FF0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 21
+                    58
+                    0
+                    30
+                    30
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 21
+                    58
+                    0
+                    31
+                    31
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 21
+                    59
+                    0
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 21
+                    59
+                    1
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 21
+                    59
+                    2
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E02])))
+    (set! failures
+          (+ failures
+             (check 21
+                    59
+                    1
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 21
+                    59
+                    0
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 21
+                    59
+                    0
+                    30
+                    31
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 21
+                    59
+                    0
+                    31
+                    30
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 21
+                    59
+                    1
+                    1
+                    30
+                    [(: 0x4E083C30 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 21
+                    59
+                    1
+                    30
+                    1
+                    [(: 0x4E083FD0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 21
+                    59
+                    1
+                    1
+                    31
+                    [(: 0x4E083C30 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 21
+                    59
+                    1
+                    31
+                    1
+                    [(: 0x4E083FF0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 21
+                    59
+                    0
+                    30
+                    30
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 21
+                    59
+                    0
+                    31
+                    31
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 37
+                    58
+                    0
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00
+                     0x4E183C30
+                     0x4E183C51
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 37
+                    58
+                    1
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183C51
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 37
+                    58
+                    2
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E02
+                     0x4E183C30
+                     0x4E183C51
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E02])))
+    (set! failures
+          (+ failures
+             (check 37
+                    58
+                    1
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 37
+                    58
+                    0
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00
+                     0x4E183C30
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 37
+                    58
+                    0
+                    30
+                    31
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00
+                     0x4E183FD0
+                     0x4E183FF1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 37
+                    58
+                    0
+                    31
+                    30
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00
+                     0x4E183FF0
+                     0x4E183FD1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 37
+                    58
+                    1
+                    1
+                    30
+                    [(: 0x4E083C30 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183FD1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 37
+                    58
+                    1
+                    30
+                    1
+                    [(: 0x4E083FD0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01
+                     0x4E183FD0
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 37
+                    58
+                    1
+                    1
+                    31
+                    [(: 0x4E083C30 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183FF1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 37
+                    58
+                    1
+                    31
+                    1
+                    [(: 0x4E083FF0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01
+                     0x4E183FF0
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 37
+                    58
+                    0
+                    30
+                    30
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00
+                     0x4E183FD0
+                     0x4E183FD1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 37
+                    58
+                    0
+                    31
+                    31
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00
+                     0x4E183FF0
+                     0x4E183FF1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 37
+                    59
+                    0
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00
+                     0x4E183C30
+                     0x4E183C51
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 37
+                    59
+                    1
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183C51
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 37
+                    59
+                    2
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E02
+                     0x4E183C30
+                     0x4E183C51
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E02])))
+    (set! failures
+          (+ failures
+             (check 37
+                    59
+                    1
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 37
+                    59
+                    0
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00
+                     0x4E183C30
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 37
+                    59
+                    0
+                    30
+                    31
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00
+                     0x4E183FD0
+                     0x4E183FF1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 37
+                    59
+                    0
+                    31
+                    30
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00
+                     0x4E183FF0
+                     0x4E183FD1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 37
+                    59
+                    1
+                    1
+                    30
+                    [(: 0x4E083C30 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183FD1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 37
+                    59
+                    1
+                    30
+                    1
+                    [(: 0x4E083FD0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01
+                     0x4E183FD0
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 37
+                    59
+                    1
+                    1
+                    31
+                    [(: 0x4E083C30 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183FF1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 37
+                    59
+                    1
+                    31
+                    1
+                    [(: 0x4E083FF0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01
+                     0x4E183FF0
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 37
+                    59
+                    0
+                    30
+                    30
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00
+                     0x4E183FD0
+                     0x4E183FD1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 37
+                    59
+                    0
+                    31
+                    31
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00
+                     0x4E183FF0
+                     0x4E183FF1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 22
+                    58
+                    0
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 22
+                    58
+                    1
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 22
+                    58
+                    2
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E02])))
+    (set! failures
+          (+ failures
+             (check 22
+                    58
+                    1
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 22
+                    58
+                    0
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 22
+                    58
+                    0
+                    30
+                    31
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 22
+                    58
+                    0
+                    31
+                    30
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 22
+                    58
+                    1
+                    1
+                    30
+                    [(: 0x4E083C30 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 22
+                    58
+                    1
+                    30
+                    1
+                    [(: 0x4E083FD0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 22
+                    58
+                    1
+                    1
+                    31
+                    [(: 0x4E083C30 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 22
+                    58
+                    1
+                    31
+                    1
+                    [(: 0x4E083FF0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 22
+                    58
+                    0
+                    30
+                    30
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 22
+                    58
+                    0
+                    31
+                    31
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 22
+                    59
+                    0
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 22
+                    59
+                    1
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 22
+                    59
+                    2
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E02])))
+    (set! failures
+          (+ failures
+             (check 22
+                    59
+                    1
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 22
+                    59
+                    0
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 22
+                    59
+                    0
+                    30
+                    31
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 22
+                    59
+                    0
+                    31
+                    30
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 22
+                    59
+                    1
+                    1
+                    30
+                    [(: 0x4E083C30 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 22
+                    59
+                    1
+                    30
+                    1
+                    [(: 0x4E083FD0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 22
+                    59
+                    1
+                    1
+                    31
+                    [(: 0x4E083C30 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 22
+                    59
+                    1
+                    31
+                    1
+                    [(: 0x4E083FF0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 22
+                    59
+                    0
+                    30
+                    30
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 22
+                    59
+                    0
+                    31
+                    31
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 38
+                    58
+                    0
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00
+                     0x4E183C30
+                     0x4E183C51
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 38
+                    58
+                    1
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183C51
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 38
+                    58
+                    2
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E02
+                     0x4E183C30
+                     0x4E183C51
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E02])))
+    (set! failures
+          (+ failures
+             (check 38
+                    58
+                    1
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 38
+                    58
+                    0
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00
+                     0x4E183C30
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 38
+                    58
+                    0
+                    30
+                    31
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00
+                     0x4E183FD0
+                     0x4E183FF1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 38
+                    58
+                    0
+                    31
+                    30
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00
+                     0x4E183FF0
+                     0x4E183FD1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 38
+                    58
+                    1
+                    1
+                    30
+                    [(: 0x4E083C30 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183FD1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 38
+                    58
+                    1
+                    30
+                    1
+                    [(: 0x4E083FD0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01
+                     0x4E183FD0
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 38
+                    58
+                    1
+                    1
+                    31
+                    [(: 0x4E083C30 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183FF1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 38
+                    58
+                    1
+                    31
+                    1
+                    [(: 0x4E083FF0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E01
+                     0x4E183FF0
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 38
+                    58
+                    0
+                    30
+                    30
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00
+                     0x4E183FD0
+                     0x4E183FD1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 38
+                    58
+                    0
+                    31
+                    31
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E081E00
+                     0x4E183FF0
+                     0x4E183FF1
+                     0xEB11021F
+                     0x9A919210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 38
+                    59
+                    0
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00
+                     0x4E183C30
+                     0x4E183C51
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 38
+                    59
+                    1
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183C51
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 38
+                    59
+                    2
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E02
+                     0x4E183C30
+                     0x4E183C51
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E02])))
+    (set! failures
+          (+ failures
+             (check 38
+                    59
+                    1
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 38
+                    59
+                    0
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00
+                     0x4E183C30
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 38
+                    59
+                    0
+                    30
+                    31
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00
+                     0x4E183FD0
+                     0x4E183FF1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 38
+                    59
+                    0
+                    31
+                    30
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00
+                     0x4E183FF0
+                     0x4E183FD1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 38
+                    59
+                    1
+                    1
+                    30
+                    [(: 0x4E083C30 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183FD1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 38
+                    59
+                    1
+                    30
+                    1
+                    [(: 0x4E083FD0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01
+                     0x4E183FD0
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 38
+                    59
+                    1
+                    1
+                    31
+                    [(: 0x4E083C30 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183FF1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 38
+                    59
+                    1
+                    31
+                    1
+                    [(: 0x4E083FF0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E01
+                     0x4E183FF0
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 38
+                    59
+                    0
+                    30
+                    30
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00
+                     0x4E183FD0
+                     0x4E183FD1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 38
+                    59
+                    0
+                    31
+                    31
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E081E00
+                     0x4E183FF0
+                     0x4E183FF1
+                     0xEB11021F
+                     0x9A912210
+                     0x4E181E00])))
+    (set! failures (+ failures (check 71 58 0 1 2 [(: 0x0E226C20 u32)])))
+    (set! failures (+ failures (check 71 58 1 1 2 [(: 0x0E226C21 u32)])))
+    (set! failures (+ failures (check 71 58 2 1 2 [(: 0x0E226C22 u32)])))
+    (set! failures (+ failures (check 71 58 1 1 1 [(: 0x0E216C21 u32)])))
+    (set! failures (+ failures (check 71 58 0 1 1 [(: 0x0E216C20 u32)])))
+    (set! failures (+ failures (check 71 58 0 30 31 [(: 0x0E3F6FC0 u32)])))
+    (set! failures (+ failures (check 71 58 0 31 30 [(: 0x0E3E6FE0 u32)])))
+    (set! failures (+ failures (check 71 58 1 1 30 [(: 0x0E3E6C21 u32)])))
+    (set! failures (+ failures (check 71 58 1 30 1 [(: 0x0E216FC1 u32)])))
+    (set! failures (+ failures (check 71 58 1 1 31 [(: 0x0E3F6C21 u32)])))
+    (set! failures (+ failures (check 71 58 1 31 1 [(: 0x0E216FE1 u32)])))
+    (set! failures (+ failures (check 71 58 0 30 30 [(: 0x0E3E6FC0 u32)])))
+    (set! failures (+ failures (check 71 58 0 31 31 [(: 0x0E3F6FE0 u32)])))
+    (set! failures (+ failures (check 71 59 0 1 2 [(: 0x0E226420 u32)])))
+    (set! failures (+ failures (check 71 59 1 1 2 [(: 0x0E226421 u32)])))
+    (set! failures (+ failures (check 71 59 2 1 2 [(: 0x0E226422 u32)])))
+    (set! failures (+ failures (check 71 59 1 1 1 [(: 0x0E216421 u32)])))
+    (set! failures (+ failures (check 71 59 0 1 1 [(: 0x0E216420 u32)])))
+    (set! failures (+ failures (check 71 59 0 30 31 [(: 0x0E3F67C0 u32)])))
+    (set! failures (+ failures (check 71 59 0 31 30 [(: 0x0E3E67E0 u32)])))
+    (set! failures (+ failures (check 71 59 1 1 30 [(: 0x0E3E6421 u32)])))
+    (set! failures (+ failures (check 71 59 1 30 1 [(: 0x0E2167C1 u32)])))
+    (set! failures (+ failures (check 71 59 1 1 31 [(: 0x0E3F6421 u32)])))
+    (set! failures (+ failures (check 71 59 1 31 1 [(: 0x0E2167E1 u32)])))
+    (set! failures (+ failures (check 71 59 0 30 30 [(: 0x0E3E67C0 u32)])))
+    (set! failures (+ failures (check 71 59 0 31 31 [(: 0x0E3F67E0 u32)])))
+    (set! failures (+ failures (check 87 58 0 1 2 [(: 0x4E226C20 u32)])))
+    (set! failures (+ failures (check 87 58 1 1 2 [(: 0x4E226C21 u32)])))
+    (set! failures (+ failures (check 87 58 2 1 2 [(: 0x4E226C22 u32)])))
+    (set! failures (+ failures (check 87 58 1 1 1 [(: 0x4E216C21 u32)])))
+    (set! failures (+ failures (check 87 58 0 1 1 [(: 0x4E216C20 u32)])))
+    (set! failures (+ failures (check 87 58 0 30 31 [(: 0x4E3F6FC0 u32)])))
+    (set! failures (+ failures (check 87 58 0 31 30 [(: 0x4E3E6FE0 u32)])))
+    (set! failures (+ failures (check 87 58 1 1 30 [(: 0x4E3E6C21 u32)])))
+    (set! failures (+ failures (check 87 58 1 30 1 [(: 0x4E216FC1 u32)])))
+    (set! failures (+ failures (check 87 58 1 1 31 [(: 0x4E3F6C21 u32)])))
+    (set! failures (+ failures (check 87 58 1 31 1 [(: 0x4E216FE1 u32)])))
+    (set! failures (+ failures (check 87 58 0 30 30 [(: 0x4E3E6FC0 u32)])))
+    (set! failures (+ failures (check 87 58 0 31 31 [(: 0x4E3F6FE0 u32)])))
+    (set! failures (+ failures (check 87 59 0 1 2 [(: 0x4E226420 u32)])))
+    (set! failures (+ failures (check 87 59 1 1 2 [(: 0x4E226421 u32)])))
+    (set! failures (+ failures (check 87 59 2 1 2 [(: 0x4E226422 u32)])))
+    (set! failures (+ failures (check 87 59 1 1 1 [(: 0x4E216421 u32)])))
+    (set! failures (+ failures (check 87 59 0 1 1 [(: 0x4E216420 u32)])))
+    (set! failures (+ failures (check 87 59 0 30 31 [(: 0x4E3F67C0 u32)])))
+    (set! failures (+ failures (check 87 59 0 31 30 [(: 0x4E3E67E0 u32)])))
+    (set! failures (+ failures (check 87 59 1 1 30 [(: 0x4E3E6421 u32)])))
+    (set! failures (+ failures (check 87 59 1 30 1 [(: 0x4E2167C1 u32)])))
+    (set! failures (+ failures (check 87 59 1 1 31 [(: 0x4E3F6421 u32)])))
+    (set! failures (+ failures (check 87 59 1 31 1 [(: 0x4E2167E1 u32)])))
+    (set! failures (+ failures (check 87 59 0 30 30 [(: 0x4E3E67C0 u32)])))
+    (set! failures (+ failures (check 87 59 0 31 31 [(: 0x4E3F67E0 u32)])))
+    (set! failures (+ failures (check 72 58 0 1 2 [(: 0x0E226C20 u32)])))
+    (set! failures (+ failures (check 72 58 1 1 2 [(: 0x0E226C21 u32)])))
+    (set! failures (+ failures (check 72 58 2 1 2 [(: 0x0E226C22 u32)])))
+    (set! failures (+ failures (check 72 58 1 1 1 [(: 0x0E216C21 u32)])))
+    (set! failures (+ failures (check 72 58 0 1 1 [(: 0x0E216C20 u32)])))
+    (set! failures (+ failures (check 72 58 0 30 31 [(: 0x0E3F6FC0 u32)])))
+    (set! failures (+ failures (check 72 58 0 31 30 [(: 0x0E3E6FE0 u32)])))
+    (set! failures (+ failures (check 72 58 1 1 30 [(: 0x0E3E6C21 u32)])))
+    (set! failures (+ failures (check 72 58 1 30 1 [(: 0x0E216FC1 u32)])))
+    (set! failures (+ failures (check 72 58 1 1 31 [(: 0x0E3F6C21 u32)])))
+    (set! failures (+ failures (check 72 58 1 31 1 [(: 0x0E216FE1 u32)])))
+    (set! failures (+ failures (check 72 58 0 30 30 [(: 0x0E3E6FC0 u32)])))
+    (set! failures (+ failures (check 72 58 0 31 31 [(: 0x0E3F6FE0 u32)])))
+    (set! failures (+ failures (check 72 59 0 1 2 [(: 0x0E226420 u32)])))
+    (set! failures (+ failures (check 72 59 1 1 2 [(: 0x0E226421 u32)])))
+    (set! failures (+ failures (check 72 59 2 1 2 [(: 0x0E226422 u32)])))
+    (set! failures (+ failures (check 72 59 1 1 1 [(: 0x0E216421 u32)])))
+    (set! failures (+ failures (check 72 59 0 1 1 [(: 0x0E216420 u32)])))
+    (set! failures (+ failures (check 72 59 0 30 31 [(: 0x0E3F67C0 u32)])))
+    (set! failures (+ failures (check 72 59 0 31 30 [(: 0x0E3E67E0 u32)])))
+    (set! failures (+ failures (check 72 59 1 1 30 [(: 0x0E3E6421 u32)])))
+    (set! failures (+ failures (check 72 59 1 30 1 [(: 0x0E2167C1 u32)])))
+    (set! failures (+ failures (check 72 59 1 1 31 [(: 0x0E3F6421 u32)])))
+    (set! failures (+ failures (check 72 59 1 31 1 [(: 0x0E2167E1 u32)])))
+    (set! failures (+ failures (check 72 59 0 30 30 [(: 0x0E3E67C0 u32)])))
+    (set! failures (+ failures (check 72 59 0 31 31 [(: 0x0E3F67E0 u32)])))
+    (set! failures (+ failures (check 88 58 0 1 2 [(: 0x4E226C20 u32)])))
+    (set! failures (+ failures (check 88 58 1 1 2 [(: 0x4E226C21 u32)])))
+    (set! failures (+ failures (check 88 58 2 1 2 [(: 0x4E226C22 u32)])))
+    (set! failures (+ failures (check 88 58 1 1 1 [(: 0x4E216C21 u32)])))
+    (set! failures (+ failures (check 88 58 0 1 1 [(: 0x4E216C20 u32)])))
+    (set! failures (+ failures (check 88 58 0 30 31 [(: 0x4E3F6FC0 u32)])))
+    (set! failures (+ failures (check 88 58 0 31 30 [(: 0x4E3E6FE0 u32)])))
+    (set! failures (+ failures (check 88 58 1 1 30 [(: 0x4E3E6C21 u32)])))
+    (set! failures (+ failures (check 88 58 1 30 1 [(: 0x4E216FC1 u32)])))
+    (set! failures (+ failures (check 88 58 1 1 31 [(: 0x4E3F6C21 u32)])))
+    (set! failures (+ failures (check 88 58 1 31 1 [(: 0x4E216FE1 u32)])))
+    (set! failures (+ failures (check 88 58 0 30 30 [(: 0x4E3E6FC0 u32)])))
+    (set! failures (+ failures (check 88 58 0 31 31 [(: 0x4E3F6FE0 u32)])))
+    (set! failures (+ failures (check 88 59 0 1 2 [(: 0x4E226420 u32)])))
+    (set! failures (+ failures (check 88 59 1 1 2 [(: 0x4E226421 u32)])))
+    (set! failures (+ failures (check 88 59 2 1 2 [(: 0x4E226422 u32)])))
+    (set! failures (+ failures (check 88 59 1 1 1 [(: 0x4E216421 u32)])))
+    (set! failures (+ failures (check 88 59 0 1 1 [(: 0x4E216420 u32)])))
+    (set! failures (+ failures (check 88 59 0 30 31 [(: 0x4E3F67C0 u32)])))
+    (set! failures (+ failures (check 88 59 0 31 30 [(: 0x4E3E67E0 u32)])))
+    (set! failures (+ failures (check 88 59 1 1 30 [(: 0x4E3E6421 u32)])))
+    (set! failures (+ failures (check 88 59 1 30 1 [(: 0x4E2167C1 u32)])))
+    (set! failures (+ failures (check 88 59 1 1 31 [(: 0x4E3F6421 u32)])))
+    (set! failures (+ failures (check 88 59 1 31 1 [(: 0x4E2167E1 u32)])))
+    (set! failures (+ failures (check 88 59 0 30 30 [(: 0x4E3E67C0 u32)])))
+    (set! failures (+ failures (check 88 59 0 31 31 [(: 0x4E3F67E0 u32)])))
+    (set! failures (+ failures (check 57 58 0 1 2 [(: 0x0E626C20 u32)])))
+    (set! failures (+ failures (check 57 58 1 1 2 [(: 0x0E626C21 u32)])))
+    (set! failures (+ failures (check 57 58 2 1 2 [(: 0x0E626C22 u32)])))
+    (set! failures (+ failures (check 57 58 1 1 1 [(: 0x0E616C21 u32)])))
+    (set! failures (+ failures (check 57 58 0 1 1 [(: 0x0E616C20 u32)])))
+    (set! failures (+ failures (check 57 58 0 30 31 [(: 0x0E7F6FC0 u32)])))
+    (set! failures (+ failures (check 57 58 0 31 30 [(: 0x0E7E6FE0 u32)])))
+    (set! failures (+ failures (check 57 58 1 1 30 [(: 0x0E7E6C21 u32)])))
+    (set! failures (+ failures (check 57 58 1 30 1 [(: 0x0E616FC1 u32)])))
+    (set! failures (+ failures (check 57 58 1 1 31 [(: 0x0E7F6C21 u32)])))
+    (set! failures (+ failures (check 57 58 1 31 1 [(: 0x0E616FE1 u32)])))
+    (set! failures (+ failures (check 57 58 0 30 30 [(: 0x0E7E6FC0 u32)])))
+    (set! failures (+ failures (check 57 58 0 31 31 [(: 0x0E7F6FE0 u32)])))
+    (set! failures (+ failures (check 57 59 0 1 2 [(: 0x0E626420 u32)])))
+    (set! failures (+ failures (check 57 59 1 1 2 [(: 0x0E626421 u32)])))
+    (set! failures (+ failures (check 57 59 2 1 2 [(: 0x0E626422 u32)])))
+    (set! failures (+ failures (check 57 59 1 1 1 [(: 0x0E616421 u32)])))
+    (set! failures (+ failures (check 57 59 0 1 1 [(: 0x0E616420 u32)])))
+    (set! failures (+ failures (check 57 59 0 30 31 [(: 0x0E7F67C0 u32)])))
+    (set! failures (+ failures (check 57 59 0 31 30 [(: 0x0E7E67E0 u32)])))
+    (set! failures (+ failures (check 57 59 1 1 30 [(: 0x0E7E6421 u32)])))
+    (set! failures (+ failures (check 57 59 1 30 1 [(: 0x0E6167C1 u32)])))
+    (set! failures (+ failures (check 57 59 1 1 31 [(: 0x0E7F6421 u32)])))
+    (set! failures (+ failures (check 57 59 1 31 1 [(: 0x0E6167E1 u32)])))
+    (set! failures (+ failures (check 57 59 0 30 30 [(: 0x0E7E67C0 u32)])))
+    (set! failures (+ failures (check 57 59 0 31 31 [(: 0x0E7F67E0 u32)])))
+    (set! failures (+ failures (check 73 58 0 1 2 [(: 0x4E626C20 u32)])))
+    (set! failures (+ failures (check 73 58 1 1 2 [(: 0x4E626C21 u32)])))
+    (set! failures (+ failures (check 73 58 2 1 2 [(: 0x4E626C22 u32)])))
+    (set! failures (+ failures (check 73 58 1 1 1 [(: 0x4E616C21 u32)])))
+    (set! failures (+ failures (check 73 58 0 1 1 [(: 0x4E616C20 u32)])))
+    (set! failures (+ failures (check 73 58 0 30 31 [(: 0x4E7F6FC0 u32)])))
+    (set! failures (+ failures (check 73 58 0 31 30 [(: 0x4E7E6FE0 u32)])))
+    (set! failures (+ failures (check 73 58 1 1 30 [(: 0x4E7E6C21 u32)])))
+    (set! failures (+ failures (check 73 58 1 30 1 [(: 0x4E616FC1 u32)])))
+    (set! failures (+ failures (check 73 58 1 1 31 [(: 0x4E7F6C21 u32)])))
+    (set! failures (+ failures (check 73 58 1 31 1 [(: 0x4E616FE1 u32)])))
+    (set! failures (+ failures (check 73 58 0 30 30 [(: 0x4E7E6FC0 u32)])))
+    (set! failures (+ failures (check 73 58 0 31 31 [(: 0x4E7F6FE0 u32)])))
+    (set! failures (+ failures (check 73 59 0 1 2 [(: 0x4E626420 u32)])))
+    (set! failures (+ failures (check 73 59 1 1 2 [(: 0x4E626421 u32)])))
+    (set! failures (+ failures (check 73 59 2 1 2 [(: 0x4E626422 u32)])))
+    (set! failures (+ failures (check 73 59 1 1 1 [(: 0x4E616421 u32)])))
+    (set! failures (+ failures (check 73 59 0 1 1 [(: 0x4E616420 u32)])))
+    (set! failures (+ failures (check 73 59 0 30 31 [(: 0x4E7F67C0 u32)])))
+    (set! failures (+ failures (check 73 59 0 31 30 [(: 0x4E7E67E0 u32)])))
+    (set! failures (+ failures (check 73 59 1 1 30 [(: 0x4E7E6421 u32)])))
+    (set! failures (+ failures (check 73 59 1 30 1 [(: 0x4E6167C1 u32)])))
+    (set! failures (+ failures (check 73 59 1 1 31 [(: 0x4E7F6421 u32)])))
+    (set! failures (+ failures (check 73 59 1 31 1 [(: 0x4E6167E1 u32)])))
+    (set! failures (+ failures (check 73 59 0 30 30 [(: 0x4E7E67C0 u32)])))
+    (set! failures (+ failures (check 73 59 0 31 31 [(: 0x4E7F67E0 u32)])))
+    (set! failures (+ failures (check 42 58 0 1 2 [(: 0x0EA26C20 u32)])))
+    (set! failures (+ failures (check 42 58 1 1 2 [(: 0x0EA26C21 u32)])))
+    (set! failures (+ failures (check 42 58 2 1 2 [(: 0x0EA26C22 u32)])))
+    (set! failures (+ failures (check 42 58 1 1 1 [(: 0x0EA16C21 u32)])))
+    (set! failures (+ failures (check 42 58 0 1 1 [(: 0x0EA16C20 u32)])))
+    (set! failures (+ failures (check 42 58 0 30 31 [(: 0x0EBF6FC0 u32)])))
+    (set! failures (+ failures (check 42 58 0 31 30 [(: 0x0EBE6FE0 u32)])))
+    (set! failures (+ failures (check 42 58 1 1 30 [(: 0x0EBE6C21 u32)])))
+    (set! failures (+ failures (check 42 58 1 30 1 [(: 0x0EA16FC1 u32)])))
+    (set! failures (+ failures (check 42 58 1 1 31 [(: 0x0EBF6C21 u32)])))
+    (set! failures (+ failures (check 42 58 1 31 1 [(: 0x0EA16FE1 u32)])))
+    (set! failures (+ failures (check 42 58 0 30 30 [(: 0x0EBE6FC0 u32)])))
+    (set! failures (+ failures (check 42 58 0 31 31 [(: 0x0EBF6FE0 u32)])))
+    (set! failures (+ failures (check 42 59 0 1 2 [(: 0x0EA26420 u32)])))
+    (set! failures (+ failures (check 42 59 1 1 2 [(: 0x0EA26421 u32)])))
+    (set! failures (+ failures (check 42 59 2 1 2 [(: 0x0EA26422 u32)])))
+    (set! failures (+ failures (check 42 59 1 1 1 [(: 0x0EA16421 u32)])))
+    (set! failures (+ failures (check 42 59 0 1 1 [(: 0x0EA16420 u32)])))
+    (set! failures (+ failures (check 42 59 0 30 31 [(: 0x0EBF67C0 u32)])))
+    (set! failures (+ failures (check 42 59 0 31 30 [(: 0x0EBE67E0 u32)])))
+    (set! failures (+ failures (check 42 59 1 1 30 [(: 0x0EBE6421 u32)])))
+    (set! failures (+ failures (check 42 59 1 30 1 [(: 0x0EA167C1 u32)])))
+    (set! failures (+ failures (check 42 59 1 1 31 [(: 0x0EBF6421 u32)])))
+    (set! failures (+ failures (check 42 59 1 31 1 [(: 0x0EA167E1 u32)])))
+    (set! failures (+ failures (check 42 59 0 30 30 [(: 0x0EBE67C0 u32)])))
+    (set! failures (+ failures (check 42 59 0 31 31 [(: 0x0EBF67E0 u32)])))
+    (set! failures (+ failures (check 58 58 0 1 2 [(: 0x4EA26C20 u32)])))
+    (set! failures (+ failures (check 58 58 1 1 2 [(: 0x4EA26C21 u32)])))
+    (set! failures (+ failures (check 58 58 2 1 2 [(: 0x4EA26C22 u32)])))
+    (set! failures (+ failures (check 58 58 1 1 1 [(: 0x4EA16C21 u32)])))
+    (set! failures (+ failures (check 58 58 0 1 1 [(: 0x4EA16C20 u32)])))
+    (set! failures (+ failures (check 58 58 0 30 31 [(: 0x4EBF6FC0 u32)])))
+    (set! failures (+ failures (check 58 58 0 31 30 [(: 0x4EBE6FE0 u32)])))
+    (set! failures (+ failures (check 58 58 1 1 30 [(: 0x4EBE6C21 u32)])))
+    (set! failures (+ failures (check 58 58 1 30 1 [(: 0x4EA16FC1 u32)])))
+    (set! failures (+ failures (check 58 58 1 1 31 [(: 0x4EBF6C21 u32)])))
+    (set! failures (+ failures (check 58 58 1 31 1 [(: 0x4EA16FE1 u32)])))
+    (set! failures (+ failures (check 58 58 0 30 30 [(: 0x4EBE6FC0 u32)])))
+    (set! failures (+ failures (check 58 58 0 31 31 [(: 0x4EBF6FE0 u32)])))
+    (set! failures (+ failures (check 58 59 0 1 2 [(: 0x4EA26420 u32)])))
+    (set! failures (+ failures (check 58 59 1 1 2 [(: 0x4EA26421 u32)])))
+    (set! failures (+ failures (check 58 59 2 1 2 [(: 0x4EA26422 u32)])))
+    (set! failures (+ failures (check 58 59 1 1 1 [(: 0x4EA16421 u32)])))
+    (set! failures (+ failures (check 58 59 0 1 1 [(: 0x4EA16420 u32)])))
+    (set! failures (+ failures (check 58 59 0 30 31 [(: 0x4EBF67C0 u32)])))
+    (set! failures (+ failures (check 58 59 0 31 30 [(: 0x4EBE67E0 u32)])))
+    (set! failures (+ failures (check 58 59 1 1 30 [(: 0x4EBE6421 u32)])))
+    (set! failures (+ failures (check 58 59 1 30 1 [(: 0x4EA167C1 u32)])))
+    (set! failures (+ failures (check 58 59 1 1 31 [(: 0x4EBF6421 u32)])))
+    (set! failures (+ failures (check 58 59 1 31 1 [(: 0x4EA167E1 u32)])))
+    (set! failures (+ failures (check 58 59 0 30 30 [(: 0x4EBE67C0 u32)])))
+    (set! failures (+ failures (check 58 59 0 31 31 [(: 0x4EBF67E0 u32)])))
+    (set! failures
+          (+ failures
+             (check 27
+                    58
+                    0
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 27
+                    58
+                    1
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 27
+                    58
+                    2
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E02])))
+    (set! failures
+          (+ failures
+             (check 27
+                    58
+                    1
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 27
+                    58
+                    0
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 27
+                    58
+                    0
+                    30
+                    31
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 27
+                    58
+                    0
+                    31
+                    30
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 27
+                    58
+                    1
+                    1
+                    30
+                    [(: 0x4E083C30 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 27
+                    58
+                    1
+                    30
+                    1
+                    [(: 0x4E083FD0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 27
+                    58
+                    1
+                    1
+                    31
+                    [(: 0x4E083C30 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 27
+                    58
+                    1
+                    31
+                    1
+                    [(: 0x4E083FF0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 27
+                    58
+                    0
+                    30
+                    30
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 27
+                    58
+                    0
+                    31
+                    31
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 27
+                    59
+                    0
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 27
+                    59
+                    1
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 27
+                    59
+                    2
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E02])))
+    (set! failures
+          (+ failures
+             (check 27
+                    59
+                    1
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 27
+                    59
+                    0
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 27
+                    59
+                    0
+                    30
+                    31
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 27
+                    59
+                    0
+                    31
+                    30
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 27
+                    59
+                    1
+                    1
+                    30
+                    [(: 0x4E083C30 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 27
+                    59
+                    1
+                    30
+                    1
+                    [(: 0x4E083FD0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 27
+                    59
+                    1
+                    1
+                    31
+                    [(: 0x4E083C30 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 27
+                    59
+                    1
+                    31
+                    1
+                    [(: 0x4E083FF0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E01])))
+    (set! failures
+          (+ failures
+             (check 27
+                    59
+                    0
+                    30
+                    30
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 27
+                    59
+                    0
+                    31
+                    31
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E00])))
+    (set! failures
+          (+ failures
+             (check 43
+                    58
+                    0
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E00
+                     0x4E183C30
+                     0x4E183C51
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 43
+                    58
+                    1
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183C51
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 43
+                    58
+                    2
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E02
+                     0x4E183C30
+                     0x4E183C51
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E181E02])))
+    (set! failures
+          (+ failures
+             (check 43
+                    58
+                    1
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 43
+                    58
+                    0
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E00
+                     0x4E183C30
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 43
+                    58
+                    0
+                    30
+                    31
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E00
+                     0x4E183FD0
+                     0x4E183FF1
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 43
+                    58
+                    0
+                    31
+                    30
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E00
+                     0x4E183FF0
+                     0x4E183FD1
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 43
+                    58
+                    1
+                    1
+                    30
+                    [(: 0x4E083C30 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183FD1
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 43
+                    58
+                    1
+                    30
+                    1
+                    [(: 0x4E083FD0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E01
+                     0x4E183FD0
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 43
+                    58
+                    1
+                    1
+                    31
+                    [(: 0x4E083C30 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183FF1
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 43
+                    58
+                    1
+                    31
+                    1
+                    [(: 0x4E083FF0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E01
+                     0x4E183FF0
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 43
+                    58
+                    0
+                    30
+                    30
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E00
+                     0x4E183FD0
+                     0x4E183FD1
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 43
+                    58
+                    0
+                    31
+                    31
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E081E00
+                     0x4E183FF0
+                     0x4E183FF1
+                     0xEB11021F
+                     0x9A91D210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 43
+                    59
+                    0
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E00
+                     0x4E183C30
+                     0x4E183C51
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 43
+                    59
+                    1
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183C51
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 43
+                    59
+                    2
+                    1
+                    2
+                    [(: 0x4E083C30 u32)
+                     0x4E083C51
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E02
+                     0x4E183C30
+                     0x4E183C51
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E181E02])))
+    (set! failures
+          (+ failures
+             (check 43
+                    59
+                    1
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 43
+                    59
+                    0
+                    1
+                    1
+                    [(: 0x4E083C30 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E00
+                     0x4E183C30
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 43
+                    59
+                    0
+                    30
+                    31
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E00
+                     0x4E183FD0
+                     0x4E183FF1
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 43
+                    59
+                    0
+                    31
+                    30
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E00
+                     0x4E183FF0
+                     0x4E183FD1
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 43
+                    59
+                    1
+                    1
+                    30
+                    [(: 0x4E083C30 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183FD1
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 43
+                    59
+                    1
+                    30
+                    1
+                    [(: 0x4E083FD0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E01
+                     0x4E183FD0
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 43
+                    59
+                    1
+                    1
+                    31
+                    [(: 0x4E083C30 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E01
+                     0x4E183C30
+                     0x4E183FF1
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 43
+                    59
+                    1
+                    31
+                    1
+                    [(: 0x4E083FF0 u32)
+                     0x4E083C31
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E01
+                     0x4E183FF0
+                     0x4E183C31
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E181E01])))
+    (set! failures
+          (+ failures
+             (check 43
+                    59
+                    0
+                    30
+                    30
+                    [(: 0x4E083FD0 u32)
+                     0x4E083FD1
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E00
+                     0x4E183FD0
+                     0x4E183FD1
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures
+             (check 43
+                    59
+                    0
+                    31
+                    31
+                    [(: 0x4E083FF0 u32)
+                     0x4E083FF1
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E081E00
+                     0x4E183FF0
+                     0x4E183FF1
+                     0xEB11021F
+                     0x9A91A210
+                     0x4E181E00])))
+    (set! failures
+          (+ failures (check 28 58 0 1 2 [(: 0x1E622020 u32) 0x1E629C20])))
+    (set! failures
+          (+ failures (check 28 58 1 1 2 [(: 0x1E622020 u32) 0x1E629C21])))
+    (set! failures
+          (+ failures (check 28 58 2 1 2 [(: 0x1E622020 u32) 0x1E629C22])))
+    (set! failures
+          (+ failures (check 28 58 1 1 1 [(: 0x1E612020 u32) 0x1E619C21])))
+    (set! failures
+          (+ failures (check 28 58 0 1 1 [(: 0x1E612020 u32) 0x1E619C20])))
+    (set! failures
+          (+ failures (check 28 58 0 30 31 [(: 0x1E7F23C0 u32) 0x1E7F9FC0])))
+    (set! failures
+          (+ failures (check 28 58 0 31 30 [(: 0x1E7E23E0 u32) 0x1E7E9FE0])))
+    (set! failures
+          (+ failures (check 28 58 1 1 30 [(: 0x1E7E2020 u32) 0x1E7E9C21])))
+    (set! failures
+          (+ failures (check 28 58 1 30 1 [(: 0x1E6123C0 u32) 0x1E619FC1])))
+    (set! failures
+          (+ failures (check 28 58 1 1 31 [(: 0x1E7F2020 u32) 0x1E7F9C21])))
+    (set! failures
+          (+ failures (check 28 58 1 31 1 [(: 0x1E6123E0 u32) 0x1E619FE1])))
+    (set! failures
+          (+ failures (check 28 58 0 30 30 [(: 0x1E7E23C0 u32) 0x1E7E9FC0])))
+    (set! failures
+          (+ failures (check 28 58 0 31 31 [(: 0x1E7F23E0 u32) 0x1E7F9FE0])))
+    (set! failures
+          (+ failures (check 28 59 0 1 2 [(: 0x1E622020 u32) 0x1E62AC20])))
+    (set! failures
+          (+ failures (check 28 59 1 1 2 [(: 0x1E622020 u32) 0x1E62AC21])))
+    (set! failures
+          (+ failures (check 28 59 2 1 2 [(: 0x1E622020 u32) 0x1E62AC22])))
+    (set! failures
+          (+ failures (check 28 59 1 1 1 [(: 0x1E612020 u32) 0x1E61AC21])))
+    (set! failures
+          (+ failures (check 28 59 0 1 1 [(: 0x1E612020 u32) 0x1E61AC20])))
+    (set! failures
+          (+ failures (check 28 59 0 30 31 [(: 0x1E7F23C0 u32) 0x1E7FAFC0])))
+    (set! failures
+          (+ failures (check 28 59 0 31 30 [(: 0x1E7E23E0 u32) 0x1E7EAFE0])))
+    (set! failures
+          (+ failures (check 28 59 1 1 30 [(: 0x1E7E2020 u32) 0x1E7EAC21])))
+    (set! failures
+          (+ failures (check 28 59 1 30 1 [(: 0x1E6123C0 u32) 0x1E61AFC1])))
+    (set! failures
+          (+ failures (check 28 59 1 1 31 [(: 0x1E7F2020 u32) 0x1E7FAC21])))
+    (set! failures
+          (+ failures (check 28 59 1 31 1 [(: 0x1E6123E0 u32) 0x1E61AFE1])))
+    (set! failures
+          (+ failures (check 28 59 0 30 30 [(: 0x1E7E23C0 u32) 0x1E7EAFC0])))
+    (set! failures
+          (+ failures (check 28 59 0 31 31 [(: 0x1E7F23E0 u32) 0x1E7FAFE0])))
+    (set! failures
+          (+ failures
+             (check 44 58 0 1 2 [(: 0x6E61E45E u32) 0x6E621C3E 0x4EBE1FC0])))
+    (set! failures
+          (+ failures
+             (check 44 58 1 1 2 [(: 0x6E61E45E u32) 0x6E621C3E 0x4EBE1FC1])))
+    (set! failures
+          (+ failures
+             (check 44 58 2 1 2 [(: 0x6E61E45E u32) 0x6E621C3E 0x4EBE1FC2])))
+    (set! failures
+          (+ failures
+             (check 44 58 1 1 1 [(: 0x6E61E43E u32) 0x6E611C3E 0x4EBE1FC1])))
+    (set! failures
+          (+ failures
+             (check 44 58 0 1 1 [(: 0x6E61E43E u32) 0x6E611C3E 0x4EBE1FC0])))
+    (set! failures
+          (+ failures (check 44 58 0 30 31 [(: 0x6E7EE7E0 u32) 0x6E7F1FC0])))
+    (set! failures
+          (+ failures (check 44 58 0 31 30 [(: 0x6E7FE7C0 u32) 0x6E7E1FE0])))
+    (set! failures
+          (+ failures
+             (check 44 58 1 1 30 [(: 0x6E61E7DF u32) 0x6E7E1C3F 0x4EBF1FE1])))
+    (set! failures
+          (+ failures
+             (check 44 58 1 30 1 [(: 0x6E7EE43F u32) 0x6E611FDF 0x4EBF1FE1])))
+    (set! failures
+          (+ failures
+             (check 44 58 1 1 31 [(: 0x6E61E7FE u32) 0x6E7F1C3E 0x4EBE1FC1])))
+    (set! failures
+          (+ failures
+             (check 44 58 1 31 1 [(: 0x6E7FE43E u32) 0x6E611FFE 0x4EBE1FC1])))
+    (set! failures
+          (+ failures
+             (check 44 58 0 30 30 [(: 0x6E7EE7DF u32) 0x6E7E1FDF 0x4EBF1FE0])))
+    (set! failures
+          (+ failures
+             (check 44 58 0 31 31 [(: 0x6E7FE7FE u32) 0x6E7F1FFE 0x4EBE1FC0])))
+    (set! failures
+          (+ failures
+             (check 44 59 0 1 2 [(: 0x6E62E43E u32) 0x6E621C3E 0x4EBE1FC0])))
+    (set! failures
+          (+ failures
+             (check 44 59 1 1 2 [(: 0x6E62E43E u32) 0x6E621C3E 0x4EBE1FC1])))
+    (set! failures
+          (+ failures
+             (check 44 59 2 1 2 [(: 0x6E62E43E u32) 0x6E621C3E 0x4EBE1FC2])))
+    (set! failures
+          (+ failures
+             (check 44 59 1 1 1 [(: 0x6E61E43E u32) 0x6E611C3E 0x4EBE1FC1])))
+    (set! failures
+          (+ failures
+             (check 44 59 0 1 1 [(: 0x6E61E43E u32) 0x6E611C3E 0x4EBE1FC0])))
+    (set! failures
+          (+ failures (check 44 59 0 30 31 [(: 0x6E7FE7C0 u32) 0x6E7F1FC0])))
+    (set! failures
+          (+ failures (check 44 59 0 31 30 [(: 0x6E7EE7E0 u32) 0x6E7E1FE0])))
+    (set! failures
+          (+ failures
+             (check 44 59 1 1 30 [(: 0x6E7EE43F u32) 0x6E7E1C3F 0x4EBF1FE1])))
+    (set! failures
+          (+ failures
+             (check 44 59 1 30 1 [(: 0x6E61E7DF u32) 0x6E611FDF 0x4EBF1FE1])))
+    (set! failures
+          (+ failures
+             (check 44 59 1 1 31 [(: 0x6E7FE43E u32) 0x6E7F1C3E 0x4EBE1FC1])))
+    (set! failures
+          (+ failures
+             (check 44 59 1 31 1 [(: 0x6E61E7FE u32) 0x6E611FFE 0x4EBE1FC1])))
+    (set! failures
+          (+ failures
+             (check 44 59 0 30 30 [(: 0x6E7EE7DF u32) 0x6E7E1FDF 0x4EBF1FE0])))
+    (set! failures
+          (+ failures
+             (check 44 59 0 31 31 [(: 0x6E7FE7FE u32) 0x6E7F1FFE 0x4EBE1FC0])))
+    (set! failures
+          (+ failures
+             (check 45 58 0 1 2 [(: 0x2E21E45E u32) 0x2E621C3E 0x1E6043C0])))
+    (set! failures
+          (+ failures
+             (check 45 58 1 1 2 [(: 0x2E21E45E u32) 0x2E621C3E 0x1E6043C1])))
+    (set! failures
+          (+ failures
+             (check 45 58 2 1 2 [(: 0x2E21E45E u32) 0x2E621C3E 0x1E6043C2])))
+    (set! failures
+          (+ failures
+             (check 45 58 1 1 1 [(: 0x2E21E43E u32) 0x2E611C3E 0x1E6043C1])))
+    (set! failures
+          (+ failures
+             (check 45 58 0 1 1 [(: 0x2E21E43E u32) 0x2E611C3E 0x1E6043C0])))
+    (set! failures
+          (+ failures (check 45 58 0 30 31 [(: 0x2E3EE7E0 u32) 0x2E7F1FC0])))
+    (set! failures
+          (+ failures (check 45 58 0 31 30 [(: 0x2E3FE7C0 u32) 0x2E7E1FE0])))
+    (set! failures
+          (+ failures
+             (check 45 58 1 1 30 [(: 0x2E21E7DF u32) 0x2E7E1C3F 0x1E6043E1])))
+    (set! failures
+          (+ failures
+             (check 45 58 1 30 1 [(: 0x2E3EE43F u32) 0x2E611FDF 0x1E6043E1])))
+    (set! failures
+          (+ failures
+             (check 45 58 1 1 31 [(: 0x2E21E7FE u32) 0x2E7F1C3E 0x1E6043C1])))
+    (set! failures
+          (+ failures
+             (check 45 58 1 31 1 [(: 0x2E3FE43E u32) 0x2E611FFE 0x1E6043C1])))
+    (set! failures
+          (+ failures
+             (check 45 58 0 30 30 [(: 0x2E3EE7DF u32) 0x2E7E1FDF 0x1E6043E0])))
+    (set! failures
+          (+ failures
+             (check 45 58 0 31 31 [(: 0x2E3FE7FE u32) 0x2E7F1FFE 0x1E6043C0])))
+    (set! failures
+          (+ failures
+             (check 45 59 0 1 2 [(: 0x2E22E43E u32) 0x2E621C3E 0x1E6043C0])))
+    (set! failures
+          (+ failures
+             (check 45 59 1 1 2 [(: 0x2E22E43E u32) 0x2E621C3E 0x1E6043C1])))
+    (set! failures
+          (+ failures
+             (check 45 59 2 1 2 [(: 0x2E22E43E u32) 0x2E621C3E 0x1E6043C2])))
+    (set! failures
+          (+ failures
+             (check 45 59 1 1 1 [(: 0x2E21E43E u32) 0x2E611C3E 0x1E6043C1])))
+    (set! failures
+          (+ failures
+             (check 45 59 0 1 1 [(: 0x2E21E43E u32) 0x2E611C3E 0x1E6043C0])))
+    (set! failures
+          (+ failures (check 45 59 0 30 31 [(: 0x2E3FE7C0 u32) 0x2E7F1FC0])))
+    (set! failures
+          (+ failures (check 45 59 0 31 30 [(: 0x2E3EE7E0 u32) 0x2E7E1FE0])))
+    (set! failures
+          (+ failures
+             (check 45 59 1 1 30 [(: 0x2E3EE43F u32) 0x2E7E1C3F 0x1E6043E1])))
+    (set! failures
+          (+ failures
+             (check 45 59 1 30 1 [(: 0x2E21E7DF u32) 0x2E611FDF 0x1E6043E1])))
+    (set! failures
+          (+ failures
+             (check 45 59 1 1 31 [(: 0x2E3FE43E u32) 0x2E7F1C3E 0x1E6043C1])))
+    (set! failures
+          (+ failures
+             (check 45 59 1 31 1 [(: 0x2E21E7FE u32) 0x2E611FFE 0x1E6043C1])))
+    (set! failures
+          (+ failures
+             (check 45 59 0 30 30 [(: 0x2E3EE7DF u32) 0x2E7E1FDF 0x1E6043E0])))
+    (set! failures
+          (+ failures
+             (check 45 59 0 31 31 [(: 0x2E3FE7FE u32) 0x2E7F1FFE 0x1E6043C0])))
+    (set! failures
+          (+ failures
+             (check 61 58 0 1 2 [(: 0x6E21E45E u32) 0x6E621C3E 0x4EBE1FC0])))
+    (set! failures
+          (+ failures
+             (check 61 58 1 1 2 [(: 0x6E21E45E u32) 0x6E621C3E 0x4EBE1FC1])))
+    (set! failures
+          (+ failures
+             (check 61 58 2 1 2 [(: 0x6E21E45E u32) 0x6E621C3E 0x4EBE1FC2])))
+    (set! failures
+          (+ failures
+             (check 61 58 1 1 1 [(: 0x6E21E43E u32) 0x6E611C3E 0x4EBE1FC1])))
+    (set! failures
+          (+ failures
+             (check 61 58 0 1 1 [(: 0x6E21E43E u32) 0x6E611C3E 0x4EBE1FC0])))
+    (set! failures
+          (+ failures (check 61 58 0 30 31 [(: 0x6E3EE7E0 u32) 0x6E7F1FC0])))
+    (set! failures
+          (+ failures (check 61 58 0 31 30 [(: 0x6E3FE7C0 u32) 0x6E7E1FE0])))
+    (set! failures
+          (+ failures
+             (check 61 58 1 1 30 [(: 0x6E21E7DF u32) 0x6E7E1C3F 0x4EBF1FE1])))
+    (set! failures
+          (+ failures
+             (check 61 58 1 30 1 [(: 0x6E3EE43F u32) 0x6E611FDF 0x4EBF1FE1])))
+    (set! failures
+          (+ failures
+             (check 61 58 1 1 31 [(: 0x6E21E7FE u32) 0x6E7F1C3E 0x4EBE1FC1])))
+    (set! failures
+          (+ failures
+             (check 61 58 1 31 1 [(: 0x6E3FE43E u32) 0x6E611FFE 0x4EBE1FC1])))
+    (set! failures
+          (+ failures
+             (check 61 58 0 30 30 [(: 0x6E3EE7DF u32) 0x6E7E1FDF 0x4EBF1FE0])))
+    (set! failures
+          (+ failures
+             (check 61 58 0 31 31 [(: 0x6E3FE7FE u32) 0x6E7F1FFE 0x4EBE1FC0])))
+    (set! failures
+          (+ failures
+             (check 61 59 0 1 2 [(: 0x6E22E43E u32) 0x6E621C3E 0x4EBE1FC0])))
+    (set! failures
+          (+ failures
+             (check 61 59 1 1 2 [(: 0x6E22E43E u32) 0x6E621C3E 0x4EBE1FC1])))
+    (set! failures
+          (+ failures
+             (check 61 59 2 1 2 [(: 0x6E22E43E u32) 0x6E621C3E 0x4EBE1FC2])))
+    (set! failures
+          (+ failures
+             (check 61 59 1 1 1 [(: 0x6E21E43E u32) 0x6E611C3E 0x4EBE1FC1])))
+    (set! failures
+          (+ failures
+             (check 61 59 0 1 1 [(: 0x6E21E43E u32) 0x6E611C3E 0x4EBE1FC0])))
+    (set! failures
+          (+ failures (check 61 59 0 30 31 [(: 0x6E3FE7C0 u32) 0x6E7F1FC0])))
+    (set! failures
+          (+ failures (check 61 59 0 31 30 [(: 0x6E3EE7E0 u32) 0x6E7E1FE0])))
+    (set! failures
+          (+ failures
+             (check 61 59 1 1 30 [(: 0x6E3EE43F u32) 0x6E7E1C3F 0x4EBF1FE1])))
+    (set! failures
+          (+ failures
+             (check 61 59 1 30 1 [(: 0x6E21E7DF u32) 0x6E611FDF 0x4EBF1FE1])))
+    (set! failures
+          (+ failures
+             (check 61 59 1 1 31 [(: 0x6E3FE43E u32) 0x6E7F1C3E 0x4EBE1FC1])))
+    (set! failures
+          (+ failures
+             (check 61 59 1 31 1 [(: 0x6E21E7FE u32) 0x6E611FFE 0x4EBE1FC1])))
+    (set! failures
+          (+ failures
+             (check 61 59 0 30 30 [(: 0x6E3EE7DF u32) 0x6E7E1FDF 0x4EBF1FE0])))
+    (set! failures
+          (+ failures
+             (check 61 59 0 31 31 [(: 0x6E3FE7FE u32) 0x6E7F1FFE 0x4EBE1FC0])))
+    (set! failures (+ failures (invalid 37 26 0 1 2)))
+    (set! failures (+ failures (invalid 37 58 30 1 2)))
+    (set! failures (+ failures (invalid 37 59 31 1 2)))
+    (set! failures (+ failures (invalid 37 58 -1 1 2)))
+    (set! failures (+ failures (invalid 37 58 0 32 2)))
+    (set! failures (+ failures (invalid 37 58 0 1 -1)))
+    (set! failures (+ failures (invalid 37 58 0 1 32)))
+    (set! failures (+ failures (invalid 81 58 0 1 2)))
+    (set! failures (+ failures (invalid 5 59 0 1 2)))
+    (set! failures (+ failures (invalid 53 58 0 1 2)))
+    (for base [(: 1 i32) 2 3 4 5 6 7 8 9 10 11 12 13]
+      (for lanes [(: 1 i32) 2 4 8 16 32 64]
+        (for op [(: 58 i32) 59]
+          (when (!= (va/valid-type? op (types/vector-type base lanes))
+                    (!= base 1))
+            (set! failures (+ failures 1))))))
+    (println "vector extrema: 624 MC cases, 1808 words; failures {}" failures)
+    failures))

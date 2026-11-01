@@ -57,8 +57,10 @@ Darwin variadic packing against LLVM C calls. Vector integer ADD/SUB/MUL/DIV/MOD
 ADD/SUB/MUL/DIV, now have
 native and linked coverage. Vector NEG/ABS/NOT, byte swap, lane bit counts and SHL/SHR/SAR with vector or
 scalar counts, plus ROL/ROR with protected source aliases, have native and linked
-coverage. Remaining vector operations
-and broader ABI coverage are unfinished.
+coverage. Lane-wise integer and floating MIN/MAX also have native and linked
+coverage. Floating extrema select the left operand on an ordered tie and the
+right operand for unordered inputs, preserving exact payloads and zero signs.
+Remaining vector operations and broader ABI coverage are unfinished.
 
 Native copy, overlap-safe move and zero builders expand into existing memory
 and control nodes. Fixed small transfers use exact-width accesses; larger and
