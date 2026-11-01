@@ -643,3 +643,37 @@ standalone run; subsequent full-run terminal fixtures used the final source.
 The linked log has no warnings. Formatting and git diff checks pass. All 281
 implementation/test files remain Coil. Module-image composition and compiler bulk
 memory/aggregate operations remain concrete integration requirements.
+
+### Module image composition
+
+`stogir.link/compose` now combines independently compiled images into an owned
+module with per-input section bases and stable old-to-new symbol ID maps. Public
+declarations resolve against a single definition; private identities are renamed
+and isolated. Public names are reserved before private label generation. Input
+contents, metadata and relocation records are validated without trusting derived
+name caches. Duplicate definitions and malformed inputs fail without mutation of
+sources, and partial output is released.
+
+Text/data bytes, symbol locations, relocation locations/targets and text-data
+ranges are rebased while addends and internal relative code remain unchanged.
+Composition preserves the current image contract of four-byte instruction text
+and eight-byte data bases; wider global-data alignment remains an image-format
+requirement. Batch composition avoids repeated whole-prefix copies.
+
+Focused checks cover 64 inputs with 1,024 private symbols, repeated declarations,
+private/public spelling collisions, malformed symbols/relocations/ranges,
+zero-sized conflicting definitions and immutable sources. Independently compiled
+mutually recursive functions, shared writable data, a relocated function pointer
+and a dense switch compose twice and execute after every original allocation is
+released. Text/data prefixes exceed 4 KB/8 KB to exercise page rebasing. A second
+JIT mapping proves writable-data isolation. The same module executes as linked
+Mach-O; full regression and commit checkpoints are recorded in the project pad.
+
+The module checkpoint passes all 160 standalone files and 39 linked AOT consumers
+with debug checks and regenerated objects; the linked log has no warnings. An
+exact source/pass-set comparison confirms every standalone file ran once. The
+new execution producer is named module-execution.coil to avoid the reserved
+*-link.coil consumer convention. Formatting and git diff checks pass. All 286
+implementation/test files are Coil. Stronger global-image alignment, compiler
+memory/aggregate/atomic/wide semantics, optimization/scaling, backend integration
+and LLVM/TPDE runtime/compile-time comparisons remain required.

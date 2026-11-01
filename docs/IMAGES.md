@@ -169,3 +169,47 @@ The writer splits large ranges at element boundaries to fit each u16 length and
 keeps serialization immutable and repeatable. Objects without embedded data keep
 their previous load-command and section layout. Manually constructed ranges are
 subject to the same bounds/order validation as generated tables.
+
+## Module composition
+
+`stogir.link/compose(sources, allocator)` borrows a slice of images and returns an
+owned `link/Module`. It composes all inputs in one batch and leaves their bytes,
+names, symbols and relocation IDs unchanged. On failure it releases its partial
+output. `link/release!` releases the output image and its per-input maps; retain
+the module while borrowing its `.image` for JIT loading or object writing.
+
+Each `Module.parts` entry corresponds to one input and holds its text/data base
+and a `symbols` array mapping every old symbol ID to the composed image ID. This
+allows callers to find private entry points without depending on generated names.
+The returned image owns every byte, name and metadata record independently of
+its inputs, which may be released immediately after composition.
+
+Public declarations with the same exact name share an ID and may be fulfilled
+by one public definition in any input order. Two definitions conflict, even if
+zero-sized sections place them at the same offset. Private definitions retain
+separate identities and receive fresh private names. They cannot fulfill another
+input's public declaration. All public names are reserved before private labels
+are generated, including names that use the private-label prefix.
+
+The name arena and symbol records are validated independently of an input's
+mutable lookup-cache fields. Duplicate raw symbol records, invalid name/section
+bounds, embedded zeros, malformed text/data ranges and invalid or overlapping
+relocation records are rejected. Inputs keep the current image alignment
+contract: four-byte instruction text and eight-byte data bases. Composition uses
+checked size/alignment arithmetic and zeroes data padding. Wider global-data
+alignment is not yet represented in the image format; aligned stack frames are a
+separate implemented feature.
+
+Relocation locations and defined symbol offsets are rebased by section. Symbol
+target IDs are remapped; addends are preserved. Already-patched internal branches
+and relative tables keep their bytes because the whole input text moves together.
+Text-data metadata receives the corresponding base offset. This preserves JIT
+movement and Mach-O JUMP_TABLE32 records through nested composition. Address-
+dependent bytes must still carry their normal image relocations; composition
+does not infer pointers from numeric constants.
+
+Collect per-function images and compose them in one batch to copy each section
+once. Repeatedly composing an ever-growing prefix introduces repeated copying.
+The compiler adapter must establish module-level function bindings and final
+export visibility consistently; graph, aggregate and backend integration work
+remains unfinished.

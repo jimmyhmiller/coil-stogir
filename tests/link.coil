@@ -1,0 +1,160 @@
+(module stogir.tests.link)
+(import "stogir.link" :as link)
+(import "stogir.image" :as image)
+(import "stogir.bytes" :as bytes)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.hashmap" :use [HashMap])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [id] id) (Err [message] (println "{}" message) -1)))
+
+(defn scale-check [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut sources) (ArrayList::new [image/Image] allocator)
+        (mut seen) (HashMap::new-scalar [i32 i32] allocator)
+        (mut i) (: 0 i64)
+        (mut failures) 0]
+    (while (< i 64)
+      (let [(mut source) (image/create allocator)
+            (mut j) (: 0 i64)]
+        (bytes/append32! (mut (.text source)) 0xD65F03C0)
+        (bytes/append32! (mut (.data source)) 0)
+        (bytes/append32! (mut (.data source)) 0)
+        (while (< j 16)
+          (require (image/fresh-local! (mut source) 2 0 allocator))
+          (set! j (+ j 1)))
+        (let [external (require (image/symbol! (mut source) "_external" 0 0))]
+          (image/relocate! (mut source)
+                           (image/Relocation
+                             :section 2
+                             :offset 0
+                             :kind 1
+                             :symbol external
+                             :addend 0)))
+        (push! (mut sources) source))
+      (set! i (+ i 1)))
+    (match (link/compose (slice sources) allocator)
+      (Err [message]
+           (println "scale: {}" message)
+           (set! failures (+ failures 1)))
+      (Ok [module]
+          (let [(mut owned) module]
+            (when (or (!= (len (.symbols (.image owned))) 1025)
+                      (!= (len (.relocations (.image owned))) 64)
+                      (!= (len (.text (.image owned))) 256)
+                      (!= (len (.data (.image owned))) 512))
+              (set! failures (+ failures 1)))
+            (set! i 0)
+            (for part (.parts owned)
+              (let [(mut j) (: 0 i64)]
+                (while (< j 16)
+                  (let [id (get (.symbols part) j)
+                        symbol (get (.symbols (.image owned)) (cast i64 id))]
+                    (match (get seen id)
+                      (Some [_] (set! failures (+ failures 1)))
+                      (None [] (set! (mut seen) id (cast i32 i))))
+                    (when (or (.global? symbol)
+                              (!= (.section symbol) 2)
+                              (!= (.offset symbol) (* i 8)))
+                      (set! failures (+ failures 1))))
+                  (set! j (+ j 1))))
+              (set! i (+ i 1)))
+            (link/release! (mut owned)))))
+    (for source sources
+      (let [(mut owned) source] (image/release! (mut owned))))
+    (free! (mut sources))
+    (free! (mut seen))
+    failures))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut a) (image/create allocator)
+        (mut b) (image/create allocator)
+        (mut c) (image/create allocator)
+        (mut failures) (scale-check)]
+    (bytes/append32! (mut (.text a)) 0xD65F03C0)
+    (push! (mut (.data a)) 42)
+    (let [decl (require (image/symbol! (mut a) "_callee" 0 0))
+          local (require (image/local-symbol! (mut a) "L_same" 2 0))]
+      (while (< (len (.data a)) 16) (push! (mut (.data a)) 0))
+      (image/relocate! (mut a)
+                       (image/Relocation
+                         :section 2
+                         :offset 8
+                         :kind 1
+                         :symbol decl
+                         :addend 7)))
+    (bytes/append32! (mut (.text b)) 0xD65F03C0)
+    (push! (mut (.data b)) 99)
+    (let [definition (require (image/symbol! (mut b) "_callee" 1 0))
+          local (require (image/local-symbol! (mut b) "L_same" 2 0))]
+      (while (< (len (.data b)) 9) (push! (mut (.data b)) 0))
+      (image/relocate! (mut b)
+                       (image/Relocation
+                         :section 2
+                         :offset 1
+                         :kind 1
+                         :symbol local
+                         :addend -1)))
+    ; Reserve a public spelling that the first generated private label would use.
+    (image/symbol! (mut c) "L_stogir_0000000000000000" 0 0)
+    (match (link/compose [a b c] allocator)
+      (Err [message]
+           (println "compose: {}" message)
+           (set! failures (+ failures 1)))
+      (Ok [module]
+          (let [(mut owned) module
+                pa (get (.parts owned) 0)
+                pb (get (.parts owned) 1)
+                pc (get (.parts owned) 2)
+                da (get (.symbols pa) 0)
+                db (get (.symbols pb) 0)
+                la (get (.symbols pa) 1)
+                lb (get (.symbols pb) 1)]
+            (when (or (!= (len (.text (.image owned))) 8)
+                      (!= (len (.data (.image owned))) 32)
+                      (!= (.text pb) 4)
+                      (!= (.data pb) 16)
+                      (!= (.data pc) 32)
+                      (!= da db)
+                      (= la lb)
+                      (!= (.offset (get (.symbols (.image owned)) (cast i64 da)))
+                          4)
+                      (!= (.offset (get (.symbols (.image owned)) (cast i64 la)))
+                          0)
+                      (!= (.offset (get (.symbols (.image owned)) (cast i64 lb)))
+                          16)
+                      (.global? (get (.symbols (.image owned)) (cast i64 la))))
+              (set! failures (+ failures 1)))
+            (when (or (!= (.symbol (get (.relocations (.image owned)) 0)) da)
+                      (!= (.symbol (get (.relocations (.image owned)) 1)) lb)
+                      (!= (.offset (get (.relocations (.image owned)) 1)) 17)
+                      (!= (.addend (get (.relocations (.image owned)) 0)) 7)
+                      (!= (.addend (get (.relocations (.image owned)) 1)) -1))
+              (set! failures (+ failures 1)))
+            (match (image/find-symbol (.image owned)
+                                      "L_stogir_0000000000000000")
+              (None [] (set! failures (+ failures 1)))
+              (Some [id]
+                    (when (or (= id la) (= id lb))
+                      (set! failures (+ failures 1)))))
+            (link/release! (mut owned)))))
+    (when (or (!= (.section (get (.symbols a) 0)) 0)
+              (!= (.offset (get (.symbols b) 0)) 0)
+              (!= (len (.data b)) 9)
+              (!= (.symbol (get (.relocations b) 0)) 1))
+      (set! failures (+ failures 1)))
+    (match (link/compose [b b] allocator)
+      (Err [_] 0)
+      (Ok [module]
+          (let [(mut owned) module]
+            (link/release! (mut owned))
+            (set! failures (+ failures 1)))))
+    (image/release! (mut a))
+    (image/release! (mut b))
+    (image/release! (mut c))
+    (println "module symbol remapping, alignment and source immutability: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

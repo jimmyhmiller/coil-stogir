@@ -23,6 +23,8 @@ are also supported. Tests execute generated functions through JIT and linked Mac
 image writer supports text/data, local/exported/undefined symbols, and pointer,
 branch, and page relocations. Named function/data references and binary string
 literals compile through this shared image, including recursive calls.
+Module composition resolves public declarations, renames private symbols and
+remaps relocations across independently compiled functions and data.
 
 Scalar local storage supports VAR, VADDR, VLOAD/VSTORE and their volatile
 variants, with typed views that fit the declared object and power-of-two

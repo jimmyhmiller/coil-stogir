@@ -1,0 +1,342 @@
+(module stogir.tests.module-execution)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.symbols" :as symbols)
+(import "stogir.calls" :as calls)
+(import "stogir.link" :as link)
+(import "stogir.image" :as image)
+(import "stogir.text-data" :as text-data)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.bytes" :as bytes)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.fs" :as fs)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn owned-image [(result (Result image/Image (slice u8)))] (-> image/Image)
+  (match result
+    (Ok [source] source)
+    (Err [message] (println "{}" message) (image/create (malloc-allocator)))))
+
+(defn pair-image [(first? bool)] (-> image/Image)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        n (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        literal (require (symbols/string! (mut graph) (if first? "A" "B")))
+        byte (require (b/emit! (mut graph) 91 2 [start literal]))
+        tag (require (b/conversion! (mut graph) 34 11 8 byte))
+        global (require (symbols/symbol! (mut graph) "_stogir_module_shared"))
+        value (require (b/emit! (mut graph) 91 11 [byte global]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        positive (require (b/emit! (mut graph) 16 1 [zero n]))
+        split (require (b/emit! (mut graph) 116 0 [value positive]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        base (require (b/emit! (mut graph) 26 11 [value tag]))
+        base-ret (require (b/emit! (mut graph) 120 11 [no base (: 0 i32)]))
+        previous (require (b/emit! (mut graph) 27 11 [n one]))
+        callee
+          (require (symbols/function! (mut graph)
+                                      (if first?
+                                          "_stogir_module_b"
+                                          "_stogir_module_a")
+                                      0))
+        (mut roots) (ArrayList::new [i32] allocator)]
+    (push! (mut roots) base-ret)
+    (match (calls/create 9 11 [(: 11 u8)] allocator)
+      (Err [message] (println "{}" message))
+      (Ok [prototype]
+          (let [(mut owned) prototype
+                called
+                  (require (calls/emit! (mut graph)
+                                        owned
+                                        yes
+                                        callee
+                                        [previous]
+                                        allocator))
+                answer (require (b/emit! (mut graph) 26 11 [called tag]))
+                ret
+                  (require (b/emit! (mut graph)
+                                    120
+                                    11
+                                    [called answer (: 0 i32)]))]
+            (require (calls/function! (mut graph) owned allocator))
+            (push! (mut roots) ret)
+            (free! (mut (.parameters owned))))))
+    (let [result
+            (owned-image (compile/image graph
+                                        start
+                                        (slice roots)
+                                        (if first?
+                                            "_stogir_module_a"
+                                            "_stogir_module_b")
+                                        allocator))]
+      (free! (mut roots))
+      (g/release! (mut graph))
+      result)))
+
+(defn pointer-image [] (-> image/Image)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        n (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        slot (require (symbols/symbol! (mut graph) "_stogir_module_fnptr"))
+        target (require (b/emit! (mut graph) 91 6 [start slot]))
+        (mut root) (: 0 i32)]
+    (match (calls/create 9 11 [(: 11 u8)] allocator)
+      (Err [message] (println "{}" message))
+      (Ok [prototype]
+          (let [(mut owned) prototype
+                called
+                  (require (calls/emit! (mut graph)
+                                        owned
+                                        target
+                                        target
+                                        [n]
+                                        allocator))]
+            (require (calls/function! (mut graph) owned allocator))
+            (set! root
+                  (require (b/emit! (mut graph)
+                                    120
+                                    11
+                                    [called called (: 0 i32)])))
+            (free! (mut (.parameters owned))))))
+    (let [result
+            (owned-image (compile/image graph
+                                        start
+                                        [root]
+                                        "_stogir_module_via_pointer"
+                                        allocator))]
+      (g/release! (mut graph))
+      result)))
+
+(defn table-image [] (-> image/Image)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        n (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        split (require (b/switch! (mut graph) start n))
+        (mut roots) (ArrayList::new [i32] allocator)]
+    (for tag [(: 0 u64) 2 4]
+      (let [value (require (b/scalar-constant! (mut graph) 5 tag 8))
+            projection (require (b/case-value! (mut graph) split value))
+            answer (require (b/scalar-constant! (mut graph) 5 (+ 100 tag) 8))]
+        (push! (mut roots)
+               (require (b/emit! (mut graph)
+                                 120
+                                 5
+                                 [projection answer (: 0 i32)])))))
+    (let [fallback (require (b/case-default! (mut graph) split))
+          answer (require (b/scalar-constant! (mut graph) 5 777 8))]
+      (push! (mut roots)
+             (require (b/emit! (mut graph) 120 5 [fallback answer (: 0 i32)]))))
+    (let [result
+            (owned-image (compile/image graph
+                                        start
+                                        (slice roots)
+                                        "_stogir_module_table"
+                                        allocator))]
+      (free! (mut roots))
+      (g/release! (mut graph))
+      result)))
+
+(defn data-image [] (-> image/Image)
+  (let [allocator (malloc-allocator)
+        (mut source) (image/create allocator)]
+    (while (< (len (.data source)) 8) (push! (mut (.data source)) 0xA5))
+    (bytes/append32! (mut (.data source)) 10)
+    (bytes/append32! (mut (.data source)) 0)
+    (bytes/append32! (mut (.data source)) 0)
+    (bytes/append32! (mut (.data source)) 0)
+    (require (image/symbol! (mut source) "_stogir_module_shared" 2 8))
+    (require (image/symbol! (mut source) "_stogir_module_fnptr" 2 16))
+    (let [target (require (image/symbol! (mut source) "_stogir_module_a" 0 0))]
+      (image/relocate! (mut source)
+                       (image/Relocation
+                         :section 2
+                         :offset 16
+                         :kind 1
+                         :symbol target
+                         :addend 0)))
+    source))
+
+(defn expected [(n i64) (first? bool) (shared i64)] (-> i64)
+  (let [(mut i) 0
+        (mut a?) first?
+        (mut result) shared]
+    (while (<= i (if (< n 0) 0 n))
+      (set! result (+ result (if a? 65 66)))
+      (set! a? (not a?))
+      (set! i (+ i 1)))
+    result))
+
+(defn find [(source image/Image) (text (slice u8))] (-> i32)
+  (match (image/find-symbol source text) (Some [id] id) (None [] -1)))
+
+(defn run [(module link/Module)] (-> i64)
+  (let [allocator (malloc-allocator)
+        source (.image module)
+        ai (find source "_stogir_module_a")
+        bi (find source "_stogir_module_b")
+        vi (find source "_stogir_module_via_pointer")
+        ti (find source "_stogir_module_table")
+        si (find source "_stogir_module_shared")
+        pi (find source "_stogir_module_fnptr")
+        (mut failures) 0]
+    (if (or (< ai 0) (< bi 0) (< vi 0) (< ti 0) (< si 0) (< pi 0))
+        1
+        (do
+          (match (macho/image-object source allocator)
+            (Err [message]
+                 (println "{}" message)
+                 (set! failures (+ failures 1)))
+            (Ok [object]
+                (let [(mut bytes) object]
+                  (match (fs/write-file allocator
+                                        "/tmp/coil-stogir-module.o"
+                                        (slice bytes))
+                    (Err [_] (set! failures (+ failures 1)))
+                    (Ok [_] 0))
+                  (free! (mut bytes)))))
+          (match (jit/map-image source allocator)
+            (Err [message]
+                 (println "{}" message)
+                 (set! failures (+ failures 1)))
+            (Ok [loaded]
+                (let [(mut owned) loaded
+                      a
+                        (primitive/cast (fnptr (cc/C) [i64] i64)
+                                        (primitive/cast (ptr u8)
+                                                        (get (.addresses owned)
+                                                             (cast i64 ai))))
+                      b
+                        (primitive/cast (fnptr (cc/C) [i64] i64)
+                                        (primitive/cast (ptr u8)
+                                                        (get (.addresses owned)
+                                                             (cast i64 bi))))
+                      via
+                        (primitive/cast (fnptr (cc/C) [i64] i64)
+                                        (primitive/cast (ptr u8)
+                                                        (get (.addresses owned)
+                                                             (cast i64 vi))))
+                      table
+                        (primitive/cast (fnptr (cc/C) [u64] u64)
+                                        (primitive/cast (ptr u8)
+                                                        (get (.addresses owned)
+                                                             (cast i64 ti))))
+                      shared
+                        (primitive/cast (ptr i64)
+                                        (get (.addresses owned) (cast i64 si)))
+                      pointer
+                        (primitive/cast (ptr u64)
+                                        (get (.addresses owned) (cast i64 pi)))
+                      (mut n) (: -2 i64)]
+                  (when (!= (primitive/load pointer)
+                            (get (.addresses owned) (cast i64 ai)))
+                    (set! failures (+ failures 1)))
+                  (while (<= n 24)
+                    (when (or (!= (call-ptr a n) (expected n true 10))
+                              (!= (call-ptr b n) (expected n false 10))
+                              (!= (call-ptr via n) (expected n true 10)))
+                      (set! failures (+ failures 1)))
+                    (set! n (+ n 1)))
+                  (for tag [(: 0 u64) 1 2 3 4 5 0xFFFFFFFFFFFFFFFF]
+                    (let [want
+                            (if (or (= tag 0) (= tag 2) (= tag 4))
+                                (+ 100 tag)
+                                777)]
+                      (when (!= (call-ptr table tag) want)
+                        (set! failures (+ failures 1)))))
+                  (primitive/store! shared 20)
+                  (when (!= (call-ptr via 12) (expected 12 true 20))
+                    (set! failures (+ failures 1)))
+                  (match (jit/map-image source allocator)
+                    (Err [message]
+                         (println "{}" message)
+                         (set! failures (+ failures 1)))
+                    (Ok [another]
+                        (let [(mut other) another
+                              second
+                                (primitive/cast (fnptr (cc/C) [i64] i64)
+                                                (primitive/cast (ptr u8)
+                                                                (get (.addresses other)
+                                                                     (cast i64
+                                                                           ai))))]
+                          (when (!= (call-ptr second 12) (expected 12 true 10))
+                            (set! failures (+ failures 1)))
+                          (jit/release-image! (mut other)))))
+                  (jit/release-image! (mut owned)))))
+          failures))))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut data) (data-image)
+        (mut a) (pair-image true)
+        (mut b) (pair-image false)
+        (mut via) (pointer-image)
+        (mut table) (table-image)
+        (mut prefix) (image/create allocator)
+        (mut sources-live?) true
+        (mut failures) 0]
+    (bytes/append32! (mut (.text prefix)) 0xD65F03C0)
+    (while (< (len (.text prefix)) 5004)
+      (bytes/append32! (mut (.text prefix)) 0xD503201F))
+    (while (< (len (.data prefix)) 8201)
+      (push! (mut (.data prefix)) 0xCC))
+    (require (image/local-symbol! (mut prefix) "L_same" 1 0))
+    (match (link/compose [data b a via table] allocator)
+      (Err [message]
+           (println "inner: {}" message)
+           (set! failures (+ failures 1)))
+      (Ok [module]
+          (let [(mut inner) module
+                table-base (.text (get (.parts inner) 4))]
+            (when (or (!= (len (.text-data (.image inner))) 1)
+                      (!= (.offset (get (.text-data (.image inner)) 0))
+                          (+ table-base (.offset (get (.text-data table) 0)))))
+              (set! failures (+ failures 1)))
+            (match (link/compose [prefix (.image inner)] allocator)
+              (Err [message]
+                   (println "outer: {}" message)
+                   (set! failures (+ failures 1))
+                   (link/release! (mut inner)))
+              (Ok [composed]
+                  (let [(mut outer) composed]
+                    (when (or (!= (.text (get (.parts outer) 1)) 5004)
+                              (!= (.data (get (.parts outer) 1)) 8208)
+                              (!= (.offset (get (.text-data (.image outer)) 0))
+                                  (+ 5004
+                                     (.offset (get (.text-data (.image inner))
+                                                   0)))))
+                      (set! failures (+ failures 1)))
+                    ; Destroy every original allocation before executing the outer
+                    ; module: all bytes, names, maps and metadata must be owned.
+                    (link/release! (mut inner))
+                    (image/release! (mut data))
+                    (image/release! (mut a))
+                    (image/release! (mut b))
+                    (image/release! (mut via))
+                    (image/release! (mut table))
+                    (image/release! (mut prefix))
+                    (set! sources-live? false)
+                    (set! failures (+ failures (run outer)))
+                    (link/release! (mut outer))))))))
+    (when sources-live?
+      (image/release! (mut data))
+      (image/release! (mut a))
+      (image/release! (mut b))
+      (image/release! (mut via))
+      (image/release! (mut table))
+      (image/release! (mut prefix)))
+    (println "composed recursive functions, globals, pointers and tables: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

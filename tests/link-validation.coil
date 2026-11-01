@@ -1,0 +1,163 @@
+(module stogir.tests.link-validation)
+(import "stogir.link" :as link)
+(import "stogir.image" :as image)
+(import "stogir.text-data" :as td)
+(import "stogir.bytes" :as bytes)
+(import "coil.hashmap" :use [HashMap])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn invalid [(mode i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut source) (image/create allocator)
+        (mut failures) 0]
+    (bytes/append32! (mut (.text source)) 0xD65F03C0)
+    (bytes/append32! (mut (.text source)) 0xD503201F)
+    (while (< (len (.data source)) 16) (push! (mut (.data source)) 0))
+    (image/symbol! (mut source) "_entry" 1 0)
+    (image/local-symbol! (mut source) "L_slot" 2 0)
+    (let [target (elem (mut (.symbols source)) 0)]
+      (match mode
+        (0 (push! (mut (.text source)) 0))
+        (1 (set! (.offset target) 9))
+        (2 (set! (mut (.names source)) 0 0))
+        (3 (set! (.name target) 0x7FFFFFFFFFFFFFFF))
+        (4 (push! (mut (.symbols source)) (get (.symbols source) 0)))
+        (5 (push! (mut (.relocations source))
+                  (image/Relocation
+                    :section 1
+                    :offset 4
+                    :kind 1
+                    :symbol 0
+                    :addend 0)))
+        (6 (image/relocate! (mut source)
+                            (image/Relocation
+                              :section 2
+                              :offset 0
+                              :kind 1
+                              :symbol 0
+                              :addend 0))
+           (image/relocate! (mut source)
+                            (image/Relocation
+                              :section 2
+                              :offset 4
+                              :kind 1
+                              :symbol 0
+                              :addend 0)))
+        (7 (push! (mut (.text-data source))
+                  (td/Range
+                    :offset 0
+                    :length 8
+                    :kind 4))
+           (push! (mut (.text-data source))
+                  (td/Range
+                    :offset 4
+                    :length 4
+                    :kind 4)))
+        (8 (set! (.section target) 0) (set! (.global? target) false))
+        (9 (set! (.section target) 0) (set! (.offset target) 1))
+        (10 (push! (mut (.relocations source))
+                   (image/Relocation
+                     :section 1
+                     :offset 0
+                     :kind 2
+                     :symbol 99
+                     :addend 0)))
+        (11 (set! (.length target) 0))
+        (_ (set! (.offset target) -1))))
+    (let [text-size (len (.text source))
+          data-size (len (.data source))
+          symbol-count (len (.symbols source))
+          relocation-count (len (.relocations source))]
+      (match (link/compose [source] allocator)
+        (Err [_] 0)
+        (Ok [module]
+            (let [(mut owned) module]
+              (link/release! (mut owned))
+              (set! failures 1))))
+      (when (or (!= text-size (len (.text source)))
+                (!= data-size (len (.data source)))
+                (!= symbol-count (len (.symbols source)))
+                (!= relocation-count (len (.relocations source))))
+        (set! failures (+ failures 1))))
+    (image/release! (mut source))
+    failures))
+
+(defn visibility-check [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut private) (image/create allocator)
+        (mut public) (image/create allocator)
+        (mut failures) 0]
+    (bytes/append32! (mut (.text private)) 0xD65F03C0)
+    (image/local-symbol! (mut private) "_secret" 1 0)
+    (image/symbol! (mut public) "_secret" 0 0)
+    (match (link/compose [private public] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [module]
+          (let [(mut owned) module
+                local (get (.symbols (get (.parts owned) 0)) 0)
+                external (get (.symbols (get (.parts owned) 1)) 0)]
+            (when (or (= local external)
+                      (!= (.section (get (.symbols (.image owned))
+                                         (cast i64 external)))
+                          0))
+              (set! failures (+ failures 1)))
+            (link/release! (mut owned)))))
+    (match (link/compose [public public] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [module]
+          (let [(mut owned) module]
+            (when (!= (len (.symbols (.image owned))) 1)
+              (set! failures (+ failures 1)))
+            (link/release! (mut owned)))))
+    (image/release! (mut private))
+    (image/release! (mut public))
+    failures))
+
+(defn zero-size-conflict [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut source) (image/create allocator)
+        (mut failures) 0]
+    (image/symbol! (mut source) "_zero_size" 1 0)
+    (match (link/compose [source source] allocator)
+      (Err [_] 0)
+      (Ok [module]
+          (let [(mut owned) module]
+            (link/release! (mut owned))
+            (set! failures 1))))
+    (image/release! (mut source))
+    failures))
+
+(defn derived-index-check [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut source) (image/create allocator)
+        (mut failures) 0]
+    (bytes/append32! (mut (.text source)) 0xD65F03C0)
+    (image/symbol! (mut source) "_entry" 1 0)
+    ; The name arena/symbol table are authoritative. A consumer may have loaded
+    ; them without rebuilding the mutable lookup cache yet.
+    (set! (mut (.heads source)) (image/hash-name "_entry") 999)
+    (match (link/compose [source] allocator)
+      (Err [_] (set! failures 1))
+      (Ok [module] (let [(mut owned) module] (link/release! (mut owned)))))
+    (image/release! (mut source))
+    failures))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut failures)
+          (+ (visibility-check) (zero-size-conflict) (derived-index-check))]
+    (for mode [(: 0 i32) 1 2 3 4 5 6 7 8 9 10 11 12]
+      (set! failures (+ failures (invalid mode))))
+    (match (link/compose [] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [module]
+          (let [(mut owned) module]
+            (when (!= (len (.parts owned)) 0) (set! failures (+ failures 1)))
+            (link/release! (mut owned)))))
+    (match (link/aligned 0x7FFFFFFFFFFFFFFF 8)
+      (Err [_] 0)
+      (Ok [_] (set! failures (+ failures 1))))
+    (println "module malformed-input, visibility and conflict checks: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))
