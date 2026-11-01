@@ -275,6 +275,112 @@
     (free! (mut output))
     failures))
 
+(extern reserve
+        :as
+        "mmap"
+        :cc
+        (cc/C)
+        [(ptr u8) i64 i32 i32 i32 i64]
+        (-> (ptr u8)))
+
+(extern protect :as "mprotect" :cc (cc/C) [(ptr u8) i64 i32] (-> i32))
+
+(extern unmap :as "munmap" :cc (cc/C) [(ptr u8) i64] (-> i32))
+
+(extern page-size :as "getpagesize" :cc (cc/C) [] (-> i32))
+
+(extern fork :cc (cc/C) [] (-> i32))
+
+(extern waitpid :cc (cc/C) [i32 (ptr i32) i32] (-> i32))
+
+(extern exit-child :as "_exit" :cc (cc/C) [i32] (-> void))
+
+(extern signal :cc (cc/C) [i32 u64] (-> u64))
+
+(defn fault-handler :cc (cc/C) [(number i32)] (-> void)
+  (exit-child 77))
+
+(defn guarded [(width i32) (address (ptr u8))] (-> i64)
+  (let [page (cast i64 (page-size))
+        total (* page 3)
+        a (reserve (p/cast (ptr u8) (: 0 u64)) total 0 0x1002 -1 0)
+        b (reserve (p/cast (ptr u8) (: 0 u64)) total 0 0x1002 -1 0)
+        f (p/cast (fnptr (cc/C) [u64 u64 u64 u64] u64) address)
+        (mut failures) 0]
+    (if (or (= (p/cast i64 a) -1) (= (p/cast i64 b) -1))
+        (set! failures 1)
+        (if (or (!= (protect (p/index a page) page 3) 0)
+                (!= (protect (p/index b page) page 3) 0))
+            (set! failures 1)
+            (let [child (fork)]
+              (if (< child 0)
+                  (set! failures 1)
+                  (if (= child 0)
+                      (let [source (p/index a page)
+                            destination (p/index b page)
+                            handler
+                              (p/cast u64
+                                      (p/cast (ptr u8) (fnptr-of fault-handler)))
+                            (mut errors) 0
+                            (mut i) (: 0 i64)]
+                        (signal 10 handler)
+                        (signal 11 handler)
+                        (for source-offset [(: 0 i64)
+                                            (- page (* (cast i64 width) 2))]
+                          (for destination-offset [(: 0 i64)
+                                                   (- page (cast i64 width))]
+                            (for count [(: 0 u64) 1]
+                              (set! i 0)
+                              (while (< i page)
+                                (p/store! (p/index source i) (input-byte i 0))
+                                (p/store! (p/index destination i) (: 165 u8))
+                                (set! i (+ i 1)))
+                              (when (!= (call-ptr f
+                                                  (p/cast u64
+                                                          (p/index destination
+                                                                   destination-offset))
+                                                  (p/cast u64
+                                                          (p/index source
+                                                                   source-offset))
+                                                  count
+                                                  0)
+                                        0)
+                                (set! errors (+ errors 1)))
+                              (set! i 0)
+                              (while (< i page)
+                                (let [wanted
+                                        (if (and (>= i destination-offset)
+                                                 (< i
+                                                    (+ destination-offset
+                                                       (cast i64 width))))
+                                            (input-byte (+ source-offset
+                                                           (if (= count 0)
+                                                               (cast i64 width)
+                                                               0)
+                                                           (- i
+                                                              destination-offset))
+                                                        0)
+                                            (: 165 u8))]
+                                  (when (or (!= (p/load (p/index source i))
+                                                (input-byte i 0))
+                                            (!= (p/load (p/index destination i))
+                                                wanted))
+                                    (set! errors (+ errors 1))))
+                                (set! i (+ i 1))))))
+                        (exit-child (if (= errors 0) 0 78)))
+                      (let [(mut status) (: 0 i32)]
+                        (when (or (!= (waitpid child (mut status) 0) child)
+                                  (!= status 0))
+                          (println "vector memory width{} protected child status{}"
+                                   width
+                                   status)
+                          (set! failures 1))))))))
+    (when (!= (p/cast i64 a) -1)
+      (when (!= (unmap a total) 0) (set! failures (+ failures 1))))
+    (when (!= (p/cast i64 b) -1)
+      (when (!= (unmap b total) 0) (set! failures (+ failures 1))))
+    failures))
+
 (defn require [(value (Result i32 (slice u8)))] (-> i32)
   (match value (Ok [r] r) (Err [message] (println "{}" message) 0)))
 
@@ -365,6 +471,10 @@
                              (exercise (types/size ty 8)
                                        pressure?
                                        (.base loaded))))
+                    (when (and fixture? (not pressure?))
+                      (set! failures
+                            (+ failures
+                               (guarded (types/size ty 8) (.base loaded)))))
                     (jit/release! (mut loaded)))))
             (free! (mut text)))))
     failures))
