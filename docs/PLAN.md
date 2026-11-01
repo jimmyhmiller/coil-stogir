@@ -1295,3 +1295,9 @@ pressure graphs and 860 linked Mach-O objects. Remaining lane/shuffle/conversion
 families, broader independent-library coverage/optimization/scaling/targets, the
 actual Coil compiler backend and equivalent LLVM/TPDE runtime/compile-time
 benchmarks remain required.
+
+
+The unchanged-source comparison regression passes all 201 standalone checks and
+all 59 linked consumers with debug checks, regenerated objects, exact expected
+file/consumer pass sets and no linked warnings. All 367 implementation/test files
+remain Coil. Formatting/diff checks pass; the project pad indexes the evidence.
