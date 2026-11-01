@@ -4,6 +4,8 @@
 ;;; without exposing a movable interior base pointer to callers.
 (module stogir.graph)
 (import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.long-constant" :as long)
 (import "stogir.strings" :as strings)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.hashmap" :use [HashMap])
@@ -13,6 +15,7 @@
 (defstruct Graph
   [(instructions (ArrayList n/Node))
    (constants (ArrayList n/Node))
+   (constant-spans (ArrayList i32))
    (arities (ArrayList i32))
    (constant-heads (HashMap u64 i32))
    (expressions (HashMap u128 i32))
@@ -27,6 +30,7 @@
     (Graph
       :instructions cells
       :constants (ArrayList::new [n/Node] a)
+      :constant-spans (ArrayList::new [i32] a)
       :arities arities
       :constant-heads (HashMap::new-scalar [u64 i32] a)
       :expressions (HashMap::new-scalar [u128 i32] a)
@@ -37,7 +41,10 @@
   (if (> r 0)
       (and (< (cast i64 r) (len (.instructions g)))
            (>= (get (.arities g) (cast i64 r)) 0))
-      (and (< r 0) (<= (- 0 (cast i64 r)) (len (.constants g))))))
+      (and (< r 0)
+           (= (len (.constants g)) (len (.constant-spans g)))
+           (<= (- 0 (cast i64 r)) (len (.constants g)))
+           (> (get (.constant-spans g) (- (- 0 (cast i64 r)) 1)) 0))))
 
 (defn lookup [(g Graph) (r i32)] (-> (Option n/Node))
   (if (not (contains? g r))
@@ -62,11 +69,13 @@
         (None)
         (do
           (push! (mut (.constants g)) node)
+          (push! (mut (.constant-spans g)) 1)
           (Some (cast i32 (- -1 idx)))))))
 
 (defn release! [(g (mut Graph))] (-> void)
   (free! (mut (.instructions g)))
   (free! (mut (.constants g)))
+  (free! (mut (.constant-spans g)))
   (free! (mut (.arities g)))
   (free! (mut (.constant-heads g)))
   (free! (mut (.expressions g)))
@@ -205,3 +214,104 @@
                                          (cast i32 (>> bits 32))))
           (Some [r] (do (set! (mut (.constant-heads g)) key r) (Some r)))
           (None [] (None))))))
+
+;;; Header is at the most-negative reference; payload cell k is ref+k+1.
+;;; Metadata distinguishes payload cells from usable negative graph values.
+(defn long-size [(g Graph) (reference i32)] (-> i64)
+  (match (lookup g reference)
+    (None [] -1)
+    (Some [node]
+          (let [index (- (- 0 (cast i64 reference)) 1)
+                size (cast i64 (n/auxiliary node))
+                span (long/cells size)]
+            (if (or (>= reference 0)
+                    (!= (n/opcode node) 78)
+                    (< span 2)
+                    (!= (get (.constant-spans g) index) span)
+                    (< index (- (cast i64 span) 1)))
+                -1
+                size)))))
+
+(defn long-byte [(g Graph) (reference i32) (index i64)] (-> (Option u8))
+  (let [size (long-size g reference)]
+    (if (or (< index 0) (>= index size))
+        (None)
+        (let [cell (- (- (- 0 (cast i64 reference)) 2) (/ index 16))]
+          (if (!= (get (.constant-spans g) cell) 0)
+              (None)
+              (Some (n/payload-byte (get (.constants g) cell)
+                                    (cast i32 (% index 16)))))))))
+
+;;; Complete immutable vector bytes, with upstream header/hash/payload ordering.
+;;; Allocation failure follows allocator policy. None reports invalid geometry,
+;;; malformed interning chains, or exhausted signed reference space.
+(defn intern-vector! [(g (mut Graph))
+                      (ty i32)
+                      (pointer-bytes i32)
+                      (payload (slice u8))]
+  (-> (Option i32))
+  (let [size (len payload)
+        span (long/cells size)
+        header-node (n/make 78 (cast u8 ty) (cast u16 size) 0 0 0)]
+    (if (or (not (types/vector? ty))
+            (!= (cast i64 (types/size ty pointer-bytes)) size)
+            (< span 2)
+            (!= (len (.constants g)) (len (.constant-spans g))))
+        (None)
+        (let [header (.header header-node)
+              hash (long/hash header payload)
+              head
+                (match (get (.constant-heads g) hash) (Some [r] r) (None [] 0))
+              (mut reference) head
+              (mut found) (: 0 i32)
+              (mut valid) true]
+          (while (and (!= reference 0) (= found 0) valid)
+            (if (> reference 0)
+                (set! valid false)
+                (match (lookup g reference)
+                  (None [] (set! valid false))
+                  (Some [node]
+                        (when (and (= (.header node) header)
+                                   (= (n/constant-bits node) hash))
+                          (let [(mut same) (= (long-size g reference) size)
+                                (mut i) (: 0 i64)]
+                            (while (and same (< i size))
+                              (match (long-byte g reference i)
+                                (None [] (set! same false))
+                                (Some [byte]
+                                      (when (!= byte (get payload i))
+                                        (set! same false))))
+                              (set! i (+ i 1)))
+                            (when same (set! found reference))))
+                        (let [previous (.op1 node)]
+                          (if (and (!= previous 0) (<= previous reference))
+                              (set! valid false)
+                              (set! reference previous)))))))
+          (if (not valid)
+              (None)
+              (if (!= found 0)
+                  (Some found)
+                  (if (> (+ (len (.constants g)) (cast i64 span)) 2147483648)
+                      (None)
+                      (let [(mut chunk) (- span 1)]
+                        (while (> chunk 0)
+                          (set! chunk (- chunk 1))
+                          (push! (mut (.constants g))
+                                 (n/payload-cell payload
+                                                 (* (cast i64 chunk) 16)))
+                          (push! (mut (.constant-spans g)) 0))
+                        (match (append-constant! (mut g)
+                                                 (n/make 78
+                                                         (cast u8 ty)
+                                                         (cast u16 size)
+                                                         head
+                                                         (cast i32
+                                                               (cast u32 hash))
+                                                         (cast i32 (>> hash 32))))
+                          (None [] (None))
+                          (Some [r]
+                                (set! (mut (.constant-spans g))
+                                      (- (len (.constant-spans g)) 1)
+                                      span)
+                                (set! (mut (.constant-heads g)) hash r)
+                                (Some r)))))))))))

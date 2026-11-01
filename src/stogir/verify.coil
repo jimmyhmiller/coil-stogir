@@ -3,6 +3,7 @@
 (module stogir.verify)
 (import "stogir.graph" :as g)
 (import "stogir.vector" :as vector)
+(import "stogir.long-constant" :as long)
 (import "stogir.strings" :as strings)
 (import "stogir.node" :as n)
 (import "stogir.integer-unary" :as unary)
@@ -93,38 +94,80 @@
                         (set! checked (+ checked 1)))))))))
     (if (= error "") (Ok checked) (Err error))))
 
-;;; Validate scalar constants independently of instruction typing.
-(defn scalar-constants [(graph g/Graph) (pointer-bytes i32)]
-  (-> (Result i32 (slice u8)))
+;;; Validate every constant header and its complete storage extent. Payload
+;;; cells are not values; reverse traversal matches negative-reference ordering.
+(defn constants [(graph g/Graph) (pointer-bytes i32)]
+  (-> (Result i64 (slice u8)))
   (let [(mut error) ""
-        (mut i) 0]
+        (mut i) (- (len (.constants graph)) 1)
+        (mut checked) (: 0 i64)]
     (when (not (or (= pointer-bytes 4) (= pointer-bytes 8)))
       (set! error "invalid target pointer width"))
-    (while (and (= error "") (< i (len (.constants graph))))
+    (when (!= (len (.constants graph)) (len (.constant-spans graph)))
+      (set! error "constant and span storage lengths differ"))
+    (while (and (= error "") (>= i 0))
       (let [node (get (.constants graph) i)
+            span (get (.constant-spans graph) i)
+            reference (cast i32 (- -1 i))
             ty (cast i32 (n/type-id node))
-            size (t/scalar-size ty pointer-bytes)
             bits (n/constant-bits node)
             previous (.op1 node)]
-        (if (= (cast i32 (n/opcode node)) ty)
-            (if (<= size 0)
-                (set! error "invalid scalar constant type")
-                (when (or (and (= ty 1) (> bits 1))
-                          (and (< size 8)
-                               (!= (>> bits (cast u64 (* size 8))) 0)))
-                  (set! error "scalar constant payload exceeds type width")))
-            (if (not (symbols/validate graph node))
-                (set! error
-                      "invalid address constant opcode, name or prototype")
-                (when (and (= (n/opcode node) 73)
-                           (= pointer-bytes 4)
-                           (!= (>> bits 32) 0))
-                  (set! error "function address exceeds target pointer width"))))
+        (if (= (n/opcode node) 78)
+            (if (or (not (long/valid-header? node pointer-bytes))
+                    (!= span (long/cells (cast i64 (n/auxiliary node))))
+                    (< i (- (cast i64 span) 1)))
+                (set! error "invalid LONG_CONST type, size or storage extent")
+                (let [(mut j) (: 1 i64)
+                      (mut hash) (: 5381 u32)]
+                  (while (and (= error "") (< j (cast i64 span)))
+                    (when (!= (get (.constant-spans graph) (- i j)) 0)
+                      (set! error "invalid LONG_CONST continuation marker"))
+                    (set! j (+ j 1)))
+                  (set! j 0)
+                  (while (and (= error "") (< j (cast i64 (n/auxiliary node))))
+                    (match (g/long-byte graph reference j)
+                      (None [] (set! error "LONG_CONST payload missing"))
+                      (Some [byte] (set! hash (long/hash-step hash byte))))
+                    (set! j (+ j 1)))
+                  (when (!= bits (cast u64 (^ hash (.header node))))
+                    (set! error "LONG_CONST payload hash mismatch"))))
+            (if (!= span 1)
+                (set! error "invalid constant header or orphan payload cell")
+                (let [size (t/scalar-size ty pointer-bytes)]
+                  (if (= (cast i32 (n/opcode node)) ty)
+                      (if (<= size 0)
+                          (set! error "invalid scalar constant type")
+                          (when (or (and (= ty 1) (> bits 1))
+                                    (and (< size 8)
+                                         (!= (>> bits (cast u64 (* size 8))) 0)))
+                            (set! error
+                                  "scalar constant payload exceeds type width")))
+                      (if (not (symbols/validate graph node))
+                          (set! error
+                                "invalid address constant opcode, name or prototype")
+                          (when (and (= (n/opcode node) 73)
+                                     (= pointer-bytes 4)
+                                     (!= (>> bits 32) 0))
+                            (set! error
+                                  "function address exceeds target pointer width")))))))
         (when (or (> previous 0)
-                  (and (< previous 0) (> (- 0 (cast i64 previous)) i)))
-          (set! error "constant chain must refer to an earlier constant")))
-      (set! i (+ i 1)))
-    (if (= error "") (Ok (cast i32 i)) (Err error))))
+                  (and (!= previous 0)
+                       (or (<= previous reference)
+                           (not (g/contains? graph previous)))))
+          (set! error "constant chain must refer to an earlier header"))
+        (set! i (- i (cast i64 span)))
+        (set! checked (+ checked 1))))
+    (if (= error "") (Ok checked) (Err error))))
+
+;;; Compatibility entry point; includes LONG_CONST validation as well.
+(defn scalar-constants [(graph g/Graph) (pointer-bytes i32)]
+  (-> (Result i32 (slice u8)))
+  (match (constants graph pointer-bytes)
+    (Err [message] (Err message))
+    (Ok [count]
+        (if (> count 2147483647)
+            (Err "constant count exceeds compatibility result width")
+            (Ok (cast i32 count))))))
 
 ;;; Phi-specific semantics, run after structural verification succeeds.
 (defn phis [(graph g/Graph)] (-> (Result i32 (slice u8)))
