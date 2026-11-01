@@ -641,15 +641,8 @@ callback with a two-member 128-bit homogeneous vector record. It checks every
 64-bit word of the argument and the returned 32-byte result, including high halves,
 and preserves a live scalar across the call. The generated-callee fixtures below
 add one through four members, stack/bank boundaries and linked AOT coverage.
-Broader outgoing vector calls and variadic placement still need dedicated checks.
+Outgoing vector calls and variadic placement have the dedicated checks below.
 Existing scalar and aggregate fixtures remain regression checks.
-
-The short-vector plumbing checkpoint passes all 186 standalone tests and all 50
-existing linked AOT consumers with debug checks. Test-set equality is checked,
-objects are regenerated, and linked output contains no warnings. The new vector
-ABI fixture is a JIT caller test; this regression count does not imply the
-dedicated vector ABI cases listed above are complete.
-
 
 `tests/jit-hva-incoming.coil` generates sixteen C ABI callees, covering one through
 four homogeneous members at each 64/128-bit width, with zero or seven preceding
@@ -667,6 +660,44 @@ and calls through complete typed C record signatures. Coil currently rejects
 vectors nested in records in an `extern` declaration before target ABI
 classification, although its C function-pointer path supports them; this
 inconsistency is recorded in the Coil bug pad. The producer and linked consumer
-pass with debug checks. These test-only additions do not change the previous
-186/50 full regression result; they add one standalone producer and one linked
-consumer, each verified separately.
+pass with debug checks.
+
+
+`tests/jit-hva-outgoing.coil` generates 32 callers: the same sixteen width/member/
+bank-boundary cases, each using either volatile vector loads or complete vector
+constants. Exported Coil C callbacks check prefix and trailing vectors by writing
+them to caller buffers, rotate the aggregate members and XOR every returned lane
+with a seed. Three seeds include zero and all-one bits. Checks cover every result
+word, a live scalar across the call, unchanged inputs and untouched buffer words.
+Result buffers begin eight bytes into u64 arrays and carry no promised
+sixteen-byte alignment.
+`tests/aot-hva-outgoing-link.coil` repeats all 96 executions against 32 separately
+linked objects. Callback addresses use explicit C function-pointer types.
+
+`tests/jit-hva-varargs.coil` checks all four homogeneous group sizes in one unnamed
+argument sequence, with scalar separators before/between/after groups. Both widths
+and loaded/constant forms execute through JIT and generate four Mach-O objects.
+A seven-instruction entry-SP capture probe copies exactly the supplied number of
+stack words into a buffer. Its instruction words were independently checked with
+LLVM MC; it has no prologue, changes only caller-saved registers and returns 99.
+The probe is implemented as encoded instruction words in Coil and serialized by
+the library, with no external implementation language or vendored object.
+
+`tests/aot-hva-varargs-link.coil` calls that same linked probe from ordinary Coil
+LLVM C variadic calls and from the four linked stogir callers. Each stack word
+must match the independently constructed expected sequence, and buffer/input
+boundaries are checked. This confirms eight-byte packing, including 128-bit HVA
+members beginning at stack offsets that are not multiples of sixteen. Larger
+homogeneous records remain direct packed values, rather than indirect ARGVAL
+pointers, in these checked Darwin variadic cases.
+
+Remaining vector ABI coverage includes omitted PARAM projections, recursive and
+named vector calls, mixed vector widths within one argument-copy group, and high
+register pressure around vector arguments/results. Vector arithmetic and complete
+backend integration are separate unfinished work.
+
+The complete HVA-call checkpoint passes all 189 standalone tests and all 53
+linked consumers with debug checks, exact test-set equality and regenerated
+objects. Linked output contains no warnings. All shipped implementation/test
+sources remain Coil. Correctness coverage does not establish code generation
+speed, runtime performance or readiness of the unfinished Coil backend.
