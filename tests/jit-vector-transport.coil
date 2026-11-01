@@ -1,0 +1,572 @@
+(module stogir.tests.jit-vector-transport)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.types" :as types)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn probe :cc (cc/C) [(input (ptr u8))] (-> u64)
+  (p/machine-code (Aarch64)
+                  0xf1
+                  0x03
+                  0x00
+                  0xaa
+                  0x20
+                  0x02
+                  0xc0
+                  0x3d
+                  0x21
+                  0x02
+                  0xc0
+                  0x3d
+                  0x22
+                  0x02
+                  0xc0
+                  0x3d
+                  0x23
+                  0x02
+                  0xc0
+                  0x3d
+                  0x24
+                  0x02
+                  0xc0
+                  0x3d
+                  0x25
+                  0x02
+                  0xc0
+                  0x3d
+                  0x26
+                  0x02
+                  0xc0
+                  0x3d
+                  0x27
+                  0x02
+                  0xc0
+                  0x3d
+                  0x30
+                  0x02
+                  0xc0
+                  0x3d
+                  0x31
+                  0x02
+                  0xc0
+                  0x3d
+                  0x32
+                  0x02
+                  0xc0
+                  0x3d
+                  0x33
+                  0x02
+                  0xc0
+                  0x3d
+                  0x34
+                  0x02
+                  0xc0
+                  0x3d
+                  0x35
+                  0x02
+                  0xc0
+                  0x3d
+                  0x36
+                  0x02
+                  0xc0
+                  0x3d
+                  0x37
+                  0x02
+                  0xc0
+                  0x3d
+                  0x38
+                  0x02
+                  0xc0
+                  0x3d
+                  0x39
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3a
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3b
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3c
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3d
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3e
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3f
+                  0x02
+                  0xc0
+                  0x3d
+                  0xa0
+                  0x15
+                  0x80
+                  0xd2
+                  0xc1
+                  0x15
+                  0x80
+                  0xd2
+                  0xe2
+                  0x15
+                  0x80
+                  0xd2
+                  0x03
+                  0x16
+                  0x80
+                  0xd2
+                  0x24
+                  0x16
+                  0x80
+                  0xd2
+                  0x45
+                  0x16
+                  0x80
+                  0xd2
+                  0x66
+                  0x16
+                  0x80
+                  0xd2
+                  0x87
+                  0x16
+                  0x80
+                  0xd2
+                  0xa8
+                  0x16
+                  0x80
+                  0xd2
+                  0xc9
+                  0x16
+                  0x80
+                  0xd2
+                  0xea
+                  0x16
+                  0x80
+                  0xd2
+                  0x0b
+                  0x17
+                  0x80
+                  0xd2
+                  0x2c
+                  0x17
+                  0x80
+                  0xd2
+                  0x4d
+                  0x17
+                  0x80
+                  0xd2
+                  0x6e
+                  0x17
+                  0x80
+                  0xd2
+                  0x8f
+                  0x17
+                  0x80
+                  0xd2
+                  0xc0
+                  0x03
+                  0x5f
+                  0xd6))
+
+(defn input-byte [(index i64) (seed u64)] (-> u8)
+  (let [word
+          (match (% (/ index 8) 7)
+            (0 (: 0 u64))
+            (1 0x8000000000000000)
+            (2 0x7FF0000000000000)
+            (3 0x7FF8123456789ABC)
+            (4 0xFFFFFFFFFFFFFFFF)
+            (5 0x7FC123457F800000)
+            (_ 0x0123456789ABCDEF))]
+    (cast u8 (>> (^ word seed) (cast u64 (* (% index 8) 8))))))
+
+(defn exercise [(width i32) (pressure? bool) (address (ptr u8))] (-> i64)
+  (let [allocator (malloc-allocator)
+        f (p/cast (fnptr (cc/C) [u64 u64 u64 u64] u64) address)
+        target
+          (p/cast u64
+                  (p/cast (ptr u8)
+                          (: (fnptr-of probe) (fnptr (cc/C) [(ptr u8)] u64))))
+        (mut input) (ArrayList::new [u8] allocator)
+        (mut output) (ArrayList::new [u8] allocator)
+        (mut failures) 0
+        (mut i) (: 0 i64)]
+    (for seed [(: 0 u64) 17 255]
+      (clear! (mut input))
+      (set! i 0)
+      (while (< i 2048)
+        (push! (mut input) (input-byte i seed))
+        (set! i (+ i 1)))
+      (for count [(: 0 u64) 1 2 3 7]
+        (when (or pressure? (< count 2))
+          (clear! (mut output))
+          (set! i 0)
+          (while (< i 2064) (push! (mut output) 165) (set! i (+ i 1)))
+          (let [got
+                  (call-ptr f
+                            (p/cast u64 (p/index (.data output) 3))
+                            (p/cast u64 (.data input))
+                            count
+                            target)
+                expected (if pressure? (: 811 u64) 0)]
+            (when (!= got expected)
+              (println "vector width{} pressure{} count{} return{} expected{}"
+                       width
+                       pressure?
+                       count
+                       got
+                       expected)
+              (set! failures (+ failures 1))))
+          (set! i 0)
+          (while (< i (len input))
+            (when (!= (get input i) (input-byte i seed))
+              (set! failures (+ failures 1)))
+            (set! i (+ i 1)))
+          (set! i 0)
+          (while (< i (len output))
+            (let [position (- i 3)
+                  wanted
+                    (if pressure?
+                        (if (and (>= position 0)
+                                 (< position (* 40 (cast i64 width))))
+                            (input-byte (+ (* (if (= (% count 2) 0)
+                                                  (/ position (cast i64 width))
+                                                  (^ (/ position
+                                                        (cast i64 width))
+                                                     1))
+                                              (cast i64 width))
+                                           (% position (cast i64 width)))
+                                        seed)
+                            (if (and (>= position 1024) (< position 1344))
+                                (input-byte position seed)
+                                (: 165 u8)))
+                        (if (and (>= position 0) (< position (cast i64 width)))
+                            (input-byte (+ position
+                                           (if (= count 0) (cast i64 width) 0))
+                                        seed)
+                            (: 165 u8)))]
+              (when (!= (get output i) wanted)
+                (println "vector width{} pressure{} count{} seed{} byte{} got{} expected{}"
+                         width
+                         pressure?
+                         count
+                         seed
+                         i
+                         (get output i)
+                         wanted)
+                (set! failures (+ failures 1))))
+            (set! i (+ i 1))))))
+    (free! (mut input))
+    (free! (mut output))
+    failures))
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn address! [(graph (mut g/Graph)) (base i32) (offset i32)] (-> i32)
+  (require (b/emit! (mut graph)
+                    26
+                    6
+                    [base
+                     (require (b/scalar-constant! (mut graph)
+                                                  5
+                                                  (cast u64 offset)
+                                                  8))])))
+
+(defn signature! [(graph (mut g/Graph))] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut failures) 0]
+    (match (calls/create 9 5 [(: 6 u8) 6 5 6] allocator)
+      (Err [message] (println "{}" message) (set! failures 1))
+      (Ok [signature]
+          (let [(mut signature) signature]
+            (require (calls/function! (mut graph) signature allocator))
+            (calls/release! (mut signature)))))
+    failures))
+
+(defn fixture-name [(ty i32) (pressure? bool)] (-> (slice u8))
+  (match ty
+    (21 (if pressure? "_stogir_vector_pressure_21" "_stogir_vector_branch_21"))
+    (37 (if pressure? "_stogir_vector_pressure_37" "_stogir_vector_branch_37"))
+    (45 (if pressure? "_stogir_vector_pressure_45" "_stogir_vector_branch_45"))
+    (61 (if pressure? "_stogir_vector_pressure_61" "_stogir_vector_branch_61"))
+    (_ "invalid")))
+
+(defn fixture-path [(ty i32) (pressure? bool)] (-> (slice u8))
+  (match ty
+    (21 (if pressure?
+            "/tmp/coil-stogir-vector-pressure-21.o"
+            "/tmp/coil-stogir-vector-branch-21.o"))
+    (37 (if pressure?
+            "/tmp/coil-stogir-vector-pressure-37.o"
+            "/tmp/coil-stogir-vector-branch-37.o"))
+    (45 (if pressure?
+            "/tmp/coil-stogir-vector-pressure-45.o"
+            "/tmp/coil-stogir-vector-branch-45.o"))
+    (61 (if pressure?
+            "/tmp/coil-stogir-vector-pressure-61.o"
+            "/tmp/coil-stogir-vector-branch-61.o"))
+    (_ "invalid")))
+
+(defn finish [(graph g/Graph)
+              (start i32)
+              (ret i32)
+              (ty i32)
+              (pressure? bool)
+              (fixture? bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut failures) 0]
+    (when fixture?
+      (match (compile/object graph
+                             start
+                             [ret]
+                             (fixture-name ty pressure?)
+                             allocator)
+        (Err [message]
+             (println "vector object{}: {}" ty message)
+             (set! failures (+ failures 1)))
+        (Ok [object]
+            (let [(mut object) object]
+              (match (fs/write-file allocator
+                                    (fixture-path ty pressure?)
+                                    (slice object))
+                (Err [_] (set! failures (+ failures 1)))
+                (Ok [_] 0))
+              (free! (mut object))))))
+    (match (compile/text graph start [ret] allocator)
+      (Err [message]
+           (println "vector ty{} pressure{}: {}" ty pressure? message)
+           (set! failures (+ failures 1)))
+      (Ok [text]
+          (let [(mut text) text]
+            (match (jit/map-text (slice text))
+              (Err [message]
+                   (println "{}" message)
+                   (set! failures (+ failures 1)))
+              (Ok [loaded]
+                  (let [(mut loaded) loaded]
+                    (set! failures
+                          (+ failures
+                             (exercise (types/size ty 8)
+                                       pressure?
+                                       (.base loaded))))
+                    (jit/release! (mut loaded)))))
+            (free! (mut text)))))
+    failures))
+
+(defn branch [(ty i32) (volatile? bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        output (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        input (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        count (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        a (require (b/vector-load! (mut graph) ty 8 start input volatile?))
+        b
+          (require (b/vector-load! (mut graph)
+                                   ty
+                                   8
+                                   a
+                                   (address! (mut graph)
+                                             input
+                                             (types/size ty 8))
+                                   volatile?))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        condition (require (b/emit! (mut graph) 15 1 [count zero]))
+        split (require (b/emit! (mut graph) 116 0 [b condition]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        left (require (b/emit! (mut graph) 114 0 [yes]))
+        right (require (b/emit! (mut graph) 114 0 [no]))
+        merged (require (b/emit! (mut graph) 112 0 [left right]))
+        phi (require (b/emit! (mut graph) 67 ty [merged a b]))
+        stored
+          (require (b/vector-store! (mut graph) 8 merged output phi volatile?))
+        ret (require (b/emit! (mut graph) 120 5 [stored zero (: 0 i32)]))
+        fixture? (and volatile? (or (= ty 21) (= ty 37) (= ty 45) (= ty 61)))
+        failures
+          (+ (signature! (mut graph))
+             (finish graph start ret ty false fixture?))]
+    (g/release! (mut graph))
+    failures))
+
+(defn pressure [(ty i32) (alignment i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        output (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        input (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        limit (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 3]))
+        (mut vectors) (ArrayList::new [i32] allocator)
+        (mut scalars) (ArrayList::new [i32] allocator)
+        (mut phis) (ArrayList::new [i32] allocator)
+        (mut control) start
+        (mut i) (: 0 i32)
+        (mut failures) (signature! (mut graph))
+        guard
+          (require (b/variable! (mut graph) 5 start "vector-guard" alignment))
+        sentinel (require (b/scalar-constant! (mut graph) 5 321 8))
+        dynamic-sentinel (require (b/scalar-constant! (mut graph) 5 317 8))
+        size (require (b/scalar-constant! (mut graph) 5 73 8))]
+    (set! control (require (b/emit! (mut graph) 87 0 [control guard sentinel])))
+    (let [dynamic
+            (require (b/stack-allocate! (mut graph) control size alignment))]
+      (set! control
+            (require (b/emit! (mut graph)
+                              93
+                              0
+                              [dynamic dynamic dynamic-sentinel])))
+      (while (< i 40)
+        (let [loaded
+                (if (types/vector? ty)
+                    (require (b/vector-load! (mut graph)
+                                             ty
+                                             8
+                                             control
+                                             (address! (mut graph)
+                                                       input
+                                                       (* i (types/size ty 8)))
+                                             true))
+                    (require (b/emit! (mut graph)
+                                      92
+                                      ty
+                                      [control
+                                       (address! (mut graph)
+                                                 input
+                                                 (* i (types/size ty 8)))])))]
+          (push! (mut vectors) loaded)
+          (set! control loaded))
+        (let [loaded
+                (require (b/emit! (mut graph)
+                                  92
+                                  5
+                                  [control
+                                   (address! (mut graph) input (+ 1024 (* i 8)))]))]
+          (push! (mut scalars) loaded)
+          (set! control loaded))
+        (set! i (+ i 1)))
+      (match (calls/create 9 5 [(: 6 u8)] allocator)
+        (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+        (Ok [prototype]
+            (let [(mut prototype) prototype
+                  first
+                    (require (calls/emit! (mut graph)
+                                          prototype
+                                          control
+                                          target
+                                          [input]
+                                          allocator))
+                  entry (require (b/emit! (mut graph) 114 0 [first]))
+                  loop (require (b/loop-begin! (mut graph) entry))
+                  zero (require (b/scalar-constant! (mut graph) 5 0 8))
+                  one (require (b/scalar-constant! (mut graph) 5 1 8))
+                  index (require (b/loop-phi! (mut graph) loop zero))]
+              (for initial vectors
+                (push! (mut phis)
+                       (require (b/loop-phi! (mut graph) loop initial))))
+              (let [condition (require (b/emit! (mut graph) 20 1 [index limit]))
+                    split (require (b/emit! (mut graph) 116 0 [loop condition]))
+                    body (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+                    exit (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+                    called
+                      (require (calls/emit! (mut graph)
+                                            prototype
+                                            body
+                                            target
+                                            [input]
+                                            allocator))
+                    next (require (b/emit! (mut graph) 26 5 [index one]))
+                    back (require (b/emit! (mut graph) 115 0 [called]))]
+                (require (b/patch! (mut graph) loop 2 back))
+                (require (b/patch! (mut graph) index 3 next))
+                (set! i 0)
+                (while (< i 40)
+                  (require (b/patch! (mut graph)
+                                     (get phis (cast i64 i))
+                                     3
+                                     (get phis (cast i64 (^ i 1)))))
+                  (set! i (+ i 1)))
+                (set! control exit)
+                (set! i 0)
+                (while (< i 40)
+                  (set! control
+                        (if (types/vector? ty)
+                            (require (b/vector-store! (mut graph)
+                                                      8
+                                                      control
+                                                      (address! (mut graph)
+                                                                output
+                                                                (* i
+                                                                   (types/size ty
+                                                                               8)))
+                                                      (get phis (cast i64 i))
+                                                      true))
+                            (require (b/emit! (mut graph)
+                                              94
+                                              0
+                                              [control
+                                               (address! (mut graph)
+                                                         output
+                                                         (* i (types/size ty 8)))
+                                               (get phis (cast i64 i))]))))
+                  (set! control
+                        (require (b/emit! (mut graph)
+                                          94
+                                          0
+                                          [control
+                                           (address! (mut graph)
+                                                     output
+                                                     (+ 1024 (* i 8)))
+                                           (get scalars (cast i64 i))])))
+                  (set! i (+ i 1)))
+                (let [fixed (require (b/emit! (mut graph) 86 5 [control guard]))
+                      moving
+                        (require (b/emit! (mut graph) 91 5 [fixed dynamic]))
+                      sum (require (b/emit! (mut graph) 26 5 [fixed moving]))
+                      answer (require (b/emit! (mut graph) 26 5 [sum first]))
+                      ret
+                        (require (b/emit! (mut graph)
+                                          120
+                                          5
+                                          [moving answer (: 0 i32)]))]
+                  (set! failures
+                        (+ failures
+                           (finish graph start ret ty true (= alignment 4096))))))
+              (calls/release! (mut prototype))))))
+    (free! (mut vectors))
+    (free! (mut scalars))
+    (free! (mut phis))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for base [(: 1 i32) 2 3 4 5 6 7 8 9 10 11 12 13]
+      (for lanes [(: 1 i32) 2 4 8 16]
+        (let [ty (types/vector-type base lanes)]
+          (when (types/short-vector? ty 8)
+            (for volatile? [false true]
+              (set! failures (+ failures (branch ty volatile?))))))))
+    (for ty [(: 21 i32) 37 45 61]
+      (for alignment [(: 16 i32) 4096]
+        (set! failures (+ failures (pressure ty alignment)))))
+    (set! failures (+ failures (pressure 12 16)))
+    (println "native scalar/vector memory, branch/Phi/loop swaps, GP/SIMD call pressure and aligned dynamic frames: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))
