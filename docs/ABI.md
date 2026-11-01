@@ -753,9 +753,10 @@ compile-time comparisons remain unfinished.
 ## Vector binary arithmetic
 
 `builder/vector-binary!(graph, opcode, type, left, right, guard)` validates before
-appending. Both inputs must have the exact vector result type and denote values,
-rather than VAR storage. Current families are integer ADD/SUB/MUL/DIV/MOD and AND/OR/XOR,
-and floating ADD/SUB/MUL/DIV. Integer ADD/SUB/MUL wrap independently at each lane's
+appending. The left input must match the vector result type and both inputs must
+denote values, rather than VAR/ARGVAL storage. Non-shift binary operations require
+the same vector type on the right; SHL/SHR/SAR also accept an integer scalar count. Current families are integer ADD/SUB/MUL/DIV/MOD and AND/OR/XOR,
+and floating ADD/SUB/MUL/DIV, plus integer SHL/SHR/SAR. Integer ADD/SUB/MUL wrap independently at each lane's
 width; BOOL lanes support only the logical families. Address lanes use the target
 pointer width. Logical operations preserve every raw payload bit. FP operations
 use ordinary IEEE instructions without fast-math, contraction or scalar coercion.
@@ -768,9 +769,9 @@ and the result. Native AArch64 supports eight-/sixteen-byte vectors, using the
 correct Q bit and lane-size fields. A single 64-bit integer lane uses scalar SIMD
 ADD/SUB; a single f64 lane uses scalar FP instructions. Wider arrangements use
 AdvSIMD forms. Other valid vector widths remain representable but reject during
-target allocation/emission. Unary operations are described below. Shifts, extrema,
-comparisons, lane extraction/replacement, shuffles and vector conversions remain
-unfinished. Unsupported vector uses still reject, including dead invalid uses.
+target allocation/emission. Unary operations and shifts are described below.
+Rotates, extrema, comparisons, lane extraction/replacement, shuffles and vector
+conversions remain unfinished. Unsupported vector uses still reject, including dead invalid uses.
 
 Operand constants load complete aligned private image payloads into reserved
 v30/v31, independently of the allocated input/result registers. Emission appends
@@ -905,3 +906,62 @@ checks pass. All 354 implementation/test sources remain Coil; formatting/diff
 checks pass. Remaining vector families, standalone semantics/optimization/scaling,
 actual compiler integration and LLVM/TPDE runtime/compile-time benchmarks remain
 unfinished.
+
+
+## Vector shifts and count classes
+
+`builder/vector-binary!` supports SHL (49), SHR (50) and SAR (51) for non-BOOL
+integer vectors. The right input may be the exact vector type, for independent
+lane counts, or any integer scalar type, for a broadcast count. Scalar BOOL counts
+are canonical zero/one values. Floating counts and differently typed vectors are
+rejected before graph mutation. Counts do not consume a guard operand.
+
+Counts are masked by `element_bits - 1`, consistently with this library's scalar
+shift policy. A scalar count first has its declared integer representation, then
+is masked to the data element width. SHL wraps each element, SHR zero-fills, and
+SAR fills from the element's high bit regardless of its declared signedness.
+Counts at/beyond the element width, high-bit-contaminated counts and negative
+signed count patterns therefore have deterministic masked behavior. Valid-range
+counts agree with the pinned upstream operations. Its AArch64 vector emitter uses
+signed-low-byte hardware counts without this normalization, while its LLVM path
+emits ordinary LLVM shifts. No cross-target parity is claimed for source inputs
+outside the reference's defined shift domain; frontends retain language checks.
+
+The AArch64 emitter normalizes all count lanes together by left-shifting away
+unwanted high bits and unsigned-right-shifting back. It negates normalized counts
+for SHR/SAR, then uses USHL or SSHL. Scalar counts first use DUP, or FMOV for a
+single 64-bit lane. The register sequence has three through five instructions,
+independent of lane count, excluding operand materialization. It uses reserved
+v31 as the count workspace; data literals use v30. The data source cannot occupy
+v31, while a private count literal may already be there. Allocated data/count
+operands remain untouched. Scalar counts retain their GPR class instead of being
+misclassified as SIMD values. Output bytes/references are staged transactionally.
+
+`tests/vector-shifts.coil` checks type/role and reserved-register failures without
+partial mutation, and 540 register cases containing 2,160 independently assembled
+LLVM MC words. Native coverage comprises 2,940 matrix graphs and 60 call-pressure
+graphs in `tests/jit-vector-shifts.coil`. The matrix covers all twenty supported
+integer D/Q shapes, three operations, vector counts and all eleven integer scalar
+count types. It includes loaded operands, either/both constants and identical
+vector inputs. Twenty-two patterns exercise every width boundary, high count bits
+and negative count representations. Scalar literals are explicitly truncated to
+their declared type before construction. Independent u128/i128 oracles compare
+every result lane, original data/count bytes, input immutability and output padding.
+
+Pressure keeps forty results and forty original data values live across a fully
+clobbering callback, with vector/scalar count literals, private image data,
+volatile locals, fixed guards and dynamic allocations in 16/4096-byte frames.
+`tests/aot-vector-shifts-link.coil` repeats representative matrix and all pressure
+cases through 276 separately linked objects. The existing binary and unary
+matrices continue to pass after extending typed operand capture.
+
+Remaining vector families include rotates, extrema/comparisons, lane extraction/
+replacement, shuffles and conversions. Full standalone semantics/verification/
+optimization/scaling, further ABI/target/object work, actual Coil compiler
+integration and LLVM/TPDE compile-time/runtime comparisons remain open.
+
+The vector-shift checkpoint passes all 197 standalone tests and all 57 linked
+consumers with debug checks, exact source/pass-set equality, regenerated objects
+and no linked warnings. All 358 implementation/test source files remain Coil.
+Formatting and diff checks pass; these correctness checks do not establish
+compilation speed, runtime performance or completion of the full backend goal.

@@ -55,8 +55,9 @@ preserves complete SIMD argument/result pieces. Native JIT and linked AOT checks
 cover one through four members, bank exhaustion, stack/literal arguments and
 Darwin variadic packing against LLVM C calls. Vector integer ADD/SUB/MUL/DIV/MOD and AND/OR/XOR, plus floating
 ADD/SUB/MUL/DIV, now have
-native and linked coverage. Vector NEG/ABS/NOT, byte swap and lane bit counts also have native and linked
-coverage. Remaining vector operations and broader ABI coverage are unfinished.
+native and linked coverage. Vector NEG/ABS/NOT, byte swap, lane bit counts and SHL/SHR/SAR with vector or
+scalar counts also have native and linked coverage. Remaining vector operations
+and broader ABI coverage are unfinished.
 
 Native copy, overlap-safe move and zero builders expand into existing memory
 and control nodes. Fixed small transfers use exact-width accesses; larger and

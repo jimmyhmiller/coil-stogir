@@ -1184,3 +1184,23 @@ open. Full regression passes all 195 standalone and 56 linked consumers with
 debug checks, exact coverage, regenerated objects and no linked warnings. The
 final strengthened unary literal corpus also passes focused JIT/AOT reruns. All
 354 implementation/test sources remain Coil; formatting/diff checks pass.
+
+
+### Vector shift checkpoint
+
+SHL/SHR/SAR now support same-type vector counts or broadcast integer scalar counts.
+Both count classes use width masking consistently with scalar library semantics.
+The native register sequence is three to five SIMD instructions independent of
+lane count, with one reserved count workspace and correct GPR/SIMD input classes.
+Valid-range reference behavior agrees; out-of-domain reference target differences
+are documented rather than silently inheriting signed-byte hardware counts.
+
+Checks cover 540 register cases/2,160 LLVM MC words, 2,940 matrix graphs, 60 pressure
+graphs and 276 linked objects. Existing binary/unary matrices pass. Remaining
+vector rotates/extrema/comparisons and lane/shuffle/conversion families, wider
+standalone verification/optimization/scaling, ABI/target/object features, actual
+compiler integration and equivalent LLVM/TPDE runtime/compile-time measurements
+remain open. Full regression passes all 197 standalone checks and 57 linked
+consumers with debug checks, exact coverage, regenerated objects and no linked
+warnings. All 358 implementation/test sources remain Coil; formatting/diff checks
+pass.
