@@ -1301,3 +1301,35 @@ The unchanged-source comparison regression passes all 201 standalone checks and
 all 59 linked consumers with debug checks, regenerated objects, exact expected
 file/consumer pass sets and no linked warnings. All 367 implementation/test files
 remain Coil. Formatting/diff checks pass; the project pad indexes the evidence.
+
+
+### Vector lane transport checkpoint
+
+EXTRACT, REPLACE and SPLAT now have target-width-aware checked builders and generic
+verification over all 91 vector representations. Floating scalar types match the
+vector base exactly; integer scalar types may reinterpret equal-width lane bits.
+The three builders take the result scalar/vector type and pointer-byte width;
+EXTRACT/REPLACE also take a scalar integer index. Numeric constant indices outside
+the lane count reject before graph mutation. Dynamic indices are compared unsigned;
+out-of-range extraction returns zero, and replacement preserves the input vector.
+These invalid-index results are a defined library extension, not equivalence with
+the reference's unchecked dynamic memory indexing. Boolean lanes retain raw byte
+bits, consistent with vector transport; explicit Boolean conversions can canonicalize.
+
+AArch64 D/Q constant extraction uses UMOV/SMOV or scalar DUP, replacement uses INS
+after any required full-width copy, and splat uses DUP or the singleton-D transfer.
+Dynamic extraction constructs bounded table indices and uses TBL. Dynamic
+replacement forms a lane-byte mask with precomputed lane-ID words and BSL. Neither
+path adjusts SP, branches, calls a helper or accesses memory through the index.
+The typed native adapter captures data, dynamic index and replacement bits before
+result writes; reserved x16/x17 and v30/v31 carry the prepared workspace. Scalar
+results keep their correct GPR/FP class. Emission stages bytes and references before
+append, and VAR/ARGVAL wrappers cannot be used as lane values.
+
+Focused validation passes 2,976 register cases / 9,309 LLVM MC words, abstract
+32/64-bit geometry and rejected construction checks, 4,006 JIT matrix graphs,
+328 forced-register harnesses, 60 clobbering-call/spill/dynamic-frame pressure
+graphs and 1,490 linked objects. Integer extraction is also widened and checked
+for signedness; FP payloads, original values/counts, input memory and padding are
+checked exactly. The remaining shuffle/vector-conversion families and broader
+standalone/compiler/backend/benchmark work remain required.

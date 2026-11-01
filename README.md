@@ -62,6 +62,8 @@ coverage. Floating extrema select the left operand on an ordered tie and the
 right operand for unordered inputs, preserving exact payloads and zero signs.
 Integer and floating vector comparisons return checked full-lane integer masks;
 floating U-prefixed predicates include unordered inputs, matching scalar rules.
+EXTRACT/REPLACE support checked constant and dynamic lane indices, and SPLAT
+transports complete scalar bits. Dynamic lane access stays in registers.
 Remaining vector operations and broader ABI coverage are unfinished.
 
 Native copy, overlap-safe move and zero builders expand into existing memory

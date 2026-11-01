@@ -1,0 +1,3494 @@
+(module stogir.tests.aot-vector-lanes-link)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "stogir.types" :as types)
+
+(defn pattern [(base i32) (lane i64) (seed i64) (right? bool)] (-> u64)
+  (let [i (% (+ lane (if right? (/ seed 11) (% seed 11))) 11)
+        fp? (types/floating? base)
+        wide? (= base 12)]
+    (if fp?
+        (if wide?
+            (match i
+              (0 (: 0 u64))
+              (1 0x8000000000000000)
+              (2 0x3FF0000000000000)
+              (3 0xBFF0000000000000)
+              (4 1)
+              (5 0x000FFFFFFFFFFFFF)
+              (6 0x7FEFFFFFFFFFFFFF)
+              (7 0x7FF0000000000000)
+              (8 0xFFF0000000000000)
+              (9 0x7FF8123456789ABC)
+              (_ 0x7FF0123456789ABC))
+            (match i
+              (0 (: 0 u64))
+              (1 0x80000000)
+              (2 0x3F800000)
+              (3 0xBF800000)
+              (4 1)
+              (5 0x007FFFFF)
+              (6 0x7F7FFFFF)
+              (7 0x7F800000)
+              (8 0xFF800000)
+              (9 0x7FC12345)
+              (_ 0x7F812345)))
+        (match i
+          (0 (: 0 u64))
+          (1 1)
+          (2 0xFFFFFFFFFFFFFFFF)
+          (3 (<< (: 1 u64) (cast u64 (- (* 8 (types/scalar-size base 8)) 1))))
+          (4 (- (<< (: 1 u64) (cast u64 (- (* 8 (types/scalar-size base 8)) 1)))
+                1))
+          (5 0x8080808080808080)
+          (6 0x7F7F7F7F7F7F7F7F)
+          (7 0xFFFF0000FFFF0000)
+          (8 0x123456789ABCDEF0)
+          (9 0xFFFFFFFFFFFFFFFE)
+          (_ 0x0102030405060708)))))
+
+(defn input-byte [(base i32) (index i64) (seed i64) (right? bool)] (-> u8)
+  (let [width (cast i64 (types/scalar-size base 8))]
+    (cast u8
+          (>> (pattern base (/ index width) seed right?)
+              (cast u64 (* (% index width) 8))))))
+
+(defn read-word [(buffer (slice u8)) (offset i64) (width i32)] (-> u64)
+  (let [(mut result) (: 0 u64)
+        (mut i) (: 0 i32)]
+    (while (< i width)
+      (set! result
+            (| result
+               (<< (cast u64 (get buffer (+ offset (cast i64 i))))
+                   (cast u64 (* i 8)))))
+      (set! i (+ i 1)))
+    result))
+
+(defn mask-width [(ty i32)] (-> u64)
+  (cast u64 (- (<< (: 1 u128) (cast u128 (* 8 (types/scalar-size ty 8)))) 1)))
+
+(defn replacement-bits [(st i32) (seed i64) (mode i32)] (-> u64)
+  (let [literal? (or (= mode 2) (= mode 3))
+        bits (& (pattern st 0 (if literal? 10 seed) false) (mask-width st))]
+    (if (and literal? (= st 1)) (& bits 1) bits)))
+
+(defn vector-byte [(base i32) (i i64) (seed i64) (mode i32)] (-> u8)
+  (input-byte base i (if (= mode 1) 9 (if (= mode 3) 10 seed)) false))
+
+(defn count-value [(ty i32) (test i32)] (-> u64)
+  (let [raw
+          (match test
+            (0 (: 0 u64))
+            (1 1)
+            (2 2)
+            (3 3)
+            (4 4)
+            (5 7)
+            (6 8)
+            (7 15)
+            (8 16)
+            (9 31)
+            (10 32)
+            (11 63)
+            (12 64)
+            (13 127)
+            (14 128)
+            (15 255)
+            (16 256)
+            (17 0x100000001)
+            (18 0x8000000000000000)
+            (19 0xFFFFFFFFFFFFFFFF)
+            (20 0xFFFFFFFFFFFFFFFE)
+            (_ 0x123456789ABCDEF0))]
+    (& raw (mask-width ty))))
+
+(defn signed-wide [(st i32) (bits u64)] (-> u64)
+  (let [width (* 8 (types/scalar-size st 8))
+        modulus (<< (: 1 u128) (cast u128 width))]
+    (if (and (types/signed? st) (>= (cast u128 bits) (>> modulus 1)))
+        (cast u64 (- (cast i128 bits) (cast i128 modulus)))
+        bits)))
+
+(defn exercise [(ty i32)
+                (op i32)
+                (st i32)
+                (ity i32)
+                (lane i32)
+                (mode i32)
+                (address (ptr u8))] (-> i64)
+  (let [alc (malloc-allocator)
+        width (types/size ty 8)
+        base (types/base-type ty)
+        element (types/scalar-size st 8)
+        f (p/cast (fnptr (cc/C) [u64 u64 u64 u64] void) address)
+        (mut input) (ArrayList::new [u8] alc)
+        (mut index) (ArrayList::new [u8] alc)
+        (mut replacement) (ArrayList::new [u8] alc)
+        (mut output) (ArrayList::new [u8] alc)
+        (mut failures) 0
+        (mut seed) (: 0 i64)]
+    (while (< seed 11)
+      (let [(mut test) (: 0 i32)]
+        (while (< test (if (and (< lane 0) (!= op 63)) 22 1))
+          (clear! (mut input))
+          (clear! (mut index))
+          (clear! (mut replacement))
+          (clear! (mut output))
+          (let [index-bits (count-value ity test)
+                selected (if (>= lane 0) (cast u64 lane) index-bits)
+                fresh (replacement-bits st seed mode)
+                (mut i) (: 0 i64)]
+            (while (< i 128) (push! (mut output) 165) (set! i (+ i 1)))
+            (set! i 0)
+            (while (< i 32)
+              (push! (mut input) (input-byte base i seed false))
+              (set! i (+ i 1)))
+            (set! i 0)
+            (while (< i 16)
+              (push! (mut index)
+                     (cast u8 (>> index-bits (cast u64 (* (% i 8) 8)))))
+              (push! (mut replacement)
+                     (cast u8 (>> fresh (cast u64 (* (% i 8) 8)))))
+              (set! i (+ i 1)))
+            (call-ptr f
+                      (p/cast u64 (.data output))
+                      (p/cast u64 (.data input))
+                      (p/cast u64 (.data index))
+                      (p/cast u64 (.data replacement)))
+            (let [valid? (< selected (cast u64 (types/lanes ty)))
+                  offset
+                    (if valid?
+                        (* (cast i64 selected) (cast i64 element))
+                        (: 0 i64))
+                  (mut extracted) (: 0 u64)]
+              (set! i 0)
+              (while (< i (cast i64 element))
+                (when valid?
+                  (set! extracted
+                        (| extracted
+                           (<< (cast u64
+                                     (vector-byte base (+ offset i) seed mode))
+                               (cast u64 (* i 8))))))
+                (set! i (+ i 1)))
+              (set! i 0)
+              (while (< i 128)
+                (let [wanted
+                        (cond (< i
+                                 (if (= op 61)
+                                     (cast i64 element)
+                                     (cast i64 width)))
+                                (if (= op 61)
+                                    (cast u8 (>> extracted (cast u64 (* i 8))))
+                                    (if (or (= op 63)
+                                            (and valid?
+                                                 (>= i offset)
+                                                 (< i
+                                                    (+ offset
+                                                       (cast i64 element)))))
+                                        (cast u8
+                                              (>> fresh
+                                                  (cast u64
+                                                        (* (% i
+                                                              (cast i64 element))
+                                                           8))))
+                                        (vector-byte base i seed mode)))
+                              (and (= op 61)
+                                   (types/integer? st)
+                                   (>= i 16)
+                                   (< i 24))
+                                (cast u8
+                                      (>> (signed-wide st extracted)
+                                          (cast u64 (* (- i 16) 8))))
+                              (and (< mode 4)
+                                   (!= op 63)
+                                   (>= i 32)
+                                   (< i (+ 32 (cast i64 width))))
+                                (vector-byte base (- i 32) seed mode)
+                              (and (< mode 4)
+                                   (!= op 61)
+                                   (>= i 64)
+                                   (< i (+ 64 (cast i64 element))))
+                                (cast u8 (>> fresh (cast u64 (* (- i 64) 8))))
+                              (and (< mode 4)
+                                   (!= op 63)
+                                   (>= i 80)
+                                   (< i
+                                      (+ 80
+                                         (cast i64 (types/scalar-size ity 8)))))
+                                (cast u8
+                                      (>> selected (cast u64 (* (- i 80) 8))))
+                              :else (: 165 u8))]
+                  (when (!= (get output i) wanted)
+                    (when (< failures 6)
+                      (println "lane ty{} op{} st{} ity{} lane{} mode{} seed{} test{} byte{} got{} expected{}"
+                               ty
+                               op
+                               st
+                               ity
+                               lane
+                               mode
+                               seed
+                               test
+                               i
+                               (get output i)
+                               wanted))
+                    (set! failures (+ failures 1))))
+                (set! i (+ i 1))))
+            (set! i 0)
+            (while (< i 32)
+              (when (!= (get input i) (input-byte base i seed false))
+                (set! failures (+ failures 1)))
+              (set! i (+ i 1)))
+            (set! i 0)
+            (while (< i 16)
+              (when (or (!= (get index i)
+                            (cast u8 (>> index-bits (cast u64 (* (% i 8) 8)))))
+                        (!= (get replacement i)
+                            (cast u8 (>> fresh (cast u64 (* (% i 8) 8))))))
+                (set! failures (+ failures 1)))
+              (set! i (+ i 1))))
+          (set! test (+ test 1))))
+      (set! seed (+ seed 1)))
+    (free! (mut input))
+    (free! (mut index))
+    (free! (mut replacement))
+    (free! (mut output))
+    failures))
+
+(defn probe :cc (cc/C) [(input (ptr u8))] (-> u64)
+  (p/machine-code (Aarch64)
+                  0xf1
+                  0x03
+                  0x00
+                  0xaa
+                  0x20
+                  0x02
+                  0xc0
+                  0x3d
+                  0x21
+                  0x02
+                  0xc0
+                  0x3d
+                  0x22
+                  0x02
+                  0xc0
+                  0x3d
+                  0x23
+                  0x02
+                  0xc0
+                  0x3d
+                  0x24
+                  0x02
+                  0xc0
+                  0x3d
+                  0x25
+                  0x02
+                  0xc0
+                  0x3d
+                  0x26
+                  0x02
+                  0xc0
+                  0x3d
+                  0x27
+                  0x02
+                  0xc0
+                  0x3d
+                  0x30
+                  0x02
+                  0xc0
+                  0x3d
+                  0x31
+                  0x02
+                  0xc0
+                  0x3d
+                  0x32
+                  0x02
+                  0xc0
+                  0x3d
+                  0x33
+                  0x02
+                  0xc0
+                  0x3d
+                  0x34
+                  0x02
+                  0xc0
+                  0x3d
+                  0x35
+                  0x02
+                  0xc0
+                  0x3d
+                  0x36
+                  0x02
+                  0xc0
+                  0x3d
+                  0x37
+                  0x02
+                  0xc0
+                  0x3d
+                  0x38
+                  0x02
+                  0xc0
+                  0x3d
+                  0x39
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3a
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3b
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3c
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3d
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3e
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3f
+                  0x02
+                  0xc0
+                  0x3d
+                  0xa0
+                  0x15
+                  0x80
+                  0xd2
+                  0xc1
+                  0x15
+                  0x80
+                  0xd2
+                  0xe2
+                  0x15
+                  0x80
+                  0xd2
+                  0x03
+                  0x16
+                  0x80
+                  0xd2
+                  0x24
+                  0x16
+                  0x80
+                  0xd2
+                  0x45
+                  0x16
+                  0x80
+                  0xd2
+                  0x66
+                  0x16
+                  0x80
+                  0xd2
+                  0x87
+                  0x16
+                  0x80
+                  0xd2
+                  0xa8
+                  0x16
+                  0x80
+                  0xd2
+                  0xc9
+                  0x16
+                  0x80
+                  0xd2
+                  0xea
+                  0x16
+                  0x80
+                  0xd2
+                  0x0b
+                  0x17
+                  0x80
+                  0xd2
+                  0x2c
+                  0x17
+                  0x80
+                  0xd2
+                  0x4d
+                  0x17
+                  0x80
+                  0xd2
+                  0x6e
+                  0x17
+                  0x80
+                  0xd2
+                  0x8f
+                  0x17
+                  0x80
+                  0xd2
+                  0xc0
+                  0x03
+                  0x5f
+                  0xd6))
+
+(defn pressure-exercise [(ty i32) (op i32) (st i32) (address (ptr u8))] (-> i64)
+  (let [alc (malloc-allocator)
+        width (types/size ty 8)
+        base (types/base-type ty)
+        element (types/scalar-size st 8)
+        lanes (types/lanes ty)
+        f (p/cast (fnptr (cc/C) [u64 u64 u64] u64) address)
+        target
+          (p/cast u64
+                  (p/cast (ptr u8)
+                          (: (fnptr-of probe) (fnptr (cc/C) [(ptr u8)] u64))))
+        (mut input) (ArrayList::new [u8] alc)
+        (mut snapshot) (ArrayList::new [u8] alc)
+        (mut output) (ArrayList::new [u8] alc)
+        (mut failures) 0
+        (mut seed) (: 0 i64)]
+    (while (< seed 11)
+      (clear! (mut input))
+      (clear! (mut snapshot))
+      (clear! (mut output))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 4096) (push! (mut input) 165) (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 2048) (push! (mut output) 165) (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i (* 40 (cast i64 width)))
+          (set! (mut input) i (input-byte base i seed false))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 40)
+          (let [count (count-value 5 (cast i32 (% i 22)))
+                bits (& (pattern st i seed false) (mask-width st))
+                (mut byte) (: 0 i64)]
+            (while (< byte 8)
+              (set! (mut input)
+                    (+ 1024 (* i 8) byte)
+                    (cast u8 (>> count (cast u64 (* byte 8)))))
+              (set! (mut input)
+                    (+ 1536 (* i 8) byte)
+                    (cast u8 (>> bits (cast u64 (* byte 8)))))
+              (set! byte (+ byte 1))))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 4096) (push! (mut snapshot) (get input i)) (set! i (+ i 1)))
+        (when (!= (call-ptr f
+                            (p/cast u64 (.data output))
+                            (p/cast u64 (.data input))
+                            target)
+                  811)
+          (println "lane pressure guard ty{} op{}" ty op)
+          (set! failures (+ failures 1)))
+        (set! i 0)
+        (while (< i 2048)
+          (let [slot (/ i 16)
+                byte (% i 16)
+                original-slot (/ (- i 640) 16)
+                original-byte (% (- i 640) 16)
+                replacement-slot (/ (- i 1280) 8)
+                replacement-byte (% (- i 1280) 8)
+                index-slot (/ (- i 1600) 8)
+                index-byte (% (- i 1600) 8)
+                selected (count-value 5 (cast i32 (% slot 22)))
+                valid? (< selected (cast u64 lanes))
+                fresh (& (pattern st slot seed false) (mask-width st))
+                wanted
+                  (cond (and (< i 640)
+                             (< byte
+                                (if (= op 61)
+                                    (cast i64 element)
+                                    (cast i64 width))))
+                          (if (= op 61)
+                              (if valid?
+                                  (get snapshot
+                                       (+ (* slot (cast i64 width))
+                                          (* (cast i64 selected)
+                                             (cast i64 element))
+                                          byte))
+                                  (: 0 u8))
+                              (if (or (= op 63)
+                                      (and valid?
+                                           (= (/ byte (cast i64 element))
+                                              (cast i64 selected))))
+                                  (cast u8
+                                        (>> fresh
+                                            (cast u64
+                                                  (* (% byte (cast i64 element))
+                                                     8))))
+                                  (get snapshot
+                                       (+ (* slot (cast i64 width)) byte))))
+                        (and (!= op 63)
+                             (>= i 640)
+                             (< i 1280)
+                             (< original-byte (cast i64 width)))
+                          (get snapshot
+                               (+ (* original-slot (cast i64 width))
+                                  original-byte))
+                        (and (!= op 61)
+                             (>= i 1280)
+                             (< i 1600)
+                             (< replacement-byte (cast i64 element)))
+                          (cast u8
+                                (>> (& (pattern st replacement-slot seed false)
+                                       (mask-width st))
+                                    (cast u64 (* replacement-byte 8))))
+                        (and (!= op 63) (>= i 1600) (< i 1920))
+                          (cast u8
+                                (>> (count-value 5 (cast i32 (% index-slot 22)))
+                                    (cast u64 (* index-byte 8))))
+                        :else (: 165 u8))]
+            (when (!= (get output i) wanted)
+              (when (< failures 6)
+                (println "lane pressure ty{} op{} st{} seed{} byte{} got{} expected{}"
+                         ty
+                         op
+                         st
+                         seed
+                         i
+                         (get output i)
+                         wanted))
+              (set! failures (+ failures 1))))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 4096)
+          (when (!= (get input i) (get snapshot i))
+            (set! failures (+ failures 1)))
+          (set! i (+ i 1))))
+      (set! seed (+ seed 1)))
+    (free! (mut input))
+    (free! (mut snapshot))
+    (free! (mut output))
+    failures))
+
+(import "coil.os" :as os)
+
+(defn linked [(ty i32)
+              (op i32)
+              (st i32)
+              (ity i32)
+              (lane i32)
+              (mode i32)
+              (name (ptr i8))] (-> i64)
+  (let [address (os/dlsym (p/cast (ptr i8) (: -2 i64)) name)]
+    (if (= (p/cast u64 address) 0)
+        (do (println "missing linked lane symbol") 1)
+        (exercise ty op st ity lane mode (p/cast (ptr u8) address)))))
+
+(defn linked-pressure [(ty i32) (op i32) (st i32) (name (ptr i8))] (-> i64)
+  (let [address (os/dlsym (p/cast (ptr i8) (: -2 i64)) name)]
+    (if (= (p/cast u64 address) 0)
+        (do (println "missing lane pressure symbol") 1)
+        (pressure-exercise ty op st (p/cast (ptr u8) address)))))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (set! failures (+ failures (linked 65 61 1 5 0 0 c"stogir_vector_lane_0")))
+    (set! failures (+ failures (linked 65 61 1 5 0 1 c"stogir_vector_lane_1")))
+    (set! failures (+ failures (linked 65 61 1 5 1 0 c"stogir_vector_lane_2")))
+    (set! failures (+ failures (linked 65 61 1 5 1 1 c"stogir_vector_lane_3")))
+    (set! failures (+ failures (linked 65 61 1 5 2 0 c"stogir_vector_lane_4")))
+    (set! failures (+ failures (linked 65 61 1 5 2 1 c"stogir_vector_lane_5")))
+    (set! failures (+ failures (linked 65 61 1 5 3 0 c"stogir_vector_lane_6")))
+    (set! failures (+ failures (linked 65 61 1 5 3 1 c"stogir_vector_lane_7")))
+    (set! failures (+ failures (linked 65 61 1 5 4 0 c"stogir_vector_lane_8")))
+    (set! failures (+ failures (linked 65 61 1 5 4 1 c"stogir_vector_lane_9")))
+    (set! failures (+ failures (linked 65 61 1 5 5 0 c"stogir_vector_lane_10")))
+    (set! failures (+ failures (linked 65 61 1 5 5 1 c"stogir_vector_lane_11")))
+    (set! failures (+ failures (linked 65 61 1 5 6 0 c"stogir_vector_lane_12")))
+    (set! failures (+ failures (linked 65 61 1 5 6 1 c"stogir_vector_lane_13")))
+    (set! failures (+ failures (linked 65 61 1 5 7 0 c"stogir_vector_lane_14")))
+    (set! failures (+ failures (linked 65 61 1 5 7 1 c"stogir_vector_lane_15")))
+    (set! failures
+          (+ failures (linked 65 61 1 1 -1 0 c"stogir_vector_lane_16")))
+    (set! failures
+          (+ failures (linked 65 61 1 5 -1 0 c"stogir_vector_lane_17")))
+    (set! failures
+          (+ failures (linked 65 61 1 5 -1 1 c"stogir_vector_lane_18")))
+    (set! failures
+          (+ failures (linked 65 61 1 5 -1 4 c"stogir_vector_lane_19")))
+    (set! failures
+          (+ failures (linked 65 61 1 8 -1 0 c"stogir_vector_lane_20")))
+    (set! failures (+ failures (linked 65 62 1 5 0 0 c"stogir_vector_lane_21")))
+    (set! failures (+ failures (linked 65 62 1 5 0 3 c"stogir_vector_lane_22")))
+    (set! failures (+ failures (linked 65 62 1 5 1 0 c"stogir_vector_lane_23")))
+    (set! failures (+ failures (linked 65 62 1 5 1 3 c"stogir_vector_lane_24")))
+    (set! failures (+ failures (linked 65 62 1 5 2 0 c"stogir_vector_lane_25")))
+    (set! failures (+ failures (linked 65 62 1 5 2 3 c"stogir_vector_lane_26")))
+    (set! failures (+ failures (linked 65 62 1 5 3 0 c"stogir_vector_lane_27")))
+    (set! failures (+ failures (linked 65 62 1 5 3 3 c"stogir_vector_lane_28")))
+    (set! failures (+ failures (linked 65 62 1 5 4 0 c"stogir_vector_lane_29")))
+    (set! failures (+ failures (linked 65 62 1 5 4 3 c"stogir_vector_lane_30")))
+    (set! failures (+ failures (linked 65 62 1 5 5 0 c"stogir_vector_lane_31")))
+    (set! failures (+ failures (linked 65 62 1 5 5 3 c"stogir_vector_lane_32")))
+    (set! failures (+ failures (linked 65 62 1 5 6 0 c"stogir_vector_lane_33")))
+    (set! failures (+ failures (linked 65 62 1 5 6 3 c"stogir_vector_lane_34")))
+    (set! failures (+ failures (linked 65 62 1 5 7 0 c"stogir_vector_lane_35")))
+    (set! failures (+ failures (linked 65 62 1 5 7 3 c"stogir_vector_lane_36")))
+    (set! failures
+          (+ failures (linked 65 62 1 1 -1 0 c"stogir_vector_lane_37")))
+    (set! failures
+          (+ failures (linked 65 62 1 1 -1 3 c"stogir_vector_lane_38")))
+    (set! failures
+          (+ failures (linked 65 62 1 5 -1 0 c"stogir_vector_lane_39")))
+    (set! failures
+          (+ failures (linked 65 62 1 5 -1 1 c"stogir_vector_lane_40")))
+    (set! failures
+          (+ failures (linked 65 62 1 5 -1 3 c"stogir_vector_lane_41")))
+    (set! failures
+          (+ failures (linked 65 62 1 5 -1 4 c"stogir_vector_lane_42")))
+    (set! failures
+          (+ failures (linked 65 62 1 8 -1 0 c"stogir_vector_lane_43")))
+    (set! failures
+          (+ failures (linked 65 62 1 8 -1 3 c"stogir_vector_lane_44")))
+    (set! failures (+ failures (linked 65 63 1 5 0 0 c"stogir_vector_lane_45")))
+    (set! failures (+ failures (linked 65 63 1 5 0 2 c"stogir_vector_lane_46")))
+    (set! failures (+ failures (linked 65 61 2 5 7 0 c"stogir_vector_lane_47")))
+    (set! failures (+ failures (linked 65 61 2 5 7 1 c"stogir_vector_lane_48")))
+    (set! failures
+          (+ failures (linked 65 61 2 5 -1 0 c"stogir_vector_lane_49")))
+    (set! failures
+          (+ failures (linked 65 61 2 5 -1 1 c"stogir_vector_lane_50")))
+    (set! failures (+ failures (linked 65 62 2 5 7 0 c"stogir_vector_lane_51")))
+    (set! failures (+ failures (linked 65 62 2 5 7 3 c"stogir_vector_lane_52")))
+    (set! failures
+          (+ failures (linked 65 62 2 5 -1 0 c"stogir_vector_lane_53")))
+    (set! failures
+          (+ failures (linked 65 62 2 5 -1 3 c"stogir_vector_lane_54")))
+    (set! failures (+ failures (linked 65 63 2 5 0 0 c"stogir_vector_lane_55")))
+    (set! failures (+ failures (linked 65 63 2 5 0 2 c"stogir_vector_lane_56")))
+    (set! failures (+ failures (linked 65 61 7 5 7 0 c"stogir_vector_lane_57")))
+    (set! failures (+ failures (linked 65 61 7 5 7 1 c"stogir_vector_lane_58")))
+    (set! failures
+          (+ failures (linked 65 61 7 5 -1 0 c"stogir_vector_lane_59")))
+    (set! failures
+          (+ failures (linked 65 61 7 5 -1 1 c"stogir_vector_lane_60")))
+    (set! failures (+ failures (linked 65 62 7 5 7 0 c"stogir_vector_lane_61")))
+    (set! failures (+ failures (linked 65 62 7 5 7 3 c"stogir_vector_lane_62")))
+    (set! failures
+          (+ failures (linked 65 62 7 5 -1 0 c"stogir_vector_lane_63")))
+    (set! failures
+          (+ failures (linked 65 62 7 5 -1 3 c"stogir_vector_lane_64")))
+    (set! failures (+ failures (linked 65 63 7 5 0 0 c"stogir_vector_lane_65")))
+    (set! failures (+ failures (linked 65 63 7 5 0 2 c"stogir_vector_lane_66")))
+    (set! failures (+ failures (linked 65 61 8 5 7 0 c"stogir_vector_lane_67")))
+    (set! failures (+ failures (linked 65 61 8 5 7 1 c"stogir_vector_lane_68")))
+    (set! failures
+          (+ failures (linked 65 61 8 5 -1 0 c"stogir_vector_lane_69")))
+    (set! failures
+          (+ failures (linked 65 61 8 5 -1 1 c"stogir_vector_lane_70")))
+    (set! failures (+ failures (linked 65 62 8 5 7 0 c"stogir_vector_lane_71")))
+    (set! failures (+ failures (linked 65 62 8 5 7 3 c"stogir_vector_lane_72")))
+    (set! failures
+          (+ failures (linked 65 62 8 5 -1 0 c"stogir_vector_lane_73")))
+    (set! failures
+          (+ failures (linked 65 62 8 5 -1 3 c"stogir_vector_lane_74")))
+    (set! failures (+ failures (linked 65 63 8 5 0 0 c"stogir_vector_lane_75")))
+    (set! failures (+ failures (linked 65 63 8 5 0 2 c"stogir_vector_lane_76")))
+    (set! failures (+ failures (linked 81 61 1 5 0 0 c"stogir_vector_lane_77")))
+    (set! failures (+ failures (linked 81 61 1 5 0 1 c"stogir_vector_lane_78")))
+    (set! failures (+ failures (linked 81 61 1 5 1 0 c"stogir_vector_lane_79")))
+    (set! failures (+ failures (linked 81 61 1 5 1 1 c"stogir_vector_lane_80")))
+    (set! failures (+ failures (linked 81 61 1 5 2 0 c"stogir_vector_lane_81")))
+    (set! failures (+ failures (linked 81 61 1 5 2 1 c"stogir_vector_lane_82")))
+    (set! failures (+ failures (linked 81 61 1 5 3 0 c"stogir_vector_lane_83")))
+    (set! failures (+ failures (linked 81 61 1 5 3 1 c"stogir_vector_lane_84")))
+    (set! failures (+ failures (linked 81 61 1 5 4 0 c"stogir_vector_lane_85")))
+    (set! failures (+ failures (linked 81 61 1 5 4 1 c"stogir_vector_lane_86")))
+    (set! failures (+ failures (linked 81 61 1 5 5 0 c"stogir_vector_lane_87")))
+    (set! failures (+ failures (linked 81 61 1 5 5 1 c"stogir_vector_lane_88")))
+    (set! failures (+ failures (linked 81 61 1 5 6 0 c"stogir_vector_lane_89")))
+    (set! failures (+ failures (linked 81 61 1 5 6 1 c"stogir_vector_lane_90")))
+    (set! failures (+ failures (linked 81 61 1 5 7 0 c"stogir_vector_lane_91")))
+    (set! failures (+ failures (linked 81 61 1 5 7 1 c"stogir_vector_lane_92")))
+    (set! failures (+ failures (linked 81 61 1 5 8 0 c"stogir_vector_lane_93")))
+    (set! failures (+ failures (linked 81 61 1 5 8 1 c"stogir_vector_lane_94")))
+    (set! failures (+ failures (linked 81 61 1 5 9 0 c"stogir_vector_lane_95")))
+    (set! failures (+ failures (linked 81 61 1 5 9 1 c"stogir_vector_lane_96")))
+    (set! failures
+          (+ failures (linked 81 61 1 5 10 0 c"stogir_vector_lane_97")))
+    (set! failures
+          (+ failures (linked 81 61 1 5 10 1 c"stogir_vector_lane_98")))
+    (set! failures
+          (+ failures (linked 81 61 1 5 11 0 c"stogir_vector_lane_99")))
+    (set! failures
+          (+ failures (linked 81 61 1 5 11 1 c"stogir_vector_lane_100")))
+    (set! failures
+          (+ failures (linked 81 61 1 5 12 0 c"stogir_vector_lane_101")))
+    (set! failures
+          (+ failures (linked 81 61 1 5 12 1 c"stogir_vector_lane_102")))
+    (set! failures
+          (+ failures (linked 81 61 1 5 13 0 c"stogir_vector_lane_103")))
+    (set! failures
+          (+ failures (linked 81 61 1 5 13 1 c"stogir_vector_lane_104")))
+    (set! failures
+          (+ failures (linked 81 61 1 5 14 0 c"stogir_vector_lane_105")))
+    (set! failures
+          (+ failures (linked 81 61 1 5 14 1 c"stogir_vector_lane_106")))
+    (set! failures
+          (+ failures (linked 81 61 1 5 15 0 c"stogir_vector_lane_107")))
+    (set! failures
+          (+ failures (linked 81 61 1 5 15 1 c"stogir_vector_lane_108")))
+    (set! failures
+          (+ failures (linked 81 61 1 1 -1 0 c"stogir_vector_lane_109")))
+    (set! failures
+          (+ failures (linked 81 61 1 5 -1 0 c"stogir_vector_lane_110")))
+    (set! failures
+          (+ failures (linked 81 61 1 5 -1 1 c"stogir_vector_lane_111")))
+    (set! failures
+          (+ failures (linked 81 61 1 5 -1 4 c"stogir_vector_lane_112")))
+    (set! failures
+          (+ failures (linked 81 61 1 8 -1 0 c"stogir_vector_lane_113")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 0 0 c"stogir_vector_lane_114")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 0 3 c"stogir_vector_lane_115")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 1 0 c"stogir_vector_lane_116")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 1 3 c"stogir_vector_lane_117")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 2 0 c"stogir_vector_lane_118")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 2 3 c"stogir_vector_lane_119")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 3 0 c"stogir_vector_lane_120")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 3 3 c"stogir_vector_lane_121")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 4 0 c"stogir_vector_lane_122")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 4 3 c"stogir_vector_lane_123")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 5 0 c"stogir_vector_lane_124")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 5 3 c"stogir_vector_lane_125")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 6 0 c"stogir_vector_lane_126")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 6 3 c"stogir_vector_lane_127")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 7 0 c"stogir_vector_lane_128")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 7 3 c"stogir_vector_lane_129")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 8 0 c"stogir_vector_lane_130")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 8 3 c"stogir_vector_lane_131")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 9 0 c"stogir_vector_lane_132")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 9 3 c"stogir_vector_lane_133")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 10 0 c"stogir_vector_lane_134")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 10 3 c"stogir_vector_lane_135")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 11 0 c"stogir_vector_lane_136")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 11 3 c"stogir_vector_lane_137")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 12 0 c"stogir_vector_lane_138")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 12 3 c"stogir_vector_lane_139")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 13 0 c"stogir_vector_lane_140")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 13 3 c"stogir_vector_lane_141")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 14 0 c"stogir_vector_lane_142")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 14 3 c"stogir_vector_lane_143")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 15 0 c"stogir_vector_lane_144")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 15 3 c"stogir_vector_lane_145")))
+    (set! failures
+          (+ failures (linked 81 62 1 1 -1 0 c"stogir_vector_lane_146")))
+    (set! failures
+          (+ failures (linked 81 62 1 1 -1 3 c"stogir_vector_lane_147")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 -1 0 c"stogir_vector_lane_148")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 -1 1 c"stogir_vector_lane_149")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 -1 3 c"stogir_vector_lane_150")))
+    (set! failures
+          (+ failures (linked 81 62 1 5 -1 4 c"stogir_vector_lane_151")))
+    (set! failures
+          (+ failures (linked 81 62 1 8 -1 0 c"stogir_vector_lane_152")))
+    (set! failures
+          (+ failures (linked 81 62 1 8 -1 3 c"stogir_vector_lane_153")))
+    (set! failures
+          (+ failures (linked 81 63 1 5 0 0 c"stogir_vector_lane_154")))
+    (set! failures
+          (+ failures (linked 81 63 1 5 0 2 c"stogir_vector_lane_155")))
+    (set! failures
+          (+ failures (linked 81 61 2 5 15 0 c"stogir_vector_lane_156")))
+    (set! failures
+          (+ failures (linked 81 61 2 5 15 1 c"stogir_vector_lane_157")))
+    (set! failures
+          (+ failures (linked 81 61 2 5 -1 0 c"stogir_vector_lane_158")))
+    (set! failures
+          (+ failures (linked 81 61 2 5 -1 1 c"stogir_vector_lane_159")))
+    (set! failures
+          (+ failures (linked 81 62 2 5 15 0 c"stogir_vector_lane_160")))
+    (set! failures
+          (+ failures (linked 81 62 2 5 15 3 c"stogir_vector_lane_161")))
+    (set! failures
+          (+ failures (linked 81 62 2 5 -1 0 c"stogir_vector_lane_162")))
+    (set! failures
+          (+ failures (linked 81 62 2 5 -1 3 c"stogir_vector_lane_163")))
+    (set! failures
+          (+ failures (linked 81 63 2 5 0 0 c"stogir_vector_lane_164")))
+    (set! failures
+          (+ failures (linked 81 63 2 5 0 2 c"stogir_vector_lane_165")))
+    (set! failures
+          (+ failures (linked 81 61 7 5 15 0 c"stogir_vector_lane_166")))
+    (set! failures
+          (+ failures (linked 81 61 7 5 15 1 c"stogir_vector_lane_167")))
+    (set! failures
+          (+ failures (linked 81 61 7 5 -1 0 c"stogir_vector_lane_168")))
+    (set! failures
+          (+ failures (linked 81 61 7 5 -1 1 c"stogir_vector_lane_169")))
+    (set! failures
+          (+ failures (linked 81 62 7 5 15 0 c"stogir_vector_lane_170")))
+    (set! failures
+          (+ failures (linked 81 62 7 5 15 3 c"stogir_vector_lane_171")))
+    (set! failures
+          (+ failures (linked 81 62 7 5 -1 0 c"stogir_vector_lane_172")))
+    (set! failures
+          (+ failures (linked 81 62 7 5 -1 3 c"stogir_vector_lane_173")))
+    (set! failures
+          (+ failures (linked 81 63 7 5 0 0 c"stogir_vector_lane_174")))
+    (set! failures
+          (+ failures (linked 81 63 7 5 0 2 c"stogir_vector_lane_175")))
+    (set! failures
+          (+ failures (linked 81 61 8 5 15 0 c"stogir_vector_lane_176")))
+    (set! failures
+          (+ failures (linked 81 61 8 5 15 1 c"stogir_vector_lane_177")))
+    (set! failures
+          (+ failures (linked 81 61 8 5 -1 0 c"stogir_vector_lane_178")))
+    (set! failures
+          (+ failures (linked 81 61 8 5 -1 1 c"stogir_vector_lane_179")))
+    (set! failures
+          (+ failures (linked 81 62 8 5 15 0 c"stogir_vector_lane_180")))
+    (set! failures
+          (+ failures (linked 81 62 8 5 15 3 c"stogir_vector_lane_181")))
+    (set! failures
+          (+ failures (linked 81 62 8 5 -1 0 c"stogir_vector_lane_182")))
+    (set! failures
+          (+ failures (linked 81 62 8 5 -1 3 c"stogir_vector_lane_183")))
+    (set! failures
+          (+ failures (linked 81 63 8 5 0 0 c"stogir_vector_lane_184")))
+    (set! failures
+          (+ failures (linked 81 63 8 5 0 2 c"stogir_vector_lane_185")))
+    (set! failures
+          (+ failures (linked 66 61 2 5 0 0 c"stogir_vector_lane_186")))
+    (set! failures
+          (+ failures (linked 66 61 2 5 0 1 c"stogir_vector_lane_187")))
+    (set! failures
+          (+ failures (linked 66 61 2 5 1 0 c"stogir_vector_lane_188")))
+    (set! failures
+          (+ failures (linked 66 61 2 5 1 1 c"stogir_vector_lane_189")))
+    (set! failures
+          (+ failures (linked 66 61 2 5 2 0 c"stogir_vector_lane_190")))
+    (set! failures
+          (+ failures (linked 66 61 2 5 2 1 c"stogir_vector_lane_191")))
+    (set! failures
+          (+ failures (linked 66 61 2 5 3 0 c"stogir_vector_lane_192")))
+    (set! failures
+          (+ failures (linked 66 61 2 5 3 1 c"stogir_vector_lane_193")))
+    (set! failures
+          (+ failures (linked 66 61 2 5 4 0 c"stogir_vector_lane_194")))
+    (set! failures
+          (+ failures (linked 66 61 2 5 4 1 c"stogir_vector_lane_195")))
+    (set! failures
+          (+ failures (linked 66 61 2 5 5 0 c"stogir_vector_lane_196")))
+    (set! failures
+          (+ failures (linked 66 61 2 5 5 1 c"stogir_vector_lane_197")))
+    (set! failures
+          (+ failures (linked 66 61 2 5 6 0 c"stogir_vector_lane_198")))
+    (set! failures
+          (+ failures (linked 66 61 2 5 6 1 c"stogir_vector_lane_199")))
+    (set! failures
+          (+ failures (linked 66 61 2 5 7 0 c"stogir_vector_lane_200")))
+    (set! failures
+          (+ failures (linked 66 61 2 5 7 1 c"stogir_vector_lane_201")))
+    (set! failures
+          (+ failures (linked 66 61 2 1 -1 0 c"stogir_vector_lane_202")))
+    (set! failures
+          (+ failures (linked 66 61 2 5 -1 0 c"stogir_vector_lane_203")))
+    (set! failures
+          (+ failures (linked 66 61 2 5 -1 1 c"stogir_vector_lane_204")))
+    (set! failures
+          (+ failures (linked 66 61 2 5 -1 4 c"stogir_vector_lane_205")))
+    (set! failures
+          (+ failures (linked 66 61 2 8 -1 0 c"stogir_vector_lane_206")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 0 0 c"stogir_vector_lane_207")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 0 3 c"stogir_vector_lane_208")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 1 0 c"stogir_vector_lane_209")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 1 3 c"stogir_vector_lane_210")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 2 0 c"stogir_vector_lane_211")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 2 3 c"stogir_vector_lane_212")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 3 0 c"stogir_vector_lane_213")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 3 3 c"stogir_vector_lane_214")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 4 0 c"stogir_vector_lane_215")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 4 3 c"stogir_vector_lane_216")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 5 0 c"stogir_vector_lane_217")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 5 3 c"stogir_vector_lane_218")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 6 0 c"stogir_vector_lane_219")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 6 3 c"stogir_vector_lane_220")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 7 0 c"stogir_vector_lane_221")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 7 3 c"stogir_vector_lane_222")))
+    (set! failures
+          (+ failures (linked 66 62 2 1 -1 0 c"stogir_vector_lane_223")))
+    (set! failures
+          (+ failures (linked 66 62 2 1 -1 3 c"stogir_vector_lane_224")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 -1 0 c"stogir_vector_lane_225")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 -1 1 c"stogir_vector_lane_226")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 -1 3 c"stogir_vector_lane_227")))
+    (set! failures
+          (+ failures (linked 66 62 2 5 -1 4 c"stogir_vector_lane_228")))
+    (set! failures
+          (+ failures (linked 66 62 2 8 -1 0 c"stogir_vector_lane_229")))
+    (set! failures
+          (+ failures (linked 66 62 2 8 -1 3 c"stogir_vector_lane_230")))
+    (set! failures
+          (+ failures (linked 66 63 2 5 0 0 c"stogir_vector_lane_231")))
+    (set! failures
+          (+ failures (linked 66 63 2 5 0 2 c"stogir_vector_lane_232")))
+    (set! failures
+          (+ failures (linked 66 61 1 5 7 0 c"stogir_vector_lane_233")))
+    (set! failures
+          (+ failures (linked 66 61 1 5 7 1 c"stogir_vector_lane_234")))
+    (set! failures
+          (+ failures (linked 66 61 1 5 -1 0 c"stogir_vector_lane_235")))
+    (set! failures
+          (+ failures (linked 66 61 1 5 -1 1 c"stogir_vector_lane_236")))
+    (set! failures
+          (+ failures (linked 66 62 1 5 7 0 c"stogir_vector_lane_237")))
+    (set! failures
+          (+ failures (linked 66 62 1 5 7 3 c"stogir_vector_lane_238")))
+    (set! failures
+          (+ failures (linked 66 62 1 5 -1 0 c"stogir_vector_lane_239")))
+    (set! failures
+          (+ failures (linked 66 62 1 5 -1 3 c"stogir_vector_lane_240")))
+    (set! failures
+          (+ failures (linked 66 63 1 5 0 0 c"stogir_vector_lane_241")))
+    (set! failures
+          (+ failures (linked 66 63 1 5 0 2 c"stogir_vector_lane_242")))
+    (set! failures
+          (+ failures (linked 66 61 7 5 7 0 c"stogir_vector_lane_243")))
+    (set! failures
+          (+ failures (linked 66 61 7 5 7 1 c"stogir_vector_lane_244")))
+    (set! failures
+          (+ failures (linked 66 61 7 5 -1 0 c"stogir_vector_lane_245")))
+    (set! failures
+          (+ failures (linked 66 61 7 5 -1 1 c"stogir_vector_lane_246")))
+    (set! failures
+          (+ failures (linked 66 62 7 5 7 0 c"stogir_vector_lane_247")))
+    (set! failures
+          (+ failures (linked 66 62 7 5 7 3 c"stogir_vector_lane_248")))
+    (set! failures
+          (+ failures (linked 66 62 7 5 -1 0 c"stogir_vector_lane_249")))
+    (set! failures
+          (+ failures (linked 66 62 7 5 -1 3 c"stogir_vector_lane_250")))
+    (set! failures
+          (+ failures (linked 66 63 7 5 0 0 c"stogir_vector_lane_251")))
+    (set! failures
+          (+ failures (linked 66 63 7 5 0 2 c"stogir_vector_lane_252")))
+    (set! failures
+          (+ failures (linked 66 61 8 5 7 0 c"stogir_vector_lane_253")))
+    (set! failures
+          (+ failures (linked 66 61 8 5 7 1 c"stogir_vector_lane_254")))
+    (set! failures
+          (+ failures (linked 66 61 8 5 -1 0 c"stogir_vector_lane_255")))
+    (set! failures
+          (+ failures (linked 66 61 8 5 -1 1 c"stogir_vector_lane_256")))
+    (set! failures
+          (+ failures (linked 66 62 8 5 7 0 c"stogir_vector_lane_257")))
+    (set! failures
+          (+ failures (linked 66 62 8 5 7 3 c"stogir_vector_lane_258")))
+    (set! failures
+          (+ failures (linked 66 62 8 5 -1 0 c"stogir_vector_lane_259")))
+    (set! failures
+          (+ failures (linked 66 62 8 5 -1 3 c"stogir_vector_lane_260")))
+    (set! failures
+          (+ failures (linked 66 63 8 5 0 0 c"stogir_vector_lane_261")))
+    (set! failures
+          (+ failures (linked 66 63 8 5 0 2 c"stogir_vector_lane_262")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 0 0 c"stogir_vector_lane_263")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 0 1 c"stogir_vector_lane_264")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 1 0 c"stogir_vector_lane_265")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 1 1 c"stogir_vector_lane_266")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 2 0 c"stogir_vector_lane_267")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 2 1 c"stogir_vector_lane_268")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 3 0 c"stogir_vector_lane_269")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 3 1 c"stogir_vector_lane_270")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 4 0 c"stogir_vector_lane_271")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 4 1 c"stogir_vector_lane_272")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 5 0 c"stogir_vector_lane_273")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 5 1 c"stogir_vector_lane_274")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 6 0 c"stogir_vector_lane_275")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 6 1 c"stogir_vector_lane_276")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 7 0 c"stogir_vector_lane_277")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 7 1 c"stogir_vector_lane_278")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 8 0 c"stogir_vector_lane_279")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 8 1 c"stogir_vector_lane_280")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 9 0 c"stogir_vector_lane_281")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 9 1 c"stogir_vector_lane_282")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 10 0 c"stogir_vector_lane_283")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 10 1 c"stogir_vector_lane_284")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 11 0 c"stogir_vector_lane_285")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 11 1 c"stogir_vector_lane_286")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 12 0 c"stogir_vector_lane_287")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 12 1 c"stogir_vector_lane_288")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 13 0 c"stogir_vector_lane_289")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 13 1 c"stogir_vector_lane_290")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 14 0 c"stogir_vector_lane_291")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 14 1 c"stogir_vector_lane_292")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 15 0 c"stogir_vector_lane_293")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 15 1 c"stogir_vector_lane_294")))
+    (set! failures
+          (+ failures (linked 82 61 2 1 -1 0 c"stogir_vector_lane_295")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 -1 0 c"stogir_vector_lane_296")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 -1 1 c"stogir_vector_lane_297")))
+    (set! failures
+          (+ failures (linked 82 61 2 5 -1 4 c"stogir_vector_lane_298")))
+    (set! failures
+          (+ failures (linked 82 61 2 8 -1 0 c"stogir_vector_lane_299")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 0 0 c"stogir_vector_lane_300")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 0 3 c"stogir_vector_lane_301")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 1 0 c"stogir_vector_lane_302")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 1 3 c"stogir_vector_lane_303")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 2 0 c"stogir_vector_lane_304")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 2 3 c"stogir_vector_lane_305")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 3 0 c"stogir_vector_lane_306")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 3 3 c"stogir_vector_lane_307")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 4 0 c"stogir_vector_lane_308")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 4 3 c"stogir_vector_lane_309")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 5 0 c"stogir_vector_lane_310")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 5 3 c"stogir_vector_lane_311")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 6 0 c"stogir_vector_lane_312")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 6 3 c"stogir_vector_lane_313")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 7 0 c"stogir_vector_lane_314")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 7 3 c"stogir_vector_lane_315")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 8 0 c"stogir_vector_lane_316")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 8 3 c"stogir_vector_lane_317")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 9 0 c"stogir_vector_lane_318")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 9 3 c"stogir_vector_lane_319")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 10 0 c"stogir_vector_lane_320")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 10 3 c"stogir_vector_lane_321")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 11 0 c"stogir_vector_lane_322")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 11 3 c"stogir_vector_lane_323")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 12 0 c"stogir_vector_lane_324")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 12 3 c"stogir_vector_lane_325")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 13 0 c"stogir_vector_lane_326")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 13 3 c"stogir_vector_lane_327")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 14 0 c"stogir_vector_lane_328")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 14 3 c"stogir_vector_lane_329")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 15 0 c"stogir_vector_lane_330")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 15 3 c"stogir_vector_lane_331")))
+    (set! failures
+          (+ failures (linked 82 62 2 1 -1 0 c"stogir_vector_lane_332")))
+    (set! failures
+          (+ failures (linked 82 62 2 1 -1 3 c"stogir_vector_lane_333")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 -1 0 c"stogir_vector_lane_334")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 -1 1 c"stogir_vector_lane_335")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 -1 3 c"stogir_vector_lane_336")))
+    (set! failures
+          (+ failures (linked 82 62 2 5 -1 4 c"stogir_vector_lane_337")))
+    (set! failures
+          (+ failures (linked 82 62 2 8 -1 0 c"stogir_vector_lane_338")))
+    (set! failures
+          (+ failures (linked 82 62 2 8 -1 3 c"stogir_vector_lane_339")))
+    (set! failures
+          (+ failures (linked 82 63 2 5 0 0 c"stogir_vector_lane_340")))
+    (set! failures
+          (+ failures (linked 82 63 2 5 0 2 c"stogir_vector_lane_341")))
+    (set! failures
+          (+ failures (linked 82 61 1 5 15 0 c"stogir_vector_lane_342")))
+    (set! failures
+          (+ failures (linked 82 61 1 5 15 1 c"stogir_vector_lane_343")))
+    (set! failures
+          (+ failures (linked 82 61 1 5 -1 0 c"stogir_vector_lane_344")))
+    (set! failures
+          (+ failures (linked 82 61 1 5 -1 1 c"stogir_vector_lane_345")))
+    (set! failures
+          (+ failures (linked 82 62 1 5 15 0 c"stogir_vector_lane_346")))
+    (set! failures
+          (+ failures (linked 82 62 1 5 15 3 c"stogir_vector_lane_347")))
+    (set! failures
+          (+ failures (linked 82 62 1 5 -1 0 c"stogir_vector_lane_348")))
+    (set! failures
+          (+ failures (linked 82 62 1 5 -1 3 c"stogir_vector_lane_349")))
+    (set! failures
+          (+ failures (linked 82 63 1 5 0 0 c"stogir_vector_lane_350")))
+    (set! failures
+          (+ failures (linked 82 63 1 5 0 2 c"stogir_vector_lane_351")))
+    (set! failures
+          (+ failures (linked 82 61 7 5 15 0 c"stogir_vector_lane_352")))
+    (set! failures
+          (+ failures (linked 82 61 7 5 15 1 c"stogir_vector_lane_353")))
+    (set! failures
+          (+ failures (linked 82 61 7 5 -1 0 c"stogir_vector_lane_354")))
+    (set! failures
+          (+ failures (linked 82 61 7 5 -1 1 c"stogir_vector_lane_355")))
+    (set! failures
+          (+ failures (linked 82 62 7 5 15 0 c"stogir_vector_lane_356")))
+    (set! failures
+          (+ failures (linked 82 62 7 5 15 3 c"stogir_vector_lane_357")))
+    (set! failures
+          (+ failures (linked 82 62 7 5 -1 0 c"stogir_vector_lane_358")))
+    (set! failures
+          (+ failures (linked 82 62 7 5 -1 3 c"stogir_vector_lane_359")))
+    (set! failures
+          (+ failures (linked 82 63 7 5 0 0 c"stogir_vector_lane_360")))
+    (set! failures
+          (+ failures (linked 82 63 7 5 0 2 c"stogir_vector_lane_361")))
+    (set! failures
+          (+ failures (linked 82 61 8 5 15 0 c"stogir_vector_lane_362")))
+    (set! failures
+          (+ failures (linked 82 61 8 5 15 1 c"stogir_vector_lane_363")))
+    (set! failures
+          (+ failures (linked 82 61 8 5 -1 0 c"stogir_vector_lane_364")))
+    (set! failures
+          (+ failures (linked 82 61 8 5 -1 1 c"stogir_vector_lane_365")))
+    (set! failures
+          (+ failures (linked 82 62 8 5 15 0 c"stogir_vector_lane_366")))
+    (set! failures
+          (+ failures (linked 82 62 8 5 15 3 c"stogir_vector_lane_367")))
+    (set! failures
+          (+ failures (linked 82 62 8 5 -1 0 c"stogir_vector_lane_368")))
+    (set! failures
+          (+ failures (linked 82 62 8 5 -1 3 c"stogir_vector_lane_369")))
+    (set! failures
+          (+ failures (linked 82 63 8 5 0 0 c"stogir_vector_lane_370")))
+    (set! failures
+          (+ failures (linked 82 63 8 5 0 2 c"stogir_vector_lane_371")))
+    (set! failures
+          (+ failures (linked 51 61 3 5 0 0 c"stogir_vector_lane_372")))
+    (set! failures
+          (+ failures (linked 51 61 3 5 0 1 c"stogir_vector_lane_373")))
+    (set! failures
+          (+ failures (linked 51 61 3 5 1 0 c"stogir_vector_lane_374")))
+    (set! failures
+          (+ failures (linked 51 61 3 5 1 1 c"stogir_vector_lane_375")))
+    (set! failures
+          (+ failures (linked 51 61 3 5 2 0 c"stogir_vector_lane_376")))
+    (set! failures
+          (+ failures (linked 51 61 3 5 2 1 c"stogir_vector_lane_377")))
+    (set! failures
+          (+ failures (linked 51 61 3 5 3 0 c"stogir_vector_lane_378")))
+    (set! failures
+          (+ failures (linked 51 61 3 5 3 1 c"stogir_vector_lane_379")))
+    (set! failures
+          (+ failures (linked 51 61 3 1 -1 0 c"stogir_vector_lane_380")))
+    (set! failures
+          (+ failures (linked 51 61 3 5 -1 0 c"stogir_vector_lane_381")))
+    (set! failures
+          (+ failures (linked 51 61 3 5 -1 1 c"stogir_vector_lane_382")))
+    (set! failures
+          (+ failures (linked 51 61 3 5 -1 4 c"stogir_vector_lane_383")))
+    (set! failures
+          (+ failures (linked 51 61 3 8 -1 0 c"stogir_vector_lane_384")))
+    (set! failures
+          (+ failures (linked 51 62 3 5 0 0 c"stogir_vector_lane_385")))
+    (set! failures
+          (+ failures (linked 51 62 3 5 0 3 c"stogir_vector_lane_386")))
+    (set! failures
+          (+ failures (linked 51 62 3 5 1 0 c"stogir_vector_lane_387")))
+    (set! failures
+          (+ failures (linked 51 62 3 5 1 3 c"stogir_vector_lane_388")))
+    (set! failures
+          (+ failures (linked 51 62 3 5 2 0 c"stogir_vector_lane_389")))
+    (set! failures
+          (+ failures (linked 51 62 3 5 2 3 c"stogir_vector_lane_390")))
+    (set! failures
+          (+ failures (linked 51 62 3 5 3 0 c"stogir_vector_lane_391")))
+    (set! failures
+          (+ failures (linked 51 62 3 5 3 3 c"stogir_vector_lane_392")))
+    (set! failures
+          (+ failures (linked 51 62 3 1 -1 0 c"stogir_vector_lane_393")))
+    (set! failures
+          (+ failures (linked 51 62 3 1 -1 3 c"stogir_vector_lane_394")))
+    (set! failures
+          (+ failures (linked 51 62 3 5 -1 0 c"stogir_vector_lane_395")))
+    (set! failures
+          (+ failures (linked 51 62 3 5 -1 1 c"stogir_vector_lane_396")))
+    (set! failures
+          (+ failures (linked 51 62 3 5 -1 3 c"stogir_vector_lane_397")))
+    (set! failures
+          (+ failures (linked 51 62 3 5 -1 4 c"stogir_vector_lane_398")))
+    (set! failures
+          (+ failures (linked 51 62 3 8 -1 0 c"stogir_vector_lane_399")))
+    (set! failures
+          (+ failures (linked 51 62 3 8 -1 3 c"stogir_vector_lane_400")))
+    (set! failures
+          (+ failures (linked 51 63 3 5 0 0 c"stogir_vector_lane_401")))
+    (set! failures
+          (+ failures (linked 51 63 3 5 0 2 c"stogir_vector_lane_402")))
+    (set! failures
+          (+ failures (linked 51 61 9 5 3 0 c"stogir_vector_lane_403")))
+    (set! failures
+          (+ failures (linked 51 61 9 5 3 1 c"stogir_vector_lane_404")))
+    (set! failures
+          (+ failures (linked 51 61 9 5 -1 0 c"stogir_vector_lane_405")))
+    (set! failures
+          (+ failures (linked 51 61 9 5 -1 1 c"stogir_vector_lane_406")))
+    (set! failures
+          (+ failures (linked 51 62 9 5 3 0 c"stogir_vector_lane_407")))
+    (set! failures
+          (+ failures (linked 51 62 9 5 3 3 c"stogir_vector_lane_408")))
+    (set! failures
+          (+ failures (linked 51 62 9 5 -1 0 c"stogir_vector_lane_409")))
+    (set! failures
+          (+ failures (linked 51 62 9 5 -1 3 c"stogir_vector_lane_410")))
+    (set! failures
+          (+ failures (linked 51 63 9 5 0 0 c"stogir_vector_lane_411")))
+    (set! failures
+          (+ failures (linked 51 63 9 5 0 2 c"stogir_vector_lane_412")))
+    (set! failures
+          (+ failures (linked 67 61 3 5 0 0 c"stogir_vector_lane_413")))
+    (set! failures
+          (+ failures (linked 67 61 3 5 0 1 c"stogir_vector_lane_414")))
+    (set! failures
+          (+ failures (linked 67 61 3 5 1 0 c"stogir_vector_lane_415")))
+    (set! failures
+          (+ failures (linked 67 61 3 5 1 1 c"stogir_vector_lane_416")))
+    (set! failures
+          (+ failures (linked 67 61 3 5 2 0 c"stogir_vector_lane_417")))
+    (set! failures
+          (+ failures (linked 67 61 3 5 2 1 c"stogir_vector_lane_418")))
+    (set! failures
+          (+ failures (linked 67 61 3 5 3 0 c"stogir_vector_lane_419")))
+    (set! failures
+          (+ failures (linked 67 61 3 5 3 1 c"stogir_vector_lane_420")))
+    (set! failures
+          (+ failures (linked 67 61 3 5 4 0 c"stogir_vector_lane_421")))
+    (set! failures
+          (+ failures (linked 67 61 3 5 4 1 c"stogir_vector_lane_422")))
+    (set! failures
+          (+ failures (linked 67 61 3 5 5 0 c"stogir_vector_lane_423")))
+    (set! failures
+          (+ failures (linked 67 61 3 5 5 1 c"stogir_vector_lane_424")))
+    (set! failures
+          (+ failures (linked 67 61 3 5 6 0 c"stogir_vector_lane_425")))
+    (set! failures
+          (+ failures (linked 67 61 3 5 6 1 c"stogir_vector_lane_426")))
+    (set! failures
+          (+ failures (linked 67 61 3 5 7 0 c"stogir_vector_lane_427")))
+    (set! failures
+          (+ failures (linked 67 61 3 5 7 1 c"stogir_vector_lane_428")))
+    (set! failures
+          (+ failures (linked 67 61 3 1 -1 0 c"stogir_vector_lane_429")))
+    (set! failures
+          (+ failures (linked 67 61 3 5 -1 0 c"stogir_vector_lane_430")))
+    (set! failures
+          (+ failures (linked 67 61 3 5 -1 1 c"stogir_vector_lane_431")))
+    (set! failures
+          (+ failures (linked 67 61 3 5 -1 4 c"stogir_vector_lane_432")))
+    (set! failures
+          (+ failures (linked 67 61 3 8 -1 0 c"stogir_vector_lane_433")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 0 0 c"stogir_vector_lane_434")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 0 3 c"stogir_vector_lane_435")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 1 0 c"stogir_vector_lane_436")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 1 3 c"stogir_vector_lane_437")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 2 0 c"stogir_vector_lane_438")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 2 3 c"stogir_vector_lane_439")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 3 0 c"stogir_vector_lane_440")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 3 3 c"stogir_vector_lane_441")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 4 0 c"stogir_vector_lane_442")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 4 3 c"stogir_vector_lane_443")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 5 0 c"stogir_vector_lane_444")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 5 3 c"stogir_vector_lane_445")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 6 0 c"stogir_vector_lane_446")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 6 3 c"stogir_vector_lane_447")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 7 0 c"stogir_vector_lane_448")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 7 3 c"stogir_vector_lane_449")))
+    (set! failures
+          (+ failures (linked 67 62 3 1 -1 0 c"stogir_vector_lane_450")))
+    (set! failures
+          (+ failures (linked 67 62 3 1 -1 3 c"stogir_vector_lane_451")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 -1 0 c"stogir_vector_lane_452")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 -1 1 c"stogir_vector_lane_453")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 -1 3 c"stogir_vector_lane_454")))
+    (set! failures
+          (+ failures (linked 67 62 3 5 -1 4 c"stogir_vector_lane_455")))
+    (set! failures
+          (+ failures (linked 67 62 3 8 -1 0 c"stogir_vector_lane_456")))
+    (set! failures
+          (+ failures (linked 67 62 3 8 -1 3 c"stogir_vector_lane_457")))
+    (set! failures
+          (+ failures (linked 67 63 3 5 0 0 c"stogir_vector_lane_458")))
+    (set! failures
+          (+ failures (linked 67 63 3 5 0 2 c"stogir_vector_lane_459")))
+    (set! failures
+          (+ failures (linked 67 61 9 5 7 0 c"stogir_vector_lane_460")))
+    (set! failures
+          (+ failures (linked 67 61 9 5 7 1 c"stogir_vector_lane_461")))
+    (set! failures
+          (+ failures (linked 67 61 9 5 -1 0 c"stogir_vector_lane_462")))
+    (set! failures
+          (+ failures (linked 67 61 9 5 -1 1 c"stogir_vector_lane_463")))
+    (set! failures
+          (+ failures (linked 67 62 9 5 7 0 c"stogir_vector_lane_464")))
+    (set! failures
+          (+ failures (linked 67 62 9 5 7 3 c"stogir_vector_lane_465")))
+    (set! failures
+          (+ failures (linked 67 62 9 5 -1 0 c"stogir_vector_lane_466")))
+    (set! failures
+          (+ failures (linked 67 62 9 5 -1 3 c"stogir_vector_lane_467")))
+    (set! failures
+          (+ failures (linked 67 63 9 5 0 0 c"stogir_vector_lane_468")))
+    (set! failures
+          (+ failures (linked 67 63 9 5 0 2 c"stogir_vector_lane_469")))
+    (set! failures
+          (+ failures (linked 36 61 4 5 0 0 c"stogir_vector_lane_470")))
+    (set! failures
+          (+ failures (linked 36 61 4 5 0 1 c"stogir_vector_lane_471")))
+    (set! failures
+          (+ failures (linked 36 61 4 5 1 0 c"stogir_vector_lane_472")))
+    (set! failures
+          (+ failures (linked 36 61 4 5 1 1 c"stogir_vector_lane_473")))
+    (set! failures
+          (+ failures (linked 36 61 4 1 -1 0 c"stogir_vector_lane_474")))
+    (set! failures
+          (+ failures (linked 36 61 4 5 -1 0 c"stogir_vector_lane_475")))
+    (set! failures
+          (+ failures (linked 36 61 4 5 -1 1 c"stogir_vector_lane_476")))
+    (set! failures
+          (+ failures (linked 36 61 4 5 -1 4 c"stogir_vector_lane_477")))
+    (set! failures
+          (+ failures (linked 36 61 4 8 -1 0 c"stogir_vector_lane_478")))
+    (set! failures
+          (+ failures (linked 36 62 4 5 0 0 c"stogir_vector_lane_479")))
+    (set! failures
+          (+ failures (linked 36 62 4 5 0 3 c"stogir_vector_lane_480")))
+    (set! failures
+          (+ failures (linked 36 62 4 5 1 0 c"stogir_vector_lane_481")))
+    (set! failures
+          (+ failures (linked 36 62 4 5 1 3 c"stogir_vector_lane_482")))
+    (set! failures
+          (+ failures (linked 36 62 4 1 -1 0 c"stogir_vector_lane_483")))
+    (set! failures
+          (+ failures (linked 36 62 4 1 -1 3 c"stogir_vector_lane_484")))
+    (set! failures
+          (+ failures (linked 36 62 4 5 -1 0 c"stogir_vector_lane_485")))
+    (set! failures
+          (+ failures (linked 36 62 4 5 -1 1 c"stogir_vector_lane_486")))
+    (set! failures
+          (+ failures (linked 36 62 4 5 -1 3 c"stogir_vector_lane_487")))
+    (set! failures
+          (+ failures (linked 36 62 4 5 -1 4 c"stogir_vector_lane_488")))
+    (set! failures
+          (+ failures (linked 36 62 4 8 -1 0 c"stogir_vector_lane_489")))
+    (set! failures
+          (+ failures (linked 36 62 4 8 -1 3 c"stogir_vector_lane_490")))
+    (set! failures
+          (+ failures (linked 36 63 4 5 0 0 c"stogir_vector_lane_491")))
+    (set! failures
+          (+ failures (linked 36 63 4 5 0 2 c"stogir_vector_lane_492")))
+    (set! failures
+          (+ failures (linked 36 61 10 5 1 0 c"stogir_vector_lane_493")))
+    (set! failures
+          (+ failures (linked 36 61 10 5 1 1 c"stogir_vector_lane_494")))
+    (set! failures
+          (+ failures (linked 36 61 10 5 -1 0 c"stogir_vector_lane_495")))
+    (set! failures
+          (+ failures (linked 36 61 10 5 -1 1 c"stogir_vector_lane_496")))
+    (set! failures
+          (+ failures (linked 36 62 10 5 1 0 c"stogir_vector_lane_497")))
+    (set! failures
+          (+ failures (linked 36 62 10 5 1 3 c"stogir_vector_lane_498")))
+    (set! failures
+          (+ failures (linked 36 62 10 5 -1 0 c"stogir_vector_lane_499")))
+    (set! failures
+          (+ failures (linked 36 62 10 5 -1 3 c"stogir_vector_lane_500")))
+    (set! failures
+          (+ failures (linked 36 63 10 5 0 0 c"stogir_vector_lane_501")))
+    (set! failures
+          (+ failures (linked 36 63 10 5 0 2 c"stogir_vector_lane_502")))
+    (set! failures
+          (+ failures (linked 52 61 4 5 0 0 c"stogir_vector_lane_503")))
+    (set! failures
+          (+ failures (linked 52 61 4 5 0 1 c"stogir_vector_lane_504")))
+    (set! failures
+          (+ failures (linked 52 61 4 5 1 0 c"stogir_vector_lane_505")))
+    (set! failures
+          (+ failures (linked 52 61 4 5 1 1 c"stogir_vector_lane_506")))
+    (set! failures
+          (+ failures (linked 52 61 4 5 2 0 c"stogir_vector_lane_507")))
+    (set! failures
+          (+ failures (linked 52 61 4 5 2 1 c"stogir_vector_lane_508")))
+    (set! failures
+          (+ failures (linked 52 61 4 5 3 0 c"stogir_vector_lane_509")))
+    (set! failures
+          (+ failures (linked 52 61 4 5 3 1 c"stogir_vector_lane_510")))
+    (set! failures
+          (+ failures (linked 52 61 4 1 -1 0 c"stogir_vector_lane_511")))
+    (set! failures
+          (+ failures (linked 52 61 4 5 -1 0 c"stogir_vector_lane_512")))
+    (set! failures
+          (+ failures (linked 52 61 4 5 -1 1 c"stogir_vector_lane_513")))
+    (set! failures
+          (+ failures (linked 52 61 4 5 -1 4 c"stogir_vector_lane_514")))
+    (set! failures
+          (+ failures (linked 52 61 4 8 -1 0 c"stogir_vector_lane_515")))
+    (set! failures
+          (+ failures (linked 52 62 4 5 0 0 c"stogir_vector_lane_516")))
+    (set! failures
+          (+ failures (linked 52 62 4 5 0 3 c"stogir_vector_lane_517")))
+    (set! failures
+          (+ failures (linked 52 62 4 5 1 0 c"stogir_vector_lane_518")))
+    (set! failures
+          (+ failures (linked 52 62 4 5 1 3 c"stogir_vector_lane_519")))
+    (set! failures
+          (+ failures (linked 52 62 4 5 2 0 c"stogir_vector_lane_520")))
+    (set! failures
+          (+ failures (linked 52 62 4 5 2 3 c"stogir_vector_lane_521")))
+    (set! failures
+          (+ failures (linked 52 62 4 5 3 0 c"stogir_vector_lane_522")))
+    (set! failures
+          (+ failures (linked 52 62 4 5 3 3 c"stogir_vector_lane_523")))
+    (set! failures
+          (+ failures (linked 52 62 4 1 -1 0 c"stogir_vector_lane_524")))
+    (set! failures
+          (+ failures (linked 52 62 4 1 -1 3 c"stogir_vector_lane_525")))
+    (set! failures
+          (+ failures (linked 52 62 4 5 -1 0 c"stogir_vector_lane_526")))
+    (set! failures
+          (+ failures (linked 52 62 4 5 -1 1 c"stogir_vector_lane_527")))
+    (set! failures
+          (+ failures (linked 52 62 4 5 -1 3 c"stogir_vector_lane_528")))
+    (set! failures
+          (+ failures (linked 52 62 4 5 -1 4 c"stogir_vector_lane_529")))
+    (set! failures
+          (+ failures (linked 52 62 4 8 -1 0 c"stogir_vector_lane_530")))
+    (set! failures
+          (+ failures (linked 52 62 4 8 -1 3 c"stogir_vector_lane_531")))
+    (set! failures
+          (+ failures (linked 52 63 4 5 0 0 c"stogir_vector_lane_532")))
+    (set! failures
+          (+ failures (linked 52 63 4 5 0 2 c"stogir_vector_lane_533")))
+    (set! failures
+          (+ failures (linked 52 61 10 5 3 0 c"stogir_vector_lane_534")))
+    (set! failures
+          (+ failures (linked 52 61 10 5 3 1 c"stogir_vector_lane_535")))
+    (set! failures
+          (+ failures (linked 52 61 10 5 -1 0 c"stogir_vector_lane_536")))
+    (set! failures
+          (+ failures (linked 52 61 10 5 -1 1 c"stogir_vector_lane_537")))
+    (set! failures
+          (+ failures (linked 52 62 10 5 3 0 c"stogir_vector_lane_538")))
+    (set! failures
+          (+ failures (linked 52 62 10 5 3 3 c"stogir_vector_lane_539")))
+    (set! failures
+          (+ failures (linked 52 62 10 5 -1 0 c"stogir_vector_lane_540")))
+    (set! failures
+          (+ failures (linked 52 62 10 5 -1 3 c"stogir_vector_lane_541")))
+    (set! failures
+          (+ failures (linked 52 63 10 5 0 0 c"stogir_vector_lane_542")))
+    (set! failures
+          (+ failures (linked 52 63 10 5 0 2 c"stogir_vector_lane_543")))
+    (set! failures
+          (+ failures (linked 21 61 5 5 0 0 c"stogir_vector_lane_544")))
+    (set! failures
+          (+ failures (linked 21 61 5 5 0 1 c"stogir_vector_lane_545")))
+    (set! failures
+          (+ failures (linked 21 61 5 1 -1 0 c"stogir_vector_lane_546")))
+    (set! failures
+          (+ failures (linked 21 61 5 5 -1 0 c"stogir_vector_lane_547")))
+    (set! failures
+          (+ failures (linked 21 61 5 5 -1 1 c"stogir_vector_lane_548")))
+    (set! failures
+          (+ failures (linked 21 61 5 5 -1 4 c"stogir_vector_lane_549")))
+    (set! failures
+          (+ failures (linked 21 61 5 8 -1 0 c"stogir_vector_lane_550")))
+    (set! failures
+          (+ failures (linked 21 62 5 5 0 0 c"stogir_vector_lane_551")))
+    (set! failures
+          (+ failures (linked 21 62 5 5 0 3 c"stogir_vector_lane_552")))
+    (set! failures
+          (+ failures (linked 21 62 5 1 -1 0 c"stogir_vector_lane_553")))
+    (set! failures
+          (+ failures (linked 21 62 5 1 -1 3 c"stogir_vector_lane_554")))
+    (set! failures
+          (+ failures (linked 21 62 5 5 -1 0 c"stogir_vector_lane_555")))
+    (set! failures
+          (+ failures (linked 21 62 5 5 -1 1 c"stogir_vector_lane_556")))
+    (set! failures
+          (+ failures (linked 21 62 5 5 -1 3 c"stogir_vector_lane_557")))
+    (set! failures
+          (+ failures (linked 21 62 5 5 -1 4 c"stogir_vector_lane_558")))
+    (set! failures
+          (+ failures (linked 21 62 5 8 -1 0 c"stogir_vector_lane_559")))
+    (set! failures
+          (+ failures (linked 21 62 5 8 -1 3 c"stogir_vector_lane_560")))
+    (set! failures
+          (+ failures (linked 21 63 5 5 0 0 c"stogir_vector_lane_561")))
+    (set! failures
+          (+ failures (linked 21 63 5 5 0 2 c"stogir_vector_lane_562")))
+    (set! failures
+          (+ failures (linked 21 61 6 5 0 0 c"stogir_vector_lane_563")))
+    (set! failures
+          (+ failures (linked 21 61 6 5 0 1 c"stogir_vector_lane_564")))
+    (set! failures
+          (+ failures (linked 21 61 6 5 -1 0 c"stogir_vector_lane_565")))
+    (set! failures
+          (+ failures (linked 21 61 6 5 -1 1 c"stogir_vector_lane_566")))
+    (set! failures
+          (+ failures (linked 21 62 6 5 0 0 c"stogir_vector_lane_567")))
+    (set! failures
+          (+ failures (linked 21 62 6 5 0 3 c"stogir_vector_lane_568")))
+    (set! failures
+          (+ failures (linked 21 62 6 5 -1 0 c"stogir_vector_lane_569")))
+    (set! failures
+          (+ failures (linked 21 62 6 5 -1 3 c"stogir_vector_lane_570")))
+    (set! failures
+          (+ failures (linked 21 63 6 5 0 0 c"stogir_vector_lane_571")))
+    (set! failures
+          (+ failures (linked 21 63 6 5 0 2 c"stogir_vector_lane_572")))
+    (set! failures
+          (+ failures (linked 21 61 11 5 0 0 c"stogir_vector_lane_573")))
+    (set! failures
+          (+ failures (linked 21 61 11 5 0 1 c"stogir_vector_lane_574")))
+    (set! failures
+          (+ failures (linked 21 61 11 5 -1 0 c"stogir_vector_lane_575")))
+    (set! failures
+          (+ failures (linked 21 61 11 5 -1 1 c"stogir_vector_lane_576")))
+    (set! failures
+          (+ failures (linked 21 62 11 5 0 0 c"stogir_vector_lane_577")))
+    (set! failures
+          (+ failures (linked 21 62 11 5 0 3 c"stogir_vector_lane_578")))
+    (set! failures
+          (+ failures (linked 21 62 11 5 -1 0 c"stogir_vector_lane_579")))
+    (set! failures
+          (+ failures (linked 21 62 11 5 -1 3 c"stogir_vector_lane_580")))
+    (set! failures
+          (+ failures (linked 21 63 11 5 0 0 c"stogir_vector_lane_581")))
+    (set! failures
+          (+ failures (linked 21 63 11 5 0 2 c"stogir_vector_lane_582")))
+    (set! failures
+          (+ failures (linked 37 61 5 5 0 0 c"stogir_vector_lane_583")))
+    (set! failures
+          (+ failures (linked 37 61 5 5 0 1 c"stogir_vector_lane_584")))
+    (set! failures
+          (+ failures (linked 37 61 5 5 1 0 c"stogir_vector_lane_585")))
+    (set! failures
+          (+ failures (linked 37 61 5 5 1 1 c"stogir_vector_lane_586")))
+    (set! failures
+          (+ failures (linked 37 61 5 1 -1 0 c"stogir_vector_lane_587")))
+    (set! failures
+          (+ failures (linked 37 61 5 5 -1 0 c"stogir_vector_lane_588")))
+    (set! failures
+          (+ failures (linked 37 61 5 5 -1 1 c"stogir_vector_lane_589")))
+    (set! failures
+          (+ failures (linked 37 61 5 5 -1 4 c"stogir_vector_lane_590")))
+    (set! failures
+          (+ failures (linked 37 61 5 8 -1 0 c"stogir_vector_lane_591")))
+    (set! failures
+          (+ failures (linked 37 62 5 5 0 0 c"stogir_vector_lane_592")))
+    (set! failures
+          (+ failures (linked 37 62 5 5 0 3 c"stogir_vector_lane_593")))
+    (set! failures
+          (+ failures (linked 37 62 5 5 1 0 c"stogir_vector_lane_594")))
+    (set! failures
+          (+ failures (linked 37 62 5 5 1 3 c"stogir_vector_lane_595")))
+    (set! failures
+          (+ failures (linked 37 62 5 1 -1 0 c"stogir_vector_lane_596")))
+    (set! failures
+          (+ failures (linked 37 62 5 1 -1 3 c"stogir_vector_lane_597")))
+    (set! failures
+          (+ failures (linked 37 62 5 5 -1 0 c"stogir_vector_lane_598")))
+    (set! failures
+          (+ failures (linked 37 62 5 5 -1 1 c"stogir_vector_lane_599")))
+    (set! failures
+          (+ failures (linked 37 62 5 5 -1 3 c"stogir_vector_lane_600")))
+    (set! failures
+          (+ failures (linked 37 62 5 5 -1 4 c"stogir_vector_lane_601")))
+    (set! failures
+          (+ failures (linked 37 62 5 8 -1 0 c"stogir_vector_lane_602")))
+    (set! failures
+          (+ failures (linked 37 62 5 8 -1 3 c"stogir_vector_lane_603")))
+    (set! failures
+          (+ failures (linked 37 63 5 5 0 0 c"stogir_vector_lane_604")))
+    (set! failures
+          (+ failures (linked 37 63 5 5 0 2 c"stogir_vector_lane_605")))
+    (set! failures
+          (+ failures (linked 37 61 6 5 1 0 c"stogir_vector_lane_606")))
+    (set! failures
+          (+ failures (linked 37 61 6 5 1 1 c"stogir_vector_lane_607")))
+    (set! failures
+          (+ failures (linked 37 61 6 5 -1 0 c"stogir_vector_lane_608")))
+    (set! failures
+          (+ failures (linked 37 61 6 5 -1 1 c"stogir_vector_lane_609")))
+    (set! failures
+          (+ failures (linked 37 62 6 5 1 0 c"stogir_vector_lane_610")))
+    (set! failures
+          (+ failures (linked 37 62 6 5 1 3 c"stogir_vector_lane_611")))
+    (set! failures
+          (+ failures (linked 37 62 6 5 -1 0 c"stogir_vector_lane_612")))
+    (set! failures
+          (+ failures (linked 37 62 6 5 -1 3 c"stogir_vector_lane_613")))
+    (set! failures
+          (+ failures (linked 37 63 6 5 0 0 c"stogir_vector_lane_614")))
+    (set! failures
+          (+ failures (linked 37 63 6 5 0 2 c"stogir_vector_lane_615")))
+    (set! failures
+          (+ failures (linked 37 61 11 5 1 0 c"stogir_vector_lane_616")))
+    (set! failures
+          (+ failures (linked 37 61 11 5 1 1 c"stogir_vector_lane_617")))
+    (set! failures
+          (+ failures (linked 37 61 11 5 -1 0 c"stogir_vector_lane_618")))
+    (set! failures
+          (+ failures (linked 37 61 11 5 -1 1 c"stogir_vector_lane_619")))
+    (set! failures
+          (+ failures (linked 37 62 11 5 1 0 c"stogir_vector_lane_620")))
+    (set! failures
+          (+ failures (linked 37 62 11 5 1 3 c"stogir_vector_lane_621")))
+    (set! failures
+          (+ failures (linked 37 62 11 5 -1 0 c"stogir_vector_lane_622")))
+    (set! failures
+          (+ failures (linked 37 62 11 5 -1 3 c"stogir_vector_lane_623")))
+    (set! failures
+          (+ failures (linked 37 63 11 5 0 0 c"stogir_vector_lane_624")))
+    (set! failures
+          (+ failures (linked 37 63 11 5 0 2 c"stogir_vector_lane_625")))
+    (set! failures
+          (+ failures (linked 22 61 6 5 0 0 c"stogir_vector_lane_626")))
+    (set! failures
+          (+ failures (linked 22 61 6 5 0 1 c"stogir_vector_lane_627")))
+    (set! failures
+          (+ failures (linked 22 61 6 1 -1 0 c"stogir_vector_lane_628")))
+    (set! failures
+          (+ failures (linked 22 61 6 5 -1 0 c"stogir_vector_lane_629")))
+    (set! failures
+          (+ failures (linked 22 61 6 5 -1 1 c"stogir_vector_lane_630")))
+    (set! failures
+          (+ failures (linked 22 61 6 5 -1 4 c"stogir_vector_lane_631")))
+    (set! failures
+          (+ failures (linked 22 61 6 8 -1 0 c"stogir_vector_lane_632")))
+    (set! failures
+          (+ failures (linked 22 62 6 5 0 0 c"stogir_vector_lane_633")))
+    (set! failures
+          (+ failures (linked 22 62 6 5 0 3 c"stogir_vector_lane_634")))
+    (set! failures
+          (+ failures (linked 22 62 6 1 -1 0 c"stogir_vector_lane_635")))
+    (set! failures
+          (+ failures (linked 22 62 6 1 -1 3 c"stogir_vector_lane_636")))
+    (set! failures
+          (+ failures (linked 22 62 6 5 -1 0 c"stogir_vector_lane_637")))
+    (set! failures
+          (+ failures (linked 22 62 6 5 -1 1 c"stogir_vector_lane_638")))
+    (set! failures
+          (+ failures (linked 22 62 6 5 -1 3 c"stogir_vector_lane_639")))
+    (set! failures
+          (+ failures (linked 22 62 6 5 -1 4 c"stogir_vector_lane_640")))
+    (set! failures
+          (+ failures (linked 22 62 6 8 -1 0 c"stogir_vector_lane_641")))
+    (set! failures
+          (+ failures (linked 22 62 6 8 -1 3 c"stogir_vector_lane_642")))
+    (set! failures
+          (+ failures (linked 22 63 6 5 0 0 c"stogir_vector_lane_643")))
+    (set! failures
+          (+ failures (linked 22 63 6 5 0 2 c"stogir_vector_lane_644")))
+    (set! failures
+          (+ failures (linked 22 61 5 5 0 0 c"stogir_vector_lane_645")))
+    (set! failures
+          (+ failures (linked 22 61 5 5 0 1 c"stogir_vector_lane_646")))
+    (set! failures
+          (+ failures (linked 22 61 5 5 -1 0 c"stogir_vector_lane_647")))
+    (set! failures
+          (+ failures (linked 22 61 5 5 -1 1 c"stogir_vector_lane_648")))
+    (set! failures
+          (+ failures (linked 22 62 5 5 0 0 c"stogir_vector_lane_649")))
+    (set! failures
+          (+ failures (linked 22 62 5 5 0 3 c"stogir_vector_lane_650")))
+    (set! failures
+          (+ failures (linked 22 62 5 5 -1 0 c"stogir_vector_lane_651")))
+    (set! failures
+          (+ failures (linked 22 62 5 5 -1 3 c"stogir_vector_lane_652")))
+    (set! failures
+          (+ failures (linked 22 63 5 5 0 0 c"stogir_vector_lane_653")))
+    (set! failures
+          (+ failures (linked 22 63 5 5 0 2 c"stogir_vector_lane_654")))
+    (set! failures
+          (+ failures (linked 22 61 11 5 0 0 c"stogir_vector_lane_655")))
+    (set! failures
+          (+ failures (linked 22 61 11 5 0 1 c"stogir_vector_lane_656")))
+    (set! failures
+          (+ failures (linked 22 61 11 5 -1 0 c"stogir_vector_lane_657")))
+    (set! failures
+          (+ failures (linked 22 61 11 5 -1 1 c"stogir_vector_lane_658")))
+    (set! failures
+          (+ failures (linked 22 62 11 5 0 0 c"stogir_vector_lane_659")))
+    (set! failures
+          (+ failures (linked 22 62 11 5 0 3 c"stogir_vector_lane_660")))
+    (set! failures
+          (+ failures (linked 22 62 11 5 -1 0 c"stogir_vector_lane_661")))
+    (set! failures
+          (+ failures (linked 22 62 11 5 -1 3 c"stogir_vector_lane_662")))
+    (set! failures
+          (+ failures (linked 22 63 11 5 0 0 c"stogir_vector_lane_663")))
+    (set! failures
+          (+ failures (linked 22 63 11 5 0 2 c"stogir_vector_lane_664")))
+    (set! failures
+          (+ failures (linked 38 61 6 5 0 0 c"stogir_vector_lane_665")))
+    (set! failures
+          (+ failures (linked 38 61 6 5 0 1 c"stogir_vector_lane_666")))
+    (set! failures
+          (+ failures (linked 38 61 6 5 1 0 c"stogir_vector_lane_667")))
+    (set! failures
+          (+ failures (linked 38 61 6 5 1 1 c"stogir_vector_lane_668")))
+    (set! failures
+          (+ failures (linked 38 61 6 1 -1 0 c"stogir_vector_lane_669")))
+    (set! failures
+          (+ failures (linked 38 61 6 5 -1 0 c"stogir_vector_lane_670")))
+    (set! failures
+          (+ failures (linked 38 61 6 5 -1 1 c"stogir_vector_lane_671")))
+    (set! failures
+          (+ failures (linked 38 61 6 5 -1 4 c"stogir_vector_lane_672")))
+    (set! failures
+          (+ failures (linked 38 61 6 8 -1 0 c"stogir_vector_lane_673")))
+    (set! failures
+          (+ failures (linked 38 62 6 5 0 0 c"stogir_vector_lane_674")))
+    (set! failures
+          (+ failures (linked 38 62 6 5 0 3 c"stogir_vector_lane_675")))
+    (set! failures
+          (+ failures (linked 38 62 6 5 1 0 c"stogir_vector_lane_676")))
+    (set! failures
+          (+ failures (linked 38 62 6 5 1 3 c"stogir_vector_lane_677")))
+    (set! failures
+          (+ failures (linked 38 62 6 1 -1 0 c"stogir_vector_lane_678")))
+    (set! failures
+          (+ failures (linked 38 62 6 1 -1 3 c"stogir_vector_lane_679")))
+    (set! failures
+          (+ failures (linked 38 62 6 5 -1 0 c"stogir_vector_lane_680")))
+    (set! failures
+          (+ failures (linked 38 62 6 5 -1 1 c"stogir_vector_lane_681")))
+    (set! failures
+          (+ failures (linked 38 62 6 5 -1 3 c"stogir_vector_lane_682")))
+    (set! failures
+          (+ failures (linked 38 62 6 5 -1 4 c"stogir_vector_lane_683")))
+    (set! failures
+          (+ failures (linked 38 62 6 8 -1 0 c"stogir_vector_lane_684")))
+    (set! failures
+          (+ failures (linked 38 62 6 8 -1 3 c"stogir_vector_lane_685")))
+    (set! failures
+          (+ failures (linked 38 63 6 5 0 0 c"stogir_vector_lane_686")))
+    (set! failures
+          (+ failures (linked 38 63 6 5 0 2 c"stogir_vector_lane_687")))
+    (set! failures
+          (+ failures (linked 38 61 5 5 1 0 c"stogir_vector_lane_688")))
+    (set! failures
+          (+ failures (linked 38 61 5 5 1 1 c"stogir_vector_lane_689")))
+    (set! failures
+          (+ failures (linked 38 61 5 5 -1 0 c"stogir_vector_lane_690")))
+    (set! failures
+          (+ failures (linked 38 61 5 5 -1 1 c"stogir_vector_lane_691")))
+    (set! failures
+          (+ failures (linked 38 62 5 5 1 0 c"stogir_vector_lane_692")))
+    (set! failures
+          (+ failures (linked 38 62 5 5 1 3 c"stogir_vector_lane_693")))
+    (set! failures
+          (+ failures (linked 38 62 5 5 -1 0 c"stogir_vector_lane_694")))
+    (set! failures
+          (+ failures (linked 38 62 5 5 -1 3 c"stogir_vector_lane_695")))
+    (set! failures
+          (+ failures (linked 38 63 5 5 0 0 c"stogir_vector_lane_696")))
+    (set! failures
+          (+ failures (linked 38 63 5 5 0 2 c"stogir_vector_lane_697")))
+    (set! failures
+          (+ failures (linked 38 61 11 5 1 0 c"stogir_vector_lane_698")))
+    (set! failures
+          (+ failures (linked 38 61 11 5 1 1 c"stogir_vector_lane_699")))
+    (set! failures
+          (+ failures (linked 38 61 11 5 -1 0 c"stogir_vector_lane_700")))
+    (set! failures
+          (+ failures (linked 38 61 11 5 -1 1 c"stogir_vector_lane_701")))
+    (set! failures
+          (+ failures (linked 38 62 11 5 1 0 c"stogir_vector_lane_702")))
+    (set! failures
+          (+ failures (linked 38 62 11 5 1 3 c"stogir_vector_lane_703")))
+    (set! failures
+          (+ failures (linked 38 62 11 5 -1 0 c"stogir_vector_lane_704")))
+    (set! failures
+          (+ failures (linked 38 62 11 5 -1 3 c"stogir_vector_lane_705")))
+    (set! failures
+          (+ failures (linked 38 63 11 5 0 0 c"stogir_vector_lane_706")))
+    (set! failures
+          (+ failures (linked 38 63 11 5 0 2 c"stogir_vector_lane_707")))
+    (set! failures
+          (+ failures (linked 71 61 7 5 0 0 c"stogir_vector_lane_708")))
+    (set! failures
+          (+ failures (linked 71 61 7 5 0 1 c"stogir_vector_lane_709")))
+    (set! failures
+          (+ failures (linked 71 61 7 5 1 0 c"stogir_vector_lane_710")))
+    (set! failures
+          (+ failures (linked 71 61 7 5 1 1 c"stogir_vector_lane_711")))
+    (set! failures
+          (+ failures (linked 71 61 7 5 2 0 c"stogir_vector_lane_712")))
+    (set! failures
+          (+ failures (linked 71 61 7 5 2 1 c"stogir_vector_lane_713")))
+    (set! failures
+          (+ failures (linked 71 61 7 5 3 0 c"stogir_vector_lane_714")))
+    (set! failures
+          (+ failures (linked 71 61 7 5 3 1 c"stogir_vector_lane_715")))
+    (set! failures
+          (+ failures (linked 71 61 7 5 4 0 c"stogir_vector_lane_716")))
+    (set! failures
+          (+ failures (linked 71 61 7 5 4 1 c"stogir_vector_lane_717")))
+    (set! failures
+          (+ failures (linked 71 61 7 5 5 0 c"stogir_vector_lane_718")))
+    (set! failures
+          (+ failures (linked 71 61 7 5 5 1 c"stogir_vector_lane_719")))
+    (set! failures
+          (+ failures (linked 71 61 7 5 6 0 c"stogir_vector_lane_720")))
+    (set! failures
+          (+ failures (linked 71 61 7 5 6 1 c"stogir_vector_lane_721")))
+    (set! failures
+          (+ failures (linked 71 61 7 5 7 0 c"stogir_vector_lane_722")))
+    (set! failures
+          (+ failures (linked 71 61 7 5 7 1 c"stogir_vector_lane_723")))
+    (set! failures
+          (+ failures (linked 71 61 7 1 -1 0 c"stogir_vector_lane_724")))
+    (set! failures
+          (+ failures (linked 71 61 7 5 -1 0 c"stogir_vector_lane_725")))
+    (set! failures
+          (+ failures (linked 71 61 7 5 -1 1 c"stogir_vector_lane_726")))
+    (set! failures
+          (+ failures (linked 71 61 7 5 -1 4 c"stogir_vector_lane_727")))
+    (set! failures
+          (+ failures (linked 71 61 7 8 -1 0 c"stogir_vector_lane_728")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 0 0 c"stogir_vector_lane_729")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 0 3 c"stogir_vector_lane_730")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 1 0 c"stogir_vector_lane_731")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 1 3 c"stogir_vector_lane_732")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 2 0 c"stogir_vector_lane_733")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 2 3 c"stogir_vector_lane_734")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 3 0 c"stogir_vector_lane_735")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 3 3 c"stogir_vector_lane_736")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 4 0 c"stogir_vector_lane_737")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 4 3 c"stogir_vector_lane_738")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 5 0 c"stogir_vector_lane_739")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 5 3 c"stogir_vector_lane_740")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 6 0 c"stogir_vector_lane_741")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 6 3 c"stogir_vector_lane_742")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 7 0 c"stogir_vector_lane_743")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 7 3 c"stogir_vector_lane_744")))
+    (set! failures
+          (+ failures (linked 71 62 7 1 -1 0 c"stogir_vector_lane_745")))
+    (set! failures
+          (+ failures (linked 71 62 7 1 -1 3 c"stogir_vector_lane_746")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 -1 0 c"stogir_vector_lane_747")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 -1 1 c"stogir_vector_lane_748")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 -1 3 c"stogir_vector_lane_749")))
+    (set! failures
+          (+ failures (linked 71 62 7 5 -1 4 c"stogir_vector_lane_750")))
+    (set! failures
+          (+ failures (linked 71 62 7 8 -1 0 c"stogir_vector_lane_751")))
+    (set! failures
+          (+ failures (linked 71 62 7 8 -1 3 c"stogir_vector_lane_752")))
+    (set! failures
+          (+ failures (linked 71 63 7 5 0 0 c"stogir_vector_lane_753")))
+    (set! failures
+          (+ failures (linked 71 63 7 5 0 2 c"stogir_vector_lane_754")))
+    (set! failures
+          (+ failures (linked 71 61 1 5 7 0 c"stogir_vector_lane_755")))
+    (set! failures
+          (+ failures (linked 71 61 1 5 7 1 c"stogir_vector_lane_756")))
+    (set! failures
+          (+ failures (linked 71 61 1 5 -1 0 c"stogir_vector_lane_757")))
+    (set! failures
+          (+ failures (linked 71 61 1 5 -1 1 c"stogir_vector_lane_758")))
+    (set! failures
+          (+ failures (linked 71 62 1 5 7 0 c"stogir_vector_lane_759")))
+    (set! failures
+          (+ failures (linked 71 62 1 5 7 3 c"stogir_vector_lane_760")))
+    (set! failures
+          (+ failures (linked 71 62 1 5 -1 0 c"stogir_vector_lane_761")))
+    (set! failures
+          (+ failures (linked 71 62 1 5 -1 3 c"stogir_vector_lane_762")))
+    (set! failures
+          (+ failures (linked 71 63 1 5 0 0 c"stogir_vector_lane_763")))
+    (set! failures
+          (+ failures (linked 71 63 1 5 0 2 c"stogir_vector_lane_764")))
+    (set! failures
+          (+ failures (linked 71 61 2 5 7 0 c"stogir_vector_lane_765")))
+    (set! failures
+          (+ failures (linked 71 61 2 5 7 1 c"stogir_vector_lane_766")))
+    (set! failures
+          (+ failures (linked 71 61 2 5 -1 0 c"stogir_vector_lane_767")))
+    (set! failures
+          (+ failures (linked 71 61 2 5 -1 1 c"stogir_vector_lane_768")))
+    (set! failures
+          (+ failures (linked 71 62 2 5 7 0 c"stogir_vector_lane_769")))
+    (set! failures
+          (+ failures (linked 71 62 2 5 7 3 c"stogir_vector_lane_770")))
+    (set! failures
+          (+ failures (linked 71 62 2 5 -1 0 c"stogir_vector_lane_771")))
+    (set! failures
+          (+ failures (linked 71 62 2 5 -1 3 c"stogir_vector_lane_772")))
+    (set! failures
+          (+ failures (linked 71 63 2 5 0 0 c"stogir_vector_lane_773")))
+    (set! failures
+          (+ failures (linked 71 63 2 5 0 2 c"stogir_vector_lane_774")))
+    (set! failures
+          (+ failures (linked 71 61 8 5 7 0 c"stogir_vector_lane_775")))
+    (set! failures
+          (+ failures (linked 71 61 8 5 7 1 c"stogir_vector_lane_776")))
+    (set! failures
+          (+ failures (linked 71 61 8 5 -1 0 c"stogir_vector_lane_777")))
+    (set! failures
+          (+ failures (linked 71 61 8 5 -1 1 c"stogir_vector_lane_778")))
+    (set! failures
+          (+ failures (linked 71 62 8 5 7 0 c"stogir_vector_lane_779")))
+    (set! failures
+          (+ failures (linked 71 62 8 5 7 3 c"stogir_vector_lane_780")))
+    (set! failures
+          (+ failures (linked 71 62 8 5 -1 0 c"stogir_vector_lane_781")))
+    (set! failures
+          (+ failures (linked 71 62 8 5 -1 3 c"stogir_vector_lane_782")))
+    (set! failures
+          (+ failures (linked 71 63 8 5 0 0 c"stogir_vector_lane_783")))
+    (set! failures
+          (+ failures (linked 71 63 8 5 0 2 c"stogir_vector_lane_784")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 0 0 c"stogir_vector_lane_785")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 0 1 c"stogir_vector_lane_786")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 1 0 c"stogir_vector_lane_787")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 1 1 c"stogir_vector_lane_788")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 2 0 c"stogir_vector_lane_789")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 2 1 c"stogir_vector_lane_790")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 3 0 c"stogir_vector_lane_791")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 3 1 c"stogir_vector_lane_792")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 4 0 c"stogir_vector_lane_793")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 4 1 c"stogir_vector_lane_794")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 5 0 c"stogir_vector_lane_795")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 5 1 c"stogir_vector_lane_796")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 6 0 c"stogir_vector_lane_797")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 6 1 c"stogir_vector_lane_798")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 7 0 c"stogir_vector_lane_799")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 7 1 c"stogir_vector_lane_800")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 8 0 c"stogir_vector_lane_801")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 8 1 c"stogir_vector_lane_802")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 9 0 c"stogir_vector_lane_803")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 9 1 c"stogir_vector_lane_804")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 10 0 c"stogir_vector_lane_805")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 10 1 c"stogir_vector_lane_806")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 11 0 c"stogir_vector_lane_807")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 11 1 c"stogir_vector_lane_808")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 12 0 c"stogir_vector_lane_809")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 12 1 c"stogir_vector_lane_810")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 13 0 c"stogir_vector_lane_811")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 13 1 c"stogir_vector_lane_812")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 14 0 c"stogir_vector_lane_813")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 14 1 c"stogir_vector_lane_814")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 15 0 c"stogir_vector_lane_815")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 15 1 c"stogir_vector_lane_816")))
+    (set! failures
+          (+ failures (linked 87 61 7 1 -1 0 c"stogir_vector_lane_817")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 -1 0 c"stogir_vector_lane_818")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 -1 1 c"stogir_vector_lane_819")))
+    (set! failures
+          (+ failures (linked 87 61 7 5 -1 4 c"stogir_vector_lane_820")))
+    (set! failures
+          (+ failures (linked 87 61 7 8 -1 0 c"stogir_vector_lane_821")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 0 0 c"stogir_vector_lane_822")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 0 3 c"stogir_vector_lane_823")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 1 0 c"stogir_vector_lane_824")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 1 3 c"stogir_vector_lane_825")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 2 0 c"stogir_vector_lane_826")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 2 3 c"stogir_vector_lane_827")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 3 0 c"stogir_vector_lane_828")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 3 3 c"stogir_vector_lane_829")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 4 0 c"stogir_vector_lane_830")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 4 3 c"stogir_vector_lane_831")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 5 0 c"stogir_vector_lane_832")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 5 3 c"stogir_vector_lane_833")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 6 0 c"stogir_vector_lane_834")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 6 3 c"stogir_vector_lane_835")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 7 0 c"stogir_vector_lane_836")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 7 3 c"stogir_vector_lane_837")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 8 0 c"stogir_vector_lane_838")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 8 3 c"stogir_vector_lane_839")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 9 0 c"stogir_vector_lane_840")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 9 3 c"stogir_vector_lane_841")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 10 0 c"stogir_vector_lane_842")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 10 3 c"stogir_vector_lane_843")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 11 0 c"stogir_vector_lane_844")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 11 3 c"stogir_vector_lane_845")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 12 0 c"stogir_vector_lane_846")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 12 3 c"stogir_vector_lane_847")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 13 0 c"stogir_vector_lane_848")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 13 3 c"stogir_vector_lane_849")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 14 0 c"stogir_vector_lane_850")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 14 3 c"stogir_vector_lane_851")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 15 0 c"stogir_vector_lane_852")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 15 3 c"stogir_vector_lane_853")))
+    (set! failures
+          (+ failures (linked 87 62 7 1 -1 0 c"stogir_vector_lane_854")))
+    (set! failures
+          (+ failures (linked 87 62 7 1 -1 3 c"stogir_vector_lane_855")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 -1 0 c"stogir_vector_lane_856")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 -1 1 c"stogir_vector_lane_857")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 -1 3 c"stogir_vector_lane_858")))
+    (set! failures
+          (+ failures (linked 87 62 7 5 -1 4 c"stogir_vector_lane_859")))
+    (set! failures
+          (+ failures (linked 87 62 7 8 -1 0 c"stogir_vector_lane_860")))
+    (set! failures
+          (+ failures (linked 87 62 7 8 -1 3 c"stogir_vector_lane_861")))
+    (set! failures
+          (+ failures (linked 87 63 7 5 0 0 c"stogir_vector_lane_862")))
+    (set! failures
+          (+ failures (linked 87 63 7 5 0 2 c"stogir_vector_lane_863")))
+    (set! failures
+          (+ failures (linked 87 61 1 5 15 0 c"stogir_vector_lane_864")))
+    (set! failures
+          (+ failures (linked 87 61 1 5 15 1 c"stogir_vector_lane_865")))
+    (set! failures
+          (+ failures (linked 87 61 1 5 -1 0 c"stogir_vector_lane_866")))
+    (set! failures
+          (+ failures (linked 87 61 1 5 -1 1 c"stogir_vector_lane_867")))
+    (set! failures
+          (+ failures (linked 87 62 1 5 15 0 c"stogir_vector_lane_868")))
+    (set! failures
+          (+ failures (linked 87 62 1 5 15 3 c"stogir_vector_lane_869")))
+    (set! failures
+          (+ failures (linked 87 62 1 5 -1 0 c"stogir_vector_lane_870")))
+    (set! failures
+          (+ failures (linked 87 62 1 5 -1 3 c"stogir_vector_lane_871")))
+    (set! failures
+          (+ failures (linked 87 63 1 5 0 0 c"stogir_vector_lane_872")))
+    (set! failures
+          (+ failures (linked 87 63 1 5 0 2 c"stogir_vector_lane_873")))
+    (set! failures
+          (+ failures (linked 87 61 2 5 15 0 c"stogir_vector_lane_874")))
+    (set! failures
+          (+ failures (linked 87 61 2 5 15 1 c"stogir_vector_lane_875")))
+    (set! failures
+          (+ failures (linked 87 61 2 5 -1 0 c"stogir_vector_lane_876")))
+    (set! failures
+          (+ failures (linked 87 61 2 5 -1 1 c"stogir_vector_lane_877")))
+    (set! failures
+          (+ failures (linked 87 62 2 5 15 0 c"stogir_vector_lane_878")))
+    (set! failures
+          (+ failures (linked 87 62 2 5 15 3 c"stogir_vector_lane_879")))
+    (set! failures
+          (+ failures (linked 87 62 2 5 -1 0 c"stogir_vector_lane_880")))
+    (set! failures
+          (+ failures (linked 87 62 2 5 -1 3 c"stogir_vector_lane_881")))
+    (set! failures
+          (+ failures (linked 87 63 2 5 0 0 c"stogir_vector_lane_882")))
+    (set! failures
+          (+ failures (linked 87 63 2 5 0 2 c"stogir_vector_lane_883")))
+    (set! failures
+          (+ failures (linked 87 61 8 5 15 0 c"stogir_vector_lane_884")))
+    (set! failures
+          (+ failures (linked 87 61 8 5 15 1 c"stogir_vector_lane_885")))
+    (set! failures
+          (+ failures (linked 87 61 8 5 -1 0 c"stogir_vector_lane_886")))
+    (set! failures
+          (+ failures (linked 87 61 8 5 -1 1 c"stogir_vector_lane_887")))
+    (set! failures
+          (+ failures (linked 87 62 8 5 15 0 c"stogir_vector_lane_888")))
+    (set! failures
+          (+ failures (linked 87 62 8 5 15 3 c"stogir_vector_lane_889")))
+    (set! failures
+          (+ failures (linked 87 62 8 5 -1 0 c"stogir_vector_lane_890")))
+    (set! failures
+          (+ failures (linked 87 62 8 5 -1 3 c"stogir_vector_lane_891")))
+    (set! failures
+          (+ failures (linked 87 63 8 5 0 0 c"stogir_vector_lane_892")))
+    (set! failures
+          (+ failures (linked 87 63 8 5 0 2 c"stogir_vector_lane_893")))
+    (set! failures
+          (+ failures (linked 72 61 8 5 0 0 c"stogir_vector_lane_894")))
+    (set! failures
+          (+ failures (linked 72 61 8 5 0 1 c"stogir_vector_lane_895")))
+    (set! failures
+          (+ failures (linked 72 61 8 5 1 0 c"stogir_vector_lane_896")))
+    (set! failures
+          (+ failures (linked 72 61 8 5 1 1 c"stogir_vector_lane_897")))
+    (set! failures
+          (+ failures (linked 72 61 8 5 2 0 c"stogir_vector_lane_898")))
+    (set! failures
+          (+ failures (linked 72 61 8 5 2 1 c"stogir_vector_lane_899")))
+    (set! failures
+          (+ failures (linked 72 61 8 5 3 0 c"stogir_vector_lane_900")))
+    (set! failures
+          (+ failures (linked 72 61 8 5 3 1 c"stogir_vector_lane_901")))
+    (set! failures
+          (+ failures (linked 72 61 8 5 4 0 c"stogir_vector_lane_902")))
+    (set! failures
+          (+ failures (linked 72 61 8 5 4 1 c"stogir_vector_lane_903")))
+    (set! failures
+          (+ failures (linked 72 61 8 5 5 0 c"stogir_vector_lane_904")))
+    (set! failures
+          (+ failures (linked 72 61 8 5 5 1 c"stogir_vector_lane_905")))
+    (set! failures
+          (+ failures (linked 72 61 8 5 6 0 c"stogir_vector_lane_906")))
+    (set! failures
+          (+ failures (linked 72 61 8 5 6 1 c"stogir_vector_lane_907")))
+    (set! failures
+          (+ failures (linked 72 61 8 5 7 0 c"stogir_vector_lane_908")))
+    (set! failures
+          (+ failures (linked 72 61 8 5 7 1 c"stogir_vector_lane_909")))
+    (set! failures
+          (+ failures (linked 72 61 8 1 -1 0 c"stogir_vector_lane_910")))
+    (set! failures
+          (+ failures (linked 72 61 8 5 -1 0 c"stogir_vector_lane_911")))
+    (set! failures
+          (+ failures (linked 72 61 8 5 -1 1 c"stogir_vector_lane_912")))
+    (set! failures
+          (+ failures (linked 72 61 8 5 -1 4 c"stogir_vector_lane_913")))
+    (set! failures
+          (+ failures (linked 72 61 8 8 -1 0 c"stogir_vector_lane_914")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 0 0 c"stogir_vector_lane_915")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 0 3 c"stogir_vector_lane_916")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 1 0 c"stogir_vector_lane_917")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 1 3 c"stogir_vector_lane_918")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 2 0 c"stogir_vector_lane_919")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 2 3 c"stogir_vector_lane_920")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 3 0 c"stogir_vector_lane_921")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 3 3 c"stogir_vector_lane_922")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 4 0 c"stogir_vector_lane_923")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 4 3 c"stogir_vector_lane_924")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 5 0 c"stogir_vector_lane_925")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 5 3 c"stogir_vector_lane_926")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 6 0 c"stogir_vector_lane_927")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 6 3 c"stogir_vector_lane_928")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 7 0 c"stogir_vector_lane_929")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 7 3 c"stogir_vector_lane_930")))
+    (set! failures
+          (+ failures (linked 72 62 8 1 -1 0 c"stogir_vector_lane_931")))
+    (set! failures
+          (+ failures (linked 72 62 8 1 -1 3 c"stogir_vector_lane_932")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 -1 0 c"stogir_vector_lane_933")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 -1 1 c"stogir_vector_lane_934")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 -1 3 c"stogir_vector_lane_935")))
+    (set! failures
+          (+ failures (linked 72 62 8 5 -1 4 c"stogir_vector_lane_936")))
+    (set! failures
+          (+ failures (linked 72 62 8 8 -1 0 c"stogir_vector_lane_937")))
+    (set! failures
+          (+ failures (linked 72 62 8 8 -1 3 c"stogir_vector_lane_938")))
+    (set! failures
+          (+ failures (linked 72 63 8 5 0 0 c"stogir_vector_lane_939")))
+    (set! failures
+          (+ failures (linked 72 63 8 5 0 2 c"stogir_vector_lane_940")))
+    (set! failures
+          (+ failures (linked 72 61 1 5 7 0 c"stogir_vector_lane_941")))
+    (set! failures
+          (+ failures (linked 72 61 1 5 7 1 c"stogir_vector_lane_942")))
+    (set! failures
+          (+ failures (linked 72 61 1 5 -1 0 c"stogir_vector_lane_943")))
+    (set! failures
+          (+ failures (linked 72 61 1 5 -1 1 c"stogir_vector_lane_944")))
+    (set! failures
+          (+ failures (linked 72 62 1 5 7 0 c"stogir_vector_lane_945")))
+    (set! failures
+          (+ failures (linked 72 62 1 5 7 3 c"stogir_vector_lane_946")))
+    (set! failures
+          (+ failures (linked 72 62 1 5 -1 0 c"stogir_vector_lane_947")))
+    (set! failures
+          (+ failures (linked 72 62 1 5 -1 3 c"stogir_vector_lane_948")))
+    (set! failures
+          (+ failures (linked 72 63 1 5 0 0 c"stogir_vector_lane_949")))
+    (set! failures
+          (+ failures (linked 72 63 1 5 0 2 c"stogir_vector_lane_950")))
+    (set! failures
+          (+ failures (linked 72 61 2 5 7 0 c"stogir_vector_lane_951")))
+    (set! failures
+          (+ failures (linked 72 61 2 5 7 1 c"stogir_vector_lane_952")))
+    (set! failures
+          (+ failures (linked 72 61 2 5 -1 0 c"stogir_vector_lane_953")))
+    (set! failures
+          (+ failures (linked 72 61 2 5 -1 1 c"stogir_vector_lane_954")))
+    (set! failures
+          (+ failures (linked 72 62 2 5 7 0 c"stogir_vector_lane_955")))
+    (set! failures
+          (+ failures (linked 72 62 2 5 7 3 c"stogir_vector_lane_956")))
+    (set! failures
+          (+ failures (linked 72 62 2 5 -1 0 c"stogir_vector_lane_957")))
+    (set! failures
+          (+ failures (linked 72 62 2 5 -1 3 c"stogir_vector_lane_958")))
+    (set! failures
+          (+ failures (linked 72 63 2 5 0 0 c"stogir_vector_lane_959")))
+    (set! failures
+          (+ failures (linked 72 63 2 5 0 2 c"stogir_vector_lane_960")))
+    (set! failures
+          (+ failures (linked 72 61 7 5 7 0 c"stogir_vector_lane_961")))
+    (set! failures
+          (+ failures (linked 72 61 7 5 7 1 c"stogir_vector_lane_962")))
+    (set! failures
+          (+ failures (linked 72 61 7 5 -1 0 c"stogir_vector_lane_963")))
+    (set! failures
+          (+ failures (linked 72 61 7 5 -1 1 c"stogir_vector_lane_964")))
+    (set! failures
+          (+ failures (linked 72 62 7 5 7 0 c"stogir_vector_lane_965")))
+    (set! failures
+          (+ failures (linked 72 62 7 5 7 3 c"stogir_vector_lane_966")))
+    (set! failures
+          (+ failures (linked 72 62 7 5 -1 0 c"stogir_vector_lane_967")))
+    (set! failures
+          (+ failures (linked 72 62 7 5 -1 3 c"stogir_vector_lane_968")))
+    (set! failures
+          (+ failures (linked 72 63 7 5 0 0 c"stogir_vector_lane_969")))
+    (set! failures
+          (+ failures (linked 72 63 7 5 0 2 c"stogir_vector_lane_970")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 0 0 c"stogir_vector_lane_971")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 0 1 c"stogir_vector_lane_972")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 1 0 c"stogir_vector_lane_973")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 1 1 c"stogir_vector_lane_974")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 2 0 c"stogir_vector_lane_975")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 2 1 c"stogir_vector_lane_976")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 3 0 c"stogir_vector_lane_977")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 3 1 c"stogir_vector_lane_978")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 4 0 c"stogir_vector_lane_979")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 4 1 c"stogir_vector_lane_980")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 5 0 c"stogir_vector_lane_981")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 5 1 c"stogir_vector_lane_982")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 6 0 c"stogir_vector_lane_983")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 6 1 c"stogir_vector_lane_984")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 7 0 c"stogir_vector_lane_985")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 7 1 c"stogir_vector_lane_986")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 8 0 c"stogir_vector_lane_987")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 8 1 c"stogir_vector_lane_988")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 9 0 c"stogir_vector_lane_989")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 9 1 c"stogir_vector_lane_990")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 10 0 c"stogir_vector_lane_991")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 10 1 c"stogir_vector_lane_992")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 11 0 c"stogir_vector_lane_993")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 11 1 c"stogir_vector_lane_994")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 12 0 c"stogir_vector_lane_995")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 12 1 c"stogir_vector_lane_996")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 13 0 c"stogir_vector_lane_997")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 13 1 c"stogir_vector_lane_998")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 14 0 c"stogir_vector_lane_999")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 14 1 c"stogir_vector_lane_1000")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 15 0 c"stogir_vector_lane_1001")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 15 1 c"stogir_vector_lane_1002")))
+    (set! failures
+          (+ failures (linked 88 61 8 1 -1 0 c"stogir_vector_lane_1003")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 -1 0 c"stogir_vector_lane_1004")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 -1 1 c"stogir_vector_lane_1005")))
+    (set! failures
+          (+ failures (linked 88 61 8 5 -1 4 c"stogir_vector_lane_1006")))
+    (set! failures
+          (+ failures (linked 88 61 8 8 -1 0 c"stogir_vector_lane_1007")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 0 0 c"stogir_vector_lane_1008")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 0 3 c"stogir_vector_lane_1009")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 1 0 c"stogir_vector_lane_1010")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 1 3 c"stogir_vector_lane_1011")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 2 0 c"stogir_vector_lane_1012")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 2 3 c"stogir_vector_lane_1013")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 3 0 c"stogir_vector_lane_1014")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 3 3 c"stogir_vector_lane_1015")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 4 0 c"stogir_vector_lane_1016")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 4 3 c"stogir_vector_lane_1017")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 5 0 c"stogir_vector_lane_1018")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 5 3 c"stogir_vector_lane_1019")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 6 0 c"stogir_vector_lane_1020")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 6 3 c"stogir_vector_lane_1021")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 7 0 c"stogir_vector_lane_1022")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 7 3 c"stogir_vector_lane_1023")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 8 0 c"stogir_vector_lane_1024")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 8 3 c"stogir_vector_lane_1025")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 9 0 c"stogir_vector_lane_1026")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 9 3 c"stogir_vector_lane_1027")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 10 0 c"stogir_vector_lane_1028")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 10 3 c"stogir_vector_lane_1029")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 11 0 c"stogir_vector_lane_1030")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 11 3 c"stogir_vector_lane_1031")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 12 0 c"stogir_vector_lane_1032")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 12 3 c"stogir_vector_lane_1033")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 13 0 c"stogir_vector_lane_1034")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 13 3 c"stogir_vector_lane_1035")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 14 0 c"stogir_vector_lane_1036")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 14 3 c"stogir_vector_lane_1037")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 15 0 c"stogir_vector_lane_1038")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 15 3 c"stogir_vector_lane_1039")))
+    (set! failures
+          (+ failures (linked 88 62 8 1 -1 0 c"stogir_vector_lane_1040")))
+    (set! failures
+          (+ failures (linked 88 62 8 1 -1 3 c"stogir_vector_lane_1041")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 -1 0 c"stogir_vector_lane_1042")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 -1 1 c"stogir_vector_lane_1043")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 -1 3 c"stogir_vector_lane_1044")))
+    (set! failures
+          (+ failures (linked 88 62 8 5 -1 4 c"stogir_vector_lane_1045")))
+    (set! failures
+          (+ failures (linked 88 62 8 8 -1 0 c"stogir_vector_lane_1046")))
+    (set! failures
+          (+ failures (linked 88 62 8 8 -1 3 c"stogir_vector_lane_1047")))
+    (set! failures
+          (+ failures (linked 88 63 8 5 0 0 c"stogir_vector_lane_1048")))
+    (set! failures
+          (+ failures (linked 88 63 8 5 0 2 c"stogir_vector_lane_1049")))
+    (set! failures
+          (+ failures (linked 88 61 1 5 15 0 c"stogir_vector_lane_1050")))
+    (set! failures
+          (+ failures (linked 88 61 1 5 15 1 c"stogir_vector_lane_1051")))
+    (set! failures
+          (+ failures (linked 88 61 1 5 -1 0 c"stogir_vector_lane_1052")))
+    (set! failures
+          (+ failures (linked 88 61 1 5 -1 1 c"stogir_vector_lane_1053")))
+    (set! failures
+          (+ failures (linked 88 62 1 5 15 0 c"stogir_vector_lane_1054")))
+    (set! failures
+          (+ failures (linked 88 62 1 5 15 3 c"stogir_vector_lane_1055")))
+    (set! failures
+          (+ failures (linked 88 62 1 5 -1 0 c"stogir_vector_lane_1056")))
+    (set! failures
+          (+ failures (linked 88 62 1 5 -1 3 c"stogir_vector_lane_1057")))
+    (set! failures
+          (+ failures (linked 88 63 1 5 0 0 c"stogir_vector_lane_1058")))
+    (set! failures
+          (+ failures (linked 88 63 1 5 0 2 c"stogir_vector_lane_1059")))
+    (set! failures
+          (+ failures (linked 88 61 2 5 15 0 c"stogir_vector_lane_1060")))
+    (set! failures
+          (+ failures (linked 88 61 2 5 15 1 c"stogir_vector_lane_1061")))
+    (set! failures
+          (+ failures (linked 88 61 2 5 -1 0 c"stogir_vector_lane_1062")))
+    (set! failures
+          (+ failures (linked 88 61 2 5 -1 1 c"stogir_vector_lane_1063")))
+    (set! failures
+          (+ failures (linked 88 62 2 5 15 0 c"stogir_vector_lane_1064")))
+    (set! failures
+          (+ failures (linked 88 62 2 5 15 3 c"stogir_vector_lane_1065")))
+    (set! failures
+          (+ failures (linked 88 62 2 5 -1 0 c"stogir_vector_lane_1066")))
+    (set! failures
+          (+ failures (linked 88 62 2 5 -1 3 c"stogir_vector_lane_1067")))
+    (set! failures
+          (+ failures (linked 88 63 2 5 0 0 c"stogir_vector_lane_1068")))
+    (set! failures
+          (+ failures (linked 88 63 2 5 0 2 c"stogir_vector_lane_1069")))
+    (set! failures
+          (+ failures (linked 88 61 7 5 15 0 c"stogir_vector_lane_1070")))
+    (set! failures
+          (+ failures (linked 88 61 7 5 15 1 c"stogir_vector_lane_1071")))
+    (set! failures
+          (+ failures (linked 88 61 7 5 -1 0 c"stogir_vector_lane_1072")))
+    (set! failures
+          (+ failures (linked 88 61 7 5 -1 1 c"stogir_vector_lane_1073")))
+    (set! failures
+          (+ failures (linked 88 62 7 5 15 0 c"stogir_vector_lane_1074")))
+    (set! failures
+          (+ failures (linked 88 62 7 5 15 3 c"stogir_vector_lane_1075")))
+    (set! failures
+          (+ failures (linked 88 62 7 5 -1 0 c"stogir_vector_lane_1076")))
+    (set! failures
+          (+ failures (linked 88 62 7 5 -1 3 c"stogir_vector_lane_1077")))
+    (set! failures
+          (+ failures (linked 88 63 7 5 0 0 c"stogir_vector_lane_1078")))
+    (set! failures
+          (+ failures (linked 88 63 7 5 0 2 c"stogir_vector_lane_1079")))
+    (set! failures
+          (+ failures (linked 57 61 9 5 0 0 c"stogir_vector_lane_1080")))
+    (set! failures
+          (+ failures (linked 57 61 9 5 0 1 c"stogir_vector_lane_1081")))
+    (set! failures
+          (+ failures (linked 57 61 9 5 1 0 c"stogir_vector_lane_1082")))
+    (set! failures
+          (+ failures (linked 57 61 9 5 1 1 c"stogir_vector_lane_1083")))
+    (set! failures
+          (+ failures (linked 57 61 9 5 2 0 c"stogir_vector_lane_1084")))
+    (set! failures
+          (+ failures (linked 57 61 9 5 2 1 c"stogir_vector_lane_1085")))
+    (set! failures
+          (+ failures (linked 57 61 9 5 3 0 c"stogir_vector_lane_1086")))
+    (set! failures
+          (+ failures (linked 57 61 9 5 3 1 c"stogir_vector_lane_1087")))
+    (set! failures
+          (+ failures (linked 57 61 9 1 -1 0 c"stogir_vector_lane_1088")))
+    (set! failures
+          (+ failures (linked 57 61 9 5 -1 0 c"stogir_vector_lane_1089")))
+    (set! failures
+          (+ failures (linked 57 61 9 5 -1 1 c"stogir_vector_lane_1090")))
+    (set! failures
+          (+ failures (linked 57 61 9 5 -1 4 c"stogir_vector_lane_1091")))
+    (set! failures
+          (+ failures (linked 57 61 9 8 -1 0 c"stogir_vector_lane_1092")))
+    (set! failures
+          (+ failures (linked 57 62 9 5 0 0 c"stogir_vector_lane_1093")))
+    (set! failures
+          (+ failures (linked 57 62 9 5 0 3 c"stogir_vector_lane_1094")))
+    (set! failures
+          (+ failures (linked 57 62 9 5 1 0 c"stogir_vector_lane_1095")))
+    (set! failures
+          (+ failures (linked 57 62 9 5 1 3 c"stogir_vector_lane_1096")))
+    (set! failures
+          (+ failures (linked 57 62 9 5 2 0 c"stogir_vector_lane_1097")))
+    (set! failures
+          (+ failures (linked 57 62 9 5 2 3 c"stogir_vector_lane_1098")))
+    (set! failures
+          (+ failures (linked 57 62 9 5 3 0 c"stogir_vector_lane_1099")))
+    (set! failures
+          (+ failures (linked 57 62 9 5 3 3 c"stogir_vector_lane_1100")))
+    (set! failures
+          (+ failures (linked 57 62 9 1 -1 0 c"stogir_vector_lane_1101")))
+    (set! failures
+          (+ failures (linked 57 62 9 1 -1 3 c"stogir_vector_lane_1102")))
+    (set! failures
+          (+ failures (linked 57 62 9 5 -1 0 c"stogir_vector_lane_1103")))
+    (set! failures
+          (+ failures (linked 57 62 9 5 -1 1 c"stogir_vector_lane_1104")))
+    (set! failures
+          (+ failures (linked 57 62 9 5 -1 3 c"stogir_vector_lane_1105")))
+    (set! failures
+          (+ failures (linked 57 62 9 5 -1 4 c"stogir_vector_lane_1106")))
+    (set! failures
+          (+ failures (linked 57 62 9 8 -1 0 c"stogir_vector_lane_1107")))
+    (set! failures
+          (+ failures (linked 57 62 9 8 -1 3 c"stogir_vector_lane_1108")))
+    (set! failures
+          (+ failures (linked 57 63 9 5 0 0 c"stogir_vector_lane_1109")))
+    (set! failures
+          (+ failures (linked 57 63 9 5 0 2 c"stogir_vector_lane_1110")))
+    (set! failures
+          (+ failures (linked 57 61 3 5 3 0 c"stogir_vector_lane_1111")))
+    (set! failures
+          (+ failures (linked 57 61 3 5 3 1 c"stogir_vector_lane_1112")))
+    (set! failures
+          (+ failures (linked 57 61 3 5 -1 0 c"stogir_vector_lane_1113")))
+    (set! failures
+          (+ failures (linked 57 61 3 5 -1 1 c"stogir_vector_lane_1114")))
+    (set! failures
+          (+ failures (linked 57 62 3 5 3 0 c"stogir_vector_lane_1115")))
+    (set! failures
+          (+ failures (linked 57 62 3 5 3 3 c"stogir_vector_lane_1116")))
+    (set! failures
+          (+ failures (linked 57 62 3 5 -1 0 c"stogir_vector_lane_1117")))
+    (set! failures
+          (+ failures (linked 57 62 3 5 -1 3 c"stogir_vector_lane_1118")))
+    (set! failures
+          (+ failures (linked 57 63 3 5 0 0 c"stogir_vector_lane_1119")))
+    (set! failures
+          (+ failures (linked 57 63 3 5 0 2 c"stogir_vector_lane_1120")))
+    (set! failures
+          (+ failures (linked 73 61 9 5 0 0 c"stogir_vector_lane_1121")))
+    (set! failures
+          (+ failures (linked 73 61 9 5 0 1 c"stogir_vector_lane_1122")))
+    (set! failures
+          (+ failures (linked 73 61 9 5 1 0 c"stogir_vector_lane_1123")))
+    (set! failures
+          (+ failures (linked 73 61 9 5 1 1 c"stogir_vector_lane_1124")))
+    (set! failures
+          (+ failures (linked 73 61 9 5 2 0 c"stogir_vector_lane_1125")))
+    (set! failures
+          (+ failures (linked 73 61 9 5 2 1 c"stogir_vector_lane_1126")))
+    (set! failures
+          (+ failures (linked 73 61 9 5 3 0 c"stogir_vector_lane_1127")))
+    (set! failures
+          (+ failures (linked 73 61 9 5 3 1 c"stogir_vector_lane_1128")))
+    (set! failures
+          (+ failures (linked 73 61 9 5 4 0 c"stogir_vector_lane_1129")))
+    (set! failures
+          (+ failures (linked 73 61 9 5 4 1 c"stogir_vector_lane_1130")))
+    (set! failures
+          (+ failures (linked 73 61 9 5 5 0 c"stogir_vector_lane_1131")))
+    (set! failures
+          (+ failures (linked 73 61 9 5 5 1 c"stogir_vector_lane_1132")))
+    (set! failures
+          (+ failures (linked 73 61 9 5 6 0 c"stogir_vector_lane_1133")))
+    (set! failures
+          (+ failures (linked 73 61 9 5 6 1 c"stogir_vector_lane_1134")))
+    (set! failures
+          (+ failures (linked 73 61 9 5 7 0 c"stogir_vector_lane_1135")))
+    (set! failures
+          (+ failures (linked 73 61 9 5 7 1 c"stogir_vector_lane_1136")))
+    (set! failures
+          (+ failures (linked 73 61 9 1 -1 0 c"stogir_vector_lane_1137")))
+    (set! failures
+          (+ failures (linked 73 61 9 5 -1 0 c"stogir_vector_lane_1138")))
+    (set! failures
+          (+ failures (linked 73 61 9 5 -1 1 c"stogir_vector_lane_1139")))
+    (set! failures
+          (+ failures (linked 73 61 9 5 -1 4 c"stogir_vector_lane_1140")))
+    (set! failures
+          (+ failures (linked 73 61 9 8 -1 0 c"stogir_vector_lane_1141")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 0 0 c"stogir_vector_lane_1142")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 0 3 c"stogir_vector_lane_1143")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 1 0 c"stogir_vector_lane_1144")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 1 3 c"stogir_vector_lane_1145")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 2 0 c"stogir_vector_lane_1146")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 2 3 c"stogir_vector_lane_1147")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 3 0 c"stogir_vector_lane_1148")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 3 3 c"stogir_vector_lane_1149")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 4 0 c"stogir_vector_lane_1150")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 4 3 c"stogir_vector_lane_1151")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 5 0 c"stogir_vector_lane_1152")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 5 3 c"stogir_vector_lane_1153")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 6 0 c"stogir_vector_lane_1154")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 6 3 c"stogir_vector_lane_1155")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 7 0 c"stogir_vector_lane_1156")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 7 3 c"stogir_vector_lane_1157")))
+    (set! failures
+          (+ failures (linked 73 62 9 1 -1 0 c"stogir_vector_lane_1158")))
+    (set! failures
+          (+ failures (linked 73 62 9 1 -1 3 c"stogir_vector_lane_1159")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 -1 0 c"stogir_vector_lane_1160")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 -1 1 c"stogir_vector_lane_1161")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 -1 3 c"stogir_vector_lane_1162")))
+    (set! failures
+          (+ failures (linked 73 62 9 5 -1 4 c"stogir_vector_lane_1163")))
+    (set! failures
+          (+ failures (linked 73 62 9 8 -1 0 c"stogir_vector_lane_1164")))
+    (set! failures
+          (+ failures (linked 73 62 9 8 -1 3 c"stogir_vector_lane_1165")))
+    (set! failures
+          (+ failures (linked 73 63 9 5 0 0 c"stogir_vector_lane_1166")))
+    (set! failures
+          (+ failures (linked 73 63 9 5 0 2 c"stogir_vector_lane_1167")))
+    (set! failures
+          (+ failures (linked 73 61 3 5 7 0 c"stogir_vector_lane_1168")))
+    (set! failures
+          (+ failures (linked 73 61 3 5 7 1 c"stogir_vector_lane_1169")))
+    (set! failures
+          (+ failures (linked 73 61 3 5 -1 0 c"stogir_vector_lane_1170")))
+    (set! failures
+          (+ failures (linked 73 61 3 5 -1 1 c"stogir_vector_lane_1171")))
+    (set! failures
+          (+ failures (linked 73 62 3 5 7 0 c"stogir_vector_lane_1172")))
+    (set! failures
+          (+ failures (linked 73 62 3 5 7 3 c"stogir_vector_lane_1173")))
+    (set! failures
+          (+ failures (linked 73 62 3 5 -1 0 c"stogir_vector_lane_1174")))
+    (set! failures
+          (+ failures (linked 73 62 3 5 -1 3 c"stogir_vector_lane_1175")))
+    (set! failures
+          (+ failures (linked 73 63 3 5 0 0 c"stogir_vector_lane_1176")))
+    (set! failures
+          (+ failures (linked 73 63 3 5 0 2 c"stogir_vector_lane_1177")))
+    (set! failures
+          (+ failures (linked 42 61 10 5 0 0 c"stogir_vector_lane_1178")))
+    (set! failures
+          (+ failures (linked 42 61 10 5 0 1 c"stogir_vector_lane_1179")))
+    (set! failures
+          (+ failures (linked 42 61 10 5 1 0 c"stogir_vector_lane_1180")))
+    (set! failures
+          (+ failures (linked 42 61 10 5 1 1 c"stogir_vector_lane_1181")))
+    (set! failures
+          (+ failures (linked 42 61 10 1 -1 0 c"stogir_vector_lane_1182")))
+    (set! failures
+          (+ failures (linked 42 61 10 5 -1 0 c"stogir_vector_lane_1183")))
+    (set! failures
+          (+ failures (linked 42 61 10 5 -1 1 c"stogir_vector_lane_1184")))
+    (set! failures
+          (+ failures (linked 42 61 10 5 -1 4 c"stogir_vector_lane_1185")))
+    (set! failures
+          (+ failures (linked 42 61 10 8 -1 0 c"stogir_vector_lane_1186")))
+    (set! failures
+          (+ failures (linked 42 62 10 5 0 0 c"stogir_vector_lane_1187")))
+    (set! failures
+          (+ failures (linked 42 62 10 5 0 3 c"stogir_vector_lane_1188")))
+    (set! failures
+          (+ failures (linked 42 62 10 5 1 0 c"stogir_vector_lane_1189")))
+    (set! failures
+          (+ failures (linked 42 62 10 5 1 3 c"stogir_vector_lane_1190")))
+    (set! failures
+          (+ failures (linked 42 62 10 1 -1 0 c"stogir_vector_lane_1191")))
+    (set! failures
+          (+ failures (linked 42 62 10 1 -1 3 c"stogir_vector_lane_1192")))
+    (set! failures
+          (+ failures (linked 42 62 10 5 -1 0 c"stogir_vector_lane_1193")))
+    (set! failures
+          (+ failures (linked 42 62 10 5 -1 1 c"stogir_vector_lane_1194")))
+    (set! failures
+          (+ failures (linked 42 62 10 5 -1 3 c"stogir_vector_lane_1195")))
+    (set! failures
+          (+ failures (linked 42 62 10 5 -1 4 c"stogir_vector_lane_1196")))
+    (set! failures
+          (+ failures (linked 42 62 10 8 -1 0 c"stogir_vector_lane_1197")))
+    (set! failures
+          (+ failures (linked 42 62 10 8 -1 3 c"stogir_vector_lane_1198")))
+    (set! failures
+          (+ failures (linked 42 63 10 5 0 0 c"stogir_vector_lane_1199")))
+    (set! failures
+          (+ failures (linked 42 63 10 5 0 2 c"stogir_vector_lane_1200")))
+    (set! failures
+          (+ failures (linked 42 61 4 5 1 0 c"stogir_vector_lane_1201")))
+    (set! failures
+          (+ failures (linked 42 61 4 5 1 1 c"stogir_vector_lane_1202")))
+    (set! failures
+          (+ failures (linked 42 61 4 5 -1 0 c"stogir_vector_lane_1203")))
+    (set! failures
+          (+ failures (linked 42 61 4 5 -1 1 c"stogir_vector_lane_1204")))
+    (set! failures
+          (+ failures (linked 42 62 4 5 1 0 c"stogir_vector_lane_1205")))
+    (set! failures
+          (+ failures (linked 42 62 4 5 1 3 c"stogir_vector_lane_1206")))
+    (set! failures
+          (+ failures (linked 42 62 4 5 -1 0 c"stogir_vector_lane_1207")))
+    (set! failures
+          (+ failures (linked 42 62 4 5 -1 3 c"stogir_vector_lane_1208")))
+    (set! failures
+          (+ failures (linked 42 63 4 5 0 0 c"stogir_vector_lane_1209")))
+    (set! failures
+          (+ failures (linked 42 63 4 5 0 2 c"stogir_vector_lane_1210")))
+    (set! failures
+          (+ failures (linked 58 61 10 5 0 0 c"stogir_vector_lane_1211")))
+    (set! failures
+          (+ failures (linked 58 61 10 5 0 1 c"stogir_vector_lane_1212")))
+    (set! failures
+          (+ failures (linked 58 61 10 5 1 0 c"stogir_vector_lane_1213")))
+    (set! failures
+          (+ failures (linked 58 61 10 5 1 1 c"stogir_vector_lane_1214")))
+    (set! failures
+          (+ failures (linked 58 61 10 5 2 0 c"stogir_vector_lane_1215")))
+    (set! failures
+          (+ failures (linked 58 61 10 5 2 1 c"stogir_vector_lane_1216")))
+    (set! failures
+          (+ failures (linked 58 61 10 5 3 0 c"stogir_vector_lane_1217")))
+    (set! failures
+          (+ failures (linked 58 61 10 5 3 1 c"stogir_vector_lane_1218")))
+    (set! failures
+          (+ failures (linked 58 61 10 1 -1 0 c"stogir_vector_lane_1219")))
+    (set! failures
+          (+ failures (linked 58 61 10 5 -1 0 c"stogir_vector_lane_1220")))
+    (set! failures
+          (+ failures (linked 58 61 10 5 -1 1 c"stogir_vector_lane_1221")))
+    (set! failures
+          (+ failures (linked 58 61 10 5 -1 4 c"stogir_vector_lane_1222")))
+    (set! failures
+          (+ failures (linked 58 61 10 8 -1 0 c"stogir_vector_lane_1223")))
+    (set! failures
+          (+ failures (linked 58 62 10 5 0 0 c"stogir_vector_lane_1224")))
+    (set! failures
+          (+ failures (linked 58 62 10 5 0 3 c"stogir_vector_lane_1225")))
+    (set! failures
+          (+ failures (linked 58 62 10 5 1 0 c"stogir_vector_lane_1226")))
+    (set! failures
+          (+ failures (linked 58 62 10 5 1 3 c"stogir_vector_lane_1227")))
+    (set! failures
+          (+ failures (linked 58 62 10 5 2 0 c"stogir_vector_lane_1228")))
+    (set! failures
+          (+ failures (linked 58 62 10 5 2 3 c"stogir_vector_lane_1229")))
+    (set! failures
+          (+ failures (linked 58 62 10 5 3 0 c"stogir_vector_lane_1230")))
+    (set! failures
+          (+ failures (linked 58 62 10 5 3 3 c"stogir_vector_lane_1231")))
+    (set! failures
+          (+ failures (linked 58 62 10 1 -1 0 c"stogir_vector_lane_1232")))
+    (set! failures
+          (+ failures (linked 58 62 10 1 -1 3 c"stogir_vector_lane_1233")))
+    (set! failures
+          (+ failures (linked 58 62 10 5 -1 0 c"stogir_vector_lane_1234")))
+    (set! failures
+          (+ failures (linked 58 62 10 5 -1 1 c"stogir_vector_lane_1235")))
+    (set! failures
+          (+ failures (linked 58 62 10 5 -1 3 c"stogir_vector_lane_1236")))
+    (set! failures
+          (+ failures (linked 58 62 10 5 -1 4 c"stogir_vector_lane_1237")))
+    (set! failures
+          (+ failures (linked 58 62 10 8 -1 0 c"stogir_vector_lane_1238")))
+    (set! failures
+          (+ failures (linked 58 62 10 8 -1 3 c"stogir_vector_lane_1239")))
+    (set! failures
+          (+ failures (linked 58 63 10 5 0 0 c"stogir_vector_lane_1240")))
+    (set! failures
+          (+ failures (linked 58 63 10 5 0 2 c"stogir_vector_lane_1241")))
+    (set! failures
+          (+ failures (linked 58 61 4 5 3 0 c"stogir_vector_lane_1242")))
+    (set! failures
+          (+ failures (linked 58 61 4 5 3 1 c"stogir_vector_lane_1243")))
+    (set! failures
+          (+ failures (linked 58 61 4 5 -1 0 c"stogir_vector_lane_1244")))
+    (set! failures
+          (+ failures (linked 58 61 4 5 -1 1 c"stogir_vector_lane_1245")))
+    (set! failures
+          (+ failures (linked 58 62 4 5 3 0 c"stogir_vector_lane_1246")))
+    (set! failures
+          (+ failures (linked 58 62 4 5 3 3 c"stogir_vector_lane_1247")))
+    (set! failures
+          (+ failures (linked 58 62 4 5 -1 0 c"stogir_vector_lane_1248")))
+    (set! failures
+          (+ failures (linked 58 62 4 5 -1 3 c"stogir_vector_lane_1249")))
+    (set! failures
+          (+ failures (linked 58 63 4 5 0 0 c"stogir_vector_lane_1250")))
+    (set! failures
+          (+ failures (linked 58 63 4 5 0 2 c"stogir_vector_lane_1251")))
+    (set! failures
+          (+ failures (linked 27 61 11 5 0 0 c"stogir_vector_lane_1252")))
+    (set! failures
+          (+ failures (linked 27 61 11 5 0 1 c"stogir_vector_lane_1253")))
+    (set! failures
+          (+ failures (linked 27 61 11 1 -1 0 c"stogir_vector_lane_1254")))
+    (set! failures
+          (+ failures (linked 27 61 11 5 -1 0 c"stogir_vector_lane_1255")))
+    (set! failures
+          (+ failures (linked 27 61 11 5 -1 1 c"stogir_vector_lane_1256")))
+    (set! failures
+          (+ failures (linked 27 61 11 5 -1 4 c"stogir_vector_lane_1257")))
+    (set! failures
+          (+ failures (linked 27 61 11 8 -1 0 c"stogir_vector_lane_1258")))
+    (set! failures
+          (+ failures (linked 27 62 11 5 0 0 c"stogir_vector_lane_1259")))
+    (set! failures
+          (+ failures (linked 27 62 11 5 0 3 c"stogir_vector_lane_1260")))
+    (set! failures
+          (+ failures (linked 27 62 11 1 -1 0 c"stogir_vector_lane_1261")))
+    (set! failures
+          (+ failures (linked 27 62 11 1 -1 3 c"stogir_vector_lane_1262")))
+    (set! failures
+          (+ failures (linked 27 62 11 5 -1 0 c"stogir_vector_lane_1263")))
+    (set! failures
+          (+ failures (linked 27 62 11 5 -1 1 c"stogir_vector_lane_1264")))
+    (set! failures
+          (+ failures (linked 27 62 11 5 -1 3 c"stogir_vector_lane_1265")))
+    (set! failures
+          (+ failures (linked 27 62 11 5 -1 4 c"stogir_vector_lane_1266")))
+    (set! failures
+          (+ failures (linked 27 62 11 8 -1 0 c"stogir_vector_lane_1267")))
+    (set! failures
+          (+ failures (linked 27 62 11 8 -1 3 c"stogir_vector_lane_1268")))
+    (set! failures
+          (+ failures (linked 27 63 11 5 0 0 c"stogir_vector_lane_1269")))
+    (set! failures
+          (+ failures (linked 27 63 11 5 0 2 c"stogir_vector_lane_1270")))
+    (set! failures
+          (+ failures (linked 27 61 5 5 0 0 c"stogir_vector_lane_1271")))
+    (set! failures
+          (+ failures (linked 27 61 5 5 0 1 c"stogir_vector_lane_1272")))
+    (set! failures
+          (+ failures (linked 27 61 5 5 -1 0 c"stogir_vector_lane_1273")))
+    (set! failures
+          (+ failures (linked 27 61 5 5 -1 1 c"stogir_vector_lane_1274")))
+    (set! failures
+          (+ failures (linked 27 62 5 5 0 0 c"stogir_vector_lane_1275")))
+    (set! failures
+          (+ failures (linked 27 62 5 5 0 3 c"stogir_vector_lane_1276")))
+    (set! failures
+          (+ failures (linked 27 62 5 5 -1 0 c"stogir_vector_lane_1277")))
+    (set! failures
+          (+ failures (linked 27 62 5 5 -1 3 c"stogir_vector_lane_1278")))
+    (set! failures
+          (+ failures (linked 27 63 5 5 0 0 c"stogir_vector_lane_1279")))
+    (set! failures
+          (+ failures (linked 27 63 5 5 0 2 c"stogir_vector_lane_1280")))
+    (set! failures
+          (+ failures (linked 27 61 6 5 0 0 c"stogir_vector_lane_1281")))
+    (set! failures
+          (+ failures (linked 27 61 6 5 0 1 c"stogir_vector_lane_1282")))
+    (set! failures
+          (+ failures (linked 27 61 6 5 -1 0 c"stogir_vector_lane_1283")))
+    (set! failures
+          (+ failures (linked 27 61 6 5 -1 1 c"stogir_vector_lane_1284")))
+    (set! failures
+          (+ failures (linked 27 62 6 5 0 0 c"stogir_vector_lane_1285")))
+    (set! failures
+          (+ failures (linked 27 62 6 5 0 3 c"stogir_vector_lane_1286")))
+    (set! failures
+          (+ failures (linked 27 62 6 5 -1 0 c"stogir_vector_lane_1287")))
+    (set! failures
+          (+ failures (linked 27 62 6 5 -1 3 c"stogir_vector_lane_1288")))
+    (set! failures
+          (+ failures (linked 27 63 6 5 0 0 c"stogir_vector_lane_1289")))
+    (set! failures
+          (+ failures (linked 27 63 6 5 0 2 c"stogir_vector_lane_1290")))
+    (set! failures
+          (+ failures (linked 43 61 11 5 0 0 c"stogir_vector_lane_1291")))
+    (set! failures
+          (+ failures (linked 43 61 11 5 0 1 c"stogir_vector_lane_1292")))
+    (set! failures
+          (+ failures (linked 43 61 11 5 1 0 c"stogir_vector_lane_1293")))
+    (set! failures
+          (+ failures (linked 43 61 11 5 1 1 c"stogir_vector_lane_1294")))
+    (set! failures
+          (+ failures (linked 43 61 11 1 -1 0 c"stogir_vector_lane_1295")))
+    (set! failures
+          (+ failures (linked 43 61 11 5 -1 0 c"stogir_vector_lane_1296")))
+    (set! failures
+          (+ failures (linked 43 61 11 5 -1 1 c"stogir_vector_lane_1297")))
+    (set! failures
+          (+ failures (linked 43 61 11 5 -1 4 c"stogir_vector_lane_1298")))
+    (set! failures
+          (+ failures (linked 43 61 11 8 -1 0 c"stogir_vector_lane_1299")))
+    (set! failures
+          (+ failures (linked 43 62 11 5 0 0 c"stogir_vector_lane_1300")))
+    (set! failures
+          (+ failures (linked 43 62 11 5 0 3 c"stogir_vector_lane_1301")))
+    (set! failures
+          (+ failures (linked 43 62 11 5 1 0 c"stogir_vector_lane_1302")))
+    (set! failures
+          (+ failures (linked 43 62 11 5 1 3 c"stogir_vector_lane_1303")))
+    (set! failures
+          (+ failures (linked 43 62 11 1 -1 0 c"stogir_vector_lane_1304")))
+    (set! failures
+          (+ failures (linked 43 62 11 1 -1 3 c"stogir_vector_lane_1305")))
+    (set! failures
+          (+ failures (linked 43 62 11 5 -1 0 c"stogir_vector_lane_1306")))
+    (set! failures
+          (+ failures (linked 43 62 11 5 -1 1 c"stogir_vector_lane_1307")))
+    (set! failures
+          (+ failures (linked 43 62 11 5 -1 3 c"stogir_vector_lane_1308")))
+    (set! failures
+          (+ failures (linked 43 62 11 5 -1 4 c"stogir_vector_lane_1309")))
+    (set! failures
+          (+ failures (linked 43 62 11 8 -1 0 c"stogir_vector_lane_1310")))
+    (set! failures
+          (+ failures (linked 43 62 11 8 -1 3 c"stogir_vector_lane_1311")))
+    (set! failures
+          (+ failures (linked 43 63 11 5 0 0 c"stogir_vector_lane_1312")))
+    (set! failures
+          (+ failures (linked 43 63 11 5 0 2 c"stogir_vector_lane_1313")))
+    (set! failures
+          (+ failures (linked 43 61 5 5 1 0 c"stogir_vector_lane_1314")))
+    (set! failures
+          (+ failures (linked 43 61 5 5 1 1 c"stogir_vector_lane_1315")))
+    (set! failures
+          (+ failures (linked 43 61 5 5 -1 0 c"stogir_vector_lane_1316")))
+    (set! failures
+          (+ failures (linked 43 61 5 5 -1 1 c"stogir_vector_lane_1317")))
+    (set! failures
+          (+ failures (linked 43 62 5 5 1 0 c"stogir_vector_lane_1318")))
+    (set! failures
+          (+ failures (linked 43 62 5 5 1 3 c"stogir_vector_lane_1319")))
+    (set! failures
+          (+ failures (linked 43 62 5 5 -1 0 c"stogir_vector_lane_1320")))
+    (set! failures
+          (+ failures (linked 43 62 5 5 -1 3 c"stogir_vector_lane_1321")))
+    (set! failures
+          (+ failures (linked 43 63 5 5 0 0 c"stogir_vector_lane_1322")))
+    (set! failures
+          (+ failures (linked 43 63 5 5 0 2 c"stogir_vector_lane_1323")))
+    (set! failures
+          (+ failures (linked 43 61 6 5 1 0 c"stogir_vector_lane_1324")))
+    (set! failures
+          (+ failures (linked 43 61 6 5 1 1 c"stogir_vector_lane_1325")))
+    (set! failures
+          (+ failures (linked 43 61 6 5 -1 0 c"stogir_vector_lane_1326")))
+    (set! failures
+          (+ failures (linked 43 61 6 5 -1 1 c"stogir_vector_lane_1327")))
+    (set! failures
+          (+ failures (linked 43 62 6 5 1 0 c"stogir_vector_lane_1328")))
+    (set! failures
+          (+ failures (linked 43 62 6 5 1 3 c"stogir_vector_lane_1329")))
+    (set! failures
+          (+ failures (linked 43 62 6 5 -1 0 c"stogir_vector_lane_1330")))
+    (set! failures
+          (+ failures (linked 43 62 6 5 -1 3 c"stogir_vector_lane_1331")))
+    (set! failures
+          (+ failures (linked 43 63 6 5 0 0 c"stogir_vector_lane_1332")))
+    (set! failures
+          (+ failures (linked 43 63 6 5 0 2 c"stogir_vector_lane_1333")))
+    (set! failures
+          (+ failures (linked 28 61 12 5 0 0 c"stogir_vector_lane_1334")))
+    (set! failures
+          (+ failures (linked 28 61 12 5 0 1 c"stogir_vector_lane_1335")))
+    (set! failures
+          (+ failures (linked 28 61 12 1 -1 0 c"stogir_vector_lane_1336")))
+    (set! failures
+          (+ failures (linked 28 61 12 5 -1 0 c"stogir_vector_lane_1337")))
+    (set! failures
+          (+ failures (linked 28 61 12 5 -1 1 c"stogir_vector_lane_1338")))
+    (set! failures
+          (+ failures (linked 28 61 12 5 -1 4 c"stogir_vector_lane_1339")))
+    (set! failures
+          (+ failures (linked 28 61 12 8 -1 0 c"stogir_vector_lane_1340")))
+    (set! failures
+          (+ failures (linked 28 62 12 5 0 0 c"stogir_vector_lane_1341")))
+    (set! failures
+          (+ failures (linked 28 62 12 5 0 3 c"stogir_vector_lane_1342")))
+    (set! failures
+          (+ failures (linked 28 62 12 1 -1 0 c"stogir_vector_lane_1343")))
+    (set! failures
+          (+ failures (linked 28 62 12 1 -1 3 c"stogir_vector_lane_1344")))
+    (set! failures
+          (+ failures (linked 28 62 12 5 -1 0 c"stogir_vector_lane_1345")))
+    (set! failures
+          (+ failures (linked 28 62 12 5 -1 1 c"stogir_vector_lane_1346")))
+    (set! failures
+          (+ failures (linked 28 62 12 5 -1 3 c"stogir_vector_lane_1347")))
+    (set! failures
+          (+ failures (linked 28 62 12 5 -1 4 c"stogir_vector_lane_1348")))
+    (set! failures
+          (+ failures (linked 28 62 12 8 -1 0 c"stogir_vector_lane_1349")))
+    (set! failures
+          (+ failures (linked 28 62 12 8 -1 3 c"stogir_vector_lane_1350")))
+    (set! failures
+          (+ failures (linked 28 63 12 5 0 0 c"stogir_vector_lane_1351")))
+    (set! failures
+          (+ failures (linked 28 63 12 5 0 2 c"stogir_vector_lane_1352")))
+    (set! failures
+          (+ failures (linked 44 61 12 5 0 0 c"stogir_vector_lane_1353")))
+    (set! failures
+          (+ failures (linked 44 61 12 5 0 1 c"stogir_vector_lane_1354")))
+    (set! failures
+          (+ failures (linked 44 61 12 5 1 0 c"stogir_vector_lane_1355")))
+    (set! failures
+          (+ failures (linked 44 61 12 5 1 1 c"stogir_vector_lane_1356")))
+    (set! failures
+          (+ failures (linked 44 61 12 1 -1 0 c"stogir_vector_lane_1357")))
+    (set! failures
+          (+ failures (linked 44 61 12 5 -1 0 c"stogir_vector_lane_1358")))
+    (set! failures
+          (+ failures (linked 44 61 12 5 -1 1 c"stogir_vector_lane_1359")))
+    (set! failures
+          (+ failures (linked 44 61 12 5 -1 4 c"stogir_vector_lane_1360")))
+    (set! failures
+          (+ failures (linked 44 61 12 8 -1 0 c"stogir_vector_lane_1361")))
+    (set! failures
+          (+ failures (linked 44 62 12 5 0 0 c"stogir_vector_lane_1362")))
+    (set! failures
+          (+ failures (linked 44 62 12 5 0 3 c"stogir_vector_lane_1363")))
+    (set! failures
+          (+ failures (linked 44 62 12 5 1 0 c"stogir_vector_lane_1364")))
+    (set! failures
+          (+ failures (linked 44 62 12 5 1 3 c"stogir_vector_lane_1365")))
+    (set! failures
+          (+ failures (linked 44 62 12 1 -1 0 c"stogir_vector_lane_1366")))
+    (set! failures
+          (+ failures (linked 44 62 12 1 -1 3 c"stogir_vector_lane_1367")))
+    (set! failures
+          (+ failures (linked 44 62 12 5 -1 0 c"stogir_vector_lane_1368")))
+    (set! failures
+          (+ failures (linked 44 62 12 5 -1 1 c"stogir_vector_lane_1369")))
+    (set! failures
+          (+ failures (linked 44 62 12 5 -1 3 c"stogir_vector_lane_1370")))
+    (set! failures
+          (+ failures (linked 44 62 12 5 -1 4 c"stogir_vector_lane_1371")))
+    (set! failures
+          (+ failures (linked 44 62 12 8 -1 0 c"stogir_vector_lane_1372")))
+    (set! failures
+          (+ failures (linked 44 62 12 8 -1 3 c"stogir_vector_lane_1373")))
+    (set! failures
+          (+ failures (linked 44 63 12 5 0 0 c"stogir_vector_lane_1374")))
+    (set! failures
+          (+ failures (linked 44 63 12 5 0 2 c"stogir_vector_lane_1375")))
+    (set! failures
+          (+ failures (linked 45 61 13 5 0 0 c"stogir_vector_lane_1376")))
+    (set! failures
+          (+ failures (linked 45 61 13 5 0 1 c"stogir_vector_lane_1377")))
+    (set! failures
+          (+ failures (linked 45 61 13 5 1 0 c"stogir_vector_lane_1378")))
+    (set! failures
+          (+ failures (linked 45 61 13 5 1 1 c"stogir_vector_lane_1379")))
+    (set! failures
+          (+ failures (linked 45 61 13 1 -1 0 c"stogir_vector_lane_1380")))
+    (set! failures
+          (+ failures (linked 45 61 13 5 -1 0 c"stogir_vector_lane_1381")))
+    (set! failures
+          (+ failures (linked 45 61 13 5 -1 1 c"stogir_vector_lane_1382")))
+    (set! failures
+          (+ failures (linked 45 61 13 5 -1 4 c"stogir_vector_lane_1383")))
+    (set! failures
+          (+ failures (linked 45 61 13 8 -1 0 c"stogir_vector_lane_1384")))
+    (set! failures
+          (+ failures (linked 45 62 13 5 0 0 c"stogir_vector_lane_1385")))
+    (set! failures
+          (+ failures (linked 45 62 13 5 0 3 c"stogir_vector_lane_1386")))
+    (set! failures
+          (+ failures (linked 45 62 13 5 1 0 c"stogir_vector_lane_1387")))
+    (set! failures
+          (+ failures (linked 45 62 13 5 1 3 c"stogir_vector_lane_1388")))
+    (set! failures
+          (+ failures (linked 45 62 13 1 -1 0 c"stogir_vector_lane_1389")))
+    (set! failures
+          (+ failures (linked 45 62 13 1 -1 3 c"stogir_vector_lane_1390")))
+    (set! failures
+          (+ failures (linked 45 62 13 5 -1 0 c"stogir_vector_lane_1391")))
+    (set! failures
+          (+ failures (linked 45 62 13 5 -1 1 c"stogir_vector_lane_1392")))
+    (set! failures
+          (+ failures (linked 45 62 13 5 -1 3 c"stogir_vector_lane_1393")))
+    (set! failures
+          (+ failures (linked 45 62 13 5 -1 4 c"stogir_vector_lane_1394")))
+    (set! failures
+          (+ failures (linked 45 62 13 8 -1 0 c"stogir_vector_lane_1395")))
+    (set! failures
+          (+ failures (linked 45 62 13 8 -1 3 c"stogir_vector_lane_1396")))
+    (set! failures
+          (+ failures (linked 45 63 13 5 0 0 c"stogir_vector_lane_1397")))
+    (set! failures
+          (+ failures (linked 45 63 13 5 0 2 c"stogir_vector_lane_1398")))
+    (set! failures
+          (+ failures (linked 61 61 13 5 0 0 c"stogir_vector_lane_1399")))
+    (set! failures
+          (+ failures (linked 61 61 13 5 0 1 c"stogir_vector_lane_1400")))
+    (set! failures
+          (+ failures (linked 61 61 13 5 1 0 c"stogir_vector_lane_1401")))
+    (set! failures
+          (+ failures (linked 61 61 13 5 1 1 c"stogir_vector_lane_1402")))
+    (set! failures
+          (+ failures (linked 61 61 13 5 2 0 c"stogir_vector_lane_1403")))
+    (set! failures
+          (+ failures (linked 61 61 13 5 2 1 c"stogir_vector_lane_1404")))
+    (set! failures
+          (+ failures (linked 61 61 13 5 3 0 c"stogir_vector_lane_1405")))
+    (set! failures
+          (+ failures (linked 61 61 13 5 3 1 c"stogir_vector_lane_1406")))
+    (set! failures
+          (+ failures (linked 61 61 13 1 -1 0 c"stogir_vector_lane_1407")))
+    (set! failures
+          (+ failures (linked 61 61 13 5 -1 0 c"stogir_vector_lane_1408")))
+    (set! failures
+          (+ failures (linked 61 61 13 5 -1 1 c"stogir_vector_lane_1409")))
+    (set! failures
+          (+ failures (linked 61 61 13 5 -1 4 c"stogir_vector_lane_1410")))
+    (set! failures
+          (+ failures (linked 61 61 13 8 -1 0 c"stogir_vector_lane_1411")))
+    (set! failures
+          (+ failures (linked 61 62 13 5 0 0 c"stogir_vector_lane_1412")))
+    (set! failures
+          (+ failures (linked 61 62 13 5 0 3 c"stogir_vector_lane_1413")))
+    (set! failures
+          (+ failures (linked 61 62 13 5 1 0 c"stogir_vector_lane_1414")))
+    (set! failures
+          (+ failures (linked 61 62 13 5 1 3 c"stogir_vector_lane_1415")))
+    (set! failures
+          (+ failures (linked 61 62 13 5 2 0 c"stogir_vector_lane_1416")))
+    (set! failures
+          (+ failures (linked 61 62 13 5 2 3 c"stogir_vector_lane_1417")))
+    (set! failures
+          (+ failures (linked 61 62 13 5 3 0 c"stogir_vector_lane_1418")))
+    (set! failures
+          (+ failures (linked 61 62 13 5 3 3 c"stogir_vector_lane_1419")))
+    (set! failures
+          (+ failures (linked 61 62 13 1 -1 0 c"stogir_vector_lane_1420")))
+    (set! failures
+          (+ failures (linked 61 62 13 1 -1 3 c"stogir_vector_lane_1421")))
+    (set! failures
+          (+ failures (linked 61 62 13 5 -1 0 c"stogir_vector_lane_1422")))
+    (set! failures
+          (+ failures (linked 61 62 13 5 -1 1 c"stogir_vector_lane_1423")))
+    (set! failures
+          (+ failures (linked 61 62 13 5 -1 3 c"stogir_vector_lane_1424")))
+    (set! failures
+          (+ failures (linked 61 62 13 5 -1 4 c"stogir_vector_lane_1425")))
+    (set! failures
+          (+ failures (linked 61 62 13 8 -1 0 c"stogir_vector_lane_1426")))
+    (set! failures
+          (+ failures (linked 61 62 13 8 -1 3 c"stogir_vector_lane_1427")))
+    (set! failures
+          (+ failures (linked 61 63 13 5 0 0 c"stogir_vector_lane_1428")))
+    (set! failures
+          (+ failures (linked 61 63 13 5 0 2 c"stogir_vector_lane_1429")))
+    (set! failures
+          (+ failures (linked-pressure 81 61 1 c"stogir_vector_lane_1430")))
+    (set! failures
+          (+ failures (linked-pressure 81 61 1 c"stogir_vector_lane_1431")))
+    (set! failures
+          (+ failures (linked-pressure 81 62 1 c"stogir_vector_lane_1432")))
+    (set! failures
+          (+ failures (linked-pressure 81 62 1 c"stogir_vector_lane_1433")))
+    (set! failures
+          (+ failures (linked-pressure 81 63 1 c"stogir_vector_lane_1434")))
+    (set! failures
+          (+ failures (linked-pressure 81 63 1 c"stogir_vector_lane_1435")))
+    (set! failures
+          (+ failures (linked-pressure 88 61 8 c"stogir_vector_lane_1436")))
+    (set! failures
+          (+ failures (linked-pressure 88 61 8 c"stogir_vector_lane_1437")))
+    (set! failures
+          (+ failures (linked-pressure 88 62 8 c"stogir_vector_lane_1438")))
+    (set! failures
+          (+ failures (linked-pressure 88 62 8 c"stogir_vector_lane_1439")))
+    (set! failures
+          (+ failures (linked-pressure 88 63 8 c"stogir_vector_lane_1440")))
+    (set! failures
+          (+ failures (linked-pressure 88 63 8 c"stogir_vector_lane_1441")))
+    (set! failures
+          (+ failures (linked-pressure 67 61 3 c"stogir_vector_lane_1442")))
+    (set! failures
+          (+ failures (linked-pressure 67 61 3 c"stogir_vector_lane_1443")))
+    (set! failures
+          (+ failures (linked-pressure 67 62 3 c"stogir_vector_lane_1444")))
+    (set! failures
+          (+ failures (linked-pressure 67 62 3 c"stogir_vector_lane_1445")))
+    (set! failures
+          (+ failures (linked-pressure 67 63 3 c"stogir_vector_lane_1446")))
+    (set! failures
+          (+ failures (linked-pressure 67 63 3 c"stogir_vector_lane_1447")))
+    (set! failures
+          (+ failures (linked-pressure 52 61 4 c"stogir_vector_lane_1448")))
+    (set! failures
+          (+ failures (linked-pressure 52 61 4 c"stogir_vector_lane_1449")))
+    (set! failures
+          (+ failures (linked-pressure 52 62 4 c"stogir_vector_lane_1450")))
+    (set! failures
+          (+ failures (linked-pressure 52 62 4 c"stogir_vector_lane_1451")))
+    (set! failures
+          (+ failures (linked-pressure 52 63 4 c"stogir_vector_lane_1452")))
+    (set! failures
+          (+ failures (linked-pressure 52 63 4 c"stogir_vector_lane_1453")))
+    (set! failures
+          (+ failures (linked-pressure 37 61 5 c"stogir_vector_lane_1454")))
+    (set! failures
+          (+ failures (linked-pressure 37 61 5 c"stogir_vector_lane_1455")))
+    (set! failures
+          (+ failures (linked-pressure 37 62 5 c"stogir_vector_lane_1456")))
+    (set! failures
+          (+ failures (linked-pressure 37 62 5 c"stogir_vector_lane_1457")))
+    (set! failures
+          (+ failures (linked-pressure 37 63 5 c"stogir_vector_lane_1458")))
+    (set! failures
+          (+ failures (linked-pressure 37 63 5 c"stogir_vector_lane_1459")))
+    (set! failures
+          (+ failures (linked-pressure 43 61 11 c"stogir_vector_lane_1460")))
+    (set! failures
+          (+ failures (linked-pressure 43 61 11 c"stogir_vector_lane_1461")))
+    (set! failures
+          (+ failures (linked-pressure 43 62 11 c"stogir_vector_lane_1462")))
+    (set! failures
+          (+ failures (linked-pressure 43 62 11 c"stogir_vector_lane_1463")))
+    (set! failures
+          (+ failures (linked-pressure 43 63 11 c"stogir_vector_lane_1464")))
+    (set! failures
+          (+ failures (linked-pressure 43 63 11 c"stogir_vector_lane_1465")))
+    (set! failures
+          (+ failures (linked-pressure 45 61 13 c"stogir_vector_lane_1466")))
+    (set! failures
+          (+ failures (linked-pressure 45 61 13 c"stogir_vector_lane_1467")))
+    (set! failures
+          (+ failures (linked-pressure 45 62 13 c"stogir_vector_lane_1468")))
+    (set! failures
+          (+ failures (linked-pressure 45 62 13 c"stogir_vector_lane_1469")))
+    (set! failures
+          (+ failures (linked-pressure 45 63 13 c"stogir_vector_lane_1470")))
+    (set! failures
+          (+ failures (linked-pressure 45 63 13 c"stogir_vector_lane_1471")))
+    (set! failures
+          (+ failures (linked-pressure 44 61 12 c"stogir_vector_lane_1472")))
+    (set! failures
+          (+ failures (linked-pressure 44 61 12 c"stogir_vector_lane_1473")))
+    (set! failures
+          (+ failures (linked-pressure 44 62 12 c"stogir_vector_lane_1474")))
+    (set! failures
+          (+ failures (linked-pressure 44 62 12 c"stogir_vector_lane_1475")))
+    (set! failures
+          (+ failures (linked-pressure 44 63 12 c"stogir_vector_lane_1476")))
+    (set! failures
+          (+ failures (linked-pressure 44 63 12 c"stogir_vector_lane_1477")))
+    (set! failures
+          (+ failures (linked-pressure 22 61 6 c"stogir_vector_lane_1478")))
+    (set! failures
+          (+ failures (linked-pressure 22 61 6 c"stogir_vector_lane_1479")))
+    (set! failures
+          (+ failures (linked-pressure 22 62 6 c"stogir_vector_lane_1480")))
+    (set! failures
+          (+ failures (linked-pressure 22 62 6 c"stogir_vector_lane_1481")))
+    (set! failures
+          (+ failures (linked-pressure 22 63 6 c"stogir_vector_lane_1482")))
+    (set! failures
+          (+ failures (linked-pressure 22 63 6 c"stogir_vector_lane_1483")))
+    (set! failures
+          (+ failures (linked-pressure 82 61 8 c"stogir_vector_lane_1484")))
+    (set! failures
+          (+ failures (linked-pressure 82 61 8 c"stogir_vector_lane_1485")))
+    (set! failures
+          (+ failures (linked-pressure 82 62 8 c"stogir_vector_lane_1486")))
+    (set! failures
+          (+ failures (linked-pressure 82 62 8 c"stogir_vector_lane_1487")))
+    (set! failures
+          (+ failures (linked-pressure 82 63 8 c"stogir_vector_lane_1488")))
+    (set! failures
+          (+ failures (linked-pressure 82 63 8 c"stogir_vector_lane_1489")))
+    (println "linked vector lanes: 1490 objects; failures {}" failures)
+    failures))
