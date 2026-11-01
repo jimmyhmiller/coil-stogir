@@ -50,6 +50,8 @@ line-for-line translation of each upstream pass or equivalent behavior.
 | Vector bitcasts | Shared BITCAST opcode and type geometry reference pinned IR. Independent Coil validation compares complete storage extents for explicit pointer widths; literal folding copies little-endian bytes and native D/Q casts reuse typed register transfers. Named addresses retain relocations. Coil byte oracles check JIT and linked objects. No external-language implementation is shipped. |
 | Atomic extension | Five new Coil opcodes follow the unchanged upstream 0–125 identifiers. Checked unsigned-storage operations and native acquire/release/LSE encodings are independent Coil implementations, checked against LLVM MC and raw-byte JIT/linked/thread-contention oracles. These operations are compiler integration requirements beyond pinned upstream IR. No TPDE or LLVM implementation is imported. |
 
+| Constant shift and copy selection | AArch64 `IR_SHIFT_CONST`, `IR_MUL_PWR2` and copy/reuse cases in pinned `ir_aarch64.dasc` are the reference. Coil selection avoids rematerializing constant shift registers; encoder words are checked against LLVM MC. Known canonical unsigned producer results and same-register integer bitcasts avoid redundant copies. This does not establish full matching/reuse/coalescing parity. |
+
 The current graph uses separate contiguous arrays for instructions and constants.
 The current allocator, fold rules, target coverage, verifier, and optimization
 pipeline remain incomplete. See [PLAN.md](PLAN.md) for the delivery gates.

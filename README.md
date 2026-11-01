@@ -99,3 +99,10 @@ copyright Zend by Perforce and Dmitry Stogov, distributed under the **MIT Licens
 See [LICENSE](LICENSE), [NOTICE](NOTICE), and the
 [source provenance and credits](docs/PROVENANCE.md). These notices must accompany
 library distributions and later vendoring into Coil.
+
+The `3a62f49` scalar-selection checkpoint passes 211 standalone checks and 65
+linked AOT consumers on a fixed toolchain with regenerated objects and unchanged
+validation inputs. It adds LLVM-MC-checked constant shift encodings, 208 constant
+shift/multiply JIT graphs, and conversion checks with the original operand live.
+Full optimized-pipeline parity is still missing; the architecture audit in
+[PLAN.md](docs/PLAN.md) lists the upstream pass order and current gaps.

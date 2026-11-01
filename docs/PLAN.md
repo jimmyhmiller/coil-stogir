@@ -1,5 +1,28 @@
 # Coil StogIR implementation plan
 
+## Upstream architecture audit — pinned 92171d0
+
+The architectural reference is `ir.h:ir_jit_compile` and `ir_main.c:ir_compile_func`, not a collection of independently useful emitter optimizations.
+
+Upstream optimized order:
+1. Fold/CSE during construction; build def-use lists.
+2. Optional mem2ssa, with CFG/dominators and subsequent CFG reset.
+3. SCCP for optimization level >1.
+4. CFG, dominators and loops; global code motion and scheduling.
+5. Target matching, including fusion and operand reuse rules.
+6. Virtual-register assignment, live ranges, coalescing and register allocation.
+7. Block scheduling, then emission into relocatable code/image data.
+
+Current Coil coverage is incomplete: compact Sea-of-Nodes graph and folding APIs exist; CFG/dominators/loop-aware placement and scheduling exist; split-interval linear scan exists. Missing/unverified stages include SCCP, mem2ssa, a persistent matched-rule/fusion plan consumed before liveness, explicit coalescing and upstream-equivalent block scheduling. The allocator is an independent implementation and still needs an invariant/algorithm audit against `ir_ra.c`, not a blanket equivalence claim.
+
+Current local target work follows actual AArch64 rules: `ir_aarch64.dasc:ir_match_insn` explicitly selects `IR_MUL_PWR2` (around line 1337) and `IR_SHIFT_CONST` (around line 1513). Therefore power-of-two multiplication belongs in target selection; an intermediate spoken claim that it belonged exclusively in folding was incorrect and corrected. Copies/extensions also have upstream reuse constraints (`IR_MAY_REUSE`, `IR_DEF_REUSES_OP1_REG`) that must be reflected in matching/allocation, rather than relying only on late instruction removal.
+
+The Coil compiler adapter should translate CIR into the library graph and use construction folding. Optimizer algorithms belong in the independent library. JIT and AOT must use the same graph/pass/relocatable-image path. No backend fallback or benchmark-specific source rewrite is permitted. Automatic vectorization is not established as a feature of this pinned upstream pipeline; the LLVM stencil gap must not justify silently inventing a different optimizer architecture.
+
+Next architectural priorities: explicit pass-coverage/invariant gates; persistent target matching before liveness; port the missing upstream SCCP stage and fold/rewrite behavior; audit coalescing and block scheduling. Keep the original measured benchmark baseline unchanged and treat 10× IR-to-code generation / runtime within 10% as unachieved acceptance criteria.
+
+
+
 Status: scalar integer and selected floating AArch64 JIT/shared-image Mach-O AOT work;
 upstream compatibility, backend integration, and performance gates remain open.
 
