@@ -50,8 +50,9 @@ results. Additional classification/vector coverage remains unfinished.
 Internal 64/128-bit vector loads/stores and branch/loop Phi values now preserve
 complete SIMD payloads through spills, clobbering calls and aligned dynamic
 frames in JIT and linked AOT. Vector constants follow the upstream LONG_CONST
-layout and use aligned private image data. Vector arithmetic and vector/HVA call
-interfaces remain unfinished.
+layout and use aligned private image data. Short-vector/HVA call plumbing now
+preserves complete SIMD argument/result pieces; initial native C interoperability
+passes. Exhaustive ABI coverage and vector arithmetic remain unfinished.
 
 Native copy, overlap-safe move and zero builders expand into existing memory
 and control nodes. Fixed small transfers use exact-width accesses; larger and

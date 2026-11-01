@@ -375,12 +375,13 @@ Records are sorted, disjoint, and cannot cross the fixed/unnamed boundary.
 Existing `calls/create` keeps the original scalar prototype bytes unchanged.
 
 Supported groups are two identical U64 or I64 pieces, or one through four
-identical f32/f64 members. These are classified ABI pieces, rather than source
+identical f32/f64 or 64/128-bit short-vector members. These are classified ABI pieces, rather than source
 record addresses. The frontend must classify and marshal the source aggregate,
 including exact-width loads of partial words. Group alignment is a power of two
 from the member width through sixteen, and the complete payload must satisfy it.
-For an integer pair, use eight- or sixteen-byte alignment. HVA/vector pieces and
-padded homogeneous representations are outside this interface's current coverage.
+For an integer pair, use eight- or sixteen-byte alignment. Vector members use
+their natural eight- or sixteen-byte alignment. Padded homogeneous representations
+are outside this interface's current coverage.
 
 Use the same grouped prototype with `calls/function!` for an incoming function.
 PARAM ordinals still index the flattened pieces. The complete prototype retains
@@ -497,7 +498,7 @@ extents against inaccessible regions. Instruction words match LLVM MC reference
 output. A separately linked Mach-O fixture verifies a four-way register/stack
 cycle through large, unaligned frame slots and preserved flags. Vector graph memory and Phi paths are now connected to this transport layer
 (see below). Vector constants now use the shared image path below; vector arithmetic and
-vector/HVA signatures remain open.
+broader vector/HVA ABI validation remains open.
 
 
 ## Mixed-width copy and spill ownership
@@ -530,8 +531,8 @@ Scalar slots remain eight bytes; the machinery can represent sixteen-byte
 values. Split-boundary and ordinary/Phi edge groups now derive transfer extents
 from their owning graph value and use one mixed-width plan. Byte/halfword values
 retain their normalized four-byte register form. Calls still use their current
-scalar/grouped ABI interface. Vector memory/Phi graph values are now supported;
-vector prototypes remain rejected until their ABI paths are implemented.
+scalar/grouped ABI interface, extended to short-vector pieces as described below.
+Vector memory/Phi graph values are supported.
 
 Validation includes729 byte-level sized-copy cases,120 native mixed GPR/SIMD/
 stack cases and a linked Mach-O mixed cycle. Native allocation tests force
@@ -556,8 +557,9 @@ including dead invalid uses. Phi incoming types must agree exactly.
 AArch64 supports memory/Phi transport for eight- and sixteen-byte vector extents.
 They use SIMD register classes, correctly sized/aligned spills and mixed-width
 split/edge copies. Larger vector shapes remain representable but target emission
-rejects their unsupported extent. Vector arithmetic, vector local objects and vector/HVA parameter/result
-signatures are not yet implemented. Vector constants use the path below.
+rejects their unsupported extent. Vector arithmetic and vector local objects
+are not yet implemented. Short-vector signatures have initial native coverage
+as described below. Vector constants use the path below.
 Scalar arguments/results may surround internal vector computations and calls.
 
 Phi results are defined simultaneously at block entry. Their live ranges start
@@ -622,3 +624,22 @@ Graph release precedes native mapping. Thirteen linked objects exercise the same
 paths, including a 5120-byte pool crossing architectural 4 KB address pages.
 Mixed string/vector data and malformed materialization inputs also have focused
 checks. These correctness checks do not establish compilation or runtime speed.
+
+
+## Short-vector call plumbing
+
+Prototype storage accepts valid encoded vector types. The AArch64 ABI planner
+restricts native values to eight- or sixteen-byte short vectors and assigns them
+to the SIMD bank. Homogeneous groups retain the existing all-or-stack placement
+rule. Each outgoing simultaneous copy now carries its own complete byte extent;
+stack capture, incoming parameters, scalar vector results and explicit homogeneous
+result roles use the same type width. Sixteen-byte homogeneous result storage is
+aligned to sixteen bytes.
+
+`tests/jit-hva-abi.coil` exercises a generated caller against an exported Coil C
+callback with a two-member 128-bit homogeneous vector record. It checks every
+64-bit word of the argument and the returned 32-byte result, including high halves,
+and preserves a live scalar across the call. This is initial interoperability
+coverage: one through four members, stack/bank boundaries, variadic placement,
+returning generated functions and linked AOT still need dedicated vector ABI
+fixtures. Existing scalar and aggregate fixtures remain regression checks.

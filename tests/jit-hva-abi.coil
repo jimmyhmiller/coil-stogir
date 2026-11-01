@@ -1,0 +1,121 @@
+(module stogir.tests.jit-hva-abi)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.call-groups" :as groups)
+(import "stogir.call-results" :as results)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.simd" :as v)
+(import "coil.result" :use [Result Ok Err])
+
+(defstruct H2 [(a (vec u64 2)) (b (vec u64 2))])
+
+(defn callback :cc (cc/C) [(seed u64) (value H2)] (-> H2)
+  (H2
+    :a (v/vinsert (.b value) 0 (^ (v/vextract (.b value) 0) seed))
+    :b (v/vinsert (.a value) 1 (^ (v/vextract (.a value) 1) (* seed 17)))))
+
+(export-c [callback :as "stogir_hva_callback"])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn address! [(graph (mut g/Graph)) (base i32) (offset i32)] (-> i32)
+  (require (b/emit! (mut graph)
+                    26
+                    6
+                    [base
+                     (require (b/scalar-constant! (mut graph)
+                                                  5
+                                                  (cast u64 offset)
+                                                  8))])))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        input (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        output (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        seed (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 3]))
+        a (require (b/vector-load! (mut graph) 37 8 start input true))
+        b
+          (require (b/vector-load! (mut graph)
+                                   37
+                                   8
+                                   a
+                                   (address! (mut graph) input 16)
+                                   true))
+        (mut input-words)
+          [(: 0x0123456789ABCDEF u64)
+           0xFEDCBA9876543210
+           0x7FF8123456789ABC
+           0x8000000000000000]
+        (mut result) [(: 0 u64) 0 0 0]
+        (mut failures) 0]
+    (match (calls/create-result 9
+                                [(: 6 u8) 5 37 37]
+                                [(groups/Group
+                                   :first 2
+                                   :count 2
+                                   :alignment 16)]
+                                (results/pieces 37 2)
+                                allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut prototype) prototype
+                called
+                  (require (calls/emit! (mut graph)
+                                        prototype
+                                        b
+                                        target
+                                        [output seed a b]
+                                        allocator))
+                ret
+                  (require (b/emit! (mut graph) 120 5 [called seed (: 0 i32)]))]
+            (match (compile/text graph start [ret] allocator)
+              (Err [message]
+                   (println "{}" message)
+                   (set! failures (+ failures 1)))
+              (Ok [text]
+                  (let [(mut text) text]
+                    (match (jit/map-text (slice text))
+                      (Err [message]
+                           (println "{}" message)
+                           (set! failures (+ failures 1)))
+                      (Ok [loaded]
+                          (let [(mut loaded) loaded
+                                f
+                                  (p/cast (fnptr (cc/C) [u64 u64 u64 u64] u64)
+                                          (.base loaded))
+                                c
+                                  (p/cast u64
+                                          (p/cast (ptr u8)
+                                                  (: (fnptr-of callback)
+                                                     (fnptr (cc/C) [u64 H2] H2))))]
+                            (when (!= (call-ptr f
+                                                c
+                                                (p/cast u64 (data input-words))
+                                                (p/cast u64 (data result))
+                                                23)
+                                      23)
+                              (set! failures (+ failures 1)))
+                            (when (or (!= (get result 0)
+                                          (^ (get input-words 2) 23))
+                                      (!= (get result 1) (get input-words 3))
+                                      (!= (get result 2) (get input-words 0))
+                                      (!= (get result 3)
+                                          (^ (get input-words 1)
+                                             (* (: 23 u64) 17))))
+                              (set! failures (+ failures 1)))
+                            (jit/release! (mut loaded)))))
+                    (free! (mut text)))))
+            (calls/release! (mut prototype)))))
+    (g/release! (mut graph))
+    (println "native HVA arguments and full result bank: {} failures" failures)
+    (if (= failures 0) 0 1)))

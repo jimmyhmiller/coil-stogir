@@ -6,6 +6,9 @@
 (import "stogir.allocation" :as allocation)
 (import "stogir.locations" :as loc)
 (import "stogir.a64.transfers" :as transfers)
+(import "stogir.a64.typed-transfers" :as typed)
+(import "stogir.a64.value" :as value)
+(import "stogir.a64.registers" :as registers)
 (import "stogir.a64.frame-address" :as frame)
 (import "stogir.a64.frame-memory" :as memory)
 (import "stogir.a64.call-abi" :as abi)
@@ -29,50 +32,68 @@
 (defn capture-at! [(output (mut buffer/Buffer))
                    (graph g/Graph)
                    (parts (ArrayList allocation/Part))
-                   (value i32)
+                   (reference i32)
                    (position i64)
                    (reg i32)
-                   (base frame/Base)] (-> (Result i32 (slice u8)))
+                   (base frame/Base)]
+  (-> (Result i32 (slice u8)))
   (if (or (not (frame/valid-base? base))
+          (< reg 0)
+          (>= reg 64)
+          (= reg 31)
           (and (= (.reg base) 29) (= reg 29)))
-      (Err "invalid capture frame base or anchor destination")
-      (if (< value 0)
-          (match (g/lookup graph value)
-            (None [] (Err "missing call constant"))
-            (Some [constant]
-                  (if (>= reg 32)
-                      (let [wide
-                              (= (types/scalar-size (cast i32
-                                                          (n/type-id constant))
-                                                    8)
-                                 8)]
-                        (match (buffer/materialize! (mut output)
-                                                    graph
-                                                    value
-                                                    wide
-                                                    16)
+      (Err "invalid capture frame base or destination")
+      (match (g/lookup graph reference)
+        (None [] (Err "missing call value"))
+        (Some [node]
+              (let [ty (cast i32 (n/type-id node))
+                    size (types/size ty 8)
+                    extent (if (< size 4) 4 size)]
+                (if (or (<= size 0) (> size 16))
+                    (Err "unsupported call capture extent")
+                    (if (< reference 0)
+                        (if (types/vector? ty)
+                            (value/constant! (mut output)
+                                             graph
+                                             reference
+                                             reg
+                                             16)
+                            (if (>= reg 32)
+                                (match (buffer/materialize! (mut output)
+                                                            graph
+                                                            reference
+                                                            (= size 8)
+                                                            16)
+                                  (Err [message] (Err message))
+                                  (Ok [count]
+                                      (match (word! (mut output)
+                                                    (encode/scalar-transfer (= size
+                                                                               8)
+                                                                            true
+                                                                            (- reg
+                                                                               32)
+                                                                            16))
+                                        (Err [message] (Err message))
+                                        (Ok [more] (Ok (+ count more))))))
+                                (buffer/materialize! (mut output)
+                                                     graph
+                                                     reference
+                                                     true
+                                                     reg)))
+                        (match (loc/lookup parts reference position)
                           (Err [message] (Err message))
-                          (Ok [size]
-                              (match (word! (mut output)
-                                            (encode/scalar-transfer wide
-                                                                    true
-                                                                    (- reg 32)
-                                                                    16))
-                                (Err [message] (Err message))
-                                (Ok [more] (Ok (+ size more)))))))
-                      (buffer/materialize! (mut output) graph value true reg))))
-          (match (loc/lookup parts value position)
-            (Err [message] (Err message))
-            (Ok [source]
-                (transfers/emit-addressed! (mut (.text output))
-                                           source
-                                           (loc/Location
-                                             :kind 0
-                                             :value (cast i64 reg))
-                                           8
-                                           17
-                                           base
-                                           16))))))
+                          (Ok [source]
+                              (transfers/emit-addressed! (mut (.text output))
+                                                         source
+                                                         (loc/Location
+                                                           :kind 0
+                                                           :value (cast i64 reg))
+                                                         extent
+                                                         (if (= extent 16)
+                                                             63
+                                                             17)
+                                                         base
+                                                         16))))))))))
 
 ;;; All stack sources are captured before argument destinations overwrite any
 ;;; register. A float variadic argument is converted to double, not bit-extended.
@@ -120,17 +141,27 @@
                               parts
                               (.value arg)
                               position
-                              16
+                              (if (registers/simd-type? (cast i32 (.ty arg)))
+                                  62
+                                  16)
                               base)
             (Err [message] (Err message))
             (Ok [_]
-                (match (abi/normalize! (mut (.text output)) (.ty arg) 16)
+                (match (abi/normalize! (mut (.text output))
+                                       (.ty arg)
+                                       (if (registers/simd-type? (cast i32
+                                                                       (.ty arg)))
+                                           62
+                                           16))
                   (Err [message] (Err message))
                   (Ok [_]
                       (memory/access! (mut (.text output))
                                       false
                                       (.size arg)
-                                      16
+                                      (if (registers/simd-type? (cast i32
+                                                                      (.ty arg)))
+                                          62
+                                          16)
                                       31
                                       (.offset arg)
                                       false
@@ -148,7 +179,7 @@
     (Ok [plan]
         (let [(mut layout) plan
               (mut code) (buffer/create allocator)
-              (mut copies) (ArrayList::new [loc/Transfer] allocator)
+              (mut copies) (ArrayList::new [typed/Copy] allocator)
               node (get (.instructions graph) (cast i64 reference))
               direct?
                 (if (< (.op2 node) 0)
@@ -232,21 +263,24 @@
               (match (loc/lookup parts (.value arg) position)
                 (Err [message] (set! error message))
                 (Ok [source]
-                    (push! (mut copies)
-                           (loc/Transfer
-                             :position position
-                             :parent (.value arg)
-                             :source source
-                             :destination
-                               (loc/Location
-                                 :kind 0
-                                 :value (cast i64 (.register arg)))))))))
+                    (let [size (types/size (cast i32 (.ty arg)) 8)]
+                      (push! (mut copies)
+                             (typed/Copy
+                               :transfer
+                                 (loc/Transfer
+                                   :position position
+                                   :parent (.value arg)
+                                   :source source
+                                   :destination
+                                     (loc/Location
+                                       :kind 0
+                                       :value (cast i64 (.register arg))))
+                               :size (if (< size 4) 4 size))))))))
           (when (= error "")
-            (match (transfers/parallel-frame! (mut (.text code))
-                                              (slice copies)
-                                              8
-                                              allocator
-                                              base)
+            (match (typed/parallel-frame! (mut (.text code))
+                                          (slice copies)
+                                          allocator
+                                          base)
               (Err [message] (set! error message))
               (Ok [_] 0)))
           (for arg (.arguments layout)
