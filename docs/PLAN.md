@@ -1204,3 +1204,20 @@ remain open. Full regression passes all 197 standalone checks and 57 linked
 consumers with debug checks, exact coverage, regenerated objects and no linked
 warnings. All 358 implementation/test sources remain Coil; formatting/diff checks
 pass.
+
+
+### Vector rotate checkpoint
+
+ROL/ROR now reuse typed scalar/vector count forms and masking. General SIMD
+sequences preserve an aliased data source in v30 after capturing counts in v31;
+single 64-bit lanes use a shorter RORV sequence through reserved x16/x17. The body
+is bounded independently of lane count and does not introduce hidden helpers.
+
+Combined coverage: 4,900 matrix graphs, 100 pressure graphs, 176 forced-register
+JIT harnesses and 460 linked objects. Rotate-specific checks add 480 register
+cases/4,086 LLVM MC words. Remaining vector extrema/comparisons, lane/shuffle/
+conversion families and the wider standalone/compiler/backend/benchmark goal are
+still open. Full regression passes all 197 standalone checks and 57 linked
+consumers with debug checks, exact coverage, regenerated objects and no linked
+warnings. All 358 implementation/test sources remain Coil; formatting/diff checks
+pass.

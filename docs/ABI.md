@@ -755,8 +755,9 @@ compile-time comparisons remain unfinished.
 `builder/vector-binary!(graph, opcode, type, left, right, guard)` validates before
 appending. The left input must match the vector result type and both inputs must
 denote values, rather than VAR/ARGVAL storage. Non-shift binary operations require
-the same vector type on the right; SHL/SHR/SAR also accept an integer scalar count. Current families are integer ADD/SUB/MUL/DIV/MOD and AND/OR/XOR,
-and floating ADD/SUB/MUL/DIV, plus integer SHL/SHR/SAR. Integer ADD/SUB/MUL wrap independently at each lane's
+the same vector type on the right; SHL/SHR/SAR and ROL/ROR also accept an integer
+scalar count. Current families are integer ADD/SUB/MUL/DIV/MOD and AND/OR/XOR,
+and floating ADD/SUB/MUL/DIV, plus integer SHL/SHR/SAR and ROL/ROR. Integer ADD/SUB/MUL wrap independently at each lane's
 width; BOOL lanes support only the logical families. Address lanes use the target
 pointer width. Logical operations preserve every raw payload bit. FP operations
 use ordinary IEEE instructions without fast-math, contraction or scalar coercion.
@@ -770,7 +771,7 @@ correct Q bit and lane-size fields. A single 64-bit integer lane uses scalar SIM
 ADD/SUB; a single f64 lane uses scalar FP instructions. Wider arrangements use
 AdvSIMD forms. Other valid vector widths remain representable but reject during
 target allocation/emission. Unary operations and shifts are described below.
-Rotates, extrema, comparisons, lane extraction/replacement, shuffles and vector
+Extrema, comparisons, lane extraction/replacement, shuffles and vector
 conversions remain unfinished. Unsupported vector uses still reject, including dead invalid uses.
 
 Operand constants load complete aligned private image payloads into reserved
@@ -955,7 +956,7 @@ volatile locals, fixed guards and dynamic allocations in 16/4096-byte frames.
 cases through 276 separately linked objects. The existing binary and unary
 matrices continue to pass after extending typed operand capture.
 
-Remaining vector families include rotates, extrema/comparisons, lane extraction/
+Remaining vector families include extrema/comparisons, lane extraction/
 replacement, shuffles and conversions. Full standalone semantics/verification/
 optimization/scaling, further ABI/target/object work, actual Coil compiler
 integration and LLVM/TPDE compile-time/runtime comparisons remain open.
@@ -965,3 +966,54 @@ consumers with debug checks, exact source/pass-set equality, regenerated objects
 and no linked warnings. All 358 implementation/test source files remain Coil.
 Formatting and diff checks pass; these correctness checks do not establish
 compilation speed, runtime performance or completion of the full backend goal.
+
+
+## Vector rotations
+
+ROL (52) and ROR (53) share the shift family's checked scalar/vector count forms
+and `element_bits - 1` mask. They wrap bits within each integer element, including
+negative signed representations and counts at or beyond the width. BOOL data
+and floating operands remain unsupported for these operations. No guard operand
+is accepted. Zero counts return the original element without a special runtime
+branch or an out-of-range shift in the oracle.
+
+The general D/Q sequence forms two complementary logical shifts and ORs their
+results. The second count is derived modulo element width, so zero remains zero.
+Counts are first captured in private v31. If result and data share a register,
+the emitter then saves the complete original data in v30 before the first partial
+result overwrites it. The order matters when a private count was in v30. Rotates
+therefore exclude v30/v31 as low-level result registers; ordinary allocated
+results already satisfy this rule. Original allocated data/count operands remain
+unchanged whenever they are distinct from the result.
+
+A single 64-bit lane uses UMOV/RORV/INS through reserved x16/x17 instead of the
+longer SIMD sequence. Scalar counts are copied before extracting data, including
+when a low-level caller placed the count in x16; a count already in x17 needs no
+copy. ROL negates the count before RORV. These single-lane register sequences use
+three through five instructions. Other arrangements use eight through eleven,
+including optional scalar broadcast and alias preservation, without per-lane
+emission loops or hidden helpers. Operand materialization is counted separately.
+All paths stage bytes before appending and leave x30 untouched.
+
+The combined native shift/rotate matrix now checks 4,900 graphs, 100 pressure
+graphs and 176 forced-alias leaf harnesses. The harnesses choose physical
+registers directly, rather than relying on allocator reuse, and check result/data
+aliases, result/count aliases, identical inputs, all roles identical, private
+v30/v31 operands and scalar counts in scratch x16/x17. Independent u128 rotate
+oracles compare every output lane and unchanged input memory. The two-input
+matrix also verifies original operand bytes and buffer padding.
+
+`tests/vector-shifts.coil` adds 480 rotate register cases containing 4,086 LLVM MC
+words to the prior 540 shift cases/2,160 words. It checks reserved-role failures
+without partial mutation. `tests/aot-vector-shifts-link.coil` repeats the combined
+matrix's representative forms and every pressure case through 460 separate
+Mach-O objects. Forced-register leaf harnesses execute through JIT. Remaining
+vector extrema/comparisons, lane/shuffle/conversion families, wider standalone
+semantics/ABI/optimization/scaling, compiler integration and LLVM/TPDE performance
+comparisons remain open.
+
+The rotate checkpoint passes all 197 standalone tests and all 57 linked
+consumers with debug checks, exact source/pass-set equality, regenerated objects
+and no linked warnings. All 358 implementation/test source files remain Coil.
+Formatting and diff checks pass. Correctness and bounded instruction counts do
+not establish runtime/compile-time benchmark results or full backend completion.

@@ -56,7 +56,8 @@ cover one through four members, bank exhaustion, stack/literal arguments and
 Darwin variadic packing against LLVM C calls. Vector integer ADD/SUB/MUL/DIV/MOD and AND/OR/XOR, plus floating
 ADD/SUB/MUL/DIV, now have
 native and linked coverage. Vector NEG/ABS/NOT, byte swap, lane bit counts and SHL/SHR/SAR with vector or
-scalar counts also have native and linked coverage. Remaining vector operations
+scalar counts, plus ROL/ROR with protected source aliases, have native and linked
+coverage. Remaining vector operations
 and broader ABI coverage are unfinished.
 
 Native copy, overlap-safe move and zero builders expand into existing memory
