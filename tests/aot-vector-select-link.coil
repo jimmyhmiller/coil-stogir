@@ -1,0 +1,1525 @@
+(module stogir.tests.aot-vector-select-link)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "stogir.types" :as types)
+
+(defn pattern [(base i32) (lane i64) (seed i64) (right? bool)] (-> u64)
+  (let [i (% (+ lane seed (if right? (: 3 i64) 0)) 11)
+        fp? (types/floating? base)
+        wide? (= base 12)]
+    (if fp?
+        (if wide?
+            (match i
+              (0 (: 0 u64))
+              (1 0x8000000000000000)
+              (2 0x3FF0000000000000)
+              (3 0xBFF0000000000000)
+              (4 1)
+              (5 0x000FFFFFFFFFFFFF)
+              (6 0x7FEFFFFFFFFFFFFF)
+              (7 0x7FF0000000000000)
+              (8 0xFFF0000000000000)
+              (9 0x7FF8123456789ABC)
+              (_ 0x7FF0123456789ABC))
+            (match i
+              (0 (: 0 u64))
+              (1 0x80000000)
+              (2 0x3F800000)
+              (3 0xBF800000)
+              (4 1)
+              (5 0x007FFFFF)
+              (6 0x7F7FFFFF)
+              (7 0x7F800000)
+              (8 0xFF800000)
+              (9 0x7FC12345)
+              (_ 0x7F812345)))
+        (match i
+          (0 (: 0 u64))
+          (1 1)
+          (2 0xFFFFFFFFFFFFFFFF)
+          (3 (<< (: 1 u64) (cast u64 (- (* 8 (types/scalar-size base 8)) 1))))
+          (4 (- (<< (: 1 u64) (cast u64 (- (* 8 (types/scalar-size base 8)) 1)))
+                1))
+          (5 0x8080808080808080)
+          (6 0x7F7F7F7F7F7F7F7F)
+          (7 0xFFFF0000FFFF0000)
+          (8 0x123456789ABCDEF0)
+          (9 0xFFFFFFFFFFFFFFFE)
+          (_ 0x0102030405060708)))))
+
+(defn input-byte [(base i32) (index i64) (seed i64) (right? bool)] (-> u8)
+  (let [width (cast i64 (types/scalar-size base 8))]
+    (cast u8
+          (>> (pattern base (/ index width) seed right?)
+              (cast u64 (* (% index width) 8))))))
+
+(defn arm-literal? [(mode i32) (right? bool)] (-> bool)
+  (or (= mode 3) (= mode 6) (= mode 7) (= mode (if right? 2 1))))
+
+(defn arm-byte [(base i32) (i i64) (seed i64) (mode i32) (right? bool)] (-> u8)
+  (let [right? (and right? (!= mode 4) (!= mode 9))
+        chosen-seed (if (arm-literal? mode right?) (if right? (: 7 i64) 9) seed)]
+    (input-byte base i chosen-seed right?)))
+
+(defn condition-bits [(ty i32) (seed i64) (mode i32)] (-> u64)
+  (if (= mode 6)
+      (if (= ty 12) (: 0x8000000000000000 u64) (if (= ty 13) 0x80000000 0))
+      (if (= mode 7)
+          (if (= ty 12) (: 0x7FF0123456789ABC u64) (if (= ty 13) 0x7F812345 1))
+          (& (pattern ty 0 seed false)
+             (cast u64
+                   (- (<< (: 1 u128) (cast u128 (* 8 (types/scalar-size ty 8))))
+                      1))))))
+
+(defn truth? [(ty i32) (bits u64)] (-> bool)
+  (!= (if (= ty 12)
+          (& bits 0x7FFFFFFFFFFFFFFF)
+          (if (= ty 13) (& bits 0x7FFFFFFF) bits))
+      0))
+
+(defn exercise [(ty i32) (cty i32) (mode i32) (address (ptr u8))] (-> i64)
+  (let [alc (malloc-allocator)
+        width (types/size ty 8)
+        base (types/base-type ty)
+        f (p/cast (fnptr (cc/C) [u64 u64 u64 u64] void) address)
+        (mut yes) (ArrayList::new [u8] alc)
+        (mut no) (ArrayList::new [u8] alc)
+        (mut condition) (ArrayList::new [u8] alc)
+        (mut output) (ArrayList::new [u8] alc)
+        (mut failures) 0
+        (mut seed) (: 0 i64)]
+    (while (< seed 11)
+      (let [(mut test) (: 0 i64)]
+        (while (< test 11)
+          (clear! (mut yes))
+          (clear! (mut no))
+          (clear! (mut condition))
+          (clear! (mut output))
+          (let [bits (condition-bits cty test mode)
+                selected? (truth? cty bits)
+                (mut i) (: 0 i64)]
+            (while (< i 32)
+              (push! (mut yes) (input-byte base i seed false))
+              (push! (mut no) (input-byte base i seed true))
+              (set! i (+ i 1)))
+            (set! i 0)
+            (while (< i 16)
+              (push! (mut condition)
+                     (cast u8 (>> bits (cast u64 (* (% i 8) 8)))))
+              (set! i (+ i 1)))
+            (set! i 0)
+            (while (< i 128) (push! (mut output) 165) (set! i (+ i 1)))
+            (call-ptr f
+                      (p/cast u64 (.data output))
+                      (p/cast u64 (.data yes))
+                      (p/cast u64 (.data no))
+                      (p/cast u64 (.data condition)))
+            (set! i 0)
+            (while (< i 128)
+              (let [wanted
+                      (cond (< i (cast i64 width))
+                              (arm-byte base i seed mode (not selected?))
+                            (and (!= mode 5)
+                                 (!= mode 8)
+                                 (!= mode 9)
+                                 (>= i 32)
+                                 (< i (+ 32 (cast i64 width))))
+                              (arm-byte base (- i 32) seed mode false)
+                            (and (!= mode 5)
+                                 (!= mode 8)
+                                 (!= mode 9)
+                                 (>= i 64)
+                                 (< i (+ 64 (cast i64 width))))
+                              (arm-byte base (- i 64) seed mode true)
+                            (and (!= mode 5)
+                                 (!= mode 8)
+                                 (!= mode 9)
+                                 (>= i 96)
+                                 (< i
+                                    (+ 96 (cast i64 (types/scalar-size cty 8)))))
+                              (cast u8 (>> bits (cast u64 (* (- i 96) 8))))
+                            :else (: 165 u8))]
+                (when (!= (get output i) wanted)
+                  (when (< failures 6)
+                    (println "select ty{} cty{} mode{} seed{} test{} byte{} got{} expected{}"
+                             ty
+                             cty
+                             mode
+                             seed
+                             test
+                             i
+                             (get output i)
+                             wanted))
+                  (set! failures (+ failures 1))))
+              (set! i (+ i 1)))
+            (set! i 0)
+            (while (< i 32)
+              (when (or (!= (get yes i) (input-byte base i seed false))
+                        (!= (get no i) (input-byte base i seed true)))
+                (set! failures (+ failures 1)))
+              (set! i (+ i 1)))
+            (set! i 0)
+            (while (< i 16)
+              (when (!= (get condition i)
+                        (cast u8 (>> bits (cast u64 (* (% i 8) 8)))))
+                (set! failures (+ failures 1)))
+              (set! i (+ i 1))))
+          (set! test (+ test 1))))
+      (set! seed (+ seed 1)))
+    (free! (mut yes))
+    (free! (mut no))
+    (free! (mut condition))
+    (free! (mut output))
+    failures))
+
+(defn probe :cc (cc/C) [(input (ptr u8))] (-> u64)
+  (p/machine-code (Aarch64)
+                  0xf1
+                  0x03
+                  0x00
+                  0xaa
+                  0x20
+                  0x02
+                  0xc0
+                  0x3d
+                  0x21
+                  0x02
+                  0xc0
+                  0x3d
+                  0x22
+                  0x02
+                  0xc0
+                  0x3d
+                  0x23
+                  0x02
+                  0xc0
+                  0x3d
+                  0x24
+                  0x02
+                  0xc0
+                  0x3d
+                  0x25
+                  0x02
+                  0xc0
+                  0x3d
+                  0x26
+                  0x02
+                  0xc0
+                  0x3d
+                  0x27
+                  0x02
+                  0xc0
+                  0x3d
+                  0x30
+                  0x02
+                  0xc0
+                  0x3d
+                  0x31
+                  0x02
+                  0xc0
+                  0x3d
+                  0x32
+                  0x02
+                  0xc0
+                  0x3d
+                  0x33
+                  0x02
+                  0xc0
+                  0x3d
+                  0x34
+                  0x02
+                  0xc0
+                  0x3d
+                  0x35
+                  0x02
+                  0xc0
+                  0x3d
+                  0x36
+                  0x02
+                  0xc0
+                  0x3d
+                  0x37
+                  0x02
+                  0xc0
+                  0x3d
+                  0x38
+                  0x02
+                  0xc0
+                  0x3d
+                  0x39
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3a
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3b
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3c
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3d
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3e
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3f
+                  0x02
+                  0xc0
+                  0x3d
+                  0xa0
+                  0x15
+                  0x80
+                  0xd2
+                  0xc1
+                  0x15
+                  0x80
+                  0xd2
+                  0xe2
+                  0x15
+                  0x80
+                  0xd2
+                  0x03
+                  0x16
+                  0x80
+                  0xd2
+                  0x24
+                  0x16
+                  0x80
+                  0xd2
+                  0x45
+                  0x16
+                  0x80
+                  0xd2
+                  0x66
+                  0x16
+                  0x80
+                  0xd2
+                  0x87
+                  0x16
+                  0x80
+                  0xd2
+                  0xa8
+                  0x16
+                  0x80
+                  0xd2
+                  0xc9
+                  0x16
+                  0x80
+                  0xd2
+                  0xea
+                  0x16
+                  0x80
+                  0xd2
+                  0x0b
+                  0x17
+                  0x80
+                  0xd2
+                  0x2c
+                  0x17
+                  0x80
+                  0xd2
+                  0x4d
+                  0x17
+                  0x80
+                  0xd2
+                  0x6e
+                  0x17
+                  0x80
+                  0xd2
+                  0x8f
+                  0x17
+                  0x80
+                  0xd2
+                  0xc0
+                  0x03
+                  0x5f
+                  0xd6))
+
+(defn read-word [(buffer (slice u8)) (offset i64) (width i32)] (-> u64)
+  (let [(mut result) (: 0 u64)
+        (mut i) (: 0 i32)]
+    (while (< i width)
+      (set! result
+            (| result
+               (<< (cast u64 (get buffer (+ offset (cast i64 i))))
+                   (cast u64 (* i 8)))))
+      (set! i (+ i 1)))
+    result))
+
+(defn pressure-exercise [(ty i32) (cty i32) (address (ptr u8))] (-> i64)
+  (let [alc (malloc-allocator)
+        width (types/size ty 8)
+        base (types/base-type ty)
+        f (p/cast (fnptr (cc/C) [u64 u64 u64] u64) address)
+        target
+          (p/cast u64
+                  (p/cast (ptr u8)
+                          (: (fnptr-of probe) (fnptr (cc/C) [(ptr u8)] u64))))
+        (mut input) (ArrayList::new [u8] alc)
+        (mut snapshot) (ArrayList::new [u8] alc)
+        (mut output) (ArrayList::new [u8] alc)
+        (mut failures) 0
+        (mut seed) (: 0 i64)]
+    (while (< seed 11)
+      (clear! (mut input))
+      (clear! (mut snapshot))
+      (clear! (mut output))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 4096) (push! (mut input) 165) (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 2304) (push! (mut output) 165) (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i (* 40 (cast i64 width)))
+          (set! (mut input) i (input-byte base i seed false))
+          (set! (mut input) (+ 640 i) (input-byte base i seed true))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 40)
+          (let [bits (condition-bits cty (+ i seed) 0)
+                (mut byte) (: 0 i64)]
+            (while (< byte 8)
+              (set! (mut input)
+                    (+ 1536 (* i 8) byte)
+                    (cast u8 (>> bits (cast u64 (* byte 8)))))
+              (set! byte (+ byte 1))))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 4096) (push! (mut snapshot) (get input i)) (set! i (+ i 1)))
+        (when (!= (call-ptr f
+                            (p/cast u64 (.data output))
+                            (p/cast u64 (.data input))
+                            target)
+                  811)
+          (println "select pressure guard ty{} cty{}" ty cty)
+          (set! failures (+ failures 1)))
+        (set! i 0)
+        (while (< i 2304)
+          (let [slot (/ i 16)
+                byte (% i 16)
+                yes-slot (/ (- i 640) 16)
+                yes-byte (% (- i 640) 16)
+                no-slot (/ (- i 1280) 16)
+                no-byte (% (- i 1280) 16)
+                condition-slot (/ (- i 1920) 8)
+                condition-byte (% (- i 1920) 8)
+                selected? (truth? cty (condition-bits cty (+ slot seed) 0))
+                wanted
+                  (cond (and (< i 640) (< byte (cast i64 width)))
+                          (get snapshot
+                               (+ (if selected? (: 0 i64) 640)
+                                  (* slot (cast i64 width))
+                                  byte))
+                        (and (>= i 640)
+                             (< i 1280)
+                             (< yes-byte (cast i64 width)))
+                          (get snapshot
+                               (+ (* yes-slot (cast i64 width)) yes-byte))
+                        (and (>= i 1280)
+                             (< i 1920)
+                             (< no-byte (cast i64 width)))
+                          (get snapshot
+                               (+ 640 (* no-slot (cast i64 width)) no-byte))
+                        (and (>= i 1920)
+                             (< i 2240)
+                             (< condition-byte
+                                (cast i64 (types/scalar-size cty 8))))
+                          (cast u8
+                                (>> (condition-bits cty
+                                                    (+ condition-slot seed)
+                                                    0)
+                                    (cast u64 (* condition-byte 8))))
+                        :else (: 165 u8))]
+            (when (!= (get output i) wanted)
+              (when (< failures 6)
+                (println "select pressure ty{} cty{} seed{} byte{} got{} expected{}"
+                         ty
+                         cty
+                         seed
+                         i
+                         (get output i)
+                         wanted))
+              (set! failures (+ failures 1))))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 4096)
+          (when (!= (get input i) (get snapshot i))
+            (set! failures (+ failures 1)))
+          (set! i (+ i 1))))
+      (set! seed (+ seed 1)))
+    (free! (mut input))
+    (free! (mut snapshot))
+    (free! (mut output))
+    failures))
+
+(import "coil.os" :as os)
+
+(defn linked [(ty i32) (cty i32) (mode i32) (name (ptr i8))] (-> i64)
+  (let [address (os/dlsym (p/cast (ptr i8) (: -2 i64)) name)]
+    (if (= (p/cast u64 address) 0)
+        (do (println "missing linked vector select symbol") 1)
+        (exercise ty cty mode (p/cast (ptr u8) address)))))
+
+(defn linked-pressure [(ty i32) (cty i32) (name (ptr i8))] (-> i64)
+  (let [address (os/dlsym (p/cast (ptr i8) (: -2 i64)) name)]
+    (if (= (p/cast u64 address) 0)
+        (do (println "missing select pressure symbol") 1)
+        (pressure-exercise ty cty (p/cast (ptr u8) address)))))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (set! failures (+ failures (linked 65 1 0 c"stogir_vector_select_0")))
+    (set! failures (+ failures (linked 65 1 3 c"stogir_vector_select_1")))
+    (set! failures (+ failures (linked 65 1 5 c"stogir_vector_select_2")))
+    (set! failures (+ failures (linked 65 1 6 c"stogir_vector_select_3")))
+    (set! failures (+ failures (linked 65 1 7 c"stogir_vector_select_4")))
+    (set! failures (+ failures (linked 65 2 0 c"stogir_vector_select_5")))
+    (set! failures (+ failures (linked 65 3 0 c"stogir_vector_select_6")))
+    (set! failures (+ failures (linked 65 4 0 c"stogir_vector_select_7")))
+    (set! failures (+ failures (linked 65 5 0 c"stogir_vector_select_8")))
+    (set! failures (+ failures (linked 65 5 1 c"stogir_vector_select_9")))
+    (set! failures (+ failures (linked 65 5 2 c"stogir_vector_select_10")))
+    (set! failures (+ failures (linked 65 5 3 c"stogir_vector_select_11")))
+    (set! failures (+ failures (linked 65 5 4 c"stogir_vector_select_12")))
+    (set! failures (+ failures (linked 65 5 5 c"stogir_vector_select_13")))
+    (set! failures (+ failures (linked 65 5 6 c"stogir_vector_select_14")))
+    (set! failures (+ failures (linked 65 5 7 c"stogir_vector_select_15")))
+    (set! failures (+ failures (linked 65 6 0 c"stogir_vector_select_16")))
+    (set! failures (+ failures (linked 65 7 0 c"stogir_vector_select_17")))
+    (set! failures (+ failures (linked 65 8 0 c"stogir_vector_select_18")))
+    (set! failures (+ failures (linked 65 9 0 c"stogir_vector_select_19")))
+    (set! failures (+ failures (linked 65 10 0 c"stogir_vector_select_20")))
+    (set! failures (+ failures (linked 65 11 0 c"stogir_vector_select_21")))
+    (set! failures (+ failures (linked 65 12 0 c"stogir_vector_select_22")))
+    (set! failures (+ failures (linked 65 12 1 c"stogir_vector_select_23")))
+    (set! failures (+ failures (linked 65 12 2 c"stogir_vector_select_24")))
+    (set! failures (+ failures (linked 65 12 3 c"stogir_vector_select_25")))
+    (set! failures (+ failures (linked 65 12 5 c"stogir_vector_select_26")))
+    (set! failures (+ failures (linked 65 12 6 c"stogir_vector_select_27")))
+    (set! failures (+ failures (linked 65 12 7 c"stogir_vector_select_28")))
+    (set! failures (+ failures (linked 65 13 0 c"stogir_vector_select_29")))
+    (set! failures (+ failures (linked 65 13 3 c"stogir_vector_select_30")))
+    (set! failures (+ failures (linked 65 13 5 c"stogir_vector_select_31")))
+    (set! failures (+ failures (linked 65 13 6 c"stogir_vector_select_32")))
+    (set! failures (+ failures (linked 65 13 7 c"stogir_vector_select_33")))
+    (set! failures (+ failures (linked 81 1 0 c"stogir_vector_select_34")))
+    (set! failures (+ failures (linked 81 1 3 c"stogir_vector_select_35")))
+    (set! failures (+ failures (linked 81 1 5 c"stogir_vector_select_36")))
+    (set! failures (+ failures (linked 81 1 6 c"stogir_vector_select_37")))
+    (set! failures (+ failures (linked 81 1 7 c"stogir_vector_select_38")))
+    (set! failures (+ failures (linked 81 2 0 c"stogir_vector_select_39")))
+    (set! failures (+ failures (linked 81 3 0 c"stogir_vector_select_40")))
+    (set! failures (+ failures (linked 81 4 0 c"stogir_vector_select_41")))
+    (set! failures (+ failures (linked 81 5 0 c"stogir_vector_select_42")))
+    (set! failures (+ failures (linked 81 5 1 c"stogir_vector_select_43")))
+    (set! failures (+ failures (linked 81 5 2 c"stogir_vector_select_44")))
+    (set! failures (+ failures (linked 81 5 3 c"stogir_vector_select_45")))
+    (set! failures (+ failures (linked 81 5 4 c"stogir_vector_select_46")))
+    (set! failures (+ failures (linked 81 5 5 c"stogir_vector_select_47")))
+    (set! failures (+ failures (linked 81 5 6 c"stogir_vector_select_48")))
+    (set! failures (+ failures (linked 81 5 7 c"stogir_vector_select_49")))
+    (set! failures (+ failures (linked 81 6 0 c"stogir_vector_select_50")))
+    (set! failures (+ failures (linked 81 7 0 c"stogir_vector_select_51")))
+    (set! failures (+ failures (linked 81 8 0 c"stogir_vector_select_52")))
+    (set! failures (+ failures (linked 81 9 0 c"stogir_vector_select_53")))
+    (set! failures (+ failures (linked 81 10 0 c"stogir_vector_select_54")))
+    (set! failures (+ failures (linked 81 11 0 c"stogir_vector_select_55")))
+    (set! failures (+ failures (linked 81 12 0 c"stogir_vector_select_56")))
+    (set! failures (+ failures (linked 81 12 1 c"stogir_vector_select_57")))
+    (set! failures (+ failures (linked 81 12 2 c"stogir_vector_select_58")))
+    (set! failures (+ failures (linked 81 12 3 c"stogir_vector_select_59")))
+    (set! failures (+ failures (linked 81 12 5 c"stogir_vector_select_60")))
+    (set! failures (+ failures (linked 81 12 6 c"stogir_vector_select_61")))
+    (set! failures (+ failures (linked 81 12 7 c"stogir_vector_select_62")))
+    (set! failures (+ failures (linked 81 13 0 c"stogir_vector_select_63")))
+    (set! failures (+ failures (linked 81 13 3 c"stogir_vector_select_64")))
+    (set! failures (+ failures (linked 81 13 5 c"stogir_vector_select_65")))
+    (set! failures (+ failures (linked 81 13 6 c"stogir_vector_select_66")))
+    (set! failures (+ failures (linked 81 13 7 c"stogir_vector_select_67")))
+    (set! failures (+ failures (linked 66 1 0 c"stogir_vector_select_68")))
+    (set! failures (+ failures (linked 66 1 3 c"stogir_vector_select_69")))
+    (set! failures (+ failures (linked 66 1 5 c"stogir_vector_select_70")))
+    (set! failures (+ failures (linked 66 1 6 c"stogir_vector_select_71")))
+    (set! failures (+ failures (linked 66 1 7 c"stogir_vector_select_72")))
+    (set! failures (+ failures (linked 66 2 0 c"stogir_vector_select_73")))
+    (set! failures (+ failures (linked 66 3 0 c"stogir_vector_select_74")))
+    (set! failures (+ failures (linked 66 4 0 c"stogir_vector_select_75")))
+    (set! failures (+ failures (linked 66 5 0 c"stogir_vector_select_76")))
+    (set! failures (+ failures (linked 66 5 1 c"stogir_vector_select_77")))
+    (set! failures (+ failures (linked 66 5 2 c"stogir_vector_select_78")))
+    (set! failures (+ failures (linked 66 5 3 c"stogir_vector_select_79")))
+    (set! failures (+ failures (linked 66 5 4 c"stogir_vector_select_80")))
+    (set! failures (+ failures (linked 66 5 5 c"stogir_vector_select_81")))
+    (set! failures (+ failures (linked 66 5 6 c"stogir_vector_select_82")))
+    (set! failures (+ failures (linked 66 5 7 c"stogir_vector_select_83")))
+    (set! failures (+ failures (linked 66 6 0 c"stogir_vector_select_84")))
+    (set! failures (+ failures (linked 66 7 0 c"stogir_vector_select_85")))
+    (set! failures (+ failures (linked 66 8 0 c"stogir_vector_select_86")))
+    (set! failures (+ failures (linked 66 9 0 c"stogir_vector_select_87")))
+    (set! failures (+ failures (linked 66 10 0 c"stogir_vector_select_88")))
+    (set! failures (+ failures (linked 66 11 0 c"stogir_vector_select_89")))
+    (set! failures (+ failures (linked 66 12 0 c"stogir_vector_select_90")))
+    (set! failures (+ failures (linked 66 12 1 c"stogir_vector_select_91")))
+    (set! failures (+ failures (linked 66 12 2 c"stogir_vector_select_92")))
+    (set! failures (+ failures (linked 66 12 3 c"stogir_vector_select_93")))
+    (set! failures (+ failures (linked 66 12 5 c"stogir_vector_select_94")))
+    (set! failures (+ failures (linked 66 12 6 c"stogir_vector_select_95")))
+    (set! failures (+ failures (linked 66 12 7 c"stogir_vector_select_96")))
+    (set! failures (+ failures (linked 66 13 0 c"stogir_vector_select_97")))
+    (set! failures (+ failures (linked 66 13 3 c"stogir_vector_select_98")))
+    (set! failures (+ failures (linked 66 13 5 c"stogir_vector_select_99")))
+    (set! failures (+ failures (linked 66 13 6 c"stogir_vector_select_100")))
+    (set! failures (+ failures (linked 66 13 7 c"stogir_vector_select_101")))
+    (set! failures (+ failures (linked 82 1 0 c"stogir_vector_select_102")))
+    (set! failures (+ failures (linked 82 1 3 c"stogir_vector_select_103")))
+    (set! failures (+ failures (linked 82 1 5 c"stogir_vector_select_104")))
+    (set! failures (+ failures (linked 82 1 6 c"stogir_vector_select_105")))
+    (set! failures (+ failures (linked 82 1 7 c"stogir_vector_select_106")))
+    (set! failures (+ failures (linked 82 2 0 c"stogir_vector_select_107")))
+    (set! failures (+ failures (linked 82 3 0 c"stogir_vector_select_108")))
+    (set! failures (+ failures (linked 82 4 0 c"stogir_vector_select_109")))
+    (set! failures (+ failures (linked 82 5 0 c"stogir_vector_select_110")))
+    (set! failures (+ failures (linked 82 5 1 c"stogir_vector_select_111")))
+    (set! failures (+ failures (linked 82 5 2 c"stogir_vector_select_112")))
+    (set! failures (+ failures (linked 82 5 3 c"stogir_vector_select_113")))
+    (set! failures (+ failures (linked 82 5 4 c"stogir_vector_select_114")))
+    (set! failures (+ failures (linked 82 5 5 c"stogir_vector_select_115")))
+    (set! failures (+ failures (linked 82 5 6 c"stogir_vector_select_116")))
+    (set! failures (+ failures (linked 82 5 7 c"stogir_vector_select_117")))
+    (set! failures (+ failures (linked 82 6 0 c"stogir_vector_select_118")))
+    (set! failures (+ failures (linked 82 7 0 c"stogir_vector_select_119")))
+    (set! failures (+ failures (linked 82 8 0 c"stogir_vector_select_120")))
+    (set! failures (+ failures (linked 82 9 0 c"stogir_vector_select_121")))
+    (set! failures (+ failures (linked 82 10 0 c"stogir_vector_select_122")))
+    (set! failures (+ failures (linked 82 11 0 c"stogir_vector_select_123")))
+    (set! failures (+ failures (linked 82 12 0 c"stogir_vector_select_124")))
+    (set! failures (+ failures (linked 82 12 1 c"stogir_vector_select_125")))
+    (set! failures (+ failures (linked 82 12 2 c"stogir_vector_select_126")))
+    (set! failures (+ failures (linked 82 12 3 c"stogir_vector_select_127")))
+    (set! failures (+ failures (linked 82 12 5 c"stogir_vector_select_128")))
+    (set! failures (+ failures (linked 82 12 6 c"stogir_vector_select_129")))
+    (set! failures (+ failures (linked 82 12 7 c"stogir_vector_select_130")))
+    (set! failures (+ failures (linked 82 13 0 c"stogir_vector_select_131")))
+    (set! failures (+ failures (linked 82 13 3 c"stogir_vector_select_132")))
+    (set! failures (+ failures (linked 82 13 5 c"stogir_vector_select_133")))
+    (set! failures (+ failures (linked 82 13 6 c"stogir_vector_select_134")))
+    (set! failures (+ failures (linked 82 13 7 c"stogir_vector_select_135")))
+    (set! failures (+ failures (linked 51 1 0 c"stogir_vector_select_136")))
+    (set! failures (+ failures (linked 51 1 3 c"stogir_vector_select_137")))
+    (set! failures (+ failures (linked 51 1 5 c"stogir_vector_select_138")))
+    (set! failures (+ failures (linked 51 1 6 c"stogir_vector_select_139")))
+    (set! failures (+ failures (linked 51 1 7 c"stogir_vector_select_140")))
+    (set! failures (+ failures (linked 51 2 0 c"stogir_vector_select_141")))
+    (set! failures (+ failures (linked 51 3 0 c"stogir_vector_select_142")))
+    (set! failures (+ failures (linked 51 4 0 c"stogir_vector_select_143")))
+    (set! failures (+ failures (linked 51 5 0 c"stogir_vector_select_144")))
+    (set! failures (+ failures (linked 51 5 1 c"stogir_vector_select_145")))
+    (set! failures (+ failures (linked 51 5 2 c"stogir_vector_select_146")))
+    (set! failures (+ failures (linked 51 5 3 c"stogir_vector_select_147")))
+    (set! failures (+ failures (linked 51 5 4 c"stogir_vector_select_148")))
+    (set! failures (+ failures (linked 51 5 5 c"stogir_vector_select_149")))
+    (set! failures (+ failures (linked 51 5 6 c"stogir_vector_select_150")))
+    (set! failures (+ failures (linked 51 5 7 c"stogir_vector_select_151")))
+    (set! failures (+ failures (linked 51 6 0 c"stogir_vector_select_152")))
+    (set! failures (+ failures (linked 51 7 0 c"stogir_vector_select_153")))
+    (set! failures (+ failures (linked 51 8 0 c"stogir_vector_select_154")))
+    (set! failures (+ failures (linked 51 9 0 c"stogir_vector_select_155")))
+    (set! failures (+ failures (linked 51 10 0 c"stogir_vector_select_156")))
+    (set! failures (+ failures (linked 51 11 0 c"stogir_vector_select_157")))
+    (set! failures (+ failures (linked 51 12 0 c"stogir_vector_select_158")))
+    (set! failures (+ failures (linked 51 12 1 c"stogir_vector_select_159")))
+    (set! failures (+ failures (linked 51 12 2 c"stogir_vector_select_160")))
+    (set! failures (+ failures (linked 51 12 3 c"stogir_vector_select_161")))
+    (set! failures (+ failures (linked 51 12 5 c"stogir_vector_select_162")))
+    (set! failures (+ failures (linked 51 12 6 c"stogir_vector_select_163")))
+    (set! failures (+ failures (linked 51 12 7 c"stogir_vector_select_164")))
+    (set! failures (+ failures (linked 51 13 0 c"stogir_vector_select_165")))
+    (set! failures (+ failures (linked 51 13 3 c"stogir_vector_select_166")))
+    (set! failures (+ failures (linked 51 13 5 c"stogir_vector_select_167")))
+    (set! failures (+ failures (linked 51 13 6 c"stogir_vector_select_168")))
+    (set! failures (+ failures (linked 51 13 7 c"stogir_vector_select_169")))
+    (set! failures (+ failures (linked 67 1 0 c"stogir_vector_select_170")))
+    (set! failures (+ failures (linked 67 1 3 c"stogir_vector_select_171")))
+    (set! failures (+ failures (linked 67 1 5 c"stogir_vector_select_172")))
+    (set! failures (+ failures (linked 67 1 6 c"stogir_vector_select_173")))
+    (set! failures (+ failures (linked 67 1 7 c"stogir_vector_select_174")))
+    (set! failures (+ failures (linked 67 2 0 c"stogir_vector_select_175")))
+    (set! failures (+ failures (linked 67 3 0 c"stogir_vector_select_176")))
+    (set! failures (+ failures (linked 67 4 0 c"stogir_vector_select_177")))
+    (set! failures (+ failures (linked 67 5 0 c"stogir_vector_select_178")))
+    (set! failures (+ failures (linked 67 5 1 c"stogir_vector_select_179")))
+    (set! failures (+ failures (linked 67 5 2 c"stogir_vector_select_180")))
+    (set! failures (+ failures (linked 67 5 3 c"stogir_vector_select_181")))
+    (set! failures (+ failures (linked 67 5 4 c"stogir_vector_select_182")))
+    (set! failures (+ failures (linked 67 5 5 c"stogir_vector_select_183")))
+    (set! failures (+ failures (linked 67 5 6 c"stogir_vector_select_184")))
+    (set! failures (+ failures (linked 67 5 7 c"stogir_vector_select_185")))
+    (set! failures (+ failures (linked 67 6 0 c"stogir_vector_select_186")))
+    (set! failures (+ failures (linked 67 7 0 c"stogir_vector_select_187")))
+    (set! failures (+ failures (linked 67 8 0 c"stogir_vector_select_188")))
+    (set! failures (+ failures (linked 67 9 0 c"stogir_vector_select_189")))
+    (set! failures (+ failures (linked 67 10 0 c"stogir_vector_select_190")))
+    (set! failures (+ failures (linked 67 11 0 c"stogir_vector_select_191")))
+    (set! failures (+ failures (linked 67 12 0 c"stogir_vector_select_192")))
+    (set! failures (+ failures (linked 67 12 1 c"stogir_vector_select_193")))
+    (set! failures (+ failures (linked 67 12 2 c"stogir_vector_select_194")))
+    (set! failures (+ failures (linked 67 12 3 c"stogir_vector_select_195")))
+    (set! failures (+ failures (linked 67 12 5 c"stogir_vector_select_196")))
+    (set! failures (+ failures (linked 67 12 6 c"stogir_vector_select_197")))
+    (set! failures (+ failures (linked 67 12 7 c"stogir_vector_select_198")))
+    (set! failures (+ failures (linked 67 13 0 c"stogir_vector_select_199")))
+    (set! failures (+ failures (linked 67 13 3 c"stogir_vector_select_200")))
+    (set! failures (+ failures (linked 67 13 5 c"stogir_vector_select_201")))
+    (set! failures (+ failures (linked 67 13 6 c"stogir_vector_select_202")))
+    (set! failures (+ failures (linked 67 13 7 c"stogir_vector_select_203")))
+    (set! failures (+ failures (linked 36 1 0 c"stogir_vector_select_204")))
+    (set! failures (+ failures (linked 36 1 3 c"stogir_vector_select_205")))
+    (set! failures (+ failures (linked 36 1 5 c"stogir_vector_select_206")))
+    (set! failures (+ failures (linked 36 1 6 c"stogir_vector_select_207")))
+    (set! failures (+ failures (linked 36 1 7 c"stogir_vector_select_208")))
+    (set! failures (+ failures (linked 36 2 0 c"stogir_vector_select_209")))
+    (set! failures (+ failures (linked 36 3 0 c"stogir_vector_select_210")))
+    (set! failures (+ failures (linked 36 4 0 c"stogir_vector_select_211")))
+    (set! failures (+ failures (linked 36 5 0 c"stogir_vector_select_212")))
+    (set! failures (+ failures (linked 36 5 1 c"stogir_vector_select_213")))
+    (set! failures (+ failures (linked 36 5 2 c"stogir_vector_select_214")))
+    (set! failures (+ failures (linked 36 5 3 c"stogir_vector_select_215")))
+    (set! failures (+ failures (linked 36 5 4 c"stogir_vector_select_216")))
+    (set! failures (+ failures (linked 36 5 5 c"stogir_vector_select_217")))
+    (set! failures (+ failures (linked 36 5 6 c"stogir_vector_select_218")))
+    (set! failures (+ failures (linked 36 5 7 c"stogir_vector_select_219")))
+    (set! failures (+ failures (linked 36 6 0 c"stogir_vector_select_220")))
+    (set! failures (+ failures (linked 36 7 0 c"stogir_vector_select_221")))
+    (set! failures (+ failures (linked 36 8 0 c"stogir_vector_select_222")))
+    (set! failures (+ failures (linked 36 9 0 c"stogir_vector_select_223")))
+    (set! failures (+ failures (linked 36 10 0 c"stogir_vector_select_224")))
+    (set! failures (+ failures (linked 36 11 0 c"stogir_vector_select_225")))
+    (set! failures (+ failures (linked 36 12 0 c"stogir_vector_select_226")))
+    (set! failures (+ failures (linked 36 12 1 c"stogir_vector_select_227")))
+    (set! failures (+ failures (linked 36 12 2 c"stogir_vector_select_228")))
+    (set! failures (+ failures (linked 36 12 3 c"stogir_vector_select_229")))
+    (set! failures (+ failures (linked 36 12 5 c"stogir_vector_select_230")))
+    (set! failures (+ failures (linked 36 12 6 c"stogir_vector_select_231")))
+    (set! failures (+ failures (linked 36 12 7 c"stogir_vector_select_232")))
+    (set! failures (+ failures (linked 36 13 0 c"stogir_vector_select_233")))
+    (set! failures (+ failures (linked 36 13 3 c"stogir_vector_select_234")))
+    (set! failures (+ failures (linked 36 13 5 c"stogir_vector_select_235")))
+    (set! failures (+ failures (linked 36 13 6 c"stogir_vector_select_236")))
+    (set! failures (+ failures (linked 36 13 7 c"stogir_vector_select_237")))
+    (set! failures (+ failures (linked 52 1 0 c"stogir_vector_select_238")))
+    (set! failures (+ failures (linked 52 1 3 c"stogir_vector_select_239")))
+    (set! failures (+ failures (linked 52 1 5 c"stogir_vector_select_240")))
+    (set! failures (+ failures (linked 52 1 6 c"stogir_vector_select_241")))
+    (set! failures (+ failures (linked 52 1 7 c"stogir_vector_select_242")))
+    (set! failures (+ failures (linked 52 2 0 c"stogir_vector_select_243")))
+    (set! failures (+ failures (linked 52 3 0 c"stogir_vector_select_244")))
+    (set! failures (+ failures (linked 52 4 0 c"stogir_vector_select_245")))
+    (set! failures (+ failures (linked 52 5 0 c"stogir_vector_select_246")))
+    (set! failures (+ failures (linked 52 5 1 c"stogir_vector_select_247")))
+    (set! failures (+ failures (linked 52 5 2 c"stogir_vector_select_248")))
+    (set! failures (+ failures (linked 52 5 3 c"stogir_vector_select_249")))
+    (set! failures (+ failures (linked 52 5 4 c"stogir_vector_select_250")))
+    (set! failures (+ failures (linked 52 5 5 c"stogir_vector_select_251")))
+    (set! failures (+ failures (linked 52 5 6 c"stogir_vector_select_252")))
+    (set! failures (+ failures (linked 52 5 7 c"stogir_vector_select_253")))
+    (set! failures (+ failures (linked 52 6 0 c"stogir_vector_select_254")))
+    (set! failures (+ failures (linked 52 7 0 c"stogir_vector_select_255")))
+    (set! failures (+ failures (linked 52 8 0 c"stogir_vector_select_256")))
+    (set! failures (+ failures (linked 52 9 0 c"stogir_vector_select_257")))
+    (set! failures (+ failures (linked 52 10 0 c"stogir_vector_select_258")))
+    (set! failures (+ failures (linked 52 11 0 c"stogir_vector_select_259")))
+    (set! failures (+ failures (linked 52 12 0 c"stogir_vector_select_260")))
+    (set! failures (+ failures (linked 52 12 1 c"stogir_vector_select_261")))
+    (set! failures (+ failures (linked 52 12 2 c"stogir_vector_select_262")))
+    (set! failures (+ failures (linked 52 12 3 c"stogir_vector_select_263")))
+    (set! failures (+ failures (linked 52 12 5 c"stogir_vector_select_264")))
+    (set! failures (+ failures (linked 52 12 6 c"stogir_vector_select_265")))
+    (set! failures (+ failures (linked 52 12 7 c"stogir_vector_select_266")))
+    (set! failures (+ failures (linked 52 13 0 c"stogir_vector_select_267")))
+    (set! failures (+ failures (linked 52 13 3 c"stogir_vector_select_268")))
+    (set! failures (+ failures (linked 52 13 5 c"stogir_vector_select_269")))
+    (set! failures (+ failures (linked 52 13 6 c"stogir_vector_select_270")))
+    (set! failures (+ failures (linked 52 13 7 c"stogir_vector_select_271")))
+    (set! failures (+ failures (linked 21 1 0 c"stogir_vector_select_272")))
+    (set! failures (+ failures (linked 21 1 3 c"stogir_vector_select_273")))
+    (set! failures (+ failures (linked 21 1 5 c"stogir_vector_select_274")))
+    (set! failures (+ failures (linked 21 1 6 c"stogir_vector_select_275")))
+    (set! failures (+ failures (linked 21 1 7 c"stogir_vector_select_276")))
+    (set! failures (+ failures (linked 21 2 0 c"stogir_vector_select_277")))
+    (set! failures (+ failures (linked 21 3 0 c"stogir_vector_select_278")))
+    (set! failures (+ failures (linked 21 4 0 c"stogir_vector_select_279")))
+    (set! failures (+ failures (linked 21 5 0 c"stogir_vector_select_280")))
+    (set! failures (+ failures (linked 21 5 1 c"stogir_vector_select_281")))
+    (set! failures (+ failures (linked 21 5 2 c"stogir_vector_select_282")))
+    (set! failures (+ failures (linked 21 5 3 c"stogir_vector_select_283")))
+    (set! failures (+ failures (linked 21 5 4 c"stogir_vector_select_284")))
+    (set! failures (+ failures (linked 21 5 5 c"stogir_vector_select_285")))
+    (set! failures (+ failures (linked 21 5 6 c"stogir_vector_select_286")))
+    (set! failures (+ failures (linked 21 5 7 c"stogir_vector_select_287")))
+    (set! failures (+ failures (linked 21 6 0 c"stogir_vector_select_288")))
+    (set! failures (+ failures (linked 21 7 0 c"stogir_vector_select_289")))
+    (set! failures (+ failures (linked 21 8 0 c"stogir_vector_select_290")))
+    (set! failures (+ failures (linked 21 9 0 c"stogir_vector_select_291")))
+    (set! failures (+ failures (linked 21 10 0 c"stogir_vector_select_292")))
+    (set! failures (+ failures (linked 21 11 0 c"stogir_vector_select_293")))
+    (set! failures (+ failures (linked 21 12 0 c"stogir_vector_select_294")))
+    (set! failures (+ failures (linked 21 12 1 c"stogir_vector_select_295")))
+    (set! failures (+ failures (linked 21 12 2 c"stogir_vector_select_296")))
+    (set! failures (+ failures (linked 21 12 3 c"stogir_vector_select_297")))
+    (set! failures (+ failures (linked 21 12 5 c"stogir_vector_select_298")))
+    (set! failures (+ failures (linked 21 12 6 c"stogir_vector_select_299")))
+    (set! failures (+ failures (linked 21 12 7 c"stogir_vector_select_300")))
+    (set! failures (+ failures (linked 21 13 0 c"stogir_vector_select_301")))
+    (set! failures (+ failures (linked 21 13 3 c"stogir_vector_select_302")))
+    (set! failures (+ failures (linked 21 13 5 c"stogir_vector_select_303")))
+    (set! failures (+ failures (linked 21 13 6 c"stogir_vector_select_304")))
+    (set! failures (+ failures (linked 21 13 7 c"stogir_vector_select_305")))
+    (set! failures (+ failures (linked 37 1 0 c"stogir_vector_select_306")))
+    (set! failures (+ failures (linked 37 1 3 c"stogir_vector_select_307")))
+    (set! failures (+ failures (linked 37 1 5 c"stogir_vector_select_308")))
+    (set! failures (+ failures (linked 37 1 6 c"stogir_vector_select_309")))
+    (set! failures (+ failures (linked 37 1 7 c"stogir_vector_select_310")))
+    (set! failures (+ failures (linked 37 2 0 c"stogir_vector_select_311")))
+    (set! failures (+ failures (linked 37 3 0 c"stogir_vector_select_312")))
+    (set! failures (+ failures (linked 37 4 0 c"stogir_vector_select_313")))
+    (set! failures (+ failures (linked 37 5 0 c"stogir_vector_select_314")))
+    (set! failures (+ failures (linked 37 5 1 c"stogir_vector_select_315")))
+    (set! failures (+ failures (linked 37 5 2 c"stogir_vector_select_316")))
+    (set! failures (+ failures (linked 37 5 3 c"stogir_vector_select_317")))
+    (set! failures (+ failures (linked 37 5 4 c"stogir_vector_select_318")))
+    (set! failures (+ failures (linked 37 5 5 c"stogir_vector_select_319")))
+    (set! failures (+ failures (linked 37 5 6 c"stogir_vector_select_320")))
+    (set! failures (+ failures (linked 37 5 7 c"stogir_vector_select_321")))
+    (set! failures (+ failures (linked 37 6 0 c"stogir_vector_select_322")))
+    (set! failures (+ failures (linked 37 7 0 c"stogir_vector_select_323")))
+    (set! failures (+ failures (linked 37 8 0 c"stogir_vector_select_324")))
+    (set! failures (+ failures (linked 37 9 0 c"stogir_vector_select_325")))
+    (set! failures (+ failures (linked 37 10 0 c"stogir_vector_select_326")))
+    (set! failures (+ failures (linked 37 11 0 c"stogir_vector_select_327")))
+    (set! failures (+ failures (linked 37 12 0 c"stogir_vector_select_328")))
+    (set! failures (+ failures (linked 37 12 1 c"stogir_vector_select_329")))
+    (set! failures (+ failures (linked 37 12 2 c"stogir_vector_select_330")))
+    (set! failures (+ failures (linked 37 12 3 c"stogir_vector_select_331")))
+    (set! failures (+ failures (linked 37 12 5 c"stogir_vector_select_332")))
+    (set! failures (+ failures (linked 37 12 6 c"stogir_vector_select_333")))
+    (set! failures (+ failures (linked 37 12 7 c"stogir_vector_select_334")))
+    (set! failures (+ failures (linked 37 13 0 c"stogir_vector_select_335")))
+    (set! failures (+ failures (linked 37 13 3 c"stogir_vector_select_336")))
+    (set! failures (+ failures (linked 37 13 5 c"stogir_vector_select_337")))
+    (set! failures (+ failures (linked 37 13 6 c"stogir_vector_select_338")))
+    (set! failures (+ failures (linked 37 13 7 c"stogir_vector_select_339")))
+    (set! failures (+ failures (linked 22 1 0 c"stogir_vector_select_340")))
+    (set! failures (+ failures (linked 22 1 3 c"stogir_vector_select_341")))
+    (set! failures (+ failures (linked 22 1 5 c"stogir_vector_select_342")))
+    (set! failures (+ failures (linked 22 1 6 c"stogir_vector_select_343")))
+    (set! failures (+ failures (linked 22 1 7 c"stogir_vector_select_344")))
+    (set! failures (+ failures (linked 22 2 0 c"stogir_vector_select_345")))
+    (set! failures (+ failures (linked 22 3 0 c"stogir_vector_select_346")))
+    (set! failures (+ failures (linked 22 4 0 c"stogir_vector_select_347")))
+    (set! failures (+ failures (linked 22 5 0 c"stogir_vector_select_348")))
+    (set! failures (+ failures (linked 22 5 1 c"stogir_vector_select_349")))
+    (set! failures (+ failures (linked 22 5 2 c"stogir_vector_select_350")))
+    (set! failures (+ failures (linked 22 5 3 c"stogir_vector_select_351")))
+    (set! failures (+ failures (linked 22 5 4 c"stogir_vector_select_352")))
+    (set! failures (+ failures (linked 22 5 5 c"stogir_vector_select_353")))
+    (set! failures (+ failures (linked 22 5 6 c"stogir_vector_select_354")))
+    (set! failures (+ failures (linked 22 5 7 c"stogir_vector_select_355")))
+    (set! failures (+ failures (linked 22 6 0 c"stogir_vector_select_356")))
+    (set! failures (+ failures (linked 22 7 0 c"stogir_vector_select_357")))
+    (set! failures (+ failures (linked 22 8 0 c"stogir_vector_select_358")))
+    (set! failures (+ failures (linked 22 9 0 c"stogir_vector_select_359")))
+    (set! failures (+ failures (linked 22 10 0 c"stogir_vector_select_360")))
+    (set! failures (+ failures (linked 22 11 0 c"stogir_vector_select_361")))
+    (set! failures (+ failures (linked 22 12 0 c"stogir_vector_select_362")))
+    (set! failures (+ failures (linked 22 12 1 c"stogir_vector_select_363")))
+    (set! failures (+ failures (linked 22 12 2 c"stogir_vector_select_364")))
+    (set! failures (+ failures (linked 22 12 3 c"stogir_vector_select_365")))
+    (set! failures (+ failures (linked 22 12 5 c"stogir_vector_select_366")))
+    (set! failures (+ failures (linked 22 12 6 c"stogir_vector_select_367")))
+    (set! failures (+ failures (linked 22 12 7 c"stogir_vector_select_368")))
+    (set! failures (+ failures (linked 22 13 0 c"stogir_vector_select_369")))
+    (set! failures (+ failures (linked 22 13 3 c"stogir_vector_select_370")))
+    (set! failures (+ failures (linked 22 13 5 c"stogir_vector_select_371")))
+    (set! failures (+ failures (linked 22 13 6 c"stogir_vector_select_372")))
+    (set! failures (+ failures (linked 22 13 7 c"stogir_vector_select_373")))
+    (set! failures (+ failures (linked 38 1 0 c"stogir_vector_select_374")))
+    (set! failures (+ failures (linked 38 1 3 c"stogir_vector_select_375")))
+    (set! failures (+ failures (linked 38 1 5 c"stogir_vector_select_376")))
+    (set! failures (+ failures (linked 38 1 6 c"stogir_vector_select_377")))
+    (set! failures (+ failures (linked 38 1 7 c"stogir_vector_select_378")))
+    (set! failures (+ failures (linked 38 2 0 c"stogir_vector_select_379")))
+    (set! failures (+ failures (linked 38 3 0 c"stogir_vector_select_380")))
+    (set! failures (+ failures (linked 38 4 0 c"stogir_vector_select_381")))
+    (set! failures (+ failures (linked 38 5 0 c"stogir_vector_select_382")))
+    (set! failures (+ failures (linked 38 5 1 c"stogir_vector_select_383")))
+    (set! failures (+ failures (linked 38 5 2 c"stogir_vector_select_384")))
+    (set! failures (+ failures (linked 38 5 3 c"stogir_vector_select_385")))
+    (set! failures (+ failures (linked 38 5 4 c"stogir_vector_select_386")))
+    (set! failures (+ failures (linked 38 5 5 c"stogir_vector_select_387")))
+    (set! failures (+ failures (linked 38 5 6 c"stogir_vector_select_388")))
+    (set! failures (+ failures (linked 38 5 7 c"stogir_vector_select_389")))
+    (set! failures (+ failures (linked 38 6 0 c"stogir_vector_select_390")))
+    (set! failures (+ failures (linked 38 7 0 c"stogir_vector_select_391")))
+    (set! failures (+ failures (linked 38 8 0 c"stogir_vector_select_392")))
+    (set! failures (+ failures (linked 38 9 0 c"stogir_vector_select_393")))
+    (set! failures (+ failures (linked 38 10 0 c"stogir_vector_select_394")))
+    (set! failures (+ failures (linked 38 11 0 c"stogir_vector_select_395")))
+    (set! failures (+ failures (linked 38 12 0 c"stogir_vector_select_396")))
+    (set! failures (+ failures (linked 38 12 1 c"stogir_vector_select_397")))
+    (set! failures (+ failures (linked 38 12 2 c"stogir_vector_select_398")))
+    (set! failures (+ failures (linked 38 12 3 c"stogir_vector_select_399")))
+    (set! failures (+ failures (linked 38 12 5 c"stogir_vector_select_400")))
+    (set! failures (+ failures (linked 38 12 6 c"stogir_vector_select_401")))
+    (set! failures (+ failures (linked 38 12 7 c"stogir_vector_select_402")))
+    (set! failures (+ failures (linked 38 13 0 c"stogir_vector_select_403")))
+    (set! failures (+ failures (linked 38 13 3 c"stogir_vector_select_404")))
+    (set! failures (+ failures (linked 38 13 5 c"stogir_vector_select_405")))
+    (set! failures (+ failures (linked 38 13 6 c"stogir_vector_select_406")))
+    (set! failures (+ failures (linked 38 13 7 c"stogir_vector_select_407")))
+    (set! failures (+ failures (linked 71 1 0 c"stogir_vector_select_408")))
+    (set! failures (+ failures (linked 71 1 3 c"stogir_vector_select_409")))
+    (set! failures (+ failures (linked 71 1 5 c"stogir_vector_select_410")))
+    (set! failures (+ failures (linked 71 1 6 c"stogir_vector_select_411")))
+    (set! failures (+ failures (linked 71 1 7 c"stogir_vector_select_412")))
+    (set! failures (+ failures (linked 71 2 0 c"stogir_vector_select_413")))
+    (set! failures (+ failures (linked 71 3 0 c"stogir_vector_select_414")))
+    (set! failures (+ failures (linked 71 4 0 c"stogir_vector_select_415")))
+    (set! failures (+ failures (linked 71 5 0 c"stogir_vector_select_416")))
+    (set! failures (+ failures (linked 71 5 1 c"stogir_vector_select_417")))
+    (set! failures (+ failures (linked 71 5 2 c"stogir_vector_select_418")))
+    (set! failures (+ failures (linked 71 5 3 c"stogir_vector_select_419")))
+    (set! failures (+ failures (linked 71 5 4 c"stogir_vector_select_420")))
+    (set! failures (+ failures (linked 71 5 5 c"stogir_vector_select_421")))
+    (set! failures (+ failures (linked 71 5 6 c"stogir_vector_select_422")))
+    (set! failures (+ failures (linked 71 5 7 c"stogir_vector_select_423")))
+    (set! failures (+ failures (linked 71 6 0 c"stogir_vector_select_424")))
+    (set! failures (+ failures (linked 71 7 0 c"stogir_vector_select_425")))
+    (set! failures (+ failures (linked 71 8 0 c"stogir_vector_select_426")))
+    (set! failures (+ failures (linked 71 9 0 c"stogir_vector_select_427")))
+    (set! failures (+ failures (linked 71 10 0 c"stogir_vector_select_428")))
+    (set! failures (+ failures (linked 71 11 0 c"stogir_vector_select_429")))
+    (set! failures (+ failures (linked 71 12 0 c"stogir_vector_select_430")))
+    (set! failures (+ failures (linked 71 12 1 c"stogir_vector_select_431")))
+    (set! failures (+ failures (linked 71 12 2 c"stogir_vector_select_432")))
+    (set! failures (+ failures (linked 71 12 3 c"stogir_vector_select_433")))
+    (set! failures (+ failures (linked 71 12 5 c"stogir_vector_select_434")))
+    (set! failures (+ failures (linked 71 12 6 c"stogir_vector_select_435")))
+    (set! failures (+ failures (linked 71 12 7 c"stogir_vector_select_436")))
+    (set! failures (+ failures (linked 71 13 0 c"stogir_vector_select_437")))
+    (set! failures (+ failures (linked 71 13 3 c"stogir_vector_select_438")))
+    (set! failures (+ failures (linked 71 13 5 c"stogir_vector_select_439")))
+    (set! failures (+ failures (linked 71 13 6 c"stogir_vector_select_440")))
+    (set! failures (+ failures (linked 71 13 7 c"stogir_vector_select_441")))
+    (set! failures (+ failures (linked 87 1 0 c"stogir_vector_select_442")))
+    (set! failures (+ failures (linked 87 1 3 c"stogir_vector_select_443")))
+    (set! failures (+ failures (linked 87 1 5 c"stogir_vector_select_444")))
+    (set! failures (+ failures (linked 87 1 6 c"stogir_vector_select_445")))
+    (set! failures (+ failures (linked 87 1 7 c"stogir_vector_select_446")))
+    (set! failures (+ failures (linked 87 2 0 c"stogir_vector_select_447")))
+    (set! failures (+ failures (linked 87 3 0 c"stogir_vector_select_448")))
+    (set! failures (+ failures (linked 87 4 0 c"stogir_vector_select_449")))
+    (set! failures (+ failures (linked 87 5 0 c"stogir_vector_select_450")))
+    (set! failures (+ failures (linked 87 5 1 c"stogir_vector_select_451")))
+    (set! failures (+ failures (linked 87 5 2 c"stogir_vector_select_452")))
+    (set! failures (+ failures (linked 87 5 3 c"stogir_vector_select_453")))
+    (set! failures (+ failures (linked 87 5 4 c"stogir_vector_select_454")))
+    (set! failures (+ failures (linked 87 5 5 c"stogir_vector_select_455")))
+    (set! failures (+ failures (linked 87 5 6 c"stogir_vector_select_456")))
+    (set! failures (+ failures (linked 87 5 7 c"stogir_vector_select_457")))
+    (set! failures (+ failures (linked 87 6 0 c"stogir_vector_select_458")))
+    (set! failures (+ failures (linked 87 7 0 c"stogir_vector_select_459")))
+    (set! failures (+ failures (linked 87 8 0 c"stogir_vector_select_460")))
+    (set! failures (+ failures (linked 87 9 0 c"stogir_vector_select_461")))
+    (set! failures (+ failures (linked 87 10 0 c"stogir_vector_select_462")))
+    (set! failures (+ failures (linked 87 11 0 c"stogir_vector_select_463")))
+    (set! failures (+ failures (linked 87 12 0 c"stogir_vector_select_464")))
+    (set! failures (+ failures (linked 87 12 1 c"stogir_vector_select_465")))
+    (set! failures (+ failures (linked 87 12 2 c"stogir_vector_select_466")))
+    (set! failures (+ failures (linked 87 12 3 c"stogir_vector_select_467")))
+    (set! failures (+ failures (linked 87 12 5 c"stogir_vector_select_468")))
+    (set! failures (+ failures (linked 87 12 6 c"stogir_vector_select_469")))
+    (set! failures (+ failures (linked 87 12 7 c"stogir_vector_select_470")))
+    (set! failures (+ failures (linked 87 13 0 c"stogir_vector_select_471")))
+    (set! failures (+ failures (linked 87 13 3 c"stogir_vector_select_472")))
+    (set! failures (+ failures (linked 87 13 5 c"stogir_vector_select_473")))
+    (set! failures (+ failures (linked 87 13 6 c"stogir_vector_select_474")))
+    (set! failures (+ failures (linked 87 13 7 c"stogir_vector_select_475")))
+    (set! failures (+ failures (linked 72 1 0 c"stogir_vector_select_476")))
+    (set! failures (+ failures (linked 72 1 3 c"stogir_vector_select_477")))
+    (set! failures (+ failures (linked 72 1 5 c"stogir_vector_select_478")))
+    (set! failures (+ failures (linked 72 1 6 c"stogir_vector_select_479")))
+    (set! failures (+ failures (linked 72 1 7 c"stogir_vector_select_480")))
+    (set! failures (+ failures (linked 72 2 0 c"stogir_vector_select_481")))
+    (set! failures (+ failures (linked 72 3 0 c"stogir_vector_select_482")))
+    (set! failures (+ failures (linked 72 4 0 c"stogir_vector_select_483")))
+    (set! failures (+ failures (linked 72 5 0 c"stogir_vector_select_484")))
+    (set! failures (+ failures (linked 72 5 1 c"stogir_vector_select_485")))
+    (set! failures (+ failures (linked 72 5 2 c"stogir_vector_select_486")))
+    (set! failures (+ failures (linked 72 5 3 c"stogir_vector_select_487")))
+    (set! failures (+ failures (linked 72 5 4 c"stogir_vector_select_488")))
+    (set! failures (+ failures (linked 72 5 5 c"stogir_vector_select_489")))
+    (set! failures (+ failures (linked 72 5 6 c"stogir_vector_select_490")))
+    (set! failures (+ failures (linked 72 5 7 c"stogir_vector_select_491")))
+    (set! failures (+ failures (linked 72 6 0 c"stogir_vector_select_492")))
+    (set! failures (+ failures (linked 72 7 0 c"stogir_vector_select_493")))
+    (set! failures (+ failures (linked 72 8 0 c"stogir_vector_select_494")))
+    (set! failures (+ failures (linked 72 9 0 c"stogir_vector_select_495")))
+    (set! failures (+ failures (linked 72 10 0 c"stogir_vector_select_496")))
+    (set! failures (+ failures (linked 72 11 0 c"stogir_vector_select_497")))
+    (set! failures (+ failures (linked 72 12 0 c"stogir_vector_select_498")))
+    (set! failures (+ failures (linked 72 12 1 c"stogir_vector_select_499")))
+    (set! failures (+ failures (linked 72 12 2 c"stogir_vector_select_500")))
+    (set! failures (+ failures (linked 72 12 3 c"stogir_vector_select_501")))
+    (set! failures (+ failures (linked 72 12 5 c"stogir_vector_select_502")))
+    (set! failures (+ failures (linked 72 12 6 c"stogir_vector_select_503")))
+    (set! failures (+ failures (linked 72 12 7 c"stogir_vector_select_504")))
+    (set! failures (+ failures (linked 72 13 0 c"stogir_vector_select_505")))
+    (set! failures (+ failures (linked 72 13 3 c"stogir_vector_select_506")))
+    (set! failures (+ failures (linked 72 13 5 c"stogir_vector_select_507")))
+    (set! failures (+ failures (linked 72 13 6 c"stogir_vector_select_508")))
+    (set! failures (+ failures (linked 72 13 7 c"stogir_vector_select_509")))
+    (set! failures (+ failures (linked 88 1 0 c"stogir_vector_select_510")))
+    (set! failures (+ failures (linked 88 1 3 c"stogir_vector_select_511")))
+    (set! failures (+ failures (linked 88 1 5 c"stogir_vector_select_512")))
+    (set! failures (+ failures (linked 88 1 6 c"stogir_vector_select_513")))
+    (set! failures (+ failures (linked 88 1 7 c"stogir_vector_select_514")))
+    (set! failures (+ failures (linked 88 2 0 c"stogir_vector_select_515")))
+    (set! failures (+ failures (linked 88 3 0 c"stogir_vector_select_516")))
+    (set! failures (+ failures (linked 88 4 0 c"stogir_vector_select_517")))
+    (set! failures (+ failures (linked 88 5 0 c"stogir_vector_select_518")))
+    (set! failures (+ failures (linked 88 5 1 c"stogir_vector_select_519")))
+    (set! failures (+ failures (linked 88 5 2 c"stogir_vector_select_520")))
+    (set! failures (+ failures (linked 88 5 3 c"stogir_vector_select_521")))
+    (set! failures (+ failures (linked 88 5 4 c"stogir_vector_select_522")))
+    (set! failures (+ failures (linked 88 5 5 c"stogir_vector_select_523")))
+    (set! failures (+ failures (linked 88 5 6 c"stogir_vector_select_524")))
+    (set! failures (+ failures (linked 88 5 7 c"stogir_vector_select_525")))
+    (set! failures (+ failures (linked 88 6 0 c"stogir_vector_select_526")))
+    (set! failures (+ failures (linked 88 7 0 c"stogir_vector_select_527")))
+    (set! failures (+ failures (linked 88 8 0 c"stogir_vector_select_528")))
+    (set! failures (+ failures (linked 88 9 0 c"stogir_vector_select_529")))
+    (set! failures (+ failures (linked 88 10 0 c"stogir_vector_select_530")))
+    (set! failures (+ failures (linked 88 11 0 c"stogir_vector_select_531")))
+    (set! failures (+ failures (linked 88 12 0 c"stogir_vector_select_532")))
+    (set! failures (+ failures (linked 88 12 1 c"stogir_vector_select_533")))
+    (set! failures (+ failures (linked 88 12 2 c"stogir_vector_select_534")))
+    (set! failures (+ failures (linked 88 12 3 c"stogir_vector_select_535")))
+    (set! failures (+ failures (linked 88 12 5 c"stogir_vector_select_536")))
+    (set! failures (+ failures (linked 88 12 6 c"stogir_vector_select_537")))
+    (set! failures (+ failures (linked 88 12 7 c"stogir_vector_select_538")))
+    (set! failures (+ failures (linked 88 13 0 c"stogir_vector_select_539")))
+    (set! failures (+ failures (linked 88 13 3 c"stogir_vector_select_540")))
+    (set! failures (+ failures (linked 88 13 5 c"stogir_vector_select_541")))
+    (set! failures (+ failures (linked 88 13 6 c"stogir_vector_select_542")))
+    (set! failures (+ failures (linked 88 13 7 c"stogir_vector_select_543")))
+    (set! failures (+ failures (linked 57 1 0 c"stogir_vector_select_544")))
+    (set! failures (+ failures (linked 57 1 3 c"stogir_vector_select_545")))
+    (set! failures (+ failures (linked 57 1 5 c"stogir_vector_select_546")))
+    (set! failures (+ failures (linked 57 1 6 c"stogir_vector_select_547")))
+    (set! failures (+ failures (linked 57 1 7 c"stogir_vector_select_548")))
+    (set! failures (+ failures (linked 57 2 0 c"stogir_vector_select_549")))
+    (set! failures (+ failures (linked 57 3 0 c"stogir_vector_select_550")))
+    (set! failures (+ failures (linked 57 4 0 c"stogir_vector_select_551")))
+    (set! failures (+ failures (linked 57 5 0 c"stogir_vector_select_552")))
+    (set! failures (+ failures (linked 57 5 1 c"stogir_vector_select_553")))
+    (set! failures (+ failures (linked 57 5 2 c"stogir_vector_select_554")))
+    (set! failures (+ failures (linked 57 5 3 c"stogir_vector_select_555")))
+    (set! failures (+ failures (linked 57 5 4 c"stogir_vector_select_556")))
+    (set! failures (+ failures (linked 57 5 5 c"stogir_vector_select_557")))
+    (set! failures (+ failures (linked 57 5 6 c"stogir_vector_select_558")))
+    (set! failures (+ failures (linked 57 5 7 c"stogir_vector_select_559")))
+    (set! failures (+ failures (linked 57 6 0 c"stogir_vector_select_560")))
+    (set! failures (+ failures (linked 57 7 0 c"stogir_vector_select_561")))
+    (set! failures (+ failures (linked 57 8 0 c"stogir_vector_select_562")))
+    (set! failures (+ failures (linked 57 9 0 c"stogir_vector_select_563")))
+    (set! failures (+ failures (linked 57 10 0 c"stogir_vector_select_564")))
+    (set! failures (+ failures (linked 57 11 0 c"stogir_vector_select_565")))
+    (set! failures (+ failures (linked 57 12 0 c"stogir_vector_select_566")))
+    (set! failures (+ failures (linked 57 12 1 c"stogir_vector_select_567")))
+    (set! failures (+ failures (linked 57 12 2 c"stogir_vector_select_568")))
+    (set! failures (+ failures (linked 57 12 3 c"stogir_vector_select_569")))
+    (set! failures (+ failures (linked 57 12 5 c"stogir_vector_select_570")))
+    (set! failures (+ failures (linked 57 12 6 c"stogir_vector_select_571")))
+    (set! failures (+ failures (linked 57 12 7 c"stogir_vector_select_572")))
+    (set! failures (+ failures (linked 57 13 0 c"stogir_vector_select_573")))
+    (set! failures (+ failures (linked 57 13 3 c"stogir_vector_select_574")))
+    (set! failures (+ failures (linked 57 13 5 c"stogir_vector_select_575")))
+    (set! failures (+ failures (linked 57 13 6 c"stogir_vector_select_576")))
+    (set! failures (+ failures (linked 57 13 7 c"stogir_vector_select_577")))
+    (set! failures (+ failures (linked 73 1 0 c"stogir_vector_select_578")))
+    (set! failures (+ failures (linked 73 1 3 c"stogir_vector_select_579")))
+    (set! failures (+ failures (linked 73 1 5 c"stogir_vector_select_580")))
+    (set! failures (+ failures (linked 73 1 6 c"stogir_vector_select_581")))
+    (set! failures (+ failures (linked 73 1 7 c"stogir_vector_select_582")))
+    (set! failures (+ failures (linked 73 2 0 c"stogir_vector_select_583")))
+    (set! failures (+ failures (linked 73 3 0 c"stogir_vector_select_584")))
+    (set! failures (+ failures (linked 73 4 0 c"stogir_vector_select_585")))
+    (set! failures (+ failures (linked 73 5 0 c"stogir_vector_select_586")))
+    (set! failures (+ failures (linked 73 5 1 c"stogir_vector_select_587")))
+    (set! failures (+ failures (linked 73 5 2 c"stogir_vector_select_588")))
+    (set! failures (+ failures (linked 73 5 3 c"stogir_vector_select_589")))
+    (set! failures (+ failures (linked 73 5 4 c"stogir_vector_select_590")))
+    (set! failures (+ failures (linked 73 5 5 c"stogir_vector_select_591")))
+    (set! failures (+ failures (linked 73 5 6 c"stogir_vector_select_592")))
+    (set! failures (+ failures (linked 73 5 7 c"stogir_vector_select_593")))
+    (set! failures (+ failures (linked 73 6 0 c"stogir_vector_select_594")))
+    (set! failures (+ failures (linked 73 7 0 c"stogir_vector_select_595")))
+    (set! failures (+ failures (linked 73 8 0 c"stogir_vector_select_596")))
+    (set! failures (+ failures (linked 73 9 0 c"stogir_vector_select_597")))
+    (set! failures (+ failures (linked 73 10 0 c"stogir_vector_select_598")))
+    (set! failures (+ failures (linked 73 11 0 c"stogir_vector_select_599")))
+    (set! failures (+ failures (linked 73 12 0 c"stogir_vector_select_600")))
+    (set! failures (+ failures (linked 73 12 1 c"stogir_vector_select_601")))
+    (set! failures (+ failures (linked 73 12 2 c"stogir_vector_select_602")))
+    (set! failures (+ failures (linked 73 12 3 c"stogir_vector_select_603")))
+    (set! failures (+ failures (linked 73 12 5 c"stogir_vector_select_604")))
+    (set! failures (+ failures (linked 73 12 6 c"stogir_vector_select_605")))
+    (set! failures (+ failures (linked 73 12 7 c"stogir_vector_select_606")))
+    (set! failures (+ failures (linked 73 13 0 c"stogir_vector_select_607")))
+    (set! failures (+ failures (linked 73 13 3 c"stogir_vector_select_608")))
+    (set! failures (+ failures (linked 73 13 5 c"stogir_vector_select_609")))
+    (set! failures (+ failures (linked 73 13 6 c"stogir_vector_select_610")))
+    (set! failures (+ failures (linked 73 13 7 c"stogir_vector_select_611")))
+    (set! failures (+ failures (linked 42 1 0 c"stogir_vector_select_612")))
+    (set! failures (+ failures (linked 42 1 3 c"stogir_vector_select_613")))
+    (set! failures (+ failures (linked 42 1 5 c"stogir_vector_select_614")))
+    (set! failures (+ failures (linked 42 1 6 c"stogir_vector_select_615")))
+    (set! failures (+ failures (linked 42 1 7 c"stogir_vector_select_616")))
+    (set! failures (+ failures (linked 42 2 0 c"stogir_vector_select_617")))
+    (set! failures (+ failures (linked 42 3 0 c"stogir_vector_select_618")))
+    (set! failures (+ failures (linked 42 4 0 c"stogir_vector_select_619")))
+    (set! failures (+ failures (linked 42 5 0 c"stogir_vector_select_620")))
+    (set! failures (+ failures (linked 42 5 1 c"stogir_vector_select_621")))
+    (set! failures (+ failures (linked 42 5 2 c"stogir_vector_select_622")))
+    (set! failures (+ failures (linked 42 5 3 c"stogir_vector_select_623")))
+    (set! failures (+ failures (linked 42 5 4 c"stogir_vector_select_624")))
+    (set! failures (+ failures (linked 42 5 5 c"stogir_vector_select_625")))
+    (set! failures (+ failures (linked 42 5 6 c"stogir_vector_select_626")))
+    (set! failures (+ failures (linked 42 5 7 c"stogir_vector_select_627")))
+    (set! failures (+ failures (linked 42 6 0 c"stogir_vector_select_628")))
+    (set! failures (+ failures (linked 42 7 0 c"stogir_vector_select_629")))
+    (set! failures (+ failures (linked 42 8 0 c"stogir_vector_select_630")))
+    (set! failures (+ failures (linked 42 9 0 c"stogir_vector_select_631")))
+    (set! failures (+ failures (linked 42 10 0 c"stogir_vector_select_632")))
+    (set! failures (+ failures (linked 42 11 0 c"stogir_vector_select_633")))
+    (set! failures (+ failures (linked 42 12 0 c"stogir_vector_select_634")))
+    (set! failures (+ failures (linked 42 12 1 c"stogir_vector_select_635")))
+    (set! failures (+ failures (linked 42 12 2 c"stogir_vector_select_636")))
+    (set! failures (+ failures (linked 42 12 3 c"stogir_vector_select_637")))
+    (set! failures (+ failures (linked 42 12 5 c"stogir_vector_select_638")))
+    (set! failures (+ failures (linked 42 12 6 c"stogir_vector_select_639")))
+    (set! failures (+ failures (linked 42 12 7 c"stogir_vector_select_640")))
+    (set! failures (+ failures (linked 42 13 0 c"stogir_vector_select_641")))
+    (set! failures (+ failures (linked 42 13 3 c"stogir_vector_select_642")))
+    (set! failures (+ failures (linked 42 13 5 c"stogir_vector_select_643")))
+    (set! failures (+ failures (linked 42 13 6 c"stogir_vector_select_644")))
+    (set! failures (+ failures (linked 42 13 7 c"stogir_vector_select_645")))
+    (set! failures (+ failures (linked 58 1 0 c"stogir_vector_select_646")))
+    (set! failures (+ failures (linked 58 1 3 c"stogir_vector_select_647")))
+    (set! failures (+ failures (linked 58 1 5 c"stogir_vector_select_648")))
+    (set! failures (+ failures (linked 58 1 6 c"stogir_vector_select_649")))
+    (set! failures (+ failures (linked 58 1 7 c"stogir_vector_select_650")))
+    (set! failures (+ failures (linked 58 2 0 c"stogir_vector_select_651")))
+    (set! failures (+ failures (linked 58 3 0 c"stogir_vector_select_652")))
+    (set! failures (+ failures (linked 58 4 0 c"stogir_vector_select_653")))
+    (set! failures (+ failures (linked 58 5 0 c"stogir_vector_select_654")))
+    (set! failures (+ failures (linked 58 5 1 c"stogir_vector_select_655")))
+    (set! failures (+ failures (linked 58 5 2 c"stogir_vector_select_656")))
+    (set! failures (+ failures (linked 58 5 3 c"stogir_vector_select_657")))
+    (set! failures (+ failures (linked 58 5 4 c"stogir_vector_select_658")))
+    (set! failures (+ failures (linked 58 5 5 c"stogir_vector_select_659")))
+    (set! failures (+ failures (linked 58 5 6 c"stogir_vector_select_660")))
+    (set! failures (+ failures (linked 58 5 7 c"stogir_vector_select_661")))
+    (set! failures (+ failures (linked 58 6 0 c"stogir_vector_select_662")))
+    (set! failures (+ failures (linked 58 7 0 c"stogir_vector_select_663")))
+    (set! failures (+ failures (linked 58 8 0 c"stogir_vector_select_664")))
+    (set! failures (+ failures (linked 58 9 0 c"stogir_vector_select_665")))
+    (set! failures (+ failures (linked 58 10 0 c"stogir_vector_select_666")))
+    (set! failures (+ failures (linked 58 11 0 c"stogir_vector_select_667")))
+    (set! failures (+ failures (linked 58 12 0 c"stogir_vector_select_668")))
+    (set! failures (+ failures (linked 58 12 1 c"stogir_vector_select_669")))
+    (set! failures (+ failures (linked 58 12 2 c"stogir_vector_select_670")))
+    (set! failures (+ failures (linked 58 12 3 c"stogir_vector_select_671")))
+    (set! failures (+ failures (linked 58 12 5 c"stogir_vector_select_672")))
+    (set! failures (+ failures (linked 58 12 6 c"stogir_vector_select_673")))
+    (set! failures (+ failures (linked 58 12 7 c"stogir_vector_select_674")))
+    (set! failures (+ failures (linked 58 13 0 c"stogir_vector_select_675")))
+    (set! failures (+ failures (linked 58 13 3 c"stogir_vector_select_676")))
+    (set! failures (+ failures (linked 58 13 5 c"stogir_vector_select_677")))
+    (set! failures (+ failures (linked 58 13 6 c"stogir_vector_select_678")))
+    (set! failures (+ failures (linked 58 13 7 c"stogir_vector_select_679")))
+    (set! failures (+ failures (linked 27 1 0 c"stogir_vector_select_680")))
+    (set! failures (+ failures (linked 27 1 3 c"stogir_vector_select_681")))
+    (set! failures (+ failures (linked 27 1 5 c"stogir_vector_select_682")))
+    (set! failures (+ failures (linked 27 1 6 c"stogir_vector_select_683")))
+    (set! failures (+ failures (linked 27 1 7 c"stogir_vector_select_684")))
+    (set! failures (+ failures (linked 27 2 0 c"stogir_vector_select_685")))
+    (set! failures (+ failures (linked 27 3 0 c"stogir_vector_select_686")))
+    (set! failures (+ failures (linked 27 4 0 c"stogir_vector_select_687")))
+    (set! failures (+ failures (linked 27 5 0 c"stogir_vector_select_688")))
+    (set! failures (+ failures (linked 27 5 1 c"stogir_vector_select_689")))
+    (set! failures (+ failures (linked 27 5 2 c"stogir_vector_select_690")))
+    (set! failures (+ failures (linked 27 5 3 c"stogir_vector_select_691")))
+    (set! failures (+ failures (linked 27 5 4 c"stogir_vector_select_692")))
+    (set! failures (+ failures (linked 27 5 5 c"stogir_vector_select_693")))
+    (set! failures (+ failures (linked 27 5 6 c"stogir_vector_select_694")))
+    (set! failures (+ failures (linked 27 5 7 c"stogir_vector_select_695")))
+    (set! failures (+ failures (linked 27 6 0 c"stogir_vector_select_696")))
+    (set! failures (+ failures (linked 27 7 0 c"stogir_vector_select_697")))
+    (set! failures (+ failures (linked 27 8 0 c"stogir_vector_select_698")))
+    (set! failures (+ failures (linked 27 9 0 c"stogir_vector_select_699")))
+    (set! failures (+ failures (linked 27 10 0 c"stogir_vector_select_700")))
+    (set! failures (+ failures (linked 27 11 0 c"stogir_vector_select_701")))
+    (set! failures (+ failures (linked 27 12 0 c"stogir_vector_select_702")))
+    (set! failures (+ failures (linked 27 12 1 c"stogir_vector_select_703")))
+    (set! failures (+ failures (linked 27 12 2 c"stogir_vector_select_704")))
+    (set! failures (+ failures (linked 27 12 3 c"stogir_vector_select_705")))
+    (set! failures (+ failures (linked 27 12 5 c"stogir_vector_select_706")))
+    (set! failures (+ failures (linked 27 12 6 c"stogir_vector_select_707")))
+    (set! failures (+ failures (linked 27 12 7 c"stogir_vector_select_708")))
+    (set! failures (+ failures (linked 27 13 0 c"stogir_vector_select_709")))
+    (set! failures (+ failures (linked 27 13 3 c"stogir_vector_select_710")))
+    (set! failures (+ failures (linked 27 13 5 c"stogir_vector_select_711")))
+    (set! failures (+ failures (linked 27 13 6 c"stogir_vector_select_712")))
+    (set! failures (+ failures (linked 27 13 7 c"stogir_vector_select_713")))
+    (set! failures (+ failures (linked 43 1 0 c"stogir_vector_select_714")))
+    (set! failures (+ failures (linked 43 1 3 c"stogir_vector_select_715")))
+    (set! failures (+ failures (linked 43 1 5 c"stogir_vector_select_716")))
+    (set! failures (+ failures (linked 43 1 6 c"stogir_vector_select_717")))
+    (set! failures (+ failures (linked 43 1 7 c"stogir_vector_select_718")))
+    (set! failures (+ failures (linked 43 2 0 c"stogir_vector_select_719")))
+    (set! failures (+ failures (linked 43 3 0 c"stogir_vector_select_720")))
+    (set! failures (+ failures (linked 43 4 0 c"stogir_vector_select_721")))
+    (set! failures (+ failures (linked 43 5 0 c"stogir_vector_select_722")))
+    (set! failures (+ failures (linked 43 5 1 c"stogir_vector_select_723")))
+    (set! failures (+ failures (linked 43 5 2 c"stogir_vector_select_724")))
+    (set! failures (+ failures (linked 43 5 3 c"stogir_vector_select_725")))
+    (set! failures (+ failures (linked 43 5 4 c"stogir_vector_select_726")))
+    (set! failures (+ failures (linked 43 5 5 c"stogir_vector_select_727")))
+    (set! failures (+ failures (linked 43 5 6 c"stogir_vector_select_728")))
+    (set! failures (+ failures (linked 43 5 7 c"stogir_vector_select_729")))
+    (set! failures (+ failures (linked 43 6 0 c"stogir_vector_select_730")))
+    (set! failures (+ failures (linked 43 7 0 c"stogir_vector_select_731")))
+    (set! failures (+ failures (linked 43 8 0 c"stogir_vector_select_732")))
+    (set! failures (+ failures (linked 43 9 0 c"stogir_vector_select_733")))
+    (set! failures (+ failures (linked 43 10 0 c"stogir_vector_select_734")))
+    (set! failures (+ failures (linked 43 11 0 c"stogir_vector_select_735")))
+    (set! failures (+ failures (linked 43 12 0 c"stogir_vector_select_736")))
+    (set! failures (+ failures (linked 43 12 1 c"stogir_vector_select_737")))
+    (set! failures (+ failures (linked 43 12 2 c"stogir_vector_select_738")))
+    (set! failures (+ failures (linked 43 12 3 c"stogir_vector_select_739")))
+    (set! failures (+ failures (linked 43 12 5 c"stogir_vector_select_740")))
+    (set! failures (+ failures (linked 43 12 6 c"stogir_vector_select_741")))
+    (set! failures (+ failures (linked 43 12 7 c"stogir_vector_select_742")))
+    (set! failures (+ failures (linked 43 13 0 c"stogir_vector_select_743")))
+    (set! failures (+ failures (linked 43 13 3 c"stogir_vector_select_744")))
+    (set! failures (+ failures (linked 43 13 5 c"stogir_vector_select_745")))
+    (set! failures (+ failures (linked 43 13 6 c"stogir_vector_select_746")))
+    (set! failures (+ failures (linked 43 13 7 c"stogir_vector_select_747")))
+    (set! failures (+ failures (linked 28 1 0 c"stogir_vector_select_748")))
+    (set! failures (+ failures (linked 28 1 3 c"stogir_vector_select_749")))
+    (set! failures (+ failures (linked 28 1 5 c"stogir_vector_select_750")))
+    (set! failures (+ failures (linked 28 1 6 c"stogir_vector_select_751")))
+    (set! failures (+ failures (linked 28 1 7 c"stogir_vector_select_752")))
+    (set! failures (+ failures (linked 28 2 0 c"stogir_vector_select_753")))
+    (set! failures (+ failures (linked 28 3 0 c"stogir_vector_select_754")))
+    (set! failures (+ failures (linked 28 4 0 c"stogir_vector_select_755")))
+    (set! failures (+ failures (linked 28 5 0 c"stogir_vector_select_756")))
+    (set! failures (+ failures (linked 28 5 1 c"stogir_vector_select_757")))
+    (set! failures (+ failures (linked 28 5 2 c"stogir_vector_select_758")))
+    (set! failures (+ failures (linked 28 5 3 c"stogir_vector_select_759")))
+    (set! failures (+ failures (linked 28 5 4 c"stogir_vector_select_760")))
+    (set! failures (+ failures (linked 28 5 5 c"stogir_vector_select_761")))
+    (set! failures (+ failures (linked 28 5 6 c"stogir_vector_select_762")))
+    (set! failures (+ failures (linked 28 5 7 c"stogir_vector_select_763")))
+    (set! failures (+ failures (linked 28 6 0 c"stogir_vector_select_764")))
+    (set! failures (+ failures (linked 28 7 0 c"stogir_vector_select_765")))
+    (set! failures (+ failures (linked 28 8 0 c"stogir_vector_select_766")))
+    (set! failures (+ failures (linked 28 9 0 c"stogir_vector_select_767")))
+    (set! failures (+ failures (linked 28 10 0 c"stogir_vector_select_768")))
+    (set! failures (+ failures (linked 28 11 0 c"stogir_vector_select_769")))
+    (set! failures (+ failures (linked 28 12 0 c"stogir_vector_select_770")))
+    (set! failures (+ failures (linked 28 12 1 c"stogir_vector_select_771")))
+    (set! failures (+ failures (linked 28 12 2 c"stogir_vector_select_772")))
+    (set! failures (+ failures (linked 28 12 3 c"stogir_vector_select_773")))
+    (set! failures (+ failures (linked 28 12 5 c"stogir_vector_select_774")))
+    (set! failures (+ failures (linked 28 12 6 c"stogir_vector_select_775")))
+    (set! failures (+ failures (linked 28 12 7 c"stogir_vector_select_776")))
+    (set! failures (+ failures (linked 28 13 0 c"stogir_vector_select_777")))
+    (set! failures (+ failures (linked 28 13 3 c"stogir_vector_select_778")))
+    (set! failures (+ failures (linked 28 13 5 c"stogir_vector_select_779")))
+    (set! failures (+ failures (linked 28 13 6 c"stogir_vector_select_780")))
+    (set! failures (+ failures (linked 28 13 7 c"stogir_vector_select_781")))
+    (set! failures (+ failures (linked 44 1 0 c"stogir_vector_select_782")))
+    (set! failures (+ failures (linked 44 1 3 c"stogir_vector_select_783")))
+    (set! failures (+ failures (linked 44 1 5 c"stogir_vector_select_784")))
+    (set! failures (+ failures (linked 44 1 6 c"stogir_vector_select_785")))
+    (set! failures (+ failures (linked 44 1 7 c"stogir_vector_select_786")))
+    (set! failures (+ failures (linked 44 2 0 c"stogir_vector_select_787")))
+    (set! failures (+ failures (linked 44 3 0 c"stogir_vector_select_788")))
+    (set! failures (+ failures (linked 44 4 0 c"stogir_vector_select_789")))
+    (set! failures (+ failures (linked 44 5 0 c"stogir_vector_select_790")))
+    (set! failures (+ failures (linked 44 5 1 c"stogir_vector_select_791")))
+    (set! failures (+ failures (linked 44 5 2 c"stogir_vector_select_792")))
+    (set! failures (+ failures (linked 44 5 3 c"stogir_vector_select_793")))
+    (set! failures (+ failures (linked 44 5 4 c"stogir_vector_select_794")))
+    (set! failures (+ failures (linked 44 5 5 c"stogir_vector_select_795")))
+    (set! failures (+ failures (linked 44 5 6 c"stogir_vector_select_796")))
+    (set! failures (+ failures (linked 44 5 7 c"stogir_vector_select_797")))
+    (set! failures (+ failures (linked 44 6 0 c"stogir_vector_select_798")))
+    (set! failures (+ failures (linked 44 7 0 c"stogir_vector_select_799")))
+    (set! failures (+ failures (linked 44 8 0 c"stogir_vector_select_800")))
+    (set! failures (+ failures (linked 44 9 0 c"stogir_vector_select_801")))
+    (set! failures (+ failures (linked 44 10 0 c"stogir_vector_select_802")))
+    (set! failures (+ failures (linked 44 11 0 c"stogir_vector_select_803")))
+    (set! failures (+ failures (linked 44 12 0 c"stogir_vector_select_804")))
+    (set! failures (+ failures (linked 44 12 1 c"stogir_vector_select_805")))
+    (set! failures (+ failures (linked 44 12 2 c"stogir_vector_select_806")))
+    (set! failures (+ failures (linked 44 12 3 c"stogir_vector_select_807")))
+    (set! failures (+ failures (linked 44 12 5 c"stogir_vector_select_808")))
+    (set! failures (+ failures (linked 44 12 6 c"stogir_vector_select_809")))
+    (set! failures (+ failures (linked 44 12 7 c"stogir_vector_select_810")))
+    (set! failures (+ failures (linked 44 13 0 c"stogir_vector_select_811")))
+    (set! failures (+ failures (linked 44 13 3 c"stogir_vector_select_812")))
+    (set! failures (+ failures (linked 44 13 5 c"stogir_vector_select_813")))
+    (set! failures (+ failures (linked 44 13 6 c"stogir_vector_select_814")))
+    (set! failures (+ failures (linked 44 13 7 c"stogir_vector_select_815")))
+    (set! failures (+ failures (linked 45 1 0 c"stogir_vector_select_816")))
+    (set! failures (+ failures (linked 45 1 3 c"stogir_vector_select_817")))
+    (set! failures (+ failures (linked 45 1 5 c"stogir_vector_select_818")))
+    (set! failures (+ failures (linked 45 1 6 c"stogir_vector_select_819")))
+    (set! failures (+ failures (linked 45 1 7 c"stogir_vector_select_820")))
+    (set! failures (+ failures (linked 45 2 0 c"stogir_vector_select_821")))
+    (set! failures (+ failures (linked 45 3 0 c"stogir_vector_select_822")))
+    (set! failures (+ failures (linked 45 4 0 c"stogir_vector_select_823")))
+    (set! failures (+ failures (linked 45 5 0 c"stogir_vector_select_824")))
+    (set! failures (+ failures (linked 45 5 1 c"stogir_vector_select_825")))
+    (set! failures (+ failures (linked 45 5 2 c"stogir_vector_select_826")))
+    (set! failures (+ failures (linked 45 5 3 c"stogir_vector_select_827")))
+    (set! failures (+ failures (linked 45 5 4 c"stogir_vector_select_828")))
+    (set! failures (+ failures (linked 45 5 5 c"stogir_vector_select_829")))
+    (set! failures (+ failures (linked 45 5 6 c"stogir_vector_select_830")))
+    (set! failures (+ failures (linked 45 5 7 c"stogir_vector_select_831")))
+    (set! failures (+ failures (linked 45 6 0 c"stogir_vector_select_832")))
+    (set! failures (+ failures (linked 45 7 0 c"stogir_vector_select_833")))
+    (set! failures (+ failures (linked 45 8 0 c"stogir_vector_select_834")))
+    (set! failures (+ failures (linked 45 9 0 c"stogir_vector_select_835")))
+    (set! failures (+ failures (linked 45 10 0 c"stogir_vector_select_836")))
+    (set! failures (+ failures (linked 45 11 0 c"stogir_vector_select_837")))
+    (set! failures (+ failures (linked 45 12 0 c"stogir_vector_select_838")))
+    (set! failures (+ failures (linked 45 12 1 c"stogir_vector_select_839")))
+    (set! failures (+ failures (linked 45 12 2 c"stogir_vector_select_840")))
+    (set! failures (+ failures (linked 45 12 3 c"stogir_vector_select_841")))
+    (set! failures (+ failures (linked 45 12 5 c"stogir_vector_select_842")))
+    (set! failures (+ failures (linked 45 12 6 c"stogir_vector_select_843")))
+    (set! failures (+ failures (linked 45 12 7 c"stogir_vector_select_844")))
+    (set! failures (+ failures (linked 45 13 0 c"stogir_vector_select_845")))
+    (set! failures (+ failures (linked 45 13 3 c"stogir_vector_select_846")))
+    (set! failures (+ failures (linked 45 13 5 c"stogir_vector_select_847")))
+    (set! failures (+ failures (linked 45 13 6 c"stogir_vector_select_848")))
+    (set! failures (+ failures (linked 45 13 7 c"stogir_vector_select_849")))
+    (set! failures (+ failures (linked 61 1 0 c"stogir_vector_select_850")))
+    (set! failures (+ failures (linked 61 1 3 c"stogir_vector_select_851")))
+    (set! failures (+ failures (linked 61 1 5 c"stogir_vector_select_852")))
+    (set! failures (+ failures (linked 61 1 6 c"stogir_vector_select_853")))
+    (set! failures (+ failures (linked 61 1 7 c"stogir_vector_select_854")))
+    (set! failures (+ failures (linked 61 2 0 c"stogir_vector_select_855")))
+    (set! failures (+ failures (linked 61 3 0 c"stogir_vector_select_856")))
+    (set! failures (+ failures (linked 61 4 0 c"stogir_vector_select_857")))
+    (set! failures (+ failures (linked 61 5 0 c"stogir_vector_select_858")))
+    (set! failures (+ failures (linked 61 5 1 c"stogir_vector_select_859")))
+    (set! failures (+ failures (linked 61 5 2 c"stogir_vector_select_860")))
+    (set! failures (+ failures (linked 61 5 3 c"stogir_vector_select_861")))
+    (set! failures (+ failures (linked 61 5 4 c"stogir_vector_select_862")))
+    (set! failures (+ failures (linked 61 5 5 c"stogir_vector_select_863")))
+    (set! failures (+ failures (linked 61 5 6 c"stogir_vector_select_864")))
+    (set! failures (+ failures (linked 61 5 7 c"stogir_vector_select_865")))
+    (set! failures (+ failures (linked 61 6 0 c"stogir_vector_select_866")))
+    (set! failures (+ failures (linked 61 7 0 c"stogir_vector_select_867")))
+    (set! failures (+ failures (linked 61 8 0 c"stogir_vector_select_868")))
+    (set! failures (+ failures (linked 61 9 0 c"stogir_vector_select_869")))
+    (set! failures (+ failures (linked 61 10 0 c"stogir_vector_select_870")))
+    (set! failures (+ failures (linked 61 11 0 c"stogir_vector_select_871")))
+    (set! failures (+ failures (linked 61 12 0 c"stogir_vector_select_872")))
+    (set! failures (+ failures (linked 61 12 1 c"stogir_vector_select_873")))
+    (set! failures (+ failures (linked 61 12 2 c"stogir_vector_select_874")))
+    (set! failures (+ failures (linked 61 12 3 c"stogir_vector_select_875")))
+    (set! failures (+ failures (linked 61 12 5 c"stogir_vector_select_876")))
+    (set! failures (+ failures (linked 61 12 6 c"stogir_vector_select_877")))
+    (set! failures (+ failures (linked 61 12 7 c"stogir_vector_select_878")))
+    (set! failures (+ failures (linked 61 13 0 c"stogir_vector_select_879")))
+    (set! failures (+ failures (linked 61 13 3 c"stogir_vector_select_880")))
+    (set! failures (+ failures (linked 61 13 5 c"stogir_vector_select_881")))
+    (set! failures (+ failures (linked 61 13 6 c"stogir_vector_select_882")))
+    (set! failures (+ failures (linked 61 13 7 c"stogir_vector_select_883")))
+    (set! failures
+          (+ failures (linked-pressure 81 1 c"stogir_vector_select_884")))
+    (set! failures
+          (+ failures (linked-pressure 81 1 c"stogir_vector_select_885")))
+    (set! failures
+          (+ failures (linked-pressure 81 5 c"stogir_vector_select_886")))
+    (set! failures
+          (+ failures (linked-pressure 81 5 c"stogir_vector_select_887")))
+    (set! failures
+          (+ failures (linked-pressure 81 12 c"stogir_vector_select_888")))
+    (set! failures
+          (+ failures (linked-pressure 81 12 c"stogir_vector_select_889")))
+    (set! failures
+          (+ failures (linked-pressure 81 13 c"stogir_vector_select_890")))
+    (set! failures
+          (+ failures (linked-pressure 81 13 c"stogir_vector_select_891")))
+    (set! failures
+          (+ failures (linked-pressure 88 1 c"stogir_vector_select_892")))
+    (set! failures
+          (+ failures (linked-pressure 88 1 c"stogir_vector_select_893")))
+    (set! failures
+          (+ failures (linked-pressure 88 5 c"stogir_vector_select_894")))
+    (set! failures
+          (+ failures (linked-pressure 88 5 c"stogir_vector_select_895")))
+    (set! failures
+          (+ failures (linked-pressure 88 12 c"stogir_vector_select_896")))
+    (set! failures
+          (+ failures (linked-pressure 88 12 c"stogir_vector_select_897")))
+    (set! failures
+          (+ failures (linked-pressure 88 13 c"stogir_vector_select_898")))
+    (set! failures
+          (+ failures (linked-pressure 88 13 c"stogir_vector_select_899")))
+    (set! failures
+          (+ failures (linked-pressure 67 1 c"stogir_vector_select_900")))
+    (set! failures
+          (+ failures (linked-pressure 67 1 c"stogir_vector_select_901")))
+    (set! failures
+          (+ failures (linked-pressure 67 5 c"stogir_vector_select_902")))
+    (set! failures
+          (+ failures (linked-pressure 67 5 c"stogir_vector_select_903")))
+    (set! failures
+          (+ failures (linked-pressure 67 12 c"stogir_vector_select_904")))
+    (set! failures
+          (+ failures (linked-pressure 67 12 c"stogir_vector_select_905")))
+    (set! failures
+          (+ failures (linked-pressure 67 13 c"stogir_vector_select_906")))
+    (set! failures
+          (+ failures (linked-pressure 67 13 c"stogir_vector_select_907")))
+    (set! failures
+          (+ failures (linked-pressure 52 1 c"stogir_vector_select_908")))
+    (set! failures
+          (+ failures (linked-pressure 52 1 c"stogir_vector_select_909")))
+    (set! failures
+          (+ failures (linked-pressure 52 5 c"stogir_vector_select_910")))
+    (set! failures
+          (+ failures (linked-pressure 52 5 c"stogir_vector_select_911")))
+    (set! failures
+          (+ failures (linked-pressure 52 12 c"stogir_vector_select_912")))
+    (set! failures
+          (+ failures (linked-pressure 52 12 c"stogir_vector_select_913")))
+    (set! failures
+          (+ failures (linked-pressure 52 13 c"stogir_vector_select_914")))
+    (set! failures
+          (+ failures (linked-pressure 52 13 c"stogir_vector_select_915")))
+    (set! failures
+          (+ failures (linked-pressure 37 1 c"stogir_vector_select_916")))
+    (set! failures
+          (+ failures (linked-pressure 37 1 c"stogir_vector_select_917")))
+    (set! failures
+          (+ failures (linked-pressure 37 5 c"stogir_vector_select_918")))
+    (set! failures
+          (+ failures (linked-pressure 37 5 c"stogir_vector_select_919")))
+    (set! failures
+          (+ failures (linked-pressure 37 12 c"stogir_vector_select_920")))
+    (set! failures
+          (+ failures (linked-pressure 37 12 c"stogir_vector_select_921")))
+    (set! failures
+          (+ failures (linked-pressure 37 13 c"stogir_vector_select_922")))
+    (set! failures
+          (+ failures (linked-pressure 37 13 c"stogir_vector_select_923")))
+    (set! failures
+          (+ failures (linked-pressure 43 1 c"stogir_vector_select_924")))
+    (set! failures
+          (+ failures (linked-pressure 43 1 c"stogir_vector_select_925")))
+    (set! failures
+          (+ failures (linked-pressure 43 5 c"stogir_vector_select_926")))
+    (set! failures
+          (+ failures (linked-pressure 43 5 c"stogir_vector_select_927")))
+    (set! failures
+          (+ failures (linked-pressure 43 12 c"stogir_vector_select_928")))
+    (set! failures
+          (+ failures (linked-pressure 43 12 c"stogir_vector_select_929")))
+    (set! failures
+          (+ failures (linked-pressure 43 13 c"stogir_vector_select_930")))
+    (set! failures
+          (+ failures (linked-pressure 43 13 c"stogir_vector_select_931")))
+    (set! failures
+          (+ failures (linked-pressure 45 1 c"stogir_vector_select_932")))
+    (set! failures
+          (+ failures (linked-pressure 45 1 c"stogir_vector_select_933")))
+    (set! failures
+          (+ failures (linked-pressure 45 5 c"stogir_vector_select_934")))
+    (set! failures
+          (+ failures (linked-pressure 45 5 c"stogir_vector_select_935")))
+    (set! failures
+          (+ failures (linked-pressure 45 12 c"stogir_vector_select_936")))
+    (set! failures
+          (+ failures (linked-pressure 45 12 c"stogir_vector_select_937")))
+    (set! failures
+          (+ failures (linked-pressure 45 13 c"stogir_vector_select_938")))
+    (set! failures
+          (+ failures (linked-pressure 45 13 c"stogir_vector_select_939")))
+    (set! failures
+          (+ failures (linked-pressure 44 1 c"stogir_vector_select_940")))
+    (set! failures
+          (+ failures (linked-pressure 44 1 c"stogir_vector_select_941")))
+    (set! failures
+          (+ failures (linked-pressure 44 5 c"stogir_vector_select_942")))
+    (set! failures
+          (+ failures (linked-pressure 44 5 c"stogir_vector_select_943")))
+    (set! failures
+          (+ failures (linked-pressure 44 12 c"stogir_vector_select_944")))
+    (set! failures
+          (+ failures (linked-pressure 44 12 c"stogir_vector_select_945")))
+    (set! failures
+          (+ failures (linked-pressure 44 13 c"stogir_vector_select_946")))
+    (set! failures
+          (+ failures (linked-pressure 44 13 c"stogir_vector_select_947")))
+    (set! failures
+          (+ failures (linked-pressure 22 1 c"stogir_vector_select_948")))
+    (set! failures
+          (+ failures (linked-pressure 22 1 c"stogir_vector_select_949")))
+    (set! failures
+          (+ failures (linked-pressure 22 5 c"stogir_vector_select_950")))
+    (set! failures
+          (+ failures (linked-pressure 22 5 c"stogir_vector_select_951")))
+    (set! failures
+          (+ failures (linked-pressure 22 12 c"stogir_vector_select_952")))
+    (set! failures
+          (+ failures (linked-pressure 22 12 c"stogir_vector_select_953")))
+    (set! failures
+          (+ failures (linked-pressure 22 13 c"stogir_vector_select_954")))
+    (set! failures
+          (+ failures (linked-pressure 22 13 c"stogir_vector_select_955")))
+    (set! failures
+          (+ failures (linked-pressure 82 8 c"stogir_vector_select_956")))
+    (set! failures
+          (+ failures (linked-pressure 82 8 c"stogir_vector_select_957")))
+    (set! failures
+          (+ failures (linked-pressure 82 9 c"stogir_vector_select_958")))
+    (set! failures
+          (+ failures (linked-pressure 82 9 c"stogir_vector_select_959")))
+    (set! failures
+          (+ failures (linked-pressure 52 8 c"stogir_vector_select_960")))
+    (set! failures
+          (+ failures (linked-pressure 52 8 c"stogir_vector_select_961")))
+    (set! failures
+          (+ failures (linked-pressure 52 9 c"stogir_vector_select_962")))
+    (set! failures
+          (+ failures (linked-pressure 52 9 c"stogir_vector_select_963")))
+    (println "linked vector selection: 964 objects; failures {}" failures)
+    failures))

@@ -9,6 +9,7 @@
 (import "stogir.a64.code" :as code)
 (import "stogir.a64.value" :as value)
 (import "stogir.a64.truth" :as truth)
+(import "stogir.a64.vector-select" :as vector)
 (import "stogir.a64.registers" :as registers)
 (import "stogir.a64.emit" :as emit)
 (import "stogir.a64.encode" :as encode)
@@ -20,7 +21,10 @@
 (defn width [(graph g/Graph) (reference i32)] (-> (Result i32 (slice u8)))
   (match (cond/validate graph reference)
     (Err [message] (Err message))
-    (Ok [ty] (Ok (* 8 (types/scalar-size ty 8))))))
+    (Ok [ty]
+        (if (and (types/vector? ty) (not (types/short-vector? ty 8)))
+            (Err "unsupported AArch64 vector selection width")
+            (Ok (* 8 (types/size ty 8)))))))
 
 ;;; Capture flags before arm materialization. Typed MOV/FMOV and address loads
 ;;; preserve NZCV, including when all three inputs need the reserved scratches.
@@ -70,19 +74,27 @@
                     (set! destination (cast i32 (.value location)))
                     (set! error "COND result requires register of its class"))))
           (when (= error "")
-            (emit/word! (mut (.text temp))
-                        (mut error)
-                        (if (types/floating? (cast i32 (n/type-id node)))
-                            (encode/floating-select (= bits 64)
-                                                    (- destination 32)
-                                                    (- yes 32)
-                                                    (- no 32)
-                                                    1)
-                            (encode/conditional-select (= bits 64)
-                                                       destination
-                                                       yes
-                                                       no
-                                                       1)))
+            (if (types/vector? (cast i32 (n/type-id node)))
+                (match (vector/emit-flags! (mut (.text temp))
+                                           (cast i32 (n/type-id node))
+                                           (- destination 32)
+                                           (- yes 32)
+                                           (- no 32))
+                  (Err [message] (set! error message))
+                  (Ok [_] 0))
+                (emit/word! (mut (.text temp))
+                            (mut error)
+                            (if (types/floating? (cast i32 (n/type-id node)))
+                                (encode/floating-select (= bits 64)
+                                                        (- destination 32)
+                                                        (- yes 32)
+                                                        (- no 32)
+                                                        1)
+                                (encode/conditional-select (= bits 64)
+                                                           destination
+                                                           yes
+                                                           no
+                                                           1))))
             (match (abi/normalize! (mut (.text temp))
                                    (n/type-id node)
                                    destination)

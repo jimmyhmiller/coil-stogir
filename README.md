@@ -64,6 +64,8 @@ Integer and floating vector comparisons return checked full-lane integer masks;
 floating U-prefixed predicates include unordered inputs, matching scalar rules.
 EXTRACT/REPLACE support checked constant and dynamic lane indices, and SPLAT
 transports complete scalar bits. Dynamic lane access stays in registers.
+Scalar conditions can also select complete vector values through COND, with
+bit-preserving native mask selection and the existing truth/folding/CSE rules.
 Remaining vector operations and broader ABI coverage are unfinished.
 
 Native copy, overlap-safe move and zero builders expand into existing memory

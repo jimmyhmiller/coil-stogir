@@ -1349,3 +1349,31 @@ The unchanged-source lane regression passes all 204 standalone checks and all
 61 linked consumers with debug checks, regenerated objects, exact expected
 file/consumer pass sets and no linked warnings. All 374 implementation/test files
 remain Coil. Formatting/diff checks pass; the project pad indexes the evidence.
+
+
+### Whole-vector conditional selection checkpoint
+
+COND now accepts scalar or vector result types with exactly typed arms, retaining
+ordinary scalar conditions, including floating NaN/nonzero and signed-zero truth.
+VAR/ARGVAL storage wrappers reject as conditions or values. All 91 abstract vector
+types participate in checked construction, constant/identical-arm folding and
+exact-key CSE; patching invalidates cached expressions. Generic vector verification
+delegates to the shared conditional validator. The AArch64 target accepts D/Q
+results and diagnoses other widths explicitly.
+
+Native emission captures scalar truth flags before arm materialization. CSETM
+turns NE into a 64-bit all-one/zero mask, FMOV or DUP extends it to the full vector,
+and BSL selects the original bits. The mask register is distinct from both arms;
+when v30/v31 hold literal operands, the distinct allocated result holds the mask.
+This handles result/source aliases, full Q payloads and signaling NaNs without
+FP arithmetic on the arms, helper calls, branches or lane loops. Scalar selection
+keeps its existing CSEL/FCSEL path.
+
+Focused checks cover 338 register cases plus 112 conditional-mask encodings /
+1,412 independent LLVM MC words; abstract typing/folding/CSE/error contracts;
+2,704 native graph variants across 26 D/Q shapes and all 13 scalar condition types;
+1,014 forced-register JIT harnesses with integer/f32/f64 flags; 80 clobbering-call/
+spill/dynamic-frame pressure graphs; and 964 linked objects. Complete selected
+bits, original arms/conditions, input memory and padding are compared. Remaining
+shuffle/vector-conversion families and broader standalone/compiler/backend/
+benchmark work remain required.
