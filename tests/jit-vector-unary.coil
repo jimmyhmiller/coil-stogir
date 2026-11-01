@@ -1,0 +1,1157 @@
+(module stogir.tests.jit-vector-unary)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "stogir.types" :as types)
+
+(defn pattern [(base i32) (lane i64) (seed i64) (right? bool)] (-> u64)
+  (let [i (% (+ lane seed (if right? (: 3 i64) 0)) 11)
+        fp? (types/floating? base)
+        wide? (= base 12)]
+    (if fp?
+        (if wide?
+            (match i
+              (0 (: 0 u64))
+              (1 0x8000000000000000)
+              (2 0x3FF0000000000000)
+              (3 0xBFF0000000000000)
+              (4 1)
+              (5 0x000FFFFFFFFFFFFF)
+              (6 0x7FEFFFFFFFFFFFFF)
+              (7 0x7FF0000000000000)
+              (8 0xFFF0000000000000)
+              (9 0x7FF8123456789ABC)
+              (_ 0x7FF0123456789ABC))
+            (match i
+              (0 (: 0 u64))
+              (1 0x80000000)
+              (2 0x3F800000)
+              (3 0xBF800000)
+              (4 1)
+              (5 0x007FFFFF)
+              (6 0x7F7FFFFF)
+              (7 0x7F800000)
+              (8 0xFF800000)
+              (9 0x7FC12345)
+              (_ 0x7F812345)))
+        (match i
+          (0 (: 0 u64))
+          (1 1)
+          (2 0xFFFFFFFFFFFFFFFF)
+          (3 0x8000000000000000)
+          (4 0x7FFFFFFFFFFFFFFF)
+          (5 0x8080808080808080)
+          (6 0x7F7F7F7F7F7F7F7F)
+          (7 0xFFFF0000FFFF0000)
+          (8 0x123456789ABCDEF0)
+          (9 0xFFFFFFFFFFFFFFFE)
+          (_ 0x0102030405060708)))))
+
+(defn input-byte [(base i32) (index i64) (seed i64) (right? bool)] (-> u8)
+  (let [width (cast i64 (types/scalar-size base 8))]
+    (cast u8
+          (>> (pattern base (/ index width) seed right?)
+              (cast u64 (* (% index width) 8))))))
+
+(defn expected [(opcode i32) (base i32) (bits u64)] (-> u64)
+  (let [width (* 8 (types/scalar-size base 8))
+        range (<< (: 1 u128) (cast u128 width))
+        mask (cast u64 (- range 1))
+        sign (cast u64 (>> range 1))
+        x (& bits mask)]
+    (if (types/floating? base)
+        (if (= opcode 31) (^ x sign) (& x (^ mask sign)))
+        (cond (= opcode 45) (^ x mask)
+              (= opcode 31)
+                (cast u64 (& (- range (cast u128 x)) (cast u128 mask)))
+              (= opcode 32)
+                (if (= (& x sign) 0)
+                    x
+                    (cast u64 (& (- range (cast u128 x)) (cast u128 mask))))
+              (= opcode 54)
+                (let [(mut result) (: 0 u64)
+                      (mut i) (: 0 i32)]
+                  (while (< i (/ width 8))
+                    (set! result
+                          (| (<< result 8) (& (>> x (cast u64 (* i 8))) 255)))
+                    (set! i (+ i 1)))
+                  result)
+              (= opcode 55)
+                (let [(mut count) (: 0 i32)]
+                  (while (and (< count width)
+                              (= (& (>> x (cast u64 (- width count 1))) 1) 0))
+                    (set! count (+ count 1)))
+                  (cast u64 count))
+              (= opcode 56)
+                (let [(mut count) (: 0 i32)]
+                  (while (and (< count width)
+                              (= (& (>> x (cast u64 count)) 1) 0))
+                    (set! count (+ count 1)))
+                  (cast u64 count))
+              :else
+                (let [(mut count) (: 0 u64)
+                      (mut i) (: 0 i32)]
+                  (while (< i width)
+                    (set! count (+ count (& (>> x (cast u64 i)) 1)))
+                    (set! i (+ i 1)))
+                  count)))))
+
+(defn read-word [(buffer (slice u8)) (offset i64) (width i32)] (-> u64)
+  (let [(mut result) (: 0 u64)
+        (mut i) (: 0 i32)]
+    (while (< i width)
+      (set! result
+            (| result
+               (<< (cast u64 (get buffer (+ offset (cast i64 i))))
+                   (cast u64 (* i 8)))))
+      (set! i (+ i 1)))
+    result))
+
+(defn exercise [(ty i32) (opcode i32) (mode i32) (address (ptr u8))] (-> i64)
+  (let [allocator (malloc-allocator)
+        base (types/base-type ty)
+        width (types/size ty 8)
+        element (types/scalar-size base 8)
+        lanes (/ width element)
+        f (p/cast (fnptr (cc/C) [u64 u64] void) address)
+        (mut input) (ArrayList::new [u8] allocator)
+        (mut output) (ArrayList::new [u8] allocator)
+        (mut failures) 0
+        (mut seed) (: 0 i64)]
+    (while (< seed 11)
+      (clear! (mut input))
+      (clear! (mut output))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 32)
+          (push! (mut input) (input-byte base i seed false))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 80) (push! (mut output) 165) (set! i (+ i 1))))
+      (call-ptr f (p/cast u64 (.data output)) (p/cast u64 (.data input)))
+      (let [(mut lane) (: 0 i32)]
+        (while (< lane lanes)
+          (let [x
+                  (pattern base
+                           (cast i64 lane)
+                           (if (= mode 1) (: 0 i64) seed)
+                           false)
+                wanted (expected opcode base x)
+                got
+                  (read-word (slice output)
+                             (* (cast i64 lane) (cast i64 element))
+                             element)]
+            (when (!= got wanted)
+              (println "vector unary ty{} op{} mode{} seed{} lane{} got{} expected{}"
+                       ty
+                       opcode
+                       mode
+                       seed
+                       lane
+                       got
+                       wanted)
+              (set! failures (+ failures 1))))
+          (set! lane (+ lane 1))))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 80)
+          (when (>= i (cast i64 width))
+            (let [wanted
+                    (if (and (!= mode 2)
+                             (>= i 24)
+                             (< i (+ 24 (cast i64 width))))
+                        (input-byte base
+                                    (- i 24)
+                                    (if (= mode 1) (: 0 i64) seed)
+                                    false)
+                        (: 165 u8))]
+              (when (!= (get output i) wanted) (set! failures (+ failures 1)))))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 32)
+          (when (!= (get input i) (input-byte base i seed false))
+            (set! failures (+ failures 1)))
+          (set! i (+ i 1))))
+      (set! seed (+ seed 1)))
+    (free! (mut input))
+    (free! (mut output))
+    failures))
+
+(defn probe :cc (cc/C) [(input (ptr u8))] (-> u64)
+  (p/machine-code (Aarch64)
+                  0xf1
+                  0x03
+                  0x00
+                  0xaa
+                  0x20
+                  0x02
+                  0xc0
+                  0x3d
+                  0x21
+                  0x02
+                  0xc0
+                  0x3d
+                  0x22
+                  0x02
+                  0xc0
+                  0x3d
+                  0x23
+                  0x02
+                  0xc0
+                  0x3d
+                  0x24
+                  0x02
+                  0xc0
+                  0x3d
+                  0x25
+                  0x02
+                  0xc0
+                  0x3d
+                  0x26
+                  0x02
+                  0xc0
+                  0x3d
+                  0x27
+                  0x02
+                  0xc0
+                  0x3d
+                  0x30
+                  0x02
+                  0xc0
+                  0x3d
+                  0x31
+                  0x02
+                  0xc0
+                  0x3d
+                  0x32
+                  0x02
+                  0xc0
+                  0x3d
+                  0x33
+                  0x02
+                  0xc0
+                  0x3d
+                  0x34
+                  0x02
+                  0xc0
+                  0x3d
+                  0x35
+                  0x02
+                  0xc0
+                  0x3d
+                  0x36
+                  0x02
+                  0xc0
+                  0x3d
+                  0x37
+                  0x02
+                  0xc0
+                  0x3d
+                  0x38
+                  0x02
+                  0xc0
+                  0x3d
+                  0x39
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3a
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3b
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3c
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3d
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3e
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3f
+                  0x02
+                  0xc0
+                  0x3d
+                  0xa0
+                  0x15
+                  0x80
+                  0xd2
+                  0xc1
+                  0x15
+                  0x80
+                  0xd2
+                  0xe2
+                  0x15
+                  0x80
+                  0xd2
+                  0x03
+                  0x16
+                  0x80
+                  0xd2
+                  0x24
+                  0x16
+                  0x80
+                  0xd2
+                  0x45
+                  0x16
+                  0x80
+                  0xd2
+                  0x66
+                  0x16
+                  0x80
+                  0xd2
+                  0x87
+                  0x16
+                  0x80
+                  0xd2
+                  0xa8
+                  0x16
+                  0x80
+                  0xd2
+                  0xc9
+                  0x16
+                  0x80
+                  0xd2
+                  0xea
+                  0x16
+                  0x80
+                  0xd2
+                  0x0b
+                  0x17
+                  0x80
+                  0xd2
+                  0x2c
+                  0x17
+                  0x80
+                  0xd2
+                  0x4d
+                  0x17
+                  0x80
+                  0xd2
+                  0x6e
+                  0x17
+                  0x80
+                  0xd2
+                  0x8f
+                  0x17
+                  0x80
+                  0xd2
+                  0xc0
+                  0x03
+                  0x5f
+                  0xd6))
+
+(defn pressure-exercise [(ty i32) (opcode i32) (address (ptr u8))] (-> i64)
+  (let [allocator (malloc-allocator)
+        base (types/base-type ty)
+        width (types/size ty 8)
+        element (types/scalar-size base 8)
+        lanes (/ width element)
+        f (p/cast (fnptr (cc/C) [u64 u64 u64] u64) address)
+        target
+          (p/cast u64
+                  (p/cast (ptr u8)
+                          (: (fnptr-of probe) (fnptr (cc/C) [(ptr u8)] u64))))
+        (mut input) (ArrayList::new [u8] allocator)
+        (mut output) (ArrayList::new [u8] allocator)
+        (mut failures) 0
+        (mut seed) (: 0 i64)]
+    (while (< seed 11)
+      (clear! (mut input))
+      (clear! (mut output))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 2048)
+          (push! (mut input) (input-byte base i seed false))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 2064) (push! (mut output) 165) (set! i (+ i 1))))
+      (when (!= (call-ptr f
+                          (p/cast u64 (p/index (.data output) 3))
+                          (p/cast u64 (.data input))
+                          target)
+                811)
+        (println "vector pressure guard/result ty{} op{} seed{}" ty opcode seed)
+        (set! failures (+ failures 1)))
+      (let [(mut lane) (: 0 i32)]
+        (while (< lane (* 40 lanes))
+          (let [a (pattern base (cast i64 lane) seed false)
+                wanted (expected opcode base a)
+                got
+                  (read-word (slice output)
+                             (+ 3 (* (cast i64 lane) (cast i64 element)))
+                             element)]
+            (when (!= wanted got)
+              (println "vector pressure ty{} op{} seed{} lane{} got{} expected{}"
+                       ty
+                       opcode
+                       seed
+                       lane
+                       got
+                       wanted)
+              (set! failures (+ failures 1))))
+          (set! lane (+ lane 1))))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 2064)
+          (let [pos (- i 3)]
+            (when (not (and (>= pos 0) (< pos (* 40 (cast i64 width)))))
+              (let [wanted
+                      (if (and (>= pos 1024)
+                               (< pos (+ 1024 (* 40 (cast i64 width)))))
+                          (input-byte base (- pos 1024) seed false)
+                          (: 165 u8))]
+                (when (!= (get output i) wanted) (set! failures (+ failures 1))))))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 2048)
+          (when (!= (get input i) (input-byte base i seed false))
+            (set! failures (+ failures 1)))
+          (set! i (+ i 1))))
+      (set! seed (+ seed 1)))
+    (free! (mut input))
+    (free! (mut output))
+    failures))
+
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.vector-arithmetic" :as va)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn address! [(graph (mut g/Graph)) (base i32) (offset i32)] (-> i32)
+  (require (b/emit! (mut graph)
+                    26
+                    6
+                    [base
+                     (require (b/scalar-constant! (mut graph)
+                                                  5
+                                                  (cast u64 offset)
+                                                  8))])))
+
+(defn fixture-id [(ty i32) (opcode i32) (mode i32)] (-> i32)
+  (match (+ (* ty 1000) (* opcode 10) mode)
+    (65450 0)
+    (81450 1)
+    (66310 2)
+    (66450 3)
+    (66550 4)
+    (66560 5)
+    (66570 6)
+    (82310 7)
+    (82450 8)
+    (82550 9)
+    (82560 10)
+    (82570 11)
+    (51310 12)
+    (51450 13)
+    (51540 14)
+    (51550 15)
+    (51560 16)
+    (51570 17)
+    (67310 18)
+    (67450 19)
+    (67540 20)
+    (67550 21)
+    (67560 22)
+    (67570 23)
+    (36310 24)
+    (36450 25)
+    (36540 26)
+    (36550 27)
+    (36560 28)
+    (36570 29)
+    (52310 30)
+    (52450 31)
+    (52540 32)
+    (52550 33)
+    (52560 34)
+    (52570 35)
+    (21310 36)
+    (21450 37)
+    (21540 38)
+    (21550 39)
+    (21560 40)
+    (21570 41)
+    (37310 42)
+    (37450 43)
+    (37540 44)
+    (37550 45)
+    (37560 46)
+    (37570 47)
+    (22450 48)
+    (22540 49)
+    (22550 50)
+    (22560 51)
+    (22570 52)
+    (38450 53)
+    (38540 54)
+    (38550 55)
+    (38560 56)
+    (38570 57)
+    (71310 58)
+    (71320 59)
+    (71450 60)
+    (71550 61)
+    (71560 62)
+    (71570 63)
+    (87310 64)
+    (87320 65)
+    (87450 66)
+    (87550 67)
+    (87560 68)
+    (87570 69)
+    (72310 70)
+    (72320 71)
+    (72450 72)
+    (72550 73)
+    (72560 74)
+    (72570 75)
+    (88310 76)
+    (88320 77)
+    (88450 78)
+    (88550 79)
+    (88560 80)
+    (88570 81)
+    (57310 82)
+    (57320 83)
+    (57450 84)
+    (57540 85)
+    (57550 86)
+    (57560 87)
+    (57570 88)
+    (73310 89)
+    (73320 90)
+    (73450 91)
+    (73540 92)
+    (73550 93)
+    (73560 94)
+    (73570 95)
+    (42310 96)
+    (42320 97)
+    (42450 98)
+    (42540 99)
+    (42550 100)
+    (42560 101)
+    (42570 102)
+    (58310 103)
+    (58320 104)
+    (58450 105)
+    (58540 106)
+    (58550 107)
+    (58560 108)
+    (58570 109)
+    (27310 110)
+    (27320 111)
+    (27450 112)
+    (27540 113)
+    (27550 114)
+    (27560 115)
+    (27570 116)
+    (43310 117)
+    (43320 118)
+    (43450 119)
+    (43540 120)
+    (43550 121)
+    (43560 122)
+    (43570 123)
+    (28310 124)
+    (28320 125)
+    (44310 126)
+    (44320 127)
+    (45310 128)
+    (45320 129)
+    (61310 130)
+    (61320 131)
+    (82311 132)
+    (88321 133)
+    (37451 134)
+    (61311 135)
+    (44321 136)
+    (67541 137)
+    (52551 138)
+    (43551 139)
+    (88561 140)
+    (37561 141)
+    (73571 142)
+    (37571 143)
+    (_ (: -1 i32))))
+
+(defn fixture-name [(id i32)] (-> (slice u8))
+  (match id
+    (0 "_stogir_vector_unary_0")
+    (1 "_stogir_vector_unary_1")
+    (2 "_stogir_vector_unary_2")
+    (3 "_stogir_vector_unary_3")
+    (4 "_stogir_vector_unary_4")
+    (5 "_stogir_vector_unary_5")
+    (6 "_stogir_vector_unary_6")
+    (7 "_stogir_vector_unary_7")
+    (8 "_stogir_vector_unary_8")
+    (9 "_stogir_vector_unary_9")
+    (10 "_stogir_vector_unary_10")
+    (11 "_stogir_vector_unary_11")
+    (12 "_stogir_vector_unary_12")
+    (13 "_stogir_vector_unary_13")
+    (14 "_stogir_vector_unary_14")
+    (15 "_stogir_vector_unary_15")
+    (16 "_stogir_vector_unary_16")
+    (17 "_stogir_vector_unary_17")
+    (18 "_stogir_vector_unary_18")
+    (19 "_stogir_vector_unary_19")
+    (20 "_stogir_vector_unary_20")
+    (21 "_stogir_vector_unary_21")
+    (22 "_stogir_vector_unary_22")
+    (23 "_stogir_vector_unary_23")
+    (24 "_stogir_vector_unary_24")
+    (25 "_stogir_vector_unary_25")
+    (26 "_stogir_vector_unary_26")
+    (27 "_stogir_vector_unary_27")
+    (28 "_stogir_vector_unary_28")
+    (29 "_stogir_vector_unary_29")
+    (30 "_stogir_vector_unary_30")
+    (31 "_stogir_vector_unary_31")
+    (32 "_stogir_vector_unary_32")
+    (33 "_stogir_vector_unary_33")
+    (34 "_stogir_vector_unary_34")
+    (35 "_stogir_vector_unary_35")
+    (36 "_stogir_vector_unary_36")
+    (37 "_stogir_vector_unary_37")
+    (38 "_stogir_vector_unary_38")
+    (39 "_stogir_vector_unary_39")
+    (40 "_stogir_vector_unary_40")
+    (41 "_stogir_vector_unary_41")
+    (42 "_stogir_vector_unary_42")
+    (43 "_stogir_vector_unary_43")
+    (44 "_stogir_vector_unary_44")
+    (45 "_stogir_vector_unary_45")
+    (46 "_stogir_vector_unary_46")
+    (47 "_stogir_vector_unary_47")
+    (48 "_stogir_vector_unary_48")
+    (49 "_stogir_vector_unary_49")
+    (50 "_stogir_vector_unary_50")
+    (51 "_stogir_vector_unary_51")
+    (52 "_stogir_vector_unary_52")
+    (53 "_stogir_vector_unary_53")
+    (54 "_stogir_vector_unary_54")
+    (55 "_stogir_vector_unary_55")
+    (56 "_stogir_vector_unary_56")
+    (57 "_stogir_vector_unary_57")
+    (58 "_stogir_vector_unary_58")
+    (59 "_stogir_vector_unary_59")
+    (60 "_stogir_vector_unary_60")
+    (61 "_stogir_vector_unary_61")
+    (62 "_stogir_vector_unary_62")
+    (63 "_stogir_vector_unary_63")
+    (64 "_stogir_vector_unary_64")
+    (65 "_stogir_vector_unary_65")
+    (66 "_stogir_vector_unary_66")
+    (67 "_stogir_vector_unary_67")
+    (68 "_stogir_vector_unary_68")
+    (69 "_stogir_vector_unary_69")
+    (70 "_stogir_vector_unary_70")
+    (71 "_stogir_vector_unary_71")
+    (72 "_stogir_vector_unary_72")
+    (73 "_stogir_vector_unary_73")
+    (74 "_stogir_vector_unary_74")
+    (75 "_stogir_vector_unary_75")
+    (76 "_stogir_vector_unary_76")
+    (77 "_stogir_vector_unary_77")
+    (78 "_stogir_vector_unary_78")
+    (79 "_stogir_vector_unary_79")
+    (80 "_stogir_vector_unary_80")
+    (81 "_stogir_vector_unary_81")
+    (82 "_stogir_vector_unary_82")
+    (83 "_stogir_vector_unary_83")
+    (84 "_stogir_vector_unary_84")
+    (85 "_stogir_vector_unary_85")
+    (86 "_stogir_vector_unary_86")
+    (87 "_stogir_vector_unary_87")
+    (88 "_stogir_vector_unary_88")
+    (89 "_stogir_vector_unary_89")
+    (90 "_stogir_vector_unary_90")
+    (91 "_stogir_vector_unary_91")
+    (92 "_stogir_vector_unary_92")
+    (93 "_stogir_vector_unary_93")
+    (94 "_stogir_vector_unary_94")
+    (95 "_stogir_vector_unary_95")
+    (96 "_stogir_vector_unary_96")
+    (97 "_stogir_vector_unary_97")
+    (98 "_stogir_vector_unary_98")
+    (99 "_stogir_vector_unary_99")
+    (100 "_stogir_vector_unary_100")
+    (101 "_stogir_vector_unary_101")
+    (102 "_stogir_vector_unary_102")
+    (103 "_stogir_vector_unary_103")
+    (104 "_stogir_vector_unary_104")
+    (105 "_stogir_vector_unary_105")
+    (106 "_stogir_vector_unary_106")
+    (107 "_stogir_vector_unary_107")
+    (108 "_stogir_vector_unary_108")
+    (109 "_stogir_vector_unary_109")
+    (110 "_stogir_vector_unary_110")
+    (111 "_stogir_vector_unary_111")
+    (112 "_stogir_vector_unary_112")
+    (113 "_stogir_vector_unary_113")
+    (114 "_stogir_vector_unary_114")
+    (115 "_stogir_vector_unary_115")
+    (116 "_stogir_vector_unary_116")
+    (117 "_stogir_vector_unary_117")
+    (118 "_stogir_vector_unary_118")
+    (119 "_stogir_vector_unary_119")
+    (120 "_stogir_vector_unary_120")
+    (121 "_stogir_vector_unary_121")
+    (122 "_stogir_vector_unary_122")
+    (123 "_stogir_vector_unary_123")
+    (124 "_stogir_vector_unary_124")
+    (125 "_stogir_vector_unary_125")
+    (126 "_stogir_vector_unary_126")
+    (127 "_stogir_vector_unary_127")
+    (128 "_stogir_vector_unary_128")
+    (129 "_stogir_vector_unary_129")
+    (130 "_stogir_vector_unary_130")
+    (131 "_stogir_vector_unary_131")
+    (132 "_stogir_vector_unary_132")
+    (133 "_stogir_vector_unary_133")
+    (134 "_stogir_vector_unary_134")
+    (135 "_stogir_vector_unary_135")
+    (136 "_stogir_vector_unary_136")
+    (137 "_stogir_vector_unary_137")
+    (138 "_stogir_vector_unary_138")
+    (139 "_stogir_vector_unary_139")
+    (140 "_stogir_vector_unary_140")
+    (141 "_stogir_vector_unary_141")
+    (142 "_stogir_vector_unary_142")
+    (143 "_stogir_vector_unary_143")
+    (144 "_stogir_vector_unary_144")
+    (145 "_stogir_vector_unary_145")
+    (146 "_stogir_vector_unary_146")
+    (147 "_stogir_vector_unary_147")
+    (148 "_stogir_vector_unary_148")
+    (149 "_stogir_vector_unary_149")
+    (150 "_stogir_vector_unary_150")
+    (151 "_stogir_vector_unary_151")
+    (152 "_stogir_vector_unary_152")
+    (153 "_stogir_vector_unary_153")
+    (154 "_stogir_vector_unary_154")
+    (155 "_stogir_vector_unary_155")
+    (156 "_stogir_vector_unary_156")
+    (157 "_stogir_vector_unary_157")
+    (158 "_stogir_vector_unary_158")
+    (159 "_stogir_vector_unary_159")
+    (160 "_stogir_vector_unary_160")
+    (161 "_stogir_vector_unary_161")
+    (162 "_stogir_vector_unary_162")
+    (163 "_stogir_vector_unary_163")
+    (164 "_stogir_vector_unary_164")
+    (165 "_stogir_vector_unary_165")
+    (166 "_stogir_vector_unary_166")
+    (167 "_stogir_vector_unary_167")
+    (_ "invalid")))
+
+(defn fixture-path [(id i32)] (-> (slice u8))
+  (match id
+    (0 "/tmp/coil-stogir-vector-unary-0.o")
+    (1 "/tmp/coil-stogir-vector-unary-1.o")
+    (2 "/tmp/coil-stogir-vector-unary-2.o")
+    (3 "/tmp/coil-stogir-vector-unary-3.o")
+    (4 "/tmp/coil-stogir-vector-unary-4.o")
+    (5 "/tmp/coil-stogir-vector-unary-5.o")
+    (6 "/tmp/coil-stogir-vector-unary-6.o")
+    (7 "/tmp/coil-stogir-vector-unary-7.o")
+    (8 "/tmp/coil-stogir-vector-unary-8.o")
+    (9 "/tmp/coil-stogir-vector-unary-9.o")
+    (10 "/tmp/coil-stogir-vector-unary-10.o")
+    (11 "/tmp/coil-stogir-vector-unary-11.o")
+    (12 "/tmp/coil-stogir-vector-unary-12.o")
+    (13 "/tmp/coil-stogir-vector-unary-13.o")
+    (14 "/tmp/coil-stogir-vector-unary-14.o")
+    (15 "/tmp/coil-stogir-vector-unary-15.o")
+    (16 "/tmp/coil-stogir-vector-unary-16.o")
+    (17 "/tmp/coil-stogir-vector-unary-17.o")
+    (18 "/tmp/coil-stogir-vector-unary-18.o")
+    (19 "/tmp/coil-stogir-vector-unary-19.o")
+    (20 "/tmp/coil-stogir-vector-unary-20.o")
+    (21 "/tmp/coil-stogir-vector-unary-21.o")
+    (22 "/tmp/coil-stogir-vector-unary-22.o")
+    (23 "/tmp/coil-stogir-vector-unary-23.o")
+    (24 "/tmp/coil-stogir-vector-unary-24.o")
+    (25 "/tmp/coil-stogir-vector-unary-25.o")
+    (26 "/tmp/coil-stogir-vector-unary-26.o")
+    (27 "/tmp/coil-stogir-vector-unary-27.o")
+    (28 "/tmp/coil-stogir-vector-unary-28.o")
+    (29 "/tmp/coil-stogir-vector-unary-29.o")
+    (30 "/tmp/coil-stogir-vector-unary-30.o")
+    (31 "/tmp/coil-stogir-vector-unary-31.o")
+    (32 "/tmp/coil-stogir-vector-unary-32.o")
+    (33 "/tmp/coil-stogir-vector-unary-33.o")
+    (34 "/tmp/coil-stogir-vector-unary-34.o")
+    (35 "/tmp/coil-stogir-vector-unary-35.o")
+    (36 "/tmp/coil-stogir-vector-unary-36.o")
+    (37 "/tmp/coil-stogir-vector-unary-37.o")
+    (38 "/tmp/coil-stogir-vector-unary-38.o")
+    (39 "/tmp/coil-stogir-vector-unary-39.o")
+    (40 "/tmp/coil-stogir-vector-unary-40.o")
+    (41 "/tmp/coil-stogir-vector-unary-41.o")
+    (42 "/tmp/coil-stogir-vector-unary-42.o")
+    (43 "/tmp/coil-stogir-vector-unary-43.o")
+    (44 "/tmp/coil-stogir-vector-unary-44.o")
+    (45 "/tmp/coil-stogir-vector-unary-45.o")
+    (46 "/tmp/coil-stogir-vector-unary-46.o")
+    (47 "/tmp/coil-stogir-vector-unary-47.o")
+    (48 "/tmp/coil-stogir-vector-unary-48.o")
+    (49 "/tmp/coil-stogir-vector-unary-49.o")
+    (50 "/tmp/coil-stogir-vector-unary-50.o")
+    (51 "/tmp/coil-stogir-vector-unary-51.o")
+    (52 "/tmp/coil-stogir-vector-unary-52.o")
+    (53 "/tmp/coil-stogir-vector-unary-53.o")
+    (54 "/tmp/coil-stogir-vector-unary-54.o")
+    (55 "/tmp/coil-stogir-vector-unary-55.o")
+    (56 "/tmp/coil-stogir-vector-unary-56.o")
+    (57 "/tmp/coil-stogir-vector-unary-57.o")
+    (58 "/tmp/coil-stogir-vector-unary-58.o")
+    (59 "/tmp/coil-stogir-vector-unary-59.o")
+    (60 "/tmp/coil-stogir-vector-unary-60.o")
+    (61 "/tmp/coil-stogir-vector-unary-61.o")
+    (62 "/tmp/coil-stogir-vector-unary-62.o")
+    (63 "/tmp/coil-stogir-vector-unary-63.o")
+    (64 "/tmp/coil-stogir-vector-unary-64.o")
+    (65 "/tmp/coil-stogir-vector-unary-65.o")
+    (66 "/tmp/coil-stogir-vector-unary-66.o")
+    (67 "/tmp/coil-stogir-vector-unary-67.o")
+    (68 "/tmp/coil-stogir-vector-unary-68.o")
+    (69 "/tmp/coil-stogir-vector-unary-69.o")
+    (70 "/tmp/coil-stogir-vector-unary-70.o")
+    (71 "/tmp/coil-stogir-vector-unary-71.o")
+    (72 "/tmp/coil-stogir-vector-unary-72.o")
+    (73 "/tmp/coil-stogir-vector-unary-73.o")
+    (74 "/tmp/coil-stogir-vector-unary-74.o")
+    (75 "/tmp/coil-stogir-vector-unary-75.o")
+    (76 "/tmp/coil-stogir-vector-unary-76.o")
+    (77 "/tmp/coil-stogir-vector-unary-77.o")
+    (78 "/tmp/coil-stogir-vector-unary-78.o")
+    (79 "/tmp/coil-stogir-vector-unary-79.o")
+    (80 "/tmp/coil-stogir-vector-unary-80.o")
+    (81 "/tmp/coil-stogir-vector-unary-81.o")
+    (82 "/tmp/coil-stogir-vector-unary-82.o")
+    (83 "/tmp/coil-stogir-vector-unary-83.o")
+    (84 "/tmp/coil-stogir-vector-unary-84.o")
+    (85 "/tmp/coil-stogir-vector-unary-85.o")
+    (86 "/tmp/coil-stogir-vector-unary-86.o")
+    (87 "/tmp/coil-stogir-vector-unary-87.o")
+    (88 "/tmp/coil-stogir-vector-unary-88.o")
+    (89 "/tmp/coil-stogir-vector-unary-89.o")
+    (90 "/tmp/coil-stogir-vector-unary-90.o")
+    (91 "/tmp/coil-stogir-vector-unary-91.o")
+    (92 "/tmp/coil-stogir-vector-unary-92.o")
+    (93 "/tmp/coil-stogir-vector-unary-93.o")
+    (94 "/tmp/coil-stogir-vector-unary-94.o")
+    (95 "/tmp/coil-stogir-vector-unary-95.o")
+    (96 "/tmp/coil-stogir-vector-unary-96.o")
+    (97 "/tmp/coil-stogir-vector-unary-97.o")
+    (98 "/tmp/coil-stogir-vector-unary-98.o")
+    (99 "/tmp/coil-stogir-vector-unary-99.o")
+    (100 "/tmp/coil-stogir-vector-unary-100.o")
+    (101 "/tmp/coil-stogir-vector-unary-101.o")
+    (102 "/tmp/coil-stogir-vector-unary-102.o")
+    (103 "/tmp/coil-stogir-vector-unary-103.o")
+    (104 "/tmp/coil-stogir-vector-unary-104.o")
+    (105 "/tmp/coil-stogir-vector-unary-105.o")
+    (106 "/tmp/coil-stogir-vector-unary-106.o")
+    (107 "/tmp/coil-stogir-vector-unary-107.o")
+    (108 "/tmp/coil-stogir-vector-unary-108.o")
+    (109 "/tmp/coil-stogir-vector-unary-109.o")
+    (110 "/tmp/coil-stogir-vector-unary-110.o")
+    (111 "/tmp/coil-stogir-vector-unary-111.o")
+    (112 "/tmp/coil-stogir-vector-unary-112.o")
+    (113 "/tmp/coil-stogir-vector-unary-113.o")
+    (114 "/tmp/coil-stogir-vector-unary-114.o")
+    (115 "/tmp/coil-stogir-vector-unary-115.o")
+    (116 "/tmp/coil-stogir-vector-unary-116.o")
+    (117 "/tmp/coil-stogir-vector-unary-117.o")
+    (118 "/tmp/coil-stogir-vector-unary-118.o")
+    (119 "/tmp/coil-stogir-vector-unary-119.o")
+    (120 "/tmp/coil-stogir-vector-unary-120.o")
+    (121 "/tmp/coil-stogir-vector-unary-121.o")
+    (122 "/tmp/coil-stogir-vector-unary-122.o")
+    (123 "/tmp/coil-stogir-vector-unary-123.o")
+    (124 "/tmp/coil-stogir-vector-unary-124.o")
+    (125 "/tmp/coil-stogir-vector-unary-125.o")
+    (126 "/tmp/coil-stogir-vector-unary-126.o")
+    (127 "/tmp/coil-stogir-vector-unary-127.o")
+    (128 "/tmp/coil-stogir-vector-unary-128.o")
+    (129 "/tmp/coil-stogir-vector-unary-129.o")
+    (130 "/tmp/coil-stogir-vector-unary-130.o")
+    (131 "/tmp/coil-stogir-vector-unary-131.o")
+    (132 "/tmp/coil-stogir-vector-unary-132.o")
+    (133 "/tmp/coil-stogir-vector-unary-133.o")
+    (134 "/tmp/coil-stogir-vector-unary-134.o")
+    (135 "/tmp/coil-stogir-vector-unary-135.o")
+    (136 "/tmp/coil-stogir-vector-unary-136.o")
+    (137 "/tmp/coil-stogir-vector-unary-137.o")
+    (138 "/tmp/coil-stogir-vector-unary-138.o")
+    (139 "/tmp/coil-stogir-vector-unary-139.o")
+    (140 "/tmp/coil-stogir-vector-unary-140.o")
+    (141 "/tmp/coil-stogir-vector-unary-141.o")
+    (142 "/tmp/coil-stogir-vector-unary-142.o")
+    (143 "/tmp/coil-stogir-vector-unary-143.o")
+    (144 "/tmp/coil-stogir-vector-unary-144.o")
+    (145 "/tmp/coil-stogir-vector-unary-145.o")
+    (146 "/tmp/coil-stogir-vector-unary-146.o")
+    (147 "/tmp/coil-stogir-vector-unary-147.o")
+    (148 "/tmp/coil-stogir-vector-unary-148.o")
+    (149 "/tmp/coil-stogir-vector-unary-149.o")
+    (150 "/tmp/coil-stogir-vector-unary-150.o")
+    (151 "/tmp/coil-stogir-vector-unary-151.o")
+    (152 "/tmp/coil-stogir-vector-unary-152.o")
+    (153 "/tmp/coil-stogir-vector-unary-153.o")
+    (154 "/tmp/coil-stogir-vector-unary-154.o")
+    (155 "/tmp/coil-stogir-vector-unary-155.o")
+    (156 "/tmp/coil-stogir-vector-unary-156.o")
+    (157 "/tmp/coil-stogir-vector-unary-157.o")
+    (158 "/tmp/coil-stogir-vector-unary-158.o")
+    (159 "/tmp/coil-stogir-vector-unary-159.o")
+    (160 "/tmp/coil-stogir-vector-unary-160.o")
+    (161 "/tmp/coil-stogir-vector-unary-161.o")
+    (162 "/tmp/coil-stogir-vector-unary-162.o")
+    (163 "/tmp/coil-stogir-vector-unary-163.o")
+    (164 "/tmp/coil-stogir-vector-unary-164.o")
+    (165 "/tmp/coil-stogir-vector-unary-165.o")
+    (166 "/tmp/coil-stogir-vector-unary-166.o")
+    (167 "/tmp/coil-stogir-vector-unary-167.o")
+    (_ "invalid")))
+
+(defn generate [(ty i32) (opcode i32) (mode i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        output (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        input (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        loaded (require (b/vector-load! (mut graph) ty 8 start input true))
+        width (types/size ty 8)
+        base (types/base-type ty)
+        (mut payload) (ArrayList::new [u8] allocator)
+        (mut i) (: 0 i32)
+        (mut failures) 0]
+    (while (< i width)
+      (push! (mut payload) (input-byte base (cast i64 i) 0 false))
+      (set! i (+ i 1)))
+    (let [operand
+            (if (= mode 1)
+                (require (b/vector-constant! (mut graph) ty 8 (slice payload)))
+                loaded)
+          result (require (b/vector-unary! (mut graph) opcode ty operand))
+          (mut control)
+            (require (b/vector-store! (mut graph) 8 loaded output result true))]
+      (when (!= mode 2)
+        (set! control
+              (require (b/vector-store! (mut graph)
+                                        8
+                                        control
+                                        (address! (mut graph) output 24)
+                                        operand
+                                        true))))
+      (let [ret (require (b/emit! (mut graph) 120 0 [control (: 0 i32) 0]))
+            id (fixture-id ty opcode mode)]
+        (when (>= id 0)
+          (match (compile/object graph start [ret] (fixture-name id) allocator)
+            (Err [message]
+                 (println "{}" message)
+                 (set! failures (+ failures 1)))
+            (Ok [object]
+                (let [(mut object) object]
+                  (match (fs/write-file allocator
+                                        (fixture-path id)
+                                        (slice object))
+                    (Err [_] (set! failures (+ failures 1)))
+                    (Ok [_] 0))
+                  (free! (mut object))))))
+        (match (compile/image graph start [ret] "_vector_unary_jit" allocator)
+          (Err [message]
+               (println "unary ty{} op{} mode{}: {}" ty opcode mode message)
+               (set! failures (+ failures 1)))
+          (Ok [source]
+              (let [(mut source) source]
+                (match (jit/map-image source allocator)
+                  (Err [message]
+                       (println "{}" message)
+                       (set! failures (+ failures 1)))
+                  (Ok [loaded]
+                      (let [(mut loaded) loaded]
+                        (set! failures
+                              (+ failures
+                                 (exercise ty
+                                           opcode
+                                           mode
+                                           (.base (.memory loaded)))))
+                        (jit/release-image! (mut loaded)))))
+                (image/release! (mut source)))))))
+    (free! (mut payload))
+    (g/release! (mut graph))
+    failures))
+
+(defn pressure [(ty i32) (opcode i32) (alignment i32) (id i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        output (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        input (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        guard (require (b/variable! (mut graph) 5 start "guard" alignment))
+        sentinel (require (b/scalar-constant! (mut graph) 5 321 8))
+        moving (require (b/scalar-constant! (mut graph) 5 317 8))
+        size (require (b/scalar-constant! (mut graph) 5 73 8))
+        guarded (require (b/emit! (mut graph) 87 0 [start guard sentinel]))
+        dynamic (require (b/stack-allocate! (mut graph) guarded size alignment))
+        (mut control)
+          (require (b/emit! (mut graph) 93 0 [dynamic dynamic moving]))
+        width (types/size ty 8)
+        base (types/base-type ty)
+        (mut inputs) (ArrayList::new [i32] allocator)
+        (mut results) (ArrayList::new [i32] allocator)
+        (mut i) (: 0 i32)
+        (mut failures) 0]
+    (while (< i 40)
+      (let [loaded
+              (require (b/vector-load! (mut graph)
+                                       ty
+                                       8
+                                       control
+                                       (address! (mut graph) input (* i width))
+                                       true))
+            result (require (b/vector-unary! (mut graph) opcode ty loaded))
+            storage (require (b/variable! (mut graph) ty start "computed" 0))]
+        (push! (mut inputs) loaded)
+        (push! (mut results) result)
+        ; The volatile store keeps the arithmetic before the clobbering call.
+        (set! control
+              (require (b/emit! (mut graph) 88 0 [loaded storage result]))))
+      (set! i (+ i 1)))
+    (match (calls/create 9 5 [(: 6 u8)] allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut prototype) prototype]
+            (set! control
+                  (require (calls/emit! (mut graph)
+                                        prototype
+                                        control
+                                        target
+                                        [input]
+                                        allocator)))
+            (calls/release! (mut prototype)))))
+    (let [called control]
+      (set! i 0)
+      (while (< i 40)
+        (set! control
+              (require (b/vector-store! (mut graph)
+                                        8
+                                        control
+                                        (address! (mut graph)
+                                                  output
+                                                  (* i width))
+                                        (get results (cast i64 i))
+                                        true)))
+        (set! control
+              (require (b/vector-store! (mut graph)
+                                        8
+                                        control
+                                        (address! (mut graph)
+                                                  output
+                                                  (+ 1024 (* i width)))
+                                        (get inputs (cast i64 i))
+                                        true)))
+        (set! i (+ i 1)))
+      (let [fixed (require (b/emit! (mut graph) 86 5 [control guard]))
+            live-dynamic (require (b/emit! (mut graph) 91 5 [fixed dynamic]))
+            sum (require (b/emit! (mut graph) 26 5 [fixed live-dynamic]))
+            answer (require (b/emit! (mut graph) 26 5 [sum called]))
+            freed (require (b/stack-free! (mut graph) live-dynamic size))
+            ret (require (b/emit! (mut graph) 120 5 [freed answer (: 0 i32)]))]
+        (match (compile/object graph start [ret] (fixture-name id) allocator)
+          (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+          (Ok [object]
+              (let [(mut object) object]
+                (match (fs/write-file allocator
+                                      (fixture-path id)
+                                      (slice object))
+                  (Err [_] (set! failures (+ failures 1)))
+                  (Ok [_] 0))
+                (free! (mut object)))))
+        (match (compile/image graph
+                              start
+                              [ret]
+                              "_vector_arithmetic_pressure"
+                              allocator)
+          (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+          (Ok [source]
+              (let [(mut source) source]
+                (match (jit/map-image source allocator)
+                  (Err [message]
+                       (println "{}" message)
+                       (set! failures (+ failures 1)))
+                  (Ok [loaded]
+                      (let [(mut loaded) loaded]
+                        (set! failures
+                              (+ failures
+                                 (pressure-exercise ty
+                                                    opcode
+                                                    (.base (.memory loaded)))))
+                        (jit/release-image! (mut loaded)))))
+                (image/release! (mut source)))))))
+    (free! (mut inputs))
+    (free! (mut results))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0
+        (mut cases) 0]
+    (for base [(: 1 i32) 2 3 4 5 6 7 8 9 10 11 12 13]
+      (for lanes [(: 1 i32) 2 4 8 16]
+        (let [ty (types/vector-type base lanes)]
+          (when (types/short-vector? ty 8)
+            (for opcode [(: 31 i32) 32 45 54 55 56 57]
+              (when (va/valid-type? opcode ty)
+                (for mode [(: 0 i32) 1 2]
+                  (set! failures (+ failures (generate ty opcode mode)))
+                  (set! cases (+ cases 1)))))))))
+    (set! failures (+ failures (pressure 82 31 16 144)))
+    (set! failures (+ failures (pressure 82 31 4096 145)))
+    (set! failures (+ failures (pressure 88 32 16 146)))
+    (set! failures (+ failures (pressure 88 32 4096 147)))
+    (set! failures (+ failures (pressure 37 45 16 148)))
+    (set! failures (+ failures (pressure 37 45 4096 149)))
+    (set! failures (+ failures (pressure 61 31 16 150)))
+    (set! failures (+ failures (pressure 61 31 4096 151)))
+    (set! failures (+ failures (pressure 44 32 16 152)))
+    (set! failures (+ failures (pressure 44 32 4096 153)))
+    (set! failures (+ failures (pressure 67 54 16 154)))
+    (set! failures (+ failures (pressure 67 54 4096 155)))
+    (set! failures (+ failures (pressure 52 55 16 156)))
+    (set! failures (+ failures (pressure 52 55 4096 157)))
+    (set! failures (+ failures (pressure 43 55 16 158)))
+    (set! failures (+ failures (pressure 43 55 4096 159)))
+    (set! failures (+ failures (pressure 88 56 16 160)))
+    (set! failures (+ failures (pressure 88 56 4096 161)))
+    (set! failures (+ failures (pressure 37 56 16 162)))
+    (set! failures (+ failures (pressure 37 56 4096 163)))
+    (set! failures (+ failures (pressure 73 57 16 164)))
+    (set! failures (+ failures (pressure 73 57 4096 165)))
+    (set! failures (+ failures (pressure 37 57 16 166)))
+    (set! failures (+ failures (pressure 37 57 4096 167)))
+    (when (!= cases 396) (set! failures (+ failures 1)))
+    (println "native vector unary operations: {} matrix graphs, 24 pressure graphs, {} failures"
+             cases
+             failures)
+    (if (= failures 0) 0 1)))
