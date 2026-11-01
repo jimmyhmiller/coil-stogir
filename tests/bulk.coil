@@ -1,0 +1,84 @@
+(module stogir.tests.bulk)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.bulk" :as bulk)
+(import "stogir.a64.compile" :as compile)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn rejected [(result (Result i32 (slice u8)))] (-> i64)
+  (match result (Err [_] 0) (Ok [_] 1)))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        destination (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        source (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        count (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        variable
+          (require (b/variable! (mut graph) 6 start "storage-not-address" 8))
+        signed (require (b/scalar-constant! (mut graph) 11 1 8))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        ended (require (b/emit! (mut graph) 114 0 [start]))
+        before (len (.instructions graph))
+        (mut failures) 0]
+    (set! failures
+          (+ failures
+             (rejected (bulk/copy! (mut graph) ended destination source count))
+             (rejected (bulk/move! (mut graph) count destination source count))
+             (rejected (bulk/copy! (mut graph) start variable source count))
+             (rejected (bulk/zero! (mut graph) start source signed))
+             (rejected (bulk/move! (mut graph) start destination variable count))
+             (rejected (bulk/copy-bytes! (mut graph)
+                                         start
+                                         destination
+                                         source
+                                         -1))))
+    (when (or (!= before (len (.instructions graph)))
+              (!= (require (bulk/copy! (mut graph)
+                                       start
+                                       destination
+                                       source
+                                       zero))
+                  start)
+              (!= (require (bulk/move-bytes! (mut graph)
+                                             start
+                                             destination
+                                             source
+                                             0))
+                  start)
+              (!= (require (bulk/zero-bytes! (mut graph) start destination 0))
+                  start)
+              (!= (require (bulk/move! (mut graph) start source source count))
+                  start)
+              (!= before (len (.instructions graph))))
+      (set! failures (+ failures 1)))
+    (g/release! (mut graph))
+    (for mode [(: 0 i32) 1 2]
+      (let [(mut graph) (g/create allocator)
+            start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+            d (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+            s (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+            n (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+            control
+              (if (= mode 0)
+                  (require (bulk/copy! (mut graph) start d s n))
+                  (if (= mode 1)
+                      (require (bulk/move! (mut graph) start d s n))
+                      (require (bulk/zero! (mut graph) start d n))))
+            ret (require (b/emit! (mut graph) 120 0 [control (: 0 i32) 0]))]
+        (when (> (len (.instructions graph)) 128)
+          (set! failures (+ failures 1)))
+        (match (compile/text graph start [ret] allocator)
+          (Err [message]
+               (println "mode {}: {}" mode message)
+               (set! failures (+ failures 1)))
+          (Ok [text] (let [(mut bytes) text] (free! (mut bytes)))))
+        (g/release! (mut graph))))
+    (println "bulk memory validation, no-op and bounded graph checks: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

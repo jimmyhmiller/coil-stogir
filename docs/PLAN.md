@@ -716,3 +716,22 @@ comparison confirms full standalone coverage without duplicates. The linked log
 has no warnings. Formatting and git diff checks pass. All 292 implementation/test
 files remain Coil. The pure planning checkpoint is 48f0902; the shared image,
 loader, composition and target-writer changes form the next checkpoint.
+
+### Native bulk memory construction
+
+`stogir.bulk` builds copy, overlap-safe move and zero operations using existing
+scalar LOAD/STORE and control nodes. Runtime byte counts are U64 references;
+`*-bytes!` wrappers accept nonnegative fixed sizes. Addresses must be ADDR values
+and control must be an open control chain. Callers supply valid accessible ranges;
+copy requires disjoint ranges or identical pointers. Zero bytes performs no access.
+
+Sizes through 64 bytes use exact 8/4/2/1-byte chunks. Small moves capture all reads
+before writing. Larger or dynamic sizes use bounded graphs with eight-byte loops
+and exact byte tails; moves select forward/backward traversal by unsigned address
+order. No libc bulk routine or additional opcode is required. The inline limit is
+a code-size policy pending measurement, not a performance result.
+
+Focused checks cover rejected inputs without graph mutation, no-op construction,
+bounded dynamic graphs, and native fixed/dynamic byte comparisons across size,
+alignment and overlap boundaries. Guard-page, spill-pressure and linked AOT bulk
+coverage remain required before treating this feature as a completed delivery gate.

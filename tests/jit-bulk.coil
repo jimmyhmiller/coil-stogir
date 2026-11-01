@@ -1,0 +1,153 @@
+(module stogir.tests.jit-bulk)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.bulk" :as bulk)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn byte-address [(p (ptr u8)) (n i64)] (-> (ptr u8))
+  (primitive/cast (ptr u8) (+ (primitive/cast u64 p) (cast u64 n))))
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [message] (println "{}" message) 0)))
+
+(defn check [(mode i32) (fixed i64)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        d (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        s (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        n (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        count
+          (if (< fixed 0)
+              n
+              (require (b/scalar-constant! (mut graph) 5 (cast u64 fixed) 8)))
+        control
+          (require (if (= mode 0)
+                       (bulk/copy! (mut graph) start d s count)
+                       (if (= mode 1)
+                           (bulk/move! (mut graph) start d s count)
+                           (bulk/zero! (mut graph) start d count))))
+        ret (require (b/emit! (mut graph) 120 0 [control (: 0 i32) 0]))
+        (mut failures) 0]
+    (match (compile/text graph start [ret] allocator)
+      (Err [message] (println "{}" message) (set! failures 1))
+      (Ok [bytes]
+          (let [(mut code) bytes]
+            (match (jit/map-text (slice code))
+              (Err [message] (println "{}" message) (set! failures 1))
+              (Ok [image]
+                  (let [(mut image) image
+                        f
+                          (primitive/cast (fnptr (cc/C)
+                                                 [(ptr u8) (ptr u8) u64]
+                                                 void)
+                                          (.base image))
+                        (mut actual) (ArrayList::new [u8] allocator)
+                        (mut expected) (ArrayList::new [u8] allocator)]
+                    (let [(mut i) (: 0 i64)]
+                      (while (< i 2048)
+                        (push! (mut actual) 0)
+                        (push! (mut expected) 0)
+                        (set! i (+ i 1))))
+                    (for size [(: 0 i64)
+                               1
+                               2
+                               3
+                               7
+                               8
+                               9
+                               15
+                               16
+                               17
+                               31
+                               32
+                               33
+                               63
+                               64
+                               65
+                               127
+                               128
+                               129
+                               255
+                               257
+                               513]
+                      (when (or (< fixed 0) (= fixed size))
+                        (for offset [(: -17 i64) -8 -7 -1 0 1 7 8 17 600]
+                          (for alignment [(: 0 i64) 1 3 7]
+                            (let [source (+ 64 alignment)
+                                  destination
+                                    (if (= mode 0)
+                                        (+ source 600)
+                                        (+ source offset))
+                                  (mut i) (: 0 i64)]
+                              (while (< i 2048)
+                                (let [v (cast u8 (% (+ (* i 37) 19) 251))]
+                                  (primitive/store! (byte-address (.data actual)
+                                                                  i)
+                                                    v)
+                                  (primitive/store! (byte-address (.data expected)
+                                                                  i)
+                                                    v))
+                                (set! i (+ i 1)))
+                              (set! i 0)
+                              (while (< i size)
+                                (primitive/store! (byte-address (.data expected)
+                                                                (+ destination
+                                                                   i))
+                                                  (if (= mode 2)
+                                                      0
+                                                      (get actual (+ source i))))
+                                (set! i (+ i 1)))
+                              (call-ptr f
+                                        (byte-address (.data actual)
+                                                      destination)
+                                        (byte-address (.data actual)
+                                                      source)
+                                        (cast u64 size))
+                              (set! i 0)
+                              (while (< i 2048)
+                                (when (!= (get actual i) (get expected i))
+                                  (set! failures (+ failures 1)))
+                                (set! i (+ i 1))))))))
+                    (free! (mut actual))
+                    (free! (mut expected))
+                    (jit/release! (mut image)))))
+            (free! (mut code)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for mode [(: 0 i32) 1 2]
+      (for fixed [(: -1 i64)
+                  0
+                  1
+                  2
+                  3
+                  7
+                  8
+                  9
+                  15
+                  16
+                  17
+                  31
+                  32
+                  33
+                  63
+                  64
+                  65
+                  127
+                  128
+                  129
+                  255
+                  257
+                  513]
+        (set! failures (+ failures (check mode fixed)))))
+    (println "native bulk memory byte comparisons: {} failures" failures)
+    (if (= failures 0) 0 1)))
