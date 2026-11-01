@@ -8,10 +8,200 @@
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.primitive" :as primitive)
 (import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
 (import "coil.result" :use [Result Ok Err])
 
 (defn byte-address [(p (ptr u8)) (n i64)] (-> (ptr u8))
   (primitive/cast (ptr u8) (+ (primitive/cast u64 p) (cast u64 n))))
+
+(extern reserve
+        :as
+        "mmap"
+        :cc
+        (cc/C)
+        [(ptr u8) i64 i32 i32 i32 i64]
+        (-> (ptr u8)))
+
+(extern protect :as "mprotect" :cc (cc/C) [(ptr u8) i64 i32] (-> i32))
+
+(extern release :as "munmap" :cc (cc/C) [(ptr u8) i64] (-> i32))
+
+(extern page-size :as "getpagesize" :cc (cc/C) [] (-> i32))
+
+(extern fork :cc (cc/C) [] (-> i32))
+
+(extern waitpid :cc (cc/C) [i32 (ptr i32) i32] (-> i32))
+
+(extern exit-child :as "_exit" :cc (cc/C) [i32] (-> void))
+
+(extern signal :cc (cc/C) [i32 u64] (-> u64))
+
+(defn fault-handler :cc (cc/C) [(number i32)] (-> void)
+  (exit-child 77))
+
+(defn pattern [(index i64)] (-> u8)
+  (cast u8 (% (+ (* index 37) 19) 251)))
+
+;;; Each accessible region has inaccessible pages on both sides. Check the
+;;; complete destination region and, for copy, the unchanged source region.
+(defn guarded-case [(f (fnptr (cc/C) [(ptr u8) (ptr u8) u64] void))
+                    (mode i32)
+                    (a (ptr u8))
+                    (b (ptr u8))
+                    (capacity i64)
+                    (source i64)
+                    (destination i64)
+                    (size i64)] (-> i64)
+  (let [(mut i) (: 0 i64)
+        (mut failures) 0]
+    (while (< i capacity)
+      (primitive/store! (byte-address a i) (pattern i))
+      (primitive/store! (byte-address b i) (pattern i))
+      (set! i (+ i 1)))
+    (let [target (if (= mode 0) b a)]
+      (call-ptr f
+                (byte-address target destination)
+                (byte-address a source)
+                (cast u64 size))
+      (set! i 0)
+      (while (< i capacity)
+        (let [expected
+                (if (and (>= i destination) (< i (+ destination size)))
+                    (if (= mode 2) 0 (pattern (+ source (- i destination))))
+                    (pattern i))]
+          (when (or (!= (primitive/load (byte-address target i)) expected)
+                    (and (= mode 0)
+                         (!= (primitive/load (byte-address a i)) (pattern i))))
+            (set! failures (+ failures 1))))
+        (set! i (+ i 1))))
+    failures))
+
+(defn guarded [(f (fnptr (cc/C) [(ptr u8) (ptr u8) u64] void))
+               (mode i32)
+               (fixed i64)] (-> i64)
+  (let [page (cast i64 (page-size))
+        capacity (* 5 page)
+        total (+ capacity (* 2 page))
+        a (reserve (primitive/cast (ptr u8) 0) total 0 0x1002 -1 0)
+        b (reserve (primitive/cast (ptr u8) 0) total 0 0x1002 -1 0)
+        (mut failures) 0]
+    (if (or (= (primitive/cast i64 a) -1) (= (primitive/cast i64 b) -1))
+        (set! failures 1)
+        (if (or (!= (protect (byte-address a page) capacity 3) 0)
+                (!= (protect (byte-address b page) capacity 3) 0))
+            (set! failures 1)
+            (let [child (fork)]
+              (if (< child 0)
+                  (set! failures 1)
+                  (if (= child 0)
+                      (let [handler
+                              (primitive/cast u64
+                                              (primitive/cast (ptr u8)
+                                                              (fnptr-of fault-handler)))
+                            first (byte-address a page)
+                            second (byte-address b page)
+                            (mut errors) 0]
+                        (signal 10 handler)
+                        (signal 11 handler)
+                        (for size [(: 0 i64)
+                                   1
+                                   2
+                                   3
+                                   4
+                                   5
+                                   6
+                                   7
+                                   8
+                                   9
+                                   10
+                                   11
+                                   12
+                                   13
+                                   14
+                                   15
+                                   16
+                                   17
+                                   31
+                                   32
+                                   33
+                                   63
+                                   64
+                                   65
+                                   127
+                                   128
+                                   129
+                                   255
+                                   257
+                                   513
+                                   4097
+                                   65537]
+                          (when (and (<= size capacity)
+                                     (or (< fixed 0) (= fixed size)))
+                            ; Both ends of each region, plus overlapping moves in
+                            ; each direction with either end abutting a guard.
+                            (for source [(: 0 i64) (- capacity size)]
+                              (for destination [(: 0 i64) (- capacity size)]
+                                (set! errors
+                                      (+ errors
+                                         (guarded-case f
+                                                       mode
+                                                       first
+                                                       second
+                                                       capacity
+                                                       source
+                                                       destination
+                                                       size)))))
+                            (when (= mode 1)
+                              (for delta [(: 1 i64) 7 8 17]
+                                (when (<= (+ size delta) capacity)
+                                  (set! errors
+                                        (+ errors
+                                           (guarded-case f
+                                                         mode
+                                                         first
+                                                         second
+                                                         capacity
+                                                         0
+                                                         delta
+                                                         size)
+                                           (guarded-case f
+                                                         mode
+                                                         first
+                                                         second
+                                                         capacity
+                                                         delta
+                                                         0
+                                                         size)
+                                           (guarded-case f
+                                                         mode
+                                                         first
+                                                         second
+                                                         capacity
+                                                         (- capacity size delta)
+                                                         (- capacity size)
+                                                         size)
+                                           (guarded-case f
+                                                         mode
+                                                         first
+                                                         second
+                                                         capacity
+                                                         (- capacity size)
+                                                         (- capacity size delta)
+                                                         size))))))))
+                        (exit-child (if (= errors 0) 0 78)))
+                      (let [(mut status) (: 0 i32)]
+                        (when (or (!= (waitpid child (mut status) 0) child)
+                                  (!= status 0))
+                          (println "guarded mode {} fixed {} child status {}"
+                                   mode
+                                   fixed
+                                   status)
+                          (set! failures 1))))))))
+    (when (!= (primitive/cast i64 a) -1)
+      (when (!= (release a total) 0) (set! failures (+ failures 1))))
+    (when (!= (primitive/cast i64 b) -1)
+      (when (!= (release b total) 0) (set! failures (+ failures 1))))
+    failures))
 
 (defn require [(r (Result i32 (slice u8)))] (-> i32)
   (match r (Ok [v] v) (Err [message] (println "{}" message) 0)))
@@ -35,6 +225,52 @@
                            (bulk/zero! (mut graph) start d count))))
         ret (require (b/emit! (mut graph) 120 0 [control (: 0 i32) 0]))
         (mut failures) 0]
+    (let [name
+            (if (and (< fixed 0) (= mode 0))
+                "_stogir_bulk_copy_dynamic"
+                (if (and (< fixed 0) (= mode 1))
+                    "_stogir_bulk_move_dynamic"
+                    (if (< fixed 0)
+                        "_stogir_bulk_zero_dynamic"
+                        (if (= mode 0)
+                            "_stogir_bulk_copy_17"
+                            (if (= mode 2)
+                                "_stogir_bulk_zero_9"
+                                (if (= fixed 63)
+                                    "_stogir_bulk_move_63"
+                                    "_stogir_bulk_move_65"))))))
+          path
+            (if (and (< fixed 0) (= mode 0))
+                "/tmp/coil-stogir-bulk-copy_dynamic.o"
+                (if (and (< fixed 0) (= mode 1))
+                    "/tmp/coil-stogir-bulk-move_dynamic.o"
+                    (if (< fixed 0)
+                        "/tmp/coil-stogir-bulk-zero_dynamic.o"
+                        (if (= mode 0)
+                            "/tmp/coil-stogir-bulk-copy_17.o"
+                            (if (= mode 2)
+                                "/tmp/coil-stogir-bulk-zero_9.o"
+                                (if (= fixed 63)
+                                    "/tmp/coil-stogir-bulk-move_63.o"
+                                    "/tmp/coil-stogir-bulk-move_65.o"))))))]
+      (when (or (< fixed 0)
+                (and (= mode 0) (= fixed 17))
+                (and (= mode 1) (or (= fixed 63) (= fixed 65)))
+                (and (= mode 2) (= fixed 9)))
+        (match (compile/object graph
+                               start
+                               [ret]
+                               name
+                               allocator)
+          (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+          (Ok [object]
+              (let [(mut bytes) object]
+                (match (fs/write-file allocator
+                                      path
+                                      (slice bytes))
+                  (Err [_] (set! failures (+ failures 1)))
+                  (Ok [_] 0))
+                (free! (mut bytes)))))))
     (match (compile/text graph start [ret] allocator)
       (Err [message] (println "{}" message) (set! failures 1))
       (Ok [bytes]
@@ -59,9 +295,17 @@
                                1
                                2
                                3
+                               4
+                               5
+                               6
                                7
                                8
                                9
+                               10
+                               11
+                               12
+                               13
+                               14
                                15
                                16
                                17
@@ -115,6 +359,7 @@
                                 (when (!= (get actual i) (get expected i))
                                   (set! failures (+ failures 1)))
                                 (set! i (+ i 1))))))))
+                    (set! failures (+ failures (guarded f mode fixed)))
                     (free! (mut actual))
                     (free! (mut expected))
                     (jit/release! (mut image)))))
@@ -130,9 +375,17 @@
                   1
                   2
                   3
+                  4
+                  5
+                  6
                   7
                   8
                   9
+                  10
+                  11
+                  12
+                  13
+                  14
                   15
                   16
                   17
@@ -147,7 +400,9 @@
                   129
                   255
                   257
-                  513]
+                  513
+                  4097
+                  65537]
         (set! failures (+ failures (check mode fixed)))))
     (println "native bulk memory byte comparisons: {} failures" failures)
     (if (= failures 0) 0 1)))

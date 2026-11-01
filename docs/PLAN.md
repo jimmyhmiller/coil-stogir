@@ -732,9 +732,12 @@ order. No libc bulk routine or additional opcode is required. The inline limit i
 a code-size policy pending measurement, not a performance result.
 
 Focused checks cover rejected inputs without graph mutation, no-op construction,
-bounded dynamic graphs, and native fixed/dynamic byte comparisons across size,
-alignment and overlap boundaries. Guard-page, spill-pressure and linked AOT bulk
-coverage remain required before treating this feature as a completed delivery gate.
+bounded dynamic graphs and explicitly unsigned predicates. Native fixed/dynamic
+checks compare complete buffers across size, alignment and overlap boundaries.
+Protected-page tests exercise exact reads/writes at both ends of accessible
+regions, including zero bytes and sizes through 65,537 bytes. Linked AOT checks
+execute seven basic bulk fixtures and two dynamic pressure fixtures. The API and
+memory contracts are documented in [MEMORY.md](MEMORY.md).
 
 Bulk-memory pressure testing exposed a general block-entry transfer defect:
 contiguous split moves at a block's first use position were replayed after CFG
@@ -746,4 +749,18 @@ transfers inside blocks. The regression retains forty pinned integer values
 through bulk loops, two calls that overwrite all allocatable GPRs, dynamic stack
 storage, both move directions and 16-byte/4 KB frame alignment. All sixteen
 fixed/dynamic graph variants pass. Focused phi, floating-loop, switch-pressure
-and stack-scope checks also pass; the complete regression run is in progress.
+and stack-scope checks also pass. This fix is committed as a7b69b0.
+Bulk counts and address comparisons now explicitly use ULT/UGT, independent of
+operand type, with construction coverage in 29f13ea.
+
+
+The bulk-memory verification checkpoint passes all 166 standalone checks and all
+41 linked AOT consumers locally with debug checks and regenerated objects. Exact
+source/pass-set comparisons confirm coverage without duplicates; the linked log
+has no warnings. The unsigned-predicate correction and final fixture additions
+landed during the standalone run, so final focused construction, native protected
+boundary/byte comparisons and call/spill/frame tests were rerun after those
+changes, followed by the complete linked run. Formatting and git diff checks pass.
+All 297 implementation/test files are Coil. Library optimization/scaling and
+remaining semantics, actual Coil backend integration and equivalent LLVM/TPDE
+runtime and compile-time measurements remain open.
