@@ -42,8 +42,9 @@ storage accesses then use an explicit x29-based frame context.
 ARGVAL supports indirect aggregate arguments through private aligned copies at
 call time, including repeated arguments, stack-passed pointers and variadic
 calls. Grouped integer pairs and homogeneous f32/f64 pieces share incoming/outgoing ABI
-placement, including bank exhaustion and variadic packing. Aggregate results and
-additional classification/vector coverage remain unfinished.
+placement, including bank exhaustion and variadic packing. Explicit result-storage
+roles support integer and homogeneous floating register results and x8 indirect
+results. Additional classification/vector coverage remains unfinished.
 
 Native copy, overlap-safe move and zero builders expand into existing memory
 and control nodes. Fixed small transfers use exact-width accesses; larger and

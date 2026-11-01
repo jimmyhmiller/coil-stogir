@@ -838,3 +838,42 @@ Remaining aggregate work includes multi-register/x8 results, HVA/wide support an
 compiler-specific classification/marshaling. Full optimizer/verifier/scaling,
 other missing semantics, the compiler adapter and LLVM/TPDE compile-time/runtime
 comparisons remain open. These checks do not establish a performance result.
+
+
+### Aggregate result ABI
+
+Result signatures carry an explicit ADDR storage role at fixed ordinal zero and
+use VOID IR calls/returns. SGAG version2 records either a classified register
+bank or an indirect x8 result. Scalar and version1 grouped encodings remain
+unchanged. Metadata foundation e895d64 checks result shapes and malformed bytes;
+71ec270 wires both directions through shared placement, allocation and emission.
+
+Register-result callers save the destination before argument installation and
+capture the physical bank immediately after the call. Generated callees expose
+a private fixed-frame buffer and install the return bank before their epilogue.
+Indirect results use x8 independently of the normal argument banks. Result-place
+operands reject VAR and ARGVAL wrappers. Private result buffers remain separate
+from user locals and allocator spill identities.
+
+Focused checks pass 192 native graph variants over sixteen C result profiles,
+three calling modes, dynamic stack storage and 16/4096-byte frame alignment.
+Eleven bit patterns cover signed zero, infinities and NaN payloads. Forty retained
+values exercise GP/FP pressure across nested calls. Eighteen linked AOT objects
+check outgoing, incoming and forwarding calls. Contract tests check malformed
+roles and x8 independence. See ABI.md for the storage and encoding contract.
+
+Named and recursive aggregate-result execution, protected result boundaries,
+HVA/wide support and compiler classification/marshaling remain work. The full
+regression checkpoint is tracked in the project pad. Optimizer/scaling work,
+remaining semantics, actual compiler backend integration and equivalent LLVM/TPDE
+compile-time/runtime measurements remain open; no performance conclusion follows
+from these correctness checks.
+
+
+The aggregate-result checkpoint passes all 176 standalone checks and all 44
+linked AOT consumers locally with debug checks and regenerated fixtures. Exact
+source/pass-set equality confirms complete coverage without duplicate runs;
+linked output contains no warnings. Formatting and git diff checks pass. All 316
+implementation/test source files remain Coil. Validation used installed Coil
+d2a49bf21376 on this arm64 Mac. These counts include the result metadata, contract,
+native matrix and linked consumer tests; remaining gates above remain open.

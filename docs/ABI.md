@@ -355,8 +355,8 @@ an eight-byte stack slot.
 
 This implements the reference's indirect ARGVAL path. It does not by itself
 classify small C aggregates, HFAs/HVAs, grouped register arguments, multi-register
-returns, or the dedicated x8 indirect-result pointer. Those remain required for
-the complete compiler backend.
+returns, or the dedicated x8 indirect-result pointer. Separate grouped and result
+interfaces below provide those ABI roles; compiler classification remains open.
 
 Checks cover malformed construction and illegal uses, distinct/aligned per-use
 copy placement, bounded code through i32::MAX bytes (emission only), 74 native
@@ -412,5 +412,50 @@ including aligned integer pairs, f32/f64 homogeneous groups of every supported
 length, register-bank boundaries and omitted incoming projections. C callbacks
 use explicit exports and typed by-value pointers to select Coil's C ABI thunks.
 Outgoing functions retain forty integer or floating values through the callback.
-Named calls use resolved JIT images and linked external C symbols. Aggregate
-results and the dedicated x8 indirect-result pointer remain required work.
+Named calls use resolved JIT images and linked external C symbols.
+
+
+## Aggregate result storage
+
+`calls/create-result(flags, parameters, groups, result, allocator)` describes a
+classified aggregate result with an explicit storage operand. Its IR return type
+is VOID, and fixed parameter ordinal zero must be ADDR. This address is a CALL
+operand and a generated function PARAM, rather than an ordinary native argument.
+VAR and ARGVAL references cannot stand in for the result address. The caller must
+provide writable storage for the complete classified extent and any alignment
+required by the source ABI.
+
+`call-results/pieces(type, count)` supports one or two U64/I64 words, or one
+through four homogeneous F32/F64 members. The result address consumes no native
+argument register or stack slot. Before calling, the emitter saves it in a
+private outgoing slot. Immediately after the call it writes the complete return
+bank into that storage, before allocation transfers can overwrite those registers.
+A generated callee exposes a private fixed-frame buffer as PARAM zero; its body
+writes the classified pieces there and RETURN installs x0–x1 or v0–v3 from it.
+Every executed return must have initialized the required pieces.
+
+`call-results/indirect()` passes the result address in x8 independently of x0–x7.
+The callee writes directly through PARAM zero. No post-call result-bank capture
+or return-bank installation is needed. Fixed parameters after ordinal zero use
+the normal argument banks and stack placement, including grouped arguments.
+
+Partial integer aggregates need storage for the full coerced register extent.
+For example, a three-byte record uses one eight-byte classified word. Source
+padding has unspecified contents; compiler marshaling must preserve logical
+fields without reading beyond the source object's bounds. The result-storage
+contract does not perform source-language aggregate classification.
+
+Aggregate signatures append SGAG version2 to the unchanged scalar prefix. The
+sixteen-byte header contains magic at0..3, version at4, result kind at5, little-
+endian u16 group count at6..7, result piece type/count at8..9 and six reserved zero
+bytes at10..15. Group records retain their eight-byte format. Kind1 is a register
+result; kind2 is indirect and requires zero type/count. Kind0 uses the original
+scalar encoding or version1 grouped encoding. Unknown kinds, malformed shapes,
+invalid result roles, reserved bytes and truncated trailers are rejected.
+
+Focused tests cover 192 native graph variants with real C aggregate interfaces:
+integer words, homogeneous floating results, indirect records and partial logical
+payloads. They check exact payload bits, live values across nested calls, dynamic
+stack storage, over-aligned frames and surrounding output bytes. Eighteen linked
+AOT objects exercise both directions. Named and recursive aggregate-result calls,
+protected result-buffer boundaries and vector results remain verification gates.
