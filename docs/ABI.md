@@ -639,13 +639,34 @@ aligned to sixteen bytes.
 `tests/jit-hva-abi.coil` exercises a generated caller against an exported Coil C
 callback with a two-member 128-bit homogeneous vector record. It checks every
 64-bit word of the argument and the returned 32-byte result, including high halves,
-and preserves a live scalar across the call. This is initial interoperability
-coverage: one through four members, stack/bank boundaries, variadic placement,
-returning generated functions and linked AOT still need dedicated vector ABI
-fixtures. Existing scalar and aggregate fixtures remain regression checks.
+and preserves a live scalar across the call. The generated-callee fixtures below
+add one through four members, stack/bank boundaries and linked AOT coverage.
+Broader outgoing vector calls and variadic placement still need dedicated checks.
+Existing scalar and aggregate fixtures remain regression checks.
 
 The short-vector plumbing checkpoint passes all 186 standalone tests and all 50
 existing linked AOT consumers with debug checks. Test-set equality is checked,
 objects are regenerated, and linked output contains no warnings. The new vector
 ABI fixture is a JIT caller test; this regression count does not imply the
 dedicated vector ABI cases listed above are complete.
+
+
+`tests/jit-hva-incoming.coil` generates sixteen C ABI callees, covering one through
+four homogeneous members at each 64/128-bit width, with zero or seven preceding
+SIMD arguments. The latter places a single member in v7, or exhausts the bank
+and sends the entire larger group to the stack. A following vector verifies the
+bank remains exhausted. Independent GP pointer/seed arguments exercise bank
+independence. Each function writes the prefix, trailing vector and seed to an
+output buffer, returns rotated aggregate members, and checks every payload word
+and untouched output word. All sixteen cases execute natively and generate
+separate Mach-O objects.
+
+`tests/aot-hva-incoming-link.coil` repeats the sixteen checks against those linked
+objects. It resolves their C symbols with `coil.os/dlsym`, checks each lookup,
+and calls through complete typed C record signatures. Coil currently rejects
+vectors nested in records in an `extern` declaration before target ABI
+classification, although its C function-pointer path supports them; this
+inconsistency is recorded in the Coil bug pad. The producer and linked consumer
+pass with debug checks. These test-only additions do not change the previous
+186/50 full regression result; they add one standalone producer and one linked
+consumer, each verified separately.
