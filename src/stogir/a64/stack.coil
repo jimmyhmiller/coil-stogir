@@ -99,14 +99,14 @@
 
 ;;; The function reserves an outgoing prefix below every active dynamic object.
 ;;; Allocate d bytes: newSP=oldSP-d, result=newSP+outgoing. Fixed slots use x29.
-(defn emit-aligned! [(output (mut code/Buffer))
-                     (graph g/Graph)
-                     (parts (ArrayList allocation/Part))
-                     (reference i32)
-                     (position i64)
-                     (base frame/Base)
-                     (outgoing i64)
-                     (alignment i64)] (-> (Result i32 (slice u8)))
+(defn emit-allocation! [(output (mut code/Buffer))
+                        (graph g/Graph)
+                        (parts (ArrayList allocation/Part))
+                        (reference i32)
+                        (position i64)
+                        (base frame/Base)
+                        (outgoing i64)
+                        (alignment i64)] (-> (Result i32 (slice u8)))
   (match (stack/validate graph reference)
     (Err [message] (Err message))
     (Ok [_]
@@ -165,6 +165,87 @@
               (set! error "invalid dynamic stack code references"))
             (code/release! (mut temporary))
             (if (= error "") (Ok count) (Err error)))))))
+
+(defn emit-scope! [(output (mut code/Buffer))
+                   (graph g/Graph)
+                   (parts (ArrayList allocation/Part))
+                   (reference i32)
+                   (position i64)
+                   (base frame/Base)]
+  (-> (Result i32 (slice u8)))
+  (match (stack/validate graph reference)
+    (Err [message] (Err message))
+    (Ok [_]
+        (let [node (get (.instructions graph) (cast i64 reference))
+              (mut temporary) (code/create (.alc (.text output)))
+              (mut error) ""]
+          (if (or (not (frame/valid-base? base)) (!= (.reg base) 29))
+              (set! error "stack scope requires an anchored frame")
+              (if (= (n/opcode node) 83)
+                  (match (locations/lookup parts reference (+ position 1))
+                    (Err [message] (set! error message))
+                    (Ok [destination]
+                        (if (or (!= (.kind destination) 0)
+                                (< (.value destination) 0)
+                                (> (.value destination) 15))
+                            (set! error
+                                  "saved stack pointer requires an allocatable GPR")
+                            (emit/word! (mut (.text temporary))
+                                        (mut error)
+                                        (encode/add-sub-immediate true
+                                                                  false
+                                                                  false
+                                                                  (cast i32
+                                                                        (.value destination))
+                                                                  31
+                                                                  0)))))
+                  (if (= (n/opcode node) 84)
+                      (match (value/register! (mut temporary)
+                                              graph
+                                              parts
+                                              (.op2 node)
+                                              position
+                                              16
+                                              62)
+                        (Err [message] (set! error message))
+                        (Ok [reg]
+                            (emit/word! (mut (.text temporary))
+                                        (mut error)
+                                        (encode/add-sub-immediate true
+                                                                  false
+                                                                  false
+                                                                  31
+                                                                  reg
+                                                                  0))))
+                      (set! error "invalid stack scope opcode"))))
+          (let [count (cast i32 (len (.text temporary)))]
+            (when (and (= error "") (not (code/append! (mut output) temporary)))
+              (set! error "invalid stack scope code references"))
+            (code/release! (mut temporary))
+            (if (= error "") (Ok count) (Err error)))))))
+
+(defn emit-aligned! [(output (mut code/Buffer))
+                     (graph g/Graph)
+                     (parts (ArrayList allocation/Part))
+                     (reference i32)
+                     (position i64)
+                     (base frame/Base)
+                     (outgoing i64)
+                     (alignment i64)]
+  (-> (Result i32 (slice u8)))
+  (match (g/lookup graph reference)
+    (None [] (Err "stack instruction missing"))
+    (Some [node]
+          (if (or (= (n/opcode node) 83) (= (n/opcode node) 84))
+              (emit-scope! (mut output) graph parts reference position base)
+              (emit-allocation! (mut output)
+                                graph
+                                parts
+                                reference
+                                position
+                                base
+                                outgoing
+                                alignment)))))
 
 (defn emit! [(output (mut code/Buffer))
              (graph g/Graph)

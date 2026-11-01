@@ -299,3 +299,23 @@ Fixed prototype parameter counts retain the upstream one-byte limit of 255.
 Total CALL inputs use sixteen bits: after control/callee, up to 65,533 actual
 arguments are representable. Variadic call construction now distinguishes those
 limits; boundary tests reject excess counts before graph mutation.
+
+## Dynamic stack scopes
+
+`builder/stack-save!` emits upstream BLOCK_BEGIN, a control-pinned ADDR result
+containing raw SP. `builder/stack-restore!` emits BLOCK_END and restores that
+pointer. A restore releases all allocations after the snapshot, so their sizes
+need not be available. Both operations require a control predecessor that has
+not ended its block; restore additionally requires an ADDR value. A VAR storage
+identity is not an address value.
+
+The saved pointer includes the outgoing argument prefix. Do not adjust it by
+`outgoing-size` or treat it as an ALLOCA object address. Snapshots are ordinary
+allocated values and may spill across calls; fixed-frame slots stay relative to
+x29. Save/restore-only functions also establish a frame record. Both instructions
+preserve condition flags.
+
+The caller must use a live snapshot from the same function invocation, preserving
+its stack/frame alignment, and must stop accessing objects released by restore.
+The IR does not insert runtime provenance checks on saved pointers. Whole-function
+return restores the entry stack regardless of remaining dynamic scopes.

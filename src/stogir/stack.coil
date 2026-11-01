@@ -21,7 +21,7 @@
               (Ok 8)))))
 
 (defn operation? [(opcode i32)] (-> bool)
-  (or (= opcode 66) (= opcode 81) (= opcode 82)))
+  (or (= opcode 66) (= opcode 81) (= opcode 82) (= opcode 83) (= opcode 84)))
 
 ;;; Allocation and free round to the same function alignment. Counts must be
 ;;; nonnegative and leave room for rounding without signed overflow.
@@ -103,6 +103,34 @@
                                                                (n/type-id input))
                                                          8)))))))))))
 
+;;; BLOCK_BEGIN returns an opaque saved SP. BLOCK_END consumes an ADDR value;
+;;; callers must restore a live snapshot from the same function invocation.
+(defn validate-scope-inputs [(graph g/Graph)
+                             (opcode i32)
+                             (ty i32)
+                             (control i32)
+                             (saved i32)]
+  (-> (Result i32 (slice u8)))
+  (if (or (not (or (= opcode 83) (= opcode 84)))
+          (!= ty (if (= opcode 83) 6 0)))
+      (Err "invalid stack scope operation type")
+      (match (g/lookup graph control)
+        (None [] (Err "stack scope control missing"))
+        (Some [node]
+              (if (or (<= control 0)
+                      (not (op/control? (cast i32 (n/opcode node))))
+                      (op/block-end? (cast i32 (n/opcode node))))
+                  (Err "invalid stack scope control")
+                  (if (= opcode 83)
+                      (Ok 8)
+                      (match (g/lookup graph saved)
+                        (None [] (Err "saved stack pointer missing"))
+                        (Some [input]
+                              (if (or (!= (n/type-id input) 6)
+                                      (= (n/opcode input) 72))
+                                  (Err "saved stack pointer must be an ADDR value")
+                                  (Ok 8))))))))))
+
 (defn validate [(graph g/Graph) (reference i32)]
   (-> (Result i32 (slice u8)))
   (match (g/lookup graph reference)
@@ -114,11 +142,17 @@
                 (if (or (<= reference 0)
                         (not (operation? opcode))
                         (!= (get (.arities graph) (cast i64 reference))
-                            (if (= opcode 81) 3 2)))
+                            (if (= opcode 81) 3 (if (= opcode 83) 1 2))))
                     (Err "invalid stack instruction")
-                    (validate-inputs graph
-                                     opcode
-                                     (cast i32 (n/type-id node))
-                                     (.op1 node)
-                                     (.op2 node)
-                                     (.op3 node))))))))
+                    (if (or (= opcode 83) (= opcode 84))
+                        (validate-scope-inputs graph
+                                               opcode
+                                               (cast i32 (n/type-id node))
+                                               (.op1 node)
+                                               (.op2 node))
+                        (validate-inputs graph
+                                         opcode
+                                         (cast i32 (n/type-id node))
+                                         (.op1 node)
+                                         (.op2 node)
+                                         (.op3 node)))))))))

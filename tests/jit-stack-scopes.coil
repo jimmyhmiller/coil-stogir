@@ -1,0 +1,198 @@
+(module stogir.tests.jit-stack-scopes)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn sum10 :cc (cc/C) [(a u64)
+                        (b u64)
+                        (c u64)
+                        (d u64)
+                        (e u64)
+                        (f u64)
+                        (g u64)
+                        (h u64)
+                        (i u64)
+                        (j u64)] (-> u64)
+  (+ a b c d e f g h i j))
+
+(defn check [(alignment i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        size (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        guard
+          (require (b/variable! (mut graph) 5 start "scope-guard" alignment))
+        sentinel (require (b/scalar-constant! (mut graph) 5 321 8))
+        one (require (b/scalar-constant! (mut graph) 5 1 8))
+        (mut control)
+          (require (b/emit! (mut graph) 87 0 [start guard sentinel]))
+        (mut snapshots) (ArrayList::new [i32] allocator)
+        (mut good) (require (b/scalar-constant! (mut graph) 1 1 8))
+        (mut failures) 0]
+    ; Every snapshot is live across a call: allocator must spill and reload them
+    ; through the fixed frame while the dynamic SP changes repeatedly.
+    (for index [(: 0 i32)
+                1
+                2
+                3
+                4
+                5
+                6
+                7
+                8
+                9
+                10
+                11
+                12
+                13
+                14
+                15
+                16
+                17
+                18
+                19
+                20
+                21
+                22
+                23]
+      (let [saved (require (b/stack-save! (mut graph) control))
+            count (require (b/emit! (mut graph) 26 5 [size one]))
+            object
+              (require (b/stack-allocate! (mut graph)
+                                          saved
+                                          (if (= (% index 2) 0) size count)
+                                          alignment))]
+        (push! (mut snapshots) saved)
+        (set! control
+              (require (b/emit! (mut graph) 93 0 [object object sentinel])))))
+    (match (calls/create 9 5 [(: 5 u8) 5 5 5 5 5 5 5 5 5] allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype
+                called
+                  (require (calls/emit! (mut graph)
+                                        owned
+                                        control
+                                        target
+                                        [size size size size size size size size
+                                         size size]
+                                        allocator))]
+            (set! control called)
+            (let [(mut i) (len snapshots)]
+              (while (> i 0)
+                (set! i (- i 1))
+                (let [saved (get snapshots i)
+                      restored
+                        (require (b/stack-restore! (mut graph) control saved))
+                      actual (require (b/stack-save! (mut graph) restored))
+                      equal (require (b/emit! (mut graph) 14 1 [actual saved]))]
+                  (set! good (require (b/emit! (mut graph) 47 1 [good equal])))
+                  (set! control actual))))
+            (let [loaded (require (b/emit! (mut graph) 85 5 [control guard]))
+                  intact (require (b/emit! (mut graph) 14 1 [loaded sentinel]))
+                  ok (require (b/emit! (mut graph) 47 1 [good intact]))
+                  zero (require (b/scalar-constant! (mut graph) 5 0xBAD 8))
+                  result (require (b/emit! (mut graph) 60 5 [ok called zero]))
+                  ret
+                    (require (b/emit! (mut graph)
+                                      120
+                                      5
+                                      [loaded result (: 0 i32)]))]
+              (match (compile/object graph
+                                     start
+                                     [ret]
+                                     (if (= alignment 16)
+                                         "_stogir_scopes_16"
+                                         "_stogir_scopes_4096")
+                                     allocator)
+                (Err [message]
+                     (println "{}" message)
+                     (set! failures (+ failures 1)))
+                (Ok [object]
+                    (let [(mut bytes) object]
+                      (match (fs/write-file allocator
+                                            (if (= alignment 16)
+                                                "/tmp/coil-stogir-scopes-16.o"
+                                                "/tmp/coil-stogir-scopes-4096.o")
+                                            (slice bytes))
+                        (Err [_] (set! failures (+ failures 1)))
+                        (Ok [_] 0))
+                      (free! (mut bytes)))))
+              (match (compile/text graph start [ret] allocator)
+                (Err [message]
+                     (println "{}" message)
+                     (set! failures (+ failures 1)))
+                (Ok [text]
+                    (let [(mut bytes) text]
+                      (match (jit/map-text (slice bytes))
+                        (Err [message]
+                             (println "{}" message)
+                             (set! failures (+ failures 1)))
+                        (Ok [image]
+                            (let [(mut owned-image) image
+                                  f
+                                    (primitive/cast (fnptr (cc/C) [u64 u64] u64)
+                                                    (.base owned-image))
+                                  target
+                                    (primitive/cast u64
+                                                    (primitive/cast (ptr u8)
+                                                                    (fnptr-of sum10)))]
+                              (for n [(: 1 u64) 15 16 17 63 65 4097]
+                                (let [got (call-ptr f target n)]
+                                  (when (!= got (* n 10))
+                                    (println "scope align={} count={} got={}"
+                                             alignment
+                                             n
+                                             got)
+                                    (set! failures (+ failures 1)))))
+                              (jit/release! (mut owned-image)))))
+                      (free! (mut bytes))))))
+            (free! (mut (.parameters owned))))))
+    (free! (mut snapshots))
+    (g/release! (mut graph))
+    failures))
+
+;;; Saving/restoring alone must anchor the frame even without ALLOCA or calls.
+(defn check-empty [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        saved (require (b/stack-save! (mut graph) start))
+        restored (require (b/stack-restore! (mut graph) saved saved))
+        actual (require (b/stack-save! (mut graph) restored))
+        equal (require (b/emit! (mut graph) 14 1 [saved actual]))
+        result (require (b/emit! (mut graph) 34 5 [equal]))
+        ret (require (b/emit! (mut graph) 120 5 [actual result (: 0 i32)]))
+        (mut failures) 0]
+    (match (compile/text graph start [ret] allocator)
+      (Err [message] (println "{}" message) (set! failures 1))
+      (Ok [text]
+          (let [(mut bytes) text]
+            (match (jit/map-text (slice bytes))
+              (Err [message] (println "{}" message) (set! failures 1))
+              (Ok [image]
+                  (let [(mut owned) image
+                        f (primitive/cast (fnptr (cc/C) [] u64) (.base owned))]
+                    (when (!= (call-ptr f) 1) (set! failures 1))
+                    (jit/release! (mut owned)))))
+            (free! (mut bytes)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures (+ (check 16) (check 4096) (check-empty))]
+    (println "nested stack scopes with spills, outgoing arguments and realignment: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))
