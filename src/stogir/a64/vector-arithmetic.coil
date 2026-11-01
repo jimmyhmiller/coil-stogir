@@ -12,6 +12,7 @@
 (import "stogir.a64.encode" :as encode)
 (import "stogir.a64.simd-lanes" :as lanes)
 (import "stogir.a64.vector-unary" :as unary)
+(import "stogir.a64.vector-shift" :as shift)
 (import "stogir.bytes" :as bytes)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.result" :use [Result Ok Err])
@@ -47,7 +48,9 @@
                          (rn i32)
                          (rm i32)]
   (-> (Result i32 (slice u8)))
-  (if (or (or (vector/unary? opcode) (not (vector/valid-type? opcode ty)))
+  (if (or (or (vector/shift? opcode)
+              (vector/unary? opcode)
+              (not (vector/valid-type? opcode ty)))
           (not (types/short-vector? ty 8))
           (not (lane-expanded? opcode ty))
           (< rd 0)
@@ -94,7 +97,9 @@
 
 (defn instruction [(opcode i32) (ty i32) (rd i32) (rn i32) (rm i32)]
   (-> (Result u32 (slice u8)))
-  (if (or (or (vector/unary? opcode) (not (vector/valid-type? opcode ty)))
+  (if (or (or (vector/shift? opcode)
+              (vector/unary? opcode)
+              (not (vector/valid-type? opcode ty)))
           (not (types/short-vector? ty 8))
           (lane-expanded? opcode ty)
           (< rd 0)
@@ -157,7 +162,8 @@
               (mut error) ""
               (mut destination) (: -1 i32)
               (mut left) (: -1 i32)
-              (mut right) (: -1 i32)]
+              (mut right) (: -1 i32)
+              (mut scalar-count?) false]
           (match (loc/lookup parts reference (+ position 1))
             (Err [message] (set! error message))
             (Ok [location]
@@ -184,7 +190,9 @@
                                     17
                                     63)
               (Err [message] (set! error message))
-              (Ok [reg] (set! right (- reg 32)))))
+              (Ok [reg]
+                  (set! scalar-count? (< reg 32))
+                  (set! right (if scalar-count? reg (- reg 32))))))
           (when (= error "")
             (if (vector/unary? (cast i32 (n/opcode node)))
                 (match (unary/emit-registers! (mut (.text temporary))
@@ -194,22 +202,33 @@
                                               left)
                   (Err [message] (set! error message))
                   (Ok [_] 0))
-                (if (lane-expanded? (cast i32 (n/opcode node)) ty)
-                    (match (integer-sequence! (mut (.text temporary))
-                                              (cast i32 (n/opcode node))
-                                              ty
-                                              destination
-                                              left
-                                              right)
+                (if (vector/shift? (cast i32 (n/opcode node)))
+                    (match (shift/emit-registers! (mut (.text temporary))
+                                                  (cast i32 (n/opcode node))
+                                                  ty
+                                                  destination
+                                                  left
+                                                  right
+                                                  scalar-count?)
                       (Err [message] (set! error message))
                       (Ok [_] 0))
-                    (match (instruction (cast i32 (n/opcode node))
-                                        ty
-                                        destination
-                                        left
-                                        right)
-                      (Err [message] (set! error message))
-                      (Ok [word] (bytes/append32! (mut (.text temporary)) word))))))
+                    (if (lane-expanded? (cast i32 (n/opcode node)) ty)
+                        (match (integer-sequence! (mut (.text temporary))
+                                                  (cast i32 (n/opcode node))
+                                                  ty
+                                                  destination
+                                                  left
+                                                  right)
+                          (Err [message] (set! error message))
+                          (Ok [_] 0))
+                        (match (instruction (cast i32 (n/opcode node))
+                                            ty
+                                            destination
+                                            left
+                                            right)
+                          (Err [message] (set! error message))
+                          (Ok [word]
+                              (bytes/append32! (mut (.text temporary)) word)))))))
           (let [count (cast i32 (len (.text temporary)))]
             (when (and (= error "") (not (code/append! (mut output) temporary)))
               (set! error "invalid vector arithmetic code references"))

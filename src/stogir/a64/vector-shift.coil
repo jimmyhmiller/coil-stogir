@@ -1,0 +1,94 @@
+;;; Width-masked vector shifts using one reserved SIMD count register.
+(module stogir.a64.vector-shift)
+(import "stogir.vector-arithmetic" :as vector)
+(import "stogir.types" :as types)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err])
+
+;;; v31 is the private count workspace; the data source cannot occupy it.
+;;; Allocated operands exclude it, and complete data literals use v30.
+(defn emit-registers! [(output (mut (ArrayList u8)))
+                       (opcode i32)
+                       (ty i32)
+                       (rd i32)
+                       (rn i32)
+                       (count i32)
+                       (scalar? bool)]
+  (-> (Result i32 (slice u8)))
+  (if (or (not (vector/shift? opcode))
+          (not (vector/valid-type? opcode ty))
+          (not (types/short-vector? ty 8))
+          (< rd 0)
+          (> rd 31)
+          (< rn 0)
+          (>= rn 31)
+          (< count 0)
+          (> count (if scalar? 30 31)))
+      (Err "invalid AArch64 vector shift shape or reserved-register conflict")
+      (let [(mut temporary) (ArrayList::new [u8] (.alc output))
+            (mut error) ""
+            element (types/scalar-size (types/base-type ty) 8)
+            bits (* element 8)
+            log
+              (if (= element 1)
+                  (: 3 i32)
+                  (if (= element 2) 4 (if (= element 4) 5 6)))
+            size (- log 3)
+            amount (- bits log)
+            singleton? (and (= element 8) (= (types/size ty 8) 8))
+            q (if (= (types/size ty 8) 16) (: 0x40000000 u32) (: 0 u32))]
+        (when scalar?
+          (if singleton?
+              (match (encode/scalar-transfer true true 31 count)
+                (Err [message] (set! error message))
+                (Ok [word] (bytes/append32! (mut temporary) word)))
+              (bytes/append32! (mut temporary)
+                               (| q
+                                  (: 0x0E000C00 u32)
+                                  (<< (cast u32 element) 16)
+                                  (<< (cast u32 count) 5)
+                                  31))))
+        ; Keep log2(element bits) low count bits, without another SIMD temporary.
+        (bytes/append32! (mut temporary)
+                         (| (if singleton?
+                                (: 0x5F005400 u32)
+                                (| q (: 0x0F005400 u32)))
+                            (<< (cast u32 (+ bits amount)) 16)
+                            (<< (cast u32 (if scalar? 31 count)) 5)
+                            31))
+        (bytes/append32! (mut temporary)
+                         (| (if singleton?
+                                (: 0x7F000400 u32)
+                                (| q (: 0x2F000400 u32)))
+                            (<< (cast u32 (- (* 2 bits) amount)) 16)
+                            (<< (: 31 u32) 5)
+                            31))
+        (when (!= opcode 49)
+          (bytes/append32! (mut temporary)
+                           (| (if singleton?
+                                  (: 0x7EE0B800 u32)
+                                  (| q
+                                     (: 0x2E20B800 u32)
+                                     (<< (cast u32 size) 22)))
+                              (<< (: 31 u32) 5)
+                              31)))
+        (bytes/append32! (mut temporary)
+                         (| (if singleton?
+                                (if (= opcode 51)
+                                    (: 0x5EE04400 u32)
+                                    (: 0x7EE04400 u32))
+                                (| q
+                                   (<< (cast u32 size) 22)
+                                   (if (= opcode 51)
+                                       (: 0x0E204400 u32)
+                                       (: 0x2E204400 u32))))
+                            (<< (: 31 u32) 16)
+                            (<< (cast u32 rn) 5)
+                            (cast u32 rd)))
+        (let [size (cast i32 (len temporary))]
+          (when (= error "")
+            (extend! (mut output) (.data temporary) (len temporary)))
+          (free! (mut temporary))
+          (if (= error "") (Ok size) (Err error))))))

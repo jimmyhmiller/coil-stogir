@@ -1,0 +1,4518 @@
+(module stogir.tests.aot-vector-shifts-link)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "stogir.types" :as types)
+
+(defn pattern [(base i32) (lane i64) (seed i64) (right? bool)] (-> u64)
+  (let [i (% (+ lane seed (if right? (: 3 i64) 0)) 11)
+        fp? (types/floating? base)
+        wide? (= base 12)]
+    (if fp?
+        (if wide?
+            (match i
+              (0 (: 0 u64))
+              (1 0x8000000000000000)
+              (2 0x3FF0000000000000)
+              (3 0xBFF0000000000000)
+              (4 1)
+              (5 0x000FFFFFFFFFFFFF)
+              (6 0x7FEFFFFFFFFFFFFF)
+              (7 0x7FF0000000000000)
+              (8 0xFFF0000000000000)
+              (9 0x7FF8123456789ABC)
+              (_ 0x7FF0123456789ABC))
+            (match i
+              (0 (: 0 u64))
+              (1 0x80000000)
+              (2 0x3F800000)
+              (3 0xBF800000)
+              (4 1)
+              (5 0x007FFFFF)
+              (6 0x7F7FFFFF)
+              (7 0x7F800000)
+              (8 0xFF800000)
+              (9 0x7FC12345)
+              (_ 0x7F812345)))
+        (match i
+          (0 (: 0 u64))
+          (1 1)
+          (2 0xFFFFFFFFFFFFFFFF)
+          (3 0x8000000000000000)
+          (4 0x7FFFFFFFFFFFFFFF)
+          (5 0x8080808080808080)
+          (6 0x7F7F7F7F7F7F7F7F)
+          (7 0xFFFF0000FFFF0000)
+          (8 0x123456789ABCDEF0)
+          (9 0xFFFFFFFFFFFFFFFE)
+          (_ 0x0102030405060708)))))
+
+(defn input-byte [(base i32) (index i64) (seed i64) (right? bool)] (-> u8)
+  (let [width (cast i64 (types/scalar-size base 8))]
+    (cast u8
+          (>> (pattern base (/ index width) seed right?)
+              (cast u64 (* (% index width) 8))))))
+
+(defn count-pattern [(index i64) (seed i64)] (-> u64)
+  (match (% (+ index seed) 22)
+    (0 (: 0 u64))
+    (1 1)
+    (2 7)
+    (3 8)
+    (4 9)
+    (5 15)
+    (6 16)
+    (7 17)
+    (8 31)
+    (9 32)
+    (10 33)
+    (11 63)
+    (12 64)
+    (13 65)
+    (14 127)
+    (15 128)
+    (16 255)
+    (17 256)
+    (18 0x100000001)
+    (19 0x8000000000000000)
+    (20 0xFFFFFFFFFFFFFFFF)
+    (_ 0x123456789ABCDEF0)))
+
+(defn count-value [(count-type i32) (index i64) (seed i64)] (-> u64)
+  (let [bits (count-pattern index seed)]
+    (if (= count-type 0)
+        bits
+        (if (= count-type 1)
+            (& bits 1)
+            (& bits
+               (cast u64
+                     (- (<< (: 1 u128)
+                            (cast u128 (* 8 (types/scalar-size count-type 8))))
+                        1)))))))
+
+(defn count-byte [(base i32) (count-type i32) (index i64) (seed i64)] (-> u8)
+  (let [element
+          (cast i64 (types/scalar-size (if (= count-type 0) base count-type) 8))]
+    (cast u8
+          (>> (count-value count-type (/ index element) seed)
+              (cast u64 (* (% index element) 8))))))
+
+(defn expected [(opcode i32) (base i32) (bits u64) (count u64)] (-> u64)
+  (let [width (* (types/scalar-size base 8) 8)
+        range (<< (: 1 u128) (cast u128 width))
+        mask (- range 1)
+        x (& (cast u128 bits) mask)
+        shift (& count (cast u64 (- width 1)))]
+    (cast u64
+          (& mask
+             (cond (= opcode 49) (<< x (cast u128 shift))
+                   (= opcode 50) (>> x (cast u128 shift))
+                   :else
+                     (let [signed
+                             (if (>= x (>> range 1))
+                                 (- (cast i128 x) (cast i128 range))
+                                 (cast i128 x))]
+                       (cast u128 (>> signed (cast i128 shift)))))))))
+
+(defn read-word [(buffer (slice u8)) (offset i64) (width i32)] (-> u64)
+  (let [(mut result) (: 0 u64)
+        (mut i) (: 0 i32)]
+    (while (< i width)
+      (set! result
+            (| result
+               (<< (cast u64 (get buffer (+ offset (cast i64 i))))
+                   (cast u64 (* i 8)))))
+      (set! i (+ i 1)))
+    result))
+
+(defn exercise [(ty i32)
+                (opcode i32)
+                (count-type i32)
+                (mode i32)
+                (address (ptr u8))] (-> i64)
+  (let [allocator (malloc-allocator)
+        base (types/base-type ty)
+        width (types/size ty 8)
+        element (types/scalar-size base 8)
+        lanes (/ width element)
+        count-width (if (= count-type 0) width (types/scalar-size count-type 8))
+        f (p/cast (fnptr (cc/C) [u64 u64 u64] void) address)
+        (mut input) (ArrayList::new [u8] allocator)
+        (mut counts) (ArrayList::new [u8] allocator)
+        (mut output) (ArrayList::new [u8] allocator)
+        (mut seed) (: 0 i64)
+        (mut failures) 0]
+    (while (< seed 22)
+      (clear! (mut input))
+      (clear! (mut counts))
+      (clear! (mut output))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 32)
+          (push! (mut input) (input-byte base i seed false))
+          (push! (mut counts) (count-byte base count-type i seed))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 80) (push! (mut output) 165) (set! i (+ i 1))))
+      (call-ptr f
+                (p/cast u64 (.data output))
+                (p/cast u64 (.data input))
+                (p/cast u64 (.data counts)))
+      (let [(mut lane) (: 0 i32)]
+        (while (< lane lanes)
+          (let [x
+                  (pattern base
+                           (cast i64 lane)
+                           (if (or (= mode 2) (= mode 3)) (: 9 i64) seed)
+                           false)
+                count
+                  (if (= mode 4)
+                      x
+                      (count-value count-type
+                                   (if (= count-type 0)
+                                       (cast i64 lane)
+                                       (: 0 i64))
+                                   (if (or (= mode 1) (= mode 3))
+                                       (: 20 i64)
+                                       seed)))
+                wanted (expected opcode base x count)
+                got
+                  (read-word (slice output)
+                             (* (cast i64 lane) (cast i64 element))
+                             element)]
+            (when (!= got wanted)
+              (println "vector shift ty{} op{} count-type{} mode{} seed{} lane{} got{} expected{}"
+                       ty
+                       opcode
+                       count-type
+                       mode
+                       seed
+                       lane
+                       got
+                       wanted)
+              (set! failures (+ failures 1))))
+          (set! lane (+ lane 1))))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 80)
+          (when (>= i (cast i64 width))
+            (let [wanted
+                    (if (and (!= mode 4)
+                             (>= i 24)
+                             (< i (+ 24 (cast i64 width))))
+                        (input-byte base
+                                    (- i 24)
+                                    (if (or (= mode 2) (= mode 3))
+                                        (: 9 i64)
+                                        seed)
+                                    false)
+                        (if (and (!= mode 4)
+                                 (>= i 48)
+                                 (< i (+ 48 (cast i64 count-width))))
+                            (count-byte base
+                                        count-type
+                                        (- i 48)
+                                        (if (or (= mode 1) (= mode 3))
+                                            (: 20 i64)
+                                            seed))
+                            (: 165 u8)))]
+              (when (!= (get output i) wanted) (set! failures (+ failures 1)))))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 32)
+          (when (or (!= (get input i) (input-byte base i seed false))
+                    (!= (get counts i) (count-byte base count-type i seed)))
+            (set! failures (+ failures 1)))
+          (set! i (+ i 1))))
+      (set! seed (+ seed 1)))
+    (free! (mut input))
+    (free! (mut counts))
+    (free! (mut output))
+    failures))
+
+(defn probe :cc (cc/C) [(input (ptr u8))] (-> u64)
+  (p/machine-code (Aarch64)
+                  0xf1
+                  0x03
+                  0x00
+                  0xaa
+                  0x20
+                  0x02
+                  0xc0
+                  0x3d
+                  0x21
+                  0x02
+                  0xc0
+                  0x3d
+                  0x22
+                  0x02
+                  0xc0
+                  0x3d
+                  0x23
+                  0x02
+                  0xc0
+                  0x3d
+                  0x24
+                  0x02
+                  0xc0
+                  0x3d
+                  0x25
+                  0x02
+                  0xc0
+                  0x3d
+                  0x26
+                  0x02
+                  0xc0
+                  0x3d
+                  0x27
+                  0x02
+                  0xc0
+                  0x3d
+                  0x30
+                  0x02
+                  0xc0
+                  0x3d
+                  0x31
+                  0x02
+                  0xc0
+                  0x3d
+                  0x32
+                  0x02
+                  0xc0
+                  0x3d
+                  0x33
+                  0x02
+                  0xc0
+                  0x3d
+                  0x34
+                  0x02
+                  0xc0
+                  0x3d
+                  0x35
+                  0x02
+                  0xc0
+                  0x3d
+                  0x36
+                  0x02
+                  0xc0
+                  0x3d
+                  0x37
+                  0x02
+                  0xc0
+                  0x3d
+                  0x38
+                  0x02
+                  0xc0
+                  0x3d
+                  0x39
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3a
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3b
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3c
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3d
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3e
+                  0x02
+                  0xc0
+                  0x3d
+                  0x3f
+                  0x02
+                  0xc0
+                  0x3d
+                  0xa0
+                  0x15
+                  0x80
+                  0xd2
+                  0xc1
+                  0x15
+                  0x80
+                  0xd2
+                  0xe2
+                  0x15
+                  0x80
+                  0xd2
+                  0x03
+                  0x16
+                  0x80
+                  0xd2
+                  0x24
+                  0x16
+                  0x80
+                  0xd2
+                  0x45
+                  0x16
+                  0x80
+                  0xd2
+                  0x66
+                  0x16
+                  0x80
+                  0xd2
+                  0x87
+                  0x16
+                  0x80
+                  0xd2
+                  0xa8
+                  0x16
+                  0x80
+                  0xd2
+                  0xc9
+                  0x16
+                  0x80
+                  0xd2
+                  0xea
+                  0x16
+                  0x80
+                  0xd2
+                  0x0b
+                  0x17
+                  0x80
+                  0xd2
+                  0x2c
+                  0x17
+                  0x80
+                  0xd2
+                  0x4d
+                  0x17
+                  0x80
+                  0xd2
+                  0x6e
+                  0x17
+                  0x80
+                  0xd2
+                  0x8f
+                  0x17
+                  0x80
+                  0xd2
+                  0xc0
+                  0x03
+                  0x5f
+                  0xd6))
+
+(defn pressure-exercise [(ty i32)
+                         (opcode i32)
+                         (count-type i32)
+                         (address (ptr u8))] (-> i64)
+  (let [allocator (malloc-allocator)
+        base (types/base-type ty)
+        width (types/size ty 8)
+        element (types/scalar-size base 8)
+        lanes (/ width element)
+        f (p/cast (fnptr (cc/C) [u64 u64 u64] u64) address)
+        target
+          (p/cast u64
+                  (p/cast (ptr u8)
+                          (: (fnptr-of probe) (fnptr (cc/C) [(ptr u8)] u64))))
+        (mut input) (ArrayList::new [u8] allocator)
+        (mut output) (ArrayList::new [u8] allocator)
+        (mut failures) 0
+        (mut seed) (: 0 i64)]
+    (while (< seed 11)
+      (clear! (mut input))
+      (clear! (mut output))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 2048)
+          (push! (mut input) (input-byte base i seed false))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 2064) (push! (mut output) 165) (set! i (+ i 1))))
+      (when (!= (call-ptr f
+                          (p/cast u64 (p/index (.data output) 3))
+                          (p/cast u64 (.data input))
+                          target)
+                811)
+        (println "vector pressure guard/result ty{} op{} seed{}" ty opcode seed)
+        (set! failures (+ failures 1)))
+      (let [(mut lane) (: 0 i32)]
+        (while (< lane (* 40 lanes))
+          (let [a (pattern base (cast i64 lane) seed false)
+                b
+                  (count-value count-type
+                               (if (= count-type 0)
+                                   (cast i64 lane)
+                                   (/ (cast i64 lane) (cast i64 lanes)))
+                               20)
+                wanted (expected opcode base a b)
+                got
+                  (read-word (slice output)
+                             (+ 3 (* (cast i64 lane) (cast i64 element)))
+                             element)]
+            (when (!= wanted got)
+              (println "vector pressure ty{} op{} seed{} lane{} got{} expected{}"
+                       ty
+                       opcode
+                       seed
+                       lane
+                       got
+                       wanted)
+              (set! failures (+ failures 1))))
+          (set! lane (+ lane 1))))
+      (let [(mut i) (: 0 i64)]
+        (while (< i 2064)
+          (let [pos (- i 3)]
+            (when (not (and (>= pos 0) (< pos (* 40 (cast i64 width)))))
+              (let [wanted
+                      (if (and (>= pos 1024)
+                               (< pos (+ 1024 (* 40 (cast i64 width)))))
+                          (input-byte base (- pos 1024) seed false)
+                          (: 165 u8))]
+                (when (!= (get output i) wanted) (set! failures (+ failures 1))))))
+          (set! i (+ i 1)))
+        (set! i 0)
+        (while (< i 2048)
+          (when (!= (get input i) (input-byte base i seed false))
+            (set! failures (+ failures 1)))
+          (set! i (+ i 1))))
+      (set! seed (+ seed 1)))
+    (free! (mut input))
+    (free! (mut output))
+    failures))
+
+(extern entry0 :as "stogir_vector_shift_0" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry1 :as "stogir_vector_shift_1" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry2 :as "stogir_vector_shift_2" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry3 :as "stogir_vector_shift_3" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry4 :as "stogir_vector_shift_4" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry5 :as "stogir_vector_shift_5" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry6 :as "stogir_vector_shift_6" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry7 :as "stogir_vector_shift_7" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry8 :as "stogir_vector_shift_8" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry9 :as "stogir_vector_shift_9" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry10 :as "stogir_vector_shift_10" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry11 :as "stogir_vector_shift_11" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry12 :as "stogir_vector_shift_12" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry13 :as "stogir_vector_shift_13" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry14 :as "stogir_vector_shift_14" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry15 :as "stogir_vector_shift_15" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry16 :as "stogir_vector_shift_16" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry17 :as "stogir_vector_shift_17" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry18 :as "stogir_vector_shift_18" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry19 :as "stogir_vector_shift_19" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry20 :as "stogir_vector_shift_20" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry21 :as "stogir_vector_shift_21" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry22 :as "stogir_vector_shift_22" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry23 :as "stogir_vector_shift_23" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry24 :as "stogir_vector_shift_24" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry25 :as "stogir_vector_shift_25" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry26 :as "stogir_vector_shift_26" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry27 :as "stogir_vector_shift_27" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry28 :as "stogir_vector_shift_28" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry29 :as "stogir_vector_shift_29" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry30 :as "stogir_vector_shift_30" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry31 :as "stogir_vector_shift_31" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry32 :as "stogir_vector_shift_32" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry33 :as "stogir_vector_shift_33" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry34 :as "stogir_vector_shift_34" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry35 :as "stogir_vector_shift_35" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry36 :as "stogir_vector_shift_36" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry37 :as "stogir_vector_shift_37" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry38 :as "stogir_vector_shift_38" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry39 :as "stogir_vector_shift_39" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry40 :as "stogir_vector_shift_40" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry41 :as "stogir_vector_shift_41" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry42 :as "stogir_vector_shift_42" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry43 :as "stogir_vector_shift_43" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry44 :as "stogir_vector_shift_44" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry45 :as "stogir_vector_shift_45" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry46 :as "stogir_vector_shift_46" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry47 :as "stogir_vector_shift_47" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry48 :as "stogir_vector_shift_48" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry49 :as "stogir_vector_shift_49" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry50 :as "stogir_vector_shift_50" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry51 :as "stogir_vector_shift_51" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry52 :as "stogir_vector_shift_52" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry53 :as "stogir_vector_shift_53" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry54 :as "stogir_vector_shift_54" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry55 :as "stogir_vector_shift_55" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry56 :as "stogir_vector_shift_56" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry57 :as "stogir_vector_shift_57" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry58 :as "stogir_vector_shift_58" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry59 :as "stogir_vector_shift_59" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry60 :as "stogir_vector_shift_60" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry61 :as "stogir_vector_shift_61" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry62 :as "stogir_vector_shift_62" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry63 :as "stogir_vector_shift_63" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry64 :as "stogir_vector_shift_64" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry65 :as "stogir_vector_shift_65" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry66 :as "stogir_vector_shift_66" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry67 :as "stogir_vector_shift_67" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry68 :as "stogir_vector_shift_68" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry69 :as "stogir_vector_shift_69" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry70 :as "stogir_vector_shift_70" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry71 :as "stogir_vector_shift_71" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry72 :as "stogir_vector_shift_72" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry73 :as "stogir_vector_shift_73" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry74 :as "stogir_vector_shift_74" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry75 :as "stogir_vector_shift_75" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry76 :as "stogir_vector_shift_76" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry77 :as "stogir_vector_shift_77" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry78 :as "stogir_vector_shift_78" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry79 :as "stogir_vector_shift_79" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry80 :as "stogir_vector_shift_80" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry81 :as "stogir_vector_shift_81" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry82 :as "stogir_vector_shift_82" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry83 :as "stogir_vector_shift_83" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry84 :as "stogir_vector_shift_84" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry85 :as "stogir_vector_shift_85" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry86 :as "stogir_vector_shift_86" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry87 :as "stogir_vector_shift_87" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry88 :as "stogir_vector_shift_88" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry89 :as "stogir_vector_shift_89" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry90 :as "stogir_vector_shift_90" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry91 :as "stogir_vector_shift_91" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry92 :as "stogir_vector_shift_92" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry93 :as "stogir_vector_shift_93" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry94 :as "stogir_vector_shift_94" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry95 :as "stogir_vector_shift_95" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry96 :as "stogir_vector_shift_96" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry97 :as "stogir_vector_shift_97" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry98 :as "stogir_vector_shift_98" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry99 :as "stogir_vector_shift_99" :cc (cc/C) [u64 u64 u64] (-> void))
+
+(extern entry100
+        :as
+        "stogir_vector_shift_100"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry101
+        :as
+        "stogir_vector_shift_101"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry102
+        :as
+        "stogir_vector_shift_102"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry103
+        :as
+        "stogir_vector_shift_103"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry104
+        :as
+        "stogir_vector_shift_104"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry105
+        :as
+        "stogir_vector_shift_105"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry106
+        :as
+        "stogir_vector_shift_106"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry107
+        :as
+        "stogir_vector_shift_107"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry108
+        :as
+        "stogir_vector_shift_108"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry109
+        :as
+        "stogir_vector_shift_109"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry110
+        :as
+        "stogir_vector_shift_110"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry111
+        :as
+        "stogir_vector_shift_111"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry112
+        :as
+        "stogir_vector_shift_112"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry113
+        :as
+        "stogir_vector_shift_113"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry114
+        :as
+        "stogir_vector_shift_114"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry115
+        :as
+        "stogir_vector_shift_115"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry116
+        :as
+        "stogir_vector_shift_116"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry117
+        :as
+        "stogir_vector_shift_117"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry118
+        :as
+        "stogir_vector_shift_118"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry119
+        :as
+        "stogir_vector_shift_119"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry120
+        :as
+        "stogir_vector_shift_120"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry121
+        :as
+        "stogir_vector_shift_121"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry122
+        :as
+        "stogir_vector_shift_122"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry123
+        :as
+        "stogir_vector_shift_123"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry124
+        :as
+        "stogir_vector_shift_124"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry125
+        :as
+        "stogir_vector_shift_125"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry126
+        :as
+        "stogir_vector_shift_126"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry127
+        :as
+        "stogir_vector_shift_127"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry128
+        :as
+        "stogir_vector_shift_128"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry129
+        :as
+        "stogir_vector_shift_129"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry130
+        :as
+        "stogir_vector_shift_130"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry131
+        :as
+        "stogir_vector_shift_131"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry132
+        :as
+        "stogir_vector_shift_132"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry133
+        :as
+        "stogir_vector_shift_133"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry134
+        :as
+        "stogir_vector_shift_134"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry135
+        :as
+        "stogir_vector_shift_135"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry136
+        :as
+        "stogir_vector_shift_136"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry137
+        :as
+        "stogir_vector_shift_137"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry138
+        :as
+        "stogir_vector_shift_138"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry139
+        :as
+        "stogir_vector_shift_139"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry140
+        :as
+        "stogir_vector_shift_140"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry141
+        :as
+        "stogir_vector_shift_141"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry142
+        :as
+        "stogir_vector_shift_142"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry143
+        :as
+        "stogir_vector_shift_143"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry144
+        :as
+        "stogir_vector_shift_144"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry145
+        :as
+        "stogir_vector_shift_145"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry146
+        :as
+        "stogir_vector_shift_146"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry147
+        :as
+        "stogir_vector_shift_147"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry148
+        :as
+        "stogir_vector_shift_148"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry149
+        :as
+        "stogir_vector_shift_149"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry150
+        :as
+        "stogir_vector_shift_150"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry151
+        :as
+        "stogir_vector_shift_151"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry152
+        :as
+        "stogir_vector_shift_152"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry153
+        :as
+        "stogir_vector_shift_153"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry154
+        :as
+        "stogir_vector_shift_154"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry155
+        :as
+        "stogir_vector_shift_155"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry156
+        :as
+        "stogir_vector_shift_156"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry157
+        :as
+        "stogir_vector_shift_157"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry158
+        :as
+        "stogir_vector_shift_158"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry159
+        :as
+        "stogir_vector_shift_159"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry160
+        :as
+        "stogir_vector_shift_160"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry161
+        :as
+        "stogir_vector_shift_161"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry162
+        :as
+        "stogir_vector_shift_162"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry163
+        :as
+        "stogir_vector_shift_163"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry164
+        :as
+        "stogir_vector_shift_164"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry165
+        :as
+        "stogir_vector_shift_165"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry166
+        :as
+        "stogir_vector_shift_166"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry167
+        :as
+        "stogir_vector_shift_167"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry168
+        :as
+        "stogir_vector_shift_168"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry169
+        :as
+        "stogir_vector_shift_169"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry170
+        :as
+        "stogir_vector_shift_170"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry171
+        :as
+        "stogir_vector_shift_171"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry172
+        :as
+        "stogir_vector_shift_172"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry173
+        :as
+        "stogir_vector_shift_173"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry174
+        :as
+        "stogir_vector_shift_174"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry175
+        :as
+        "stogir_vector_shift_175"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry176
+        :as
+        "stogir_vector_shift_176"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry177
+        :as
+        "stogir_vector_shift_177"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry178
+        :as
+        "stogir_vector_shift_178"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry179
+        :as
+        "stogir_vector_shift_179"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry180
+        :as
+        "stogir_vector_shift_180"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry181
+        :as
+        "stogir_vector_shift_181"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry182
+        :as
+        "stogir_vector_shift_182"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry183
+        :as
+        "stogir_vector_shift_183"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry184
+        :as
+        "stogir_vector_shift_184"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry185
+        :as
+        "stogir_vector_shift_185"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry186
+        :as
+        "stogir_vector_shift_186"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry187
+        :as
+        "stogir_vector_shift_187"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry188
+        :as
+        "stogir_vector_shift_188"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry189
+        :as
+        "stogir_vector_shift_189"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry190
+        :as
+        "stogir_vector_shift_190"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry191
+        :as
+        "stogir_vector_shift_191"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry192
+        :as
+        "stogir_vector_shift_192"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry193
+        :as
+        "stogir_vector_shift_193"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry194
+        :as
+        "stogir_vector_shift_194"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry195
+        :as
+        "stogir_vector_shift_195"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry196
+        :as
+        "stogir_vector_shift_196"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry197
+        :as
+        "stogir_vector_shift_197"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry198
+        :as
+        "stogir_vector_shift_198"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry199
+        :as
+        "stogir_vector_shift_199"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry200
+        :as
+        "stogir_vector_shift_200"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry201
+        :as
+        "stogir_vector_shift_201"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry202
+        :as
+        "stogir_vector_shift_202"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry203
+        :as
+        "stogir_vector_shift_203"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry204
+        :as
+        "stogir_vector_shift_204"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry205
+        :as
+        "stogir_vector_shift_205"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry206
+        :as
+        "stogir_vector_shift_206"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry207
+        :as
+        "stogir_vector_shift_207"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry208
+        :as
+        "stogir_vector_shift_208"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry209
+        :as
+        "stogir_vector_shift_209"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry210
+        :as
+        "stogir_vector_shift_210"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry211
+        :as
+        "stogir_vector_shift_211"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry212
+        :as
+        "stogir_vector_shift_212"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry213
+        :as
+        "stogir_vector_shift_213"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry214
+        :as
+        "stogir_vector_shift_214"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry215
+        :as
+        "stogir_vector_shift_215"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> void))
+
+(extern entry216
+        :as
+        "stogir_vector_shift_216"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry217
+        :as
+        "stogir_vector_shift_217"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry218
+        :as
+        "stogir_vector_shift_218"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry219
+        :as
+        "stogir_vector_shift_219"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry220
+        :as
+        "stogir_vector_shift_220"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry221
+        :as
+        "stogir_vector_shift_221"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry222
+        :as
+        "stogir_vector_shift_222"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry223
+        :as
+        "stogir_vector_shift_223"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry224
+        :as
+        "stogir_vector_shift_224"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry225
+        :as
+        "stogir_vector_shift_225"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry226
+        :as
+        "stogir_vector_shift_226"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry227
+        :as
+        "stogir_vector_shift_227"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry228
+        :as
+        "stogir_vector_shift_228"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry229
+        :as
+        "stogir_vector_shift_229"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry230
+        :as
+        "stogir_vector_shift_230"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry231
+        :as
+        "stogir_vector_shift_231"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry232
+        :as
+        "stogir_vector_shift_232"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry233
+        :as
+        "stogir_vector_shift_233"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry234
+        :as
+        "stogir_vector_shift_234"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry235
+        :as
+        "stogir_vector_shift_235"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry236
+        :as
+        "stogir_vector_shift_236"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry237
+        :as
+        "stogir_vector_shift_237"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry238
+        :as
+        "stogir_vector_shift_238"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry239
+        :as
+        "stogir_vector_shift_239"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry240
+        :as
+        "stogir_vector_shift_240"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry241
+        :as
+        "stogir_vector_shift_241"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry242
+        :as
+        "stogir_vector_shift_242"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry243
+        :as
+        "stogir_vector_shift_243"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry244
+        :as
+        "stogir_vector_shift_244"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry245
+        :as
+        "stogir_vector_shift_245"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry246
+        :as
+        "stogir_vector_shift_246"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry247
+        :as
+        "stogir_vector_shift_247"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry248
+        :as
+        "stogir_vector_shift_248"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry249
+        :as
+        "stogir_vector_shift_249"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry250
+        :as
+        "stogir_vector_shift_250"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry251
+        :as
+        "stogir_vector_shift_251"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry252
+        :as
+        "stogir_vector_shift_252"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry253
+        :as
+        "stogir_vector_shift_253"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry254
+        :as
+        "stogir_vector_shift_254"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry255
+        :as
+        "stogir_vector_shift_255"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry256
+        :as
+        "stogir_vector_shift_256"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry257
+        :as
+        "stogir_vector_shift_257"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry258
+        :as
+        "stogir_vector_shift_258"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry259
+        :as
+        "stogir_vector_shift_259"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry260
+        :as
+        "stogir_vector_shift_260"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry261
+        :as
+        "stogir_vector_shift_261"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry262
+        :as
+        "stogir_vector_shift_262"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry263
+        :as
+        "stogir_vector_shift_263"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry264
+        :as
+        "stogir_vector_shift_264"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry265
+        :as
+        "stogir_vector_shift_265"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry266
+        :as
+        "stogir_vector_shift_266"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry267
+        :as
+        "stogir_vector_shift_267"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry268
+        :as
+        "stogir_vector_shift_268"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry269
+        :as
+        "stogir_vector_shift_269"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry270
+        :as
+        "stogir_vector_shift_270"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry271
+        :as
+        "stogir_vector_shift_271"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry272
+        :as
+        "stogir_vector_shift_272"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry273
+        :as
+        "stogir_vector_shift_273"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry274
+        :as
+        "stogir_vector_shift_274"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(extern entry275
+        :as
+        "stogir_vector_shift_275"
+        :cc
+        (cc/C)
+        [u64 u64 u64]
+        (-> u64))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (set! failures
+          (+ failures
+             (exercise 66
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry0)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 66
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry1)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 66
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry2)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 66
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry3)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 66
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry4)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 66
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry5)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 82
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry6)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 82
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry7)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 82
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry8)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 82
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry9)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 82
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry10)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 82
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry11)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 51
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry12)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 51
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry13)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 51
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry14)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 51
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry15)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 51
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry16)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 51
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry17)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 67
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry18)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 67
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry19)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 67
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry20)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 67
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry21)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 67
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry22)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 67
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry23)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 36
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry24)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 36
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry25)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 36
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry26)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 36
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry27)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 36
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry28)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 36
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry29)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 52
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry30)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 52
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry31)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 52
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry32)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 52
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry33)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 52
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry34)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 52
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry35)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 21
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry36)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 21
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry37)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 21
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry38)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 21
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry39)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 21
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry40)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 21
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry41)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 37
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry42)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 37
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry43)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 37
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry44)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 37
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry45)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 37
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry46)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 37
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry47)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 22
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry48)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 22
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry49)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 22
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry50)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 22
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry51)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 22
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry52)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 22
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry53)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 38
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry54)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 38
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry55)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 38
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry56)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 38
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry57)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 38
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry58)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 38
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry59)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 71
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry60)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 71
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry61)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 71
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry62)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 71
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry63)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 71
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry64)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 71
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry65)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 87
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry66)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 87
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry67)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 87
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry68)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 87
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry69)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 87
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry70)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 87
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry71)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 72
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry72)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 72
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry73)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 72
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry74)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 72
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry75)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 72
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry76)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 72
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry77)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 88
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry78)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 88
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry79)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 88
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry80)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 88
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry81)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 88
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry82)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 88
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry83)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 57
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry84)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 57
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry85)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 57
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry86)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 57
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry87)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 57
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry88)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 57
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry89)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 73
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry90)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 73
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry91)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 73
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry92)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 73
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry93)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 73
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry94)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 73
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry95)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 42
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry96)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 42
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry97)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 42
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry98)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 42
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry99)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 42
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry100)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 42
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry101)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 58
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry102)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 58
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry103)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 58
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry104)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 58
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry105)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 58
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry106)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 58
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry107)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 27
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry108)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 27
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry109)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 27
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry110)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 27
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry111)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 27
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry112)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 27
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry113)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 43
+                       49
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry114)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 43
+                       49
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry115)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 43
+                       50
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry116)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 43
+                       50
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry117)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 43
+                       51
+                       0
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry118)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 43
+                       51
+                       5
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry119)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 66
+                       49
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry120)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 66
+                       49
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry121)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 66
+                       50
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry122)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 66
+                       50
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry123)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 66
+                       51
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry124)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 66
+                       51
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry125)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 67
+                       49
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry126)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 67
+                       49
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry127)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 67
+                       50
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry128)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 67
+                       50
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry129)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 67
+                       51
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry130)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 67
+                       51
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry131)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 52
+                       49
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry132)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 52
+                       49
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry133)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 52
+                       50
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry134)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 52
+                       50
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry135)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 52
+                       51
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry136)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 52
+                       51
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry137)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 37
+                       49
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry138)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 37
+                       49
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry139)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 37
+                       50
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry140)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 37
+                       50
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry141)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 37
+                       51
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry142)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 37
+                       51
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry143)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 88
+                       49
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry144)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 88
+                       49
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry145)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 88
+                       50
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry146)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 88
+                       50
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry147)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 88
+                       51
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry148)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 88
+                       51
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry149)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 73
+                       49
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry150)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 73
+                       49
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry151)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 73
+                       50
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry152)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 73
+                       50
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry153)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 73
+                       51
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry154)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 73
+                       51
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry155)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 58
+                       49
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry156)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 58
+                       49
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry157)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 58
+                       50
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry158)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 58
+                       50
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry159)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 58
+                       51
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry160)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 58
+                       51
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry161)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 43
+                       49
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry162)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 43
+                       49
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry163)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 43
+                       50
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry164)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 43
+                       50
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry165)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 43
+                       51
+                       8
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry166)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 43
+                       51
+                       1
+                       0
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry167)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 66
+                       49
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry168)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 66
+                       49
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry169)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 66
+                       50
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry170)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 66
+                       50
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry171)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 66
+                       51
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry172)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 66
+                       51
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry173)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 82
+                       49
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry174)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 82
+                       49
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry175)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 82
+                       50
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry176)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 82
+                       50
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry177)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 82
+                       51
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry178)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 82
+                       51
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry179)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 51
+                       49
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry180)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 51
+                       49
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry181)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 51
+                       50
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry182)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 51
+                       50
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry183)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 51
+                       51
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry184)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 51
+                       51
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry185)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 67
+                       49
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry186)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 67
+                       49
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry187)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 67
+                       50
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry188)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 67
+                       50
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry189)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 67
+                       51
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry190)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 67
+                       51
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry191)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 36
+                       49
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry192)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 36
+                       49
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry193)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 36
+                       50
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry194)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 36
+                       50
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry195)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 36
+                       51
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry196)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 36
+                       51
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry197)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 52
+                       49
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry198)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 52
+                       49
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry199)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 52
+                       50
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry200)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 52
+                       50
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry201)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 52
+                       51
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry202)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 52
+                       51
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry203)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 21
+                       49
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry204)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 21
+                       49
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry205)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 21
+                       50
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry206)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 21
+                       50
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry207)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 21
+                       51
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry208)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 21
+                       51
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry209)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 37
+                       49
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry210)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 37
+                       49
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry211)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 37
+                       50
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry212)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 37
+                       50
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry213)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 37
+                       51
+                       0
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry214)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (exercise 37
+                       51
+                       5
+                       3
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry215)
+                                  (fnptr (cc/C) [u64 u64 u64] void))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 82
+                                49
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry216)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 82
+                                49
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry217)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 82
+                                49
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry218)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 82
+                                49
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry219)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 82
+                                50
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry220)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 82
+                                50
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry221)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 82
+                                50
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry222)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 82
+                                50
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry223)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 82
+                                51
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry224)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 82
+                                51
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry225)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 82
+                                51
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry226)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 82
+                                51
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry227)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 57
+                                49
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry228)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 57
+                                49
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry229)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 57
+                                49
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry230)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 57
+                                49
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry231)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 57
+                                50
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry232)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 57
+                                50
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry233)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 57
+                                50
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry234)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 57
+                                50
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry235)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 57
+                                51
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry236)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 57
+                                51
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry237)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 57
+                                51
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry238)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 57
+                                51
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry239)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 52
+                                49
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry240)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 52
+                                49
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry241)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 52
+                                49
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry242)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 52
+                                49
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry243)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 52
+                                50
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry244)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 52
+                                50
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry245)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 52
+                                50
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry246)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 52
+                                50
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry247)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 52
+                                51
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry248)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 52
+                                51
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry249)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 52
+                                51
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry250)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 52
+                                51
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry251)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 43
+                                49
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry252)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 43
+                                49
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry253)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 43
+                                49
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry254)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 43
+                                49
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry255)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 43
+                                50
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry256)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 43
+                                50
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry257)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 43
+                                50
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry258)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 43
+                                50
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry259)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 43
+                                51
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry260)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 43
+                                51
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry261)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 43
+                                51
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry262)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 43
+                                51
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry263)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 22
+                                49
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry264)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 22
+                                49
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry265)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 22
+                                49
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry266)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 22
+                                49
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry267)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 22
+                                50
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry268)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 22
+                                50
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry269)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 22
+                                50
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry270)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 22
+                                50
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry271)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 22
+                                51
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry272)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 22
+                                51
+                                0
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry273)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 22
+                                51
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry274)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (set! failures
+          (+ failures
+             (pressure-exercise 22
+                                51
+                                5
+                                (p/cast (ptr u8)
+                                        (: (fnptr-of entry275)
+                                           (fnptr (cc/C) [u64 u64 u64] u64))))))
+    (println "linked vector shifts and full call pressure: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))
