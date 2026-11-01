@@ -1,0 +1,70 @@
+(module stogir.tests.aot-termination-link)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+
+(extern unreachable-if :as "stogir_unreachable_if" :cc (cc/C) [u64] (-> u64))
+
+(extern trap-if :as "stogir_trap_if" :cc (cc/C) [u64] (-> u64))
+
+(extern unreachable-switch
+        :as
+        "stogir_unreachable_switch"
+        :cc
+        (cc/C)
+        [u64]
+        (-> u64))
+
+(extern trap-switch :as "stogir_trap_switch" :cc (cc/C) [u64] (-> u64))
+
+(extern never :as "stogir_never" :cc (cc/C) [u64] (-> u64))
+
+(extern fork :cc (cc/C) [] (-> i32))
+
+(extern waitpid :cc (cc/C) [i32 (ptr i32) i32] (-> i32))
+
+(extern exit-child :as "_exit" :cc (cc/C) [i32] (-> void))
+
+(extern signal :cc (cc/C) [i32 u64] (-> u64))
+
+(defn trap-handler :cc (cc/C) [(number i32)] (-> void)
+  (exit-child 77))
+
+(defn trapped [(f (fnptr (cc/C) [u64] u64)) (argument u64)] (-> i64)
+  (let [child (fork)]
+    (if (< child 0)
+        1
+        (if (= child 0)
+            (do
+              (signal 5
+                      (primitive/cast u64
+                                      (primitive/cast (ptr u8)
+                                                      (fnptr-of trap-handler))))
+              (call-ptr f argument)
+              (exit-child 99)
+              1)
+            (let [(mut status) (: 0 i32)]
+              (if (and (= (waitpid child (mut status) 0) child)
+                       (= (& status 127) 0)
+                       (= (& (>> status 8) 255) 77))
+                  0
+                  1))))))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (when (!= (unreachable-if 0) 328) (set! failures (+ failures 1)))
+    (when (!= (trap-if 0) 328) (set! failures (+ failures 1)))
+    (for i [(: 0 u64) 1 2]
+      (when (!= (unreachable-switch i) (+ 328 i))
+        (set! failures (+ failures 1)))
+      (when (!= (trap-switch (if (= i 0) 0 (if (= i 1) 100 10000))) (+ 328 i))
+        (set! failures (+ failures 1))))
+    (set! failures
+          (+ failures
+             (trapped (fnptr-of unreachable-if) 1)
+             (trapped (fnptr-of trap-if) 1)
+             (trapped (fnptr-of unreachable-switch) 3)
+             (trapped (fnptr-of trap-switch) 3)
+             (trapped (fnptr-of never) 0)))
+    (println "linked returning paths and isolated terminal traps: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

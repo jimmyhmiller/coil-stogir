@@ -610,3 +610,36 @@ so jit-image, text-data and jit-switch-tables were also rerun afterward; later
 full-run cases used the final source. Formatting and git diff checks pass. All
 277 implementation/test files are Coil. UNREACHABLE/TRAP control lowering is a
 remaining compiler-facing gap, including defaults for exhaustive sum matching.
+
+### Trap and terminal paths
+
+TRAP and UNREACHABLE now have checked void/control construction and AArch64
+emission. The fixed-slot audit found one metadata error: UNREACHABLE's reserved
+second word had caused its third terminal-chain slot to be omitted. This is
+corrected in d510954; the audit found no other fixed-slot mismatches among the
+matching pinned scalar opcodes. Shape validation preserves the reserved zero,
+and complete validation checks START heads and terminal targets, permitting
+forward links while rejecting cycles with a linear color walk. Zero-only chains
+allocate no color array. START or an explicit exit head can retain linked exits.
+
+TRAP emits BRK #0 with a normal control successor. UNREACHABLE emits BRK #0 plus
+a branch back to it, ensuring a resumed breakpoint cannot fall through into a
+neighboring block. Returning paths keep normal frame restoration. The explicit
+UNREACHABLE trap policy is documented against the reference's skipped node in
+docs/CONTROL.md. No register value is assigned to either void operation.
+
+Focused native and linked checks cover safe returns and isolated SIGTRAP paths,
+IF, dense and sparse exhaustive-match defaults, functions with no RETURN node,
+ordinary/aligned dynamic frames, explicit exit roots and START-list roots.
+Malformed types, ended controls, reserved words, heads and cyclic chains are
+rejected. Full regression and commits are recorded in the project pad. Compiler
+integration, remaining library semantics/optimization/scaling and the full
+LLVM/TPDE compile-time/runtime comparison remain required.
+
+The terminal-control checkpoint passes all 157 standalone files and all 38 linked
+AOT consumers with debug checks and regenerated objects. The final START-head
+validation refinement and focused terminal/native reruns landed during the
+standalone run; subsequent full-run terminal fixtures used the final source.
+The linked log has no warnings. Formatting and git diff checks pass. All 281
+implementation/test files remain Coil. Module-image composition and compiler bulk
+memory/aggregate operations remain concrete integration requirements.

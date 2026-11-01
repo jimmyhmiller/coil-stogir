@@ -1,0 +1,196 @@
+(module stogir.tests.jit-termination)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "stogir.relocate" :as read)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(extern fork :cc (cc/C) [] (-> i32))
+
+(extern waitpid :cc (cc/C) [i32 (ptr i32) i32] (-> i32))
+
+(extern exit-child :as "_exit" :cc (cc/C) [i32] (-> void))
+
+(extern signal :cc (cc/C) [i32 u64] (-> u64))
+
+(defn trap-handler :cc (cc/C) [(number i32)] (-> void)
+  (exit-child 77))
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn trapped [(f (fnptr (cc/C) [u64] u64)) (argument u64)] (-> i64)
+  (let [child (fork)]
+    (if (< child 0)
+        1
+        (if (= child 0)
+            (do
+              (signal 5
+                      (primitive/cast u64
+                                      (primitive/cast (ptr u8)
+                                                      (fnptr-of trap-handler))))
+              (call-ptr f argument)
+              (exit-child 99)
+              1)
+            (let [(mut status) (: 0 i32)]
+              (if (and (= (waitpid child (mut status) 0) child)
+                       (= (& status 127) 0)
+                       (= (& (>> status 8) 255) 77))
+                  0
+                  1))))))
+
+(defn returning! [(graph (mut g/Graph))
+                  (control i32)
+                  (guard i32)
+                  (code u64)
+                  (previous i32)]
+  (-> i32)
+  (let [constant (require (b/scalar-constant! (mut graph) 5 code 8))
+        loaded (require (b/emit! (mut graph) 85 5 [control guard]))
+        value (require (b/emit! (mut graph) 26 5 [loaded constant]))]
+    (require (b/emit! (mut graph) 120 5 [loaded value previous]))))
+
+(defn check [(mode i32) (alignment i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        selector (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        guard
+          (require (b/variable! (mut graph) 5 start "terminal-guard" alignment))
+        sentinel (require (b/scalar-constant! (mut graph) 5 321 8))
+        count (require (b/scalar-constant! (mut graph) 5 17 8))
+        allocation
+          (require (b/stack-allocate! (mut graph) start count alignment))
+        initialized
+          (require (b/emit! (mut graph) 87 0 [allocation guard sentinel]))
+        (mut head) (: 0 i32)
+        (mut failures) 0]
+    (if (= mode 4)
+        (set! head (require (b/unreachable! (mut graph) initialized 0)))
+        (if (< mode 2)
+            (let [split
+                    (require (b/emit! (mut graph) 116 0 [initialized selector]))
+                  yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+                  no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+                  safe (returning! (mut graph) no guard 7 0)]
+              (set! head
+                    (if (= mode 0)
+                        (require (b/unreachable! (mut graph) yes safe))
+                        (returning! (mut graph)
+                                    (require (b/trap! (mut graph) yes))
+                                    guard
+                                    99
+                                    safe))))
+            (let [split (require (b/switch! (mut graph) initialized selector))
+                  (mut i) (: 0 u64)]
+              (while (< i 3)
+                (let [tag
+                        (if (= mode 2) i (if (= i 0) 0 (if (= i 1) 100 10000)))
+                      constant
+                        (require (b/scalar-constant! (mut graph) 5 tag 8))
+                      projection
+                        (require (b/case-value! (mut graph) split constant))]
+                  (set! head
+                        (returning! (mut graph) projection guard (+ 7 i) head)))
+                (set! i (+ i 1)))
+              (let [fallback (require (b/case-default! (mut graph) split))
+                    control
+                      (if (= mode 2)
+                          fallback
+                          (require (b/trap! (mut graph) fallback)))]
+                (set! head (require (b/unreachable! (mut graph) control head)))))))
+    ; Match upstream's START terminal-list head as well as the explicit root.
+    (b/patch! (mut graph) start 1 head)
+    (let [name
+            (match mode
+              (0 "_stogir_unreachable_if")
+              (1 "_stogir_trap_if")
+              (2 "_stogir_unreachable_switch")
+              (3 "_stogir_trap_switch")
+              (_ "_stogir_never"))
+          path
+            (match mode
+              (0 "/tmp/coil-stogir-unreachable-if.o")
+              (1 "/tmp/coil-stogir-trap-if.o")
+              (2 "/tmp/coil-stogir-unreachable-switch.o")
+              (3 "/tmp/coil-stogir-trap-switch.o")
+              (_ "/tmp/coil-stogir-never.o"))]
+      (when (= alignment 64)
+        (match (compile/object graph start [head] name allocator)
+          (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+          (Ok [object]
+              (let [(mut bytes) object]
+                (match (fs/write-file allocator path (slice bytes))
+                  (Err [_] (set! failures (+ failures 1)))
+                  (Ok [_] 0))
+                (free! (mut bytes)))))))
+    (match (compile/text graph start [start] allocator)
+      (Err [message]
+           (println "terminal mode={} align={}: {}" mode alignment message)
+           (set! failures (+ failures 1)))
+      (Ok [text]
+          (let [(mut bytes) text
+                (mut cursor) (: 0 i64)
+                (mut traps) 0
+                (mut loops) 0]
+            (while (<= cursor (- (len bytes) 4))
+              (when (= (read/read32 bytes cursor) 0xD4200000)
+                (set! traps (+ traps 1))
+                (when (and (<= cursor (- (len bytes) 8))
+                           (= (read/read32 bytes (+ cursor 4)) 0x17FFFFFF))
+                  (set! loops (+ loops 1))))
+              (set! cursor (+ cursor 4)))
+            (when (or (!= traps (if (= mode 3) 2 1))
+                      (!= loops (if (= mode 1) 0 1)))
+              (set! failures (+ failures 1)))
+            (match (jit/map-text (slice bytes))
+              (Err [message]
+                   (println "{}" message)
+                   (set! failures (+ failures 1)))
+              (Ok [loaded]
+                  (let [(mut owned) loaded
+                        f
+                          (primitive/cast (fnptr (cc/C) [u64] u64)
+                                          (.base owned))]
+                    (if (< mode 2)
+                        (do
+                          (when (!= (call-ptr f 0) 328)
+                            (set! failures (+ failures 1)))
+                          (set! failures
+                                (+ failures
+                                   (trapped f 1)
+                                   (trapped f 0x8000000000000000))))
+                        (if (= mode 4)
+                            (set! failures (+ failures (trapped f 0)))
+                            (do
+                              (for i [(: 0 u64) 1 2]
+                                (let [tag
+                                        (if (= mode 2)
+                                            i
+                                            (if (= i 0)
+                                                0
+                                                (if (= i 1) 100 10000)))]
+                                  (when (!= (call-ptr f tag) (+ 328 i))
+                                    (set! failures (+ failures 1)))))
+                              (set! failures
+                                    (+ failures
+                                       (trapped f 3)
+                                       (trapped f 0xFFFFFFFFFFFFFFFF))))))
+                    (jit/release! (mut owned)))))
+            (free! (mut bytes)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for alignment [(: 16 i32) 64]
+      (for mode [(: 0 i32) 1 2 3 4]
+        (set! failures (+ failures (check mode alignment)))))
+    (println "returning paths and isolated trap/unreachable execution: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

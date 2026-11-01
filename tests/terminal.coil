@@ -1,0 +1,81 @@
+(module stogir.tests.terminal)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.terminal" :as terminal)
+(import "stogir.a64.compile" :as compile)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn rejected [(result (Result i32 (slice u8)))] (-> i64)
+  (match result (Err [_] 0) (Ok [_] 1)))
+
+(defn chains [(cycle? bool) (forward? bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        split
+          (require (b/emit! (mut graph)
+                            116
+                            0
+                            [start
+                             (require (b/scalar-constant! (mut graph) 1 1 8))]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        ret (require (b/emit! (mut graph) 120 0 [yes (: 0 i32) 0]))
+        dead (require (b/unreachable! (mut graph) no (if forward? 0 ret)))
+        (mut failures) 0]
+    (when (or cycle? forward?) (b/patch! (mut graph) ret 3 dead))
+    (match (compile/validate graph)
+      (Err [message] (unless cycle? (println "{}" message) (set! failures 1)))
+      (Ok [_] (when cycle? (set! failures 1))))
+    (unless cycle?
+      (match (compile/text graph start [(if forward? ret dead)] allocator)
+        (Err [message]
+             (println "chain generation: {}" message)
+             (set! failures 1))
+        (Ok [text] (let [(mut bytes) text] (free! (mut bytes))))))
+    (g/release! (mut graph))
+    failures))
+
+(defn invalid-head [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        value (require (b/scalar-constant! (mut graph) 5 1 8))]
+    (b/patch! (mut graph) start 1 value)
+    (let [failure (rejected (compile/validate graph))]
+      (g/release! (mut graph))
+      failure)))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        value (require (b/scalar-constant! (mut graph) 5 1 8))
+        trap (require (b/trap! (mut graph) start))
+        dead (require (b/unreachable! (mut graph) trap 0))
+        (mut failures)
+          (+ (chains false false) (chains false true) (chains true false))]
+    (let [before (len (.instructions graph))]
+      (set! failures
+            (+ failures
+               (rejected (b/trap! (mut graph) value))
+               (rejected (b/trap! (mut graph) dead))
+               (rejected (b/unreachable! (mut graph) dead 0))
+               (rejected (b/unreachable! (mut graph) start value))
+               (rejected (b/unreachable! (mut graph) start trap))))
+      (when (!= before (len (.instructions graph)))
+        (set! failures (+ failures 1))))
+    (for bad [(require (b/emit! (mut graph) 96 5 [start]))
+              (require (b/emit! (mut graph) 121 0 [start (: 1 i32) 0]))
+              (require (b/emit! (mut graph) 121 5 [start (: 0 i32) 0]))
+              (require (b/emit! (mut graph) 121 0 [dead (: 0 i32) 0]))
+              (require (b/emit! (mut graph) 121 0 [start (: 0 i32) trap]))]
+      (set! failures (+ failures (rejected (terminal/validate graph bad)))))
+    (g/release! (mut graph))
+    (println "trap/unreachable shapes, control and terminal chains: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

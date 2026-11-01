@@ -67,3 +67,34 @@ previous object layout without an extra command.
 Dispatch-strategy measurements and general long-branch relaxation remain
 unfinished. These implementation details are not performance claims. Full compiler
 integration and LLVM/TPDE comparisons remain delivery gates.
+
+## Trap and unreachable paths
+
+`builder/trap!(graph, control)` emits a void, control-pinned debug breakpoint.
+Its successor may continue the control chain. `builder/unreachable!(graph,
+control, previous)` emits a void terminal; use zero for an unlinked exit or an
+existing terminal reference to extend the optional exit list. Both builders
+require an open control chain and reject malformed operands before mutation.
+
+UNREACHABLE has three operand slots: control, a reserved zero word, and the
+optional terminal link. The reserved word remains present even though it is not
+a graph edge. START's first operand may hold the terminal-list head. Complete
+validation checks head/link targets and rejects cycles in linear time, allowing
+forward links. Zero-only chains need no color-array allocation. Root marking
+follows these links, so either the exit head or a linked START can retain all
+observable exits; the links do not create CFG edges or register values.
+
+AArch64 TRAP emits BRK #0. The reference backend marks UNREACHABLE skipped; this
+target uses BRK #0 followed by a branch back to that breakpoint. The extra branch
+prevents ordinary debugger resumption from falling through into a neighboring
+block. These non-returning paths do not run a function epilogue. Returning paths
+continue to restore their fixed/dynamic stack frames normally. A caller must
+include non-returning exits among its observable roots or retain them through
+the terminal list, just as it retains returning exits.
+
+Tests execute ordinary paths directly and isolate trap paths in child processes.
+A SIGTRAP handler exits the child with a checked status, avoiding a crash report
+or termination of the test runner. JIT and linked AOT checks cover IF paths,
+dense/sparse exhaustive-match defaults, never-returning functions and aligned
+dynamic frames. These policies do not establish the still-open compiler backend
+integration or performance comparisons.
