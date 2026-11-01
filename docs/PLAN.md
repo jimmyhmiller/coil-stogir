@@ -1343,3 +1343,9 @@ object inspection confirms scalar bits are captured before copying the vector
 over the aliased result register. The corpus compares complete NaN/zero payloads
 and dynamic out-of-range behavior. These add 20 linked return fixtures to the
 1,490 memory-result/pressure fixtures above.
+
+
+The unchanged-source lane regression passes all 204 standalone checks and all
+61 linked consumers with debug checks, regenerated objects, exact expected
+file/consumer pass sets and no linked warnings. All 374 implementation/test files
+remain Coil. Formatting/diff checks pass; the project pad indexes the evidence.
