@@ -496,7 +496,8 @@ flags. Protected-page checks put both ends of sixteen-byte source/destination
 extents against inaccessible regions. Instruction words match LLVM MC reference
 output. A separately linked Mach-O fixture verifies a four-way register/stack
 cycle through large, unaligned frame slots and preserved flags. Vector graph memory and Phi paths are now connected to this transport layer
-(see below). Vector constants, arithmetic and vector/HVA signatures remain open.
+(see below). Vector constants now use the shared image path below; vector arithmetic and
+vector/HVA signatures remain open.
 
 
 ## Mixed-width copy and spill ownership
@@ -555,8 +556,8 @@ including dead invalid uses. Phi incoming types must agree exactly.
 AArch64 supports memory/Phi transport for eight- and sixteen-byte vector extents.
 They use SIMD register classes, correctly sized/aligned spills and mixed-width
 split/edge copies. Larger vector shapes remain representable but target emission
-rejects their unsupported extent. Vector constants and arithmetic, vector local
-objects and vector/HVA parameter/result signatures are not yet implemented.
+rejects their unsupported extent. Vector arithmetic, vector local objects and vector/HVA parameter/result
+signatures are not yet implemented. Vector constants use the path below.
 Scalar arguments/results may surround internal vector computations and calls.
 
 Phi results are defined simultaneously at block entry. Their live ranges start
@@ -574,3 +575,50 @@ Payload comparisons cover signed zero, infinities, NaN payloads and arbitrary
 bits, with aligned/unaligned sources and destinations. Four profiles also run
 both source/destination boundary placements and branch choices against protected
 pages. Eight Mach-O fixtures execute the branch and pressure paths after linking.
+
+
+## Complete vector constants
+
+`builder/vector-constant!(graph, type, pointer-bytes, payload)` takes a complete
+immutable byte payload whose length matches the encoded vector extent. The
+builder copies those bytes into owned graph storage and interns by the complete
+header and bytes. It preserves floating payload bits and never coerces a vector
+through a scalar u64 value. Invalid types, pointer widths and lengths reject
+without adding cells. Representable shapes currently span one through 512 bytes;
+the upstream LONG_CONST storage limit is 65520 bytes.
+
+LONG_CONST uses the upstream sixteen-byte cell layout: opcode 78, vector type,
+auxiliary byte count, previous-header reference and cached 32-bit DJB2/header hash.
+Payload cells follow the header in increasing signed-reference order. In the
+owned reversed array, payload chunks are appended in reverse order, then the
+header. A first sixteen-byte vector has header reference `-2` and payload at `-1`.
+Existing references survive array growth; existing scalar encodings are unchanged.
+
+A parallel constant-span array marks headers with their complete cell extent and
+payload cells with zero. Payload references are not graph values. `contains?`,
+`lookup`, checked construction and structural verification enforce that boundary.
+`verify/constants` traverses complete extents, checking geometry, continuation
+markers, payload hashes and earlier-header chains. The legacy `scalar-constants`
+entry point delegates to that validation. Padding outside the declared byte
+count is not part of the value; builders zero it, hashing/interning ignores it.
+The diagnostic dump prints vector bytes and skips payload cells as separate nodes.
+
+Native eight-/sixteen-byte constants materialize from aligned private image data
+through ADRP/ADD and a complete D/Q register load. Phi literals use their actual
+SIMD class and storage extent, including spill-slot destinations. Repeated uses
+of one interned constant share a private data symbol. Images own their bytes after
+the graph is released, retain alignment and relocation metadata, and feed both
+JIT mapping and Mach-O writing. `compile/text` rejects unresolved image references.
+Wider valid vector constants remain a target diagnostic when used natively.
+
+Validation covers all thirteen bases/seven lane counts at both pointer widths,
+full-byte hash collisions, mixed scalar/long hash chains, reference stability,
+padding, malformed extents/hashes/links and rejected payload references. Native
+coverage includes 61 graphs: direct stores and branch Phis over all 26 native
+shapes, eight loop/call-pressure graphs and a 320-constant pool. Forty literal
+Phis survive spills, register-clobbering calls and 16/4096-byte dynamic frames.
+Pool checks prove alignment, private binding and per-reference deduplication.
+Graph release precedes native mapping. Thirteen linked objects exercise the same
+paths, including a 5120-byte pool crossing architectural 4 KB address pages.
+Mixed string/vector data and malformed materialization inputs also have focused
+checks. These correctness checks do not establish compilation or runtime speed.

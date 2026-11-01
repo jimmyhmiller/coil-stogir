@@ -1056,3 +1056,51 @@ the final source passed in the complete run. Formatting and git diff checks pass
 All 330 implementation/test files remain Coil. Validation used installed Coil
 d2a49bf21376 on the local arm64 Mac. The Phi correction, vector transport coverage
 and remaining full-goal gates are recorded in the project pad.
+
+
+### Upstream LONG_CONST vector payloads and shared materialization
+
+Checkpoint e756f43 stores complete vector bytes with upstream LONG_CONST header,
+payload ordering and hash semantics. Scalar/reference encodings are preserved.
+Constant spans distinguish payload cells from values. Complete verification and
+dumping understand variable extents; vector interning compares every declared
+byte, handles collisions and retains references through growth. Invalid checked
+construction does not mutate storage. Payload padding remains outside the value.
+
+Checkpoint 8818a8d materializes supported native constants through owned private
+image data, complete SIMD loads and shared ADRP/ADD relocations. Phi literals use
+their real class/extent for registers and spill slots. Private data is aligned,
+deduplicated by interned reference and retained after graph release. Byte-only
+compilation still rejects unresolved references. JIT and Mach-O consume the same
+image. Larger represented constants reject at the current native width boundary.
+
+Storage checks cover all 182 type/target combinations, deliberate hash collisions,
+mixed scalar/long chains, high-half differences, array growth, nonsemantic padding,
+malformed cell/header/link/hash metadata and payload references. Materialization
+checks reject invalid classes/widths/addresses before output mutation and invalid
+payload hashes before reserving data. A mixed 5000-byte string/vector image checks
+alignment and relocation coexistence and executes after mapping.
+
+Native checks pass 61 graphs:52 direct/branch cases across all 26 native vector
+shapes, eight 40-Phi loop/call-pressure variants at 16/4096-byte dynamic alignment,
+and one 320-constant cross-page pool. Exact bits include zeros, infinities and NaNs.
+Each image's data count, alignment, private symbols and deduplication are checked;
+the graph is released before mapping. Thirteen object fixtures pass after linking,
+including the 5120-byte pool. Existing scalar image, conditional, floating-Phi/loop,
+physical-Phi and vector transport checks pass.
+
+Next requirements remain vector operations/local objects and vector/HVA ABI,
+compiler-specific source classification, wide/atomic/intrinsic/variadic access,
+optimizer/verifier/scaling and performance work, actual Coil backend integration
+and equivalent LLVM/TPDE compile-time/runtime measurements. The full goal remains
+active; no speed conclusion follows from these correctness checks.
+
+
+The vector constant checkpoint passes all 185 standalone checks and 50 linked
+AOT consumers locally with debug checks and regenerated objects. Exact
+source/pass-set equality verifies complete coverage without duplicate runs;
+linked output has no warnings. Library and test sources remained fixed throughout
+the complete run. Formatting and git diff checks pass. All 334 implementation/test
+files remain Coil. Validation used installed Coil d2a49bf21376 on the local arm64
+Mac. Evidence and the remaining full-goal requirements are indexed in the project
+pad. These checks establish constant correctness, not performance parity.
