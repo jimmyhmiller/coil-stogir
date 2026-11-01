@@ -1397,3 +1397,31 @@ final validation used an isolated snapshot of the installed aa64e44440df build
 (labelled dirty), its standard library, compiler SDK and units. Project/toolchain
 content hashes stayed fixed throughout both final passes. Formatting/diff checks
 pass; the project pad records the toolchain manifest and evidence logs.
+
+
+### Equal-storage-size vector bitcasts
+
+BITCAST now accepts scalar/vector and vector/vector types with equal nonzero
+storage extents, using explicit 32/64-bit pointer layouts. Other vector conversion
+opcodes still reject. Construction and verification require ordinary values;
+identity folding and typed CSE remain available. Literal folding copies complete
+little-endian storage, including raw vector BOOL bytes and FP NaN payloads.
+Scalar BOOL destinations retain the established canonicalization rule. Named
+address constants remain instructions with relocations.
+
+The native target admits D/Q shapes and transfers complete 8/16-byte values
+between the existing register classes. It diagnoses unsupported vector widths
+before allocation, and stages emission before appending. The first native matrix
+caught an incorrect GPR scratch argument for Q transfers; the emitter now supplies
+a SIMD scratch for that width.
+
+Focused validation passes 2,350 abstract type-pair/layout cases, rejection/CSE/
+mutation-atomicity checks, and 442 native JIT graphs plus 442 linked Mach-O
+objects. Each native graph checks both runtime and folded literal casts and a
+still-live original source, with twelve raw-bit seeds, unaligned input/output and
+surrounding bytes. Symbolic JIT resolution also passes scalar, direct vector and
+vector/FP chains; the final chained object passes linked resolution. These checks
+do not yet close forced register-alias, spill/call-pressure or typed return coverage
+for this family. The full regression checkpoint follows separately. Remaining
+vector numeric/integer conversions, shuffle, broader library requirements, actual
+Coil backend integration and runtime/compile-time LLVM/TPDE benchmarks remain open.

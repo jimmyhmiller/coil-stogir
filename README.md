@@ -66,7 +66,9 @@ EXTRACT/REPLACE support checked constant and dynamic lane indices, and SPLAT
 transports complete scalar bits. Dynamic lane access stays in registers.
 Scalar conditions can also select complete vector values through COND, with
 bit-preserving native mask selection and the existing truth/folding/CSE rules.
-Remaining vector operations and broader ABI coverage are unfinished.
+Equal-storage-size scalar/vector and vector/vector BITCAST preserves complete
+literal and runtime payloads, with native D/Q transfers and symbolic address
+relocations. Remaining vector operations and broader ABI coverage are unfinished.
 
 Native copy, overlap-safe move and zero builders expand into existing memory
 and control nodes. Fixed small transfers use exact-width accesses; larger and

@@ -71,3 +71,5 @@ vendor/import step must carry these files into Coil along with the source.
 Keep this map current as more upstream modules are ported or
 other source is reused. Attribute algorithm and design references separately from
 copied or translated source so their roles remain clear.
+
+| Vector bitcasts | Shared BITCAST opcode and type geometry reference pinned IR. Independent Coil validation compares complete storage extents for explicit pointer widths; literal folding copies little-endian bytes and native D/Q casts reuse typed register transfers. Named addresses retain relocations. Coil byte oracles check JIT and linked objects. No external-language implementation is shipped. |

@@ -1,0 +1,204 @@
+(module stogir.tests.vector-bitcasts)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.conversion" :as conversion)
+(import "stogir.a64.code" :as code)
+(import "stogir.allocation" :as allocation)
+(import "stogir.a64.convert" :as native)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn rejected [(value (Result i32 (slice u8)))] (-> i64)
+  (match value (Err [_] 0) (Ok [_] 1)))
+
+(defn errors [] (-> i64)
+  (let [alc (malloc-allocator)
+        (mut graph) (g/create alc)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        input (require (b/emit! (mut graph) 71 21 [start (: 0 i32) 0]))
+        other (require (b/emit! (mut graph) 71 21 [start (: 0 i32) 1]))
+        variable (require (b/emit! (mut graph) 72 21 [start (: 0 i32) 16]))
+        argument (require (b/emit! (mut graph) 70 21 [start (: 0 i32) 0]))
+        begin (len (.instructions graph))
+        constants (len (.constants graph))
+        (mut failures) 0]
+    (for opcode [(: 33 i32) 34 35 37 38 39]
+      (set! failures
+            (+ failures
+               (rejected (b/conversion! (mut graph) opcode 37 8 input)))))
+    (set! failures
+          (+ failures
+             (rejected (b/conversion! (mut graph) 36 37 8 input))
+             (rejected (b/conversion! (mut graph) 36 5 3 input))
+             (rejected (b/conversion! (mut graph) 36 128 8 input))
+             (rejected (b/conversion! (mut graph) 36 21 8 variable))
+             (rejected (b/conversion! (mut graph) 36 21 8 argument))))
+    (when (or (!= begin (len (.instructions graph)))
+              (!= constants (len (.constants graph))))
+      (set! failures (+ failures 1)))
+    (let [first (require (b/conversion! (mut graph) 36 28 8 input))]
+      (require (b/patch! (mut graph) first 1 other))
+      (when (= first (require (b/conversion! (mut graph) 36 28 8 input)))
+        (set! failures (+ failures 1))))
+    (for source [variable argument]
+      (let [raw (require (b/emit! (mut graph) 36 5 [source]))]
+        (set! failures
+              (+ failures (rejected (conversion/validate graph raw 8))))))
+    (let [bad (require (b/emit! (mut graph) 36 5 [input]))]
+      (set! (mut (.arities graph)) (cast i64 bad) 2)
+      (set! failures (+ failures (rejected (conversion/validate graph bad 8)))))
+    (let [narrow (require (b/emit! (mut graph) 71 20 [start (: 0 i32) 2]))
+          cast-node (require (b/conversion! (mut graph) 36 13 8 narrow))
+          (mut output) (code/create alc)
+          (mut parts) (ArrayList::new [allocation/Part] alc)]
+      (push! (mut (.text output)) (: 171 u8))
+      (set! failures
+            (+ failures
+               (rejected (native/emit! (mut output) graph parts cast-node 0))))
+      (when (or (!= (len (.text output)) 1)
+                (!= (get (.text output) 0) 171)
+                (!= (len (.references output)) 0)
+                (!= (len (.text-data output)) 0))
+        (set! failures (+ failures 1)))
+      (code/release! (mut output))
+      (free! (mut parts)))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) (errors)
+        (mut cases) 0]
+    (for pointer-bytes [(: 4 i32) 8]
+      (let [(mut src) (: 1 i32)]
+        (while (< src 128)
+          (let [(mut dst) (: 1 i32)]
+            (while (< dst 128)
+              (when (and (or (types/vector? src) (types/vector? dst))
+                         (types/valid? src)
+                         (types/valid? dst))
+                (let [valid
+                        (= (types/size src pointer-bytes)
+                           (types/size dst pointer-bytes))]
+                  (match (conversion/policy 36 src dst pointer-bytes)
+                    (Err [_] (when valid (set! failures (+ failures 1))))
+                    (Ok [bits]
+                        (when (or (not valid)
+                                  (!= bits (* 8 (types/size src pointer-bytes))))
+                          (set! failures (+ failures 1)))))
+                  (when valid
+                    (let [(mut graph) (g/create (malloc-allocator))
+                          (mut payload) (ArrayList::new [u8] (malloc-allocator))
+                          start
+                            (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+                          input
+                            (require (b/emit! (mut graph)
+                                              71
+                                              src
+                                              [start (: 0 i32) 0]))
+                          result
+                            (require (b/conversion! (mut graph)
+                                                    36
+                                                    dst
+                                                    pointer-bytes
+                                                    input))
+                          size (types/size src pointer-bytes)
+                          (mut i) (: 0 i32)]
+                      (when (or (= result 0)
+                                (!= result
+                                    (require (b/conversion! (mut graph)
+                                                            36
+                                                            dst
+                                                            pointer-bytes
+                                                            input))))
+                        (set! failures (+ failures 1)))
+                      (when (!= src dst)
+                        (match (conversion/validate graph result pointer-bytes)
+                          (Err [_] (set! failures (+ failures 1)))
+                          (Ok [bits]
+                              (when (!= bits (* 8 size))
+                                (set! failures (+ failures 1)))))
+                        (when (= pointer-bytes 8)
+                          (match (native/width graph result)
+                            (Err [_]
+                                 (when (or (= size 8) (= size 16))
+                                   (set! failures (+ failures 1))))
+                            (Ok [_]
+                                (when (not (or (= size 8) (= size 16)))
+                                  (set! failures (+ failures 1)))))))
+                      (while (< i size)
+                        (push! (mut payload) (cast u8 (+ 128 (% (* i 37) 128))))
+                        (set! i (+ i 1)))
+                      (let [literal
+                              (if (types/vector? src)
+                                  (require (b/vector-constant! (mut graph)
+                                                               src
+                                                               pointer-bytes
+                                                               (slice payload)))
+                                  (require (b/scalar-constant! (mut graph)
+                                                               src
+                                                               (if (= src 1)
+                                                                   (: 1 u64)
+                                                                   (cast u64
+                                                                         (- (<< (: 1
+                                                                                   u128)
+                                                                                (cast u128
+                                                                                      (* size
+                                                                                         8)))
+                                                                            1)))
+                                                               pointer-bytes)))
+                            folded
+                              (require (b/conversion! (mut graph)
+                                                      36
+                                                      dst
+                                                      pointer-bytes
+                                                      literal))]
+                        (when (>= folded 0) (set! failures (+ failures 1)))
+                        (if (types/vector? dst)
+                            (do
+                              (when (!= (g/long-size graph folded)
+                                        (cast i64 size))
+                                (set! failures (+ failures 1)))
+                              (set! i 0)
+                              (while (< i size)
+                                (match (g/long-byte graph folded (cast i64 i))
+                                  (None [] (set! failures (+ failures 1)))
+                                  (Some [byte]
+                                        (when (!= byte
+                                                  (if (types/vector? src)
+                                                      (get payload (cast i64 i))
+                                                      (if (= src 1)
+                                                          (: 1 u8)
+                                                          (: 255 u8))))
+                                          (set! failures (+ failures 1)))))
+                                (set! i (+ i 1))))
+                            (match (g/lookup graph folded)
+                              (None [] (set! failures (+ failures 1)))
+                              (Some [node]
+                                    (let [(mut wanted) (: 0 u64)]
+                                      (set! i 0)
+                                      (while (< i size)
+                                        (set! wanted
+                                              (| wanted
+                                                 (<< (cast u64
+                                                           (get payload
+                                                                (cast i64 i)))
+                                                     (* (cast u64 i) 8))))
+                                        (set! i (+ i 1)))
+                                      (when (!= (n/constant-bits node)
+                                                (if (= dst 1) (: 1 u64) wanted))
+                                        (set! failures (+ failures 1))))))))
+                      (free! (mut payload))
+                      (g/release! (mut graph))
+                      (set! cases (+ cases 1))))))
+              (set! dst (+ dst 1))))
+          (set! src (+ src 1)))))
+    (println "vector bitcast geometry, construction, CSE, native widths and literal bytes: {} cases, {} failures"
+             cases
+             failures)
+    (if (= failures 0) 0 1)))

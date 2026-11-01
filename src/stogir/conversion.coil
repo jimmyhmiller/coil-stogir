@@ -8,6 +8,7 @@
 (import "stogir.types" :as types)
 (import "stogir.symbols" :as symbols)
 (import "stogir.numeric-conversion" :as numeric)
+(import "coil.arraylist" :use [ArrayList])
 (import "coil.result" :use [Result Ok Err Option Some None])
 
 (defn operation? [(opcode i32)] (-> bool)
@@ -16,8 +17,19 @@
 ;;; BOOL occupies a byte. SEXT extends bit 7, not LLVM i1's bit 0.
 (defn policy [(opcode i32) (src i32) (dst i32) (pointer-bytes i32)]
   (-> (Result i32 (slice u8)))
-  (let [from (* 8 (types/scalar-size src pointer-bytes))
-        to (* 8 (types/scalar-size dst pointer-bytes))]
+  (let [vector-cast
+          (and (= opcode 36)
+               (or (types/vector? src) (types/vector? dst)))
+        from
+          (* 8
+             (if vector-cast
+                 (types/size src pointer-bytes)
+                 (types/scalar-size src pointer-bytes)))
+        to
+          (* 8
+             (if vector-cast
+                 (types/size dst pointer-bytes)
+                 (types/scalar-size dst pointer-bytes)))]
     (if (or (not (operation? opcode))
             (<= from 0)
             (<= to 0)
@@ -28,7 +40,7 @@
                     (or (not (types/integer? src))
                         (not (types/integer? dst))
                         (if (= opcode 35) (>= to from) (<= to from))))))
-        (Err "invalid scalar conversion types or widths")
+        (Err "invalid conversion types or widths")
         (Ok (if (or (= opcode 35) (= opcode 38)) to from)))))
 
 (defn validate [(graph g/Graph) (reference i32) (pointer-bytes i32)]
@@ -43,10 +55,12 @@
               (match (g/lookup graph (.op1 node))
                 (None [] (Err "conversion source missing"))
                 (Some [source]
-                      (policy (cast i32 (n/opcode node))
-                              (cast i32 (n/type-id source))
-                              (cast i32 (n/type-id node))
-                              pointer-bytes)))))))
+                      (if (or (= (n/opcode source) 72) (= (n/opcode source) 70))
+                          (Err "conversion requires an ordinary value")
+                          (policy (cast i32 (n/opcode node))
+                                  (cast i32 (n/type-id source))
+                                  (cast i32 (n/type-id node))
+                                  pointer-bytes))))))))
 
 ;;; Canonicalize Boolean destinations after truncating to their storage byte.
 ;;; This agrees with upstream constant folding and keeps BOOL values in {0,1}.
@@ -73,9 +87,65 @@
 
 (defn evaluate [(opcode i32) (src i32) (dst i32) (pointer-bytes i32) (bits u64)]
   (-> (Option u64))
-  (if (numeric/operation? opcode)
-      (numeric/evaluate opcode src dst pointer-bytes bits)
-      (bits-evaluate opcode src dst pointer-bytes bits)))
+  (if (or (types/vector? src) (types/vector? dst))
+      (None)
+      (if (numeric/operation? opcode)
+          (numeric/evaluate opcode src dst pointer-bytes bits)
+          (bits-evaluate opcode src dst pointer-bytes bits))))
+
+;;; Reinterpret little-endian literal storage without FP arithmetic.
+;;; Named scalar addresses remain instructions so relocations survive lowering.
+(defn fold-vector-bitcast! [(graph (mut g/Graph))
+                            (source i32)
+                            (src i32)
+                            (dst i32)
+                            (pointer-bytes i32)]
+  (-> (Option i32))
+  (match (g/lookup graph source)
+    (None [] (None))
+    (Some [input]
+          (if (or (>= source 0)
+                  (if (types/vector? src)
+                      (!= (g/long-size graph source)
+                          (cast i64 (types/size src pointer-bytes)))
+                      (not (symbols/numeric? input))))
+              (None)
+              (let [(mut payload)
+                      (ArrayList::new [u8] (.alc (.constants graph)))
+                    (mut i) (: 0 i32)
+                    (mut valid) true
+                    (mut bits) (: 0 u64)]
+                (while (< i (types/size src pointer-bytes))
+                  (let [byte
+                          (if (types/vector? src)
+                              (match (g/long-byte graph source (cast i64 i))
+                                (None [] (do (set! valid false) (: 0 u8)))
+                                (Some [value] value))
+                              (cast u8
+                                    (>> (n/constant-bits input)
+                                        (* (cast u64 i) 8))))]
+                    (push! (mut payload) byte)
+                    (when (< i 8)
+                      (set! bits
+                            (| bits (<< (cast u64 byte) (* (cast u64 i) 8))))))
+                  (set! i (+ i 1)))
+                (let [result
+                        (if (not valid)
+                            (None)
+                            (if (types/vector? dst)
+                                (g/intern-vector! (mut graph)
+                                                  dst
+                                                  pointer-bytes
+                                                  (slice payload))
+                                (g/intern-scalar! (mut graph)
+                                                  (cast u8 dst)
+                                                  (if (= dst 1)
+                                                      (if (= bits 0)
+                                                          (: 0 u64)
+                                                          1)
+                                                      bits))))]
+                  (free! (mut payload))
+                  result))))))
 
 (defn build! [(graph (mut g/Graph))
               (opcode i32)
@@ -86,12 +156,23 @@
     (None [] (Err "conversion source missing"))
     (Some [input]
           (let [src (cast i32 (n/type-id input))]
-            (match (policy opcode src dst pointer-bytes)
+            (match (if (or (= (n/opcode input) 72) (= (n/opcode input) 70))
+                       (Err "conversion requires an ordinary value")
+                       (policy opcode src dst pointer-bytes))
               (Err [message] (Err message))
               (Ok [_]
                   (if (and (or (= opcode 36) (= opcode 39)) (= src dst))
                       (Ok source)
                       (let [(mut folded) (: 0 i32)]
+                        (when (and (= opcode 36)
+                                   (or (types/vector? src) (types/vector? dst)))
+                          (match (fold-vector-bitcast! (mut graph)
+                                                       source
+                                                       src
+                                                       dst
+                                                       pointer-bytes)
+                            (None [] 0)
+                            (Some [reference] (set! folded reference))))
                         (when (and (< source 0) (symbols/numeric? input))
                           (match (evaluate opcode
                                            src
