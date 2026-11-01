@@ -1,0 +1,146 @@
+(module stogir.tests.a64-argument-copy)
+(import "stogir.a64.argument-copy" :as copy)
+(import "stogir.a64.encode" :as e)
+(import "stogir.bytes" :as bytes)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(extern reserve
+        :as
+        "mmap"
+        :cc
+        (cc/C)
+        [(ptr u8) i64 i32 i32 i32 i64]
+        (-> (ptr u8)))
+
+(extern protect :as "mprotect" :cc (cc/C) [(ptr u8) i64 i32] (-> i32))
+
+(extern release :as "munmap" :cc (cc/C) [(ptr u8) i64] (-> i32))
+
+(extern page-size :as "getpagesize" :cc (cc/C) [] (-> i32))
+
+(extern fork :cc (cc/C) [] (-> i32))
+
+(extern waitpid :cc (cc/C) [i32 (ptr i32) i32] (-> i32))
+
+(extern exit-child :as "_exit" :cc (cc/C) [i32] (-> void))
+
+(extern signal :cc (cc/C) [i32 u64] (-> u64))
+
+(defn fault-handler :cc (cc/C) [(number i32)] (-> void)
+  (exit-child 77))
+
+(defn word! [(code (mut (ArrayList u8))) (result (Result u32 (slice u8)))]
+  (-> i64)
+  (match result
+    (Err [message] (println "{}" message) 1)
+    (Ok [word] (bytes/append32! (mut code) word) 0)))
+
+(defn pattern [(i i64)] (-> u8)
+  (cast u8 (% (+ (* i 37) 19) 251)))
+
+(defn guarded [(f (fnptr (cc/C) [(ptr u8) (ptr u8)] void)) (size i64)] (-> i64)
+  (let [page (cast i64 (page-size))
+        capacity (* page 5)
+        total (+ capacity (* page 2))
+        a (reserve (p/cast (ptr u8) 0) total 0 0x1002 -1 0)
+        b (reserve (p/cast (ptr u8) 0) total 0 0x1002 -1 0)
+        (mut failures) 0]
+    (if (or (= (p/cast i64 a) -1) (= (p/cast i64 b) -1))
+        (set! failures 1)
+        (if (or (!= (protect (p/index a page) capacity 3) 0)
+                (!= (protect (p/index b page) capacity 3) 0))
+            (set! failures 1)
+            (let [child (fork)]
+              (if (< child 0)
+                  (set! failures 1)
+                  (if (= child 0)
+                      (let [source (p/index a page)
+                            destination (p/index b page)
+                            handler
+                              (p/cast u64
+                                      (p/cast (ptr u8) (fnptr-of fault-handler)))
+                            (mut errors) 0
+                            (mut i) (: 0 i64)]
+                        (signal 10 handler)
+                        (signal 11 handler)
+                        (for source-offset [(: 0 i64) (- capacity size)]
+                          (for destination-offset [(: 0 i64) (- capacity size)]
+                            (set! i 0)
+                            (while (< i capacity)
+                              (p/store! (p/index source i) (pattern i))
+                              (p/store! (p/index destination i) (: 255 u8))
+                              (set! i (+ i 1)))
+                            (call-ptr f
+                                      (p/index source source-offset)
+                                      (p/index destination destination-offset))
+                            (set! i 0)
+                            (while (< i capacity)
+                              (when (or (!= (p/load (p/index source i))
+                                            (pattern i))
+                                        (!= (p/load (p/index destination i))
+                                            (if (and (>= i destination-offset)
+                                                     (< i
+                                                        (+ destination-offset
+                                                           size)))
+                                                (pattern (+ source-offset
+                                                            (- i
+                                                               destination-offset)))
+                                                255)))
+                                (set! errors (+ errors 1)))
+                              (set! i (+ i 1)))))
+                        (exit-child (if (= errors 0) 0 78)))
+                      (let [(mut status) (: 0 i32)]
+                        (when (or (!= (waitpid child (mut status) 0) child)
+                                  (!= status 0))
+                          (println "native copy size {} child status {}"
+                                   size
+                                   status)
+                          (set! failures 1))))))))
+    (when (!= (p/cast i64 a) -1)
+      (when (!= (release a total) 0) (set! failures (+ failures 1))))
+    (when (!= (p/cast i64 b) -1)
+      (when (!= (release b total) 0) (set! failures (+ failures 1))))
+    failures))
+
+(defn check [(size i64)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut code) (ArrayList::new [u8] allocator)
+        (mut failures) 0]
+    ; x30 is a copy-loop/tail scratch. Keep the wrapper's return address in x15,
+    ; which the copy emitter must preserve along with every allocatable register.
+    (set! failures
+          (+ failures
+             (word! (mut code) (e/logical-register true 1 15 31 30))
+             (word! (mut code) (e/logical-register true 1 16 31 0))
+             (word! (mut code) (e/logical-register true 1 17 31 1))))
+    (match (copy/copy! (mut code) size)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [_] 0))
+    (set! failures (+ failures (word! (mut code) (e/ret 15))))
+    (when (> (len code) 128) (set! failures (+ failures 1)))
+    (match (jit/map-text (slice code))
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [image]
+          (let [(mut image) image
+                f (p/cast (fnptr (cc/C) [(ptr u8) (ptr u8)] void) (.base image))]
+            (set! failures (+ failures (guarded f size)))
+            (jit/release! (mut image)))))
+    (free! (mut code))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0
+        (mut size) (: 0 i64)]
+    (while (<= size 65)
+      (set! failures (+ failures (check size)))
+      (set! size (+ size 1)))
+    (for size [(: 127 i64) 128 129 255 256 257 4097 65537]
+      (set! failures (+ failures (check size))))
+    (println "bounded native ARGVAL copies at protected memory boundaries: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))
