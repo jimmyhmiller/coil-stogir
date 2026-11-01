@@ -8,11 +8,16 @@
 (import "stogir.opcode" :as op)
 (import "stogir.types" :as types)
 (import "stogir.prototype-bytes" :as prototype-bytes)
+(import "stogir.call-groups" :as groups)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [Allocator])
 (import "coil.result" :use [Result Ok Err Some None])
 
-(defstruct Prototype [(flags u8) (result u8) (parameters (ArrayList u8))])
+(defstruct Prototype
+  [(flags u8)
+   (result u8)
+   (parameters (ArrayList u8))
+   (groups (ArrayList groups/Group))])
 
 (defn create [(flags u8)
               (result u8)
@@ -32,7 +37,42 @@
           (Ok (Prototype
                 :flags flags
                 :result result
-                :parameters owned))))))
+                :parameters owned
+                :groups (ArrayList::new [groups/Group] allocator)))))))
+
+(defn create-grouped [(flags u8)
+                      (result u8)
+                      (parameters (slice u8))
+                      (descriptors (slice groups/Group))
+                      (allocator (dyn Allocator))]
+  (-> (Result Prototype (slice u8)))
+  (let [(mut valid?) (groups/valid? parameters descriptors)]
+    (for group descriptors
+      (when (and valid?
+                 (= (& flags 16) 0)
+                 (> (cast i64 (+ (.first group) (.count group)))
+                    (len parameters)))
+        (set! valid? false)))
+    (if (not valid?)
+        (Err "invalid call argument groups")
+        (match (create flags result parameters allocator)
+          (Err [message] (Err message))
+          (Ok [prototype]
+              (let [(mut prototype) prototype]
+                (for group descriptors (push! (mut (.groups prototype)) group))
+                (Ok prototype)))))))
+
+(defn valid-groups? [(prototype Prototype) (function? bool)] (-> bool)
+  (let [(mut good?)
+          (groups/valid? (slice (.parameters prototype))
+                         (slice (.groups prototype)))]
+    (for group (.groups prototype)
+      (when (and good?
+                 (or function? (= (& (.flags prototype) 16) 0))
+                 (> (cast i64 (+ (.first group) (.count group)))
+                    (len (.parameters prototype))))
+        (set! good? false)))
+    good?))
 
 ;;; Serialized prototype prefix matches upstream flags/return/count/type bytes.
 (defn encode [(prototype Prototype) (allocator (dyn Allocator))]
@@ -42,7 +82,29 @@
     (push! (mut bytes) (.result prototype))
     (push! (mut bytes) (cast u8 (len (.parameters prototype))))
     (for ty (.parameters prototype) (push! (mut bytes) ty))
+    (groups/append! (mut bytes) (slice (.groups prototype)))
     bytes))
+
+(defn group-arguments? [(graph g/Graph)
+                        (arguments (slice i32))
+                        (group groups/Group)] (-> bool)
+  (if (or (not (groups/shape? group))
+          (> (cast i64 (+ (.first group) (.count group))) (len arguments)))
+      false
+      (let [(mut good?) true
+            (mut ty) (: 0 u8)
+            (mut i) (: 0 i32)]
+        (while (and good? (< i (.count group)))
+          (match (g/lookup graph
+                           (get arguments (cast i64 (+ (.first group) i))))
+            (None [] (set! good? false))
+            (Some [node]
+                  (when (= i 0) (set! ty (n/type-id node)))
+                  (when (or (!= ty (n/type-id node))
+                            (not (groups/members? group ty)))
+                    (set! good? false))))
+          (set! i (+ i 1)))
+        good?)))
 
 (defn emit! [(graph (mut g/Graph))
              (prototype Prototype)
@@ -83,6 +145,9 @@
                 (set! error "call argument type mismatch"))))
       (push! (mut inputs) argument)
       (set! i (+ i 1)))
+    (for group (.groups prototype)
+      (when (and (= error "") (not (group-arguments? graph arguments group)))
+        (set! error "call group member type or count mismatch")))
     (let [result
             (if (!= error "")
                 (Err [i32 (slice u8)] error)
@@ -103,7 +168,8 @@
       result)))
 
 (defn release! [(prototype (mut Prototype))] (-> void)
-  (free! (mut (.parameters prototype))))
+  (free! (mut (.parameters prototype)))
+  (free! (mut (.groups prototype))))
 
 ;;; Check serialized scalar prototype bytes before exposing any indexed field.
 (defn valid-bytes? [(bytes (slice u8))] (-> bool)
@@ -115,7 +181,8 @@
                  (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
   (let [(mut bytes) (encode prototype allocator)
         result
-          (if (not (valid-bytes? (slice bytes)))
+          (if (or (not (valid-groups? prototype true))
+                  (not (valid-bytes? (slice bytes))))
               (Err [i32 (slice u8)] "invalid function prototype")
               (if (!= (.function-prototype graph) 0)
                   (match (strings/lookup (.strings graph)
@@ -150,7 +217,8 @@
               (Err "callee must be ADDR")
               (let [(mut bytes) (encode prototype allocator)
                     result
-                      (if (not (valid-bytes? (slice bytes)))
+                      (if (or (not (valid-groups? prototype false))
+                              (not (valid-bytes? (slice bytes))))
                           (Err [i32 (slice u8)] "invalid scalar call prototype")
                           (match (strings/intern! (mut (.strings graph))
                                                   (slice bytes))
@@ -227,6 +295,32 @@
                                       :count (cast i32 (get bytes 2))
                                       :id id)))))))))))
 
+(defn validate-groups [(graph g/Graph) (reference i32) (bytes (slice u8))]
+  (-> (Result i32 (slice u8)))
+  (let [(mut error) ""
+        (mut i) (: 0 i64)
+        actual (- (get (.arities graph) (cast i64 reference)) 2)]
+    (while (and (= error "") (< i (groups/count bytes)))
+      (let [group (groups/at bytes i)
+            (mut j) (: 0 i32)
+            (mut ty) (: 0 u8)]
+        (if (> (+ (.first group) (.count group)) actual)
+            (set! error "call argument group exceeds actual arguments")
+            (while (and (= error "") (< j (.count group)))
+              (match (g/operand graph reference (+ 3 (.first group) j))
+                (None [] (set! error "call group member missing"))
+                (Some [value]
+                      (match (g/lookup graph value)
+                        (None [] (set! error "call group member missing"))
+                        (Some [node]
+                              (when (= j 0) (set! ty (n/type-id node)))
+                              (when (or (!= ty (n/type-id node))
+                                        (not (groups/members? group ty)))
+                                (set! error "call group member type mismatch"))))))
+              (set! j (+ j 1)))))
+      (set! i (+ i 1)))
+    (if (= error "") (Ok (cast i32 (groups/count bytes))) (Err error))))
+
 ;;; Semantic validation also protects raw graphs and graphs changed after build.
 (defn validate-call [(graph g/Graph) (reference i32)]
   (-> (Result Signature (slice u8)))
@@ -291,6 +385,16 @@
                                                           (set! error
                                                                 "call prototype argument type mismatch")))))))))
                               (set! j (+ j 1)))
+                            (when (and (= error "") (> (.id sig) 0))
+                              (match (strings/lookup (.strings graph) (.id sig))
+                                (None []
+                                      (set! error "prototype string missing"))
+                                (Some [bytes]
+                                      (match (validate-groups graph
+                                                              reference
+                                                              bytes)
+                                        (Err [message] (set! error message))
+                                        (Ok [_] 0)))))
                             (if (= error "") (Ok sig) (Err error)))))))))))
 
 ;;; Requires structural verification, including string and instruction bounds.

@@ -1,0 +1,122 @@
+(module stogir.tests.grouped-prototypes)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.call-groups" :as groups)
+(import "stogir.a64.compile" :as compile)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [message] (println "{}" message) 0)))
+
+(defn rejected [(r (Result i32 (slice u8)))] (-> i64)
+  (match r (Err [_] 0) (Ok [_] 1)))
+
+(defn invalid-prototype [(r (Result calls/Prototype (slice u8)))] (-> i64)
+  (match r (Err [_] 0) (Ok [p] (let [(mut p) p] (calls/release! (mut p)) 1))))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        integer (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        single (require (b/emit! (mut graph) 71 13 [start (: 0 i32) 2]))
+        descriptor
+          (groups/Group
+            :first 1
+            :count 2
+            :alignment 8)
+        (mut failures) 0]
+    (set! failures
+          (+ failures
+             (invalid-prototype (calls/create-grouped 9
+                                                      5
+                                                      [(: 5 u8)]
+                                                      [descriptor]
+                                                      allocator))
+             (invalid-prototype (calls/create-grouped 25
+                                                      5
+                                                      [(: 5 u8)]
+                                                      [(groups/Group
+                                                         :first 2147483647
+                                                         :count 4
+                                                         :alignment 8)]
+                                                      allocator))
+             (invalid-prototype (calls/create-grouped 9
+                                                      5
+                                                      [(: 5 u8) 13]
+                                                      [(groups/Group
+                                                         :first 0
+                                                         :count 2
+                                                         :alignment 8)]
+                                                      allocator))))
+    (match (calls/create-grouped 25 5 [(: 5 u8)] [descriptor] allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut prototype) prototype
+                before (len (.instructions graph))]
+            (set! failures
+                  (+ failures
+                     (rejected (calls/emit! (mut graph)
+                                            prototype
+                                            start
+                                            target
+                                            [integer integer]
+                                            allocator))
+                     (rejected (calls/emit! (mut graph)
+                                            prototype
+                                            start
+                                            target
+                                            [integer integer single]
+                                            allocator))
+                     (rejected (calls/function! (mut graph) prototype allocator))))
+            (when (or (!= (.function-prototype graph) 0)
+                      (!= before (len (.instructions graph))))
+              (set! failures (+ failures 1)))
+            (let [called
+                    (require (calls/emit! (mut graph)
+                                          prototype
+                                          start
+                                          target
+                                          [integer integer integer]
+                                          allocator))
+                  ret
+                    (require (b/emit! (mut graph)
+                                      120
+                                      5
+                                      [called called (: 0 i32)]))]
+              (match (calls/validate-call graph called)
+                (Err [message]
+                     (println "{}" message)
+                     (set! failures (+ failures 1)))
+                (Ok [_] 0))
+              (b/patch! (mut graph) called 4 single)
+              (match (calls/validate-call graph called)
+                (Err [_] 0)
+                (Ok [_] (set! failures (+ failures 1))))
+              (b/patch! (mut graph) called 4 integer)
+              (match (compile/text graph start [ret] allocator)
+                (Err [message]
+                     (println "{}" message)
+                     (set! failures (+ failures 1)))
+                (Ok [text] (let [(mut text) text] (free! (mut text))))))
+            ; Recheck a mutated in-memory descriptor before serializing/interning.
+            (set! (.first (elem (mut (.groups prototype)) 0)) 70000)
+            (let [before (len (.instructions graph))]
+              (set! failures
+                    (+ failures
+                       (rejected (calls/emit! (mut graph)
+                                              prototype
+                                              start
+                                              target
+                                              [integer integer integer]
+                                              allocator))))
+              (when (!= before (len (.instructions graph)))
+                (set! failures (+ failures 1))))
+            (calls/release! (mut prototype)))))
+    (g/release! (mut graph))
+    (println "grouped prototype retention, rejected construction and raw mutation checks: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

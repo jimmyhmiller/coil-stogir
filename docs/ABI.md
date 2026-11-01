@@ -365,3 +365,52 @@ fixed-variadic combinations. The latter retain forty values through repeated
 mutating calls, including two copy pointers on the stack, and verify untouched
 source bytes. Four linked fixtures exercise aligned dynamic objects and both
 result banks for fixed and variadic calls.
+
+## Grouped scalar pieces
+
+`calls/create-grouped(flags, result, parameters, groups, allocator)` describes
+arguments that must travel together. `call-groups/Group` contains `first` (a
+zero-based ordinal in the flattened scalar list), `count`, and `alignment`.
+Records are sorted, disjoint, and cannot cross the fixed/unnamed boundary.
+Existing `calls/create` keeps the original scalar prototype bytes unchanged.
+
+Supported groups are two identical U64 or I64 pieces, or one through four
+identical f32/f64 members. These are classified ABI pieces, rather than source
+record addresses. The frontend must classify and marshal the source aggregate,
+including exact-width loads of partial words. Group alignment is a power of two
+from the member width through sixteen, and the complete payload must satisfy it.
+For an integer pair, use eight- or sixteen-byte alignment. HVA/vector pieces and
+padded homogeneous representations are outside this interface's current coverage.
+
+Use the same grouped prototype with `calls/function!` for an incoming function.
+PARAM ordinals still index the flattened pieces. The complete prototype retains
+all group members even when some PARAM projections are unused or absent.
+Outgoing calls and incoming parameters now use one Darwin layout planner.
+Groups fit completely in their bank or go completely to the stack and exhaust
+that bank. The other bank remains independent. Darwin permits a sixteen-aligned
+integer pair to start at an odd-numbered register.
+
+Named floating groups keep tightly packed members in memory with their declared
+alignment and payload size. For example, a three-float group can occupy stack
+bytes4..15 after a one-byte stack argument at0. An unnamed group uses eight-byte
+stack alignment and rounds its whole extent to eight bytes. Its f32 members are
+not individually promoted to double; an ordinary unnamed f32 scalar still is.
+Call-site descriptors may cover unnamed arguments beyond the fixed type prefix;
+those members are checked against actual operands. Function declarations may
+only describe their named parameters.
+
+Grouped prototypes retain the upstream flags/result/count/type prefix, followed
+by a Coil extension when groups exist: `SGAG`, version1, a zero byte, u16 record
+count, then eight-byte records containing u16 first, u8 count, u8 alignment and
+four zero reserved bytes. Integers use little-endian order. Empty extensions,
+unknown versions, nonzero reserved fields, malformed/truncated records and
+incompatible types are rejected. Extended signatures describe Coil's additional
+ABI contract; they are not an upstream aggregate-prototype format.
+
+The native tests compare actual C aggregate interfaces in both directions,
+including aligned integer pairs, f32/f64 homogeneous groups of every supported
+length, register-bank boundaries and omitted incoming projections. C callbacks
+use explicit exports and typed by-value pointers to select Coil's C ABI thunks.
+Outgoing functions retain forty integer or floating values through the callback.
+Named calls use resolved JIT images and linked external C symbols. Aggregate
+results and the dedicated x8 indirect-result pointer remain required work.

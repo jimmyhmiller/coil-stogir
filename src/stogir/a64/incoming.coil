@@ -12,7 +12,8 @@
 (import "stogir.types" :as types)
 (import "stogir.calls" :as calls)
 (import "stogir.strings" :as strings)
-(import "stogir.a64.call-abi" :as abi)
+(import "stogir.a64.abi-arguments" :as arguments)
+(import "stogir.call-groups" :as groups)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [Allocator])
 (import "coil.result" :use [Result Ok Err Some None])
@@ -43,6 +44,7 @@
   (let [(mut result) (ArrayList::new [Parameter] allocator)
         (mut parameters) (ArrayList::new [u8] allocator)
         (mut references) (ArrayList::new [i32] allocator)
+        (mut descriptors) (ArrayList::new [groups/Group] allocator)
         (mut declared?) (!= (.function-prototype graph) 0)
         (mut return-type) (: 0 u8)
         (mut error) ""
@@ -59,9 +61,13 @@
                       (set! error "unsupported AArch64 function convention"))
                     (set! return-type (get bytes 1))
                     (let [(mut i) 3]
-                      (while (< i (len bytes))
+                      (while (< i (+ 3 (cast i64 (get bytes 2))))
                         (push! (mut parameters) (get bytes i))
                         (push! (mut references) 0)
+                        (set! i (+ i 1))))
+                    (let [(mut i) (: 0 i64)]
+                      (while (< i (groups/count bytes))
+                        (push! (mut descriptors) (groups/at bytes i))
                         (set! i (+ i 1)))))))))
     (while (and (= error "") (< r (len (.instructions graph))))
       (let [node (get (.instructions graph) r)
@@ -97,38 +103,37 @@
                       (set! error
                             "return value disagrees with function prototype"))))))
         (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
-    (let [(mut integer-reg) (: 0 i32)
-          (mut float-reg) (: 0 i32)
-          (mut offset) (: 0 i64)
-          (mut i) 0]
-      (while (and (= error "") (< i (len parameters)))
-        (let [ty (get parameters i)
-              reference (get references i)
-              size (types/scalar-size (cast i32 ty) 8)
-              floating? (types/floating? (cast i32 ty))
-              reg (if floating? float-reg integer-reg)
-              (mut location)
-                (Parameter
-                  :reference reference
-                  :kind (if floating? 2 0)
-                  :register reg
-                  :offset -1
-                  :size size)]
-          (if (or (= ty 0) (not (types/valid-scalar? (cast i32 ty))))
-              (set! error
-                    "incomplete parameter types; declare a function prototype")
-              (do
-                (if floating?
-                    (set! float-reg (+ float-reg 1))
-                    (set! integer-reg (+ integer-reg 1)))
-                (when (>= reg 8)
-                  (set! offset (abi/align offset (cast i64 size)))
-                  (set! (.kind location) 1)
-                  (set! (.register location) -1)
-                  (set! (.offset location) offset)
-                  (set! offset (+ offset (cast i64 size))))
-                (when (> reference 0) (push! (mut result) location)))))
-        (set! i (+ i 1))))
+    (for ty parameters
+      (when (or (= ty 0) (not (types/valid-scalar? (cast i32 ty))))
+        (set! error "incomplete parameter types; declare a function prototype")))
+    (when (= error "")
+      (match (arguments/plan (slice parameters)
+                             (len parameters)
+                             false
+                             (slice descriptors)
+                             allocator)
+        (Err [message] (set! error message))
+        (Ok [layout]
+            (let [(mut layout) layout
+                  (mut i) (: 0 i64)]
+              (for part (.parts layout)
+                (let [reference (get references i)
+                      floating? (types/floating? (cast i32 (get parameters i)))
+                      reg (.register part)]
+                  (when (> reference 0)
+                    (push! (mut result)
+                           (Parameter
+                             :reference reference
+                             :kind (if (< reg 0) 1 (if floating? 2 0))
+                             :register
+                               (if (< reg 0)
+                                   (: -1 i32)
+                                   (if floating? (- reg 32) reg))
+                             :offset (.offset part)
+                             :size (.size part)))))
+                (set! i (+ i 1)))
+              (arguments/release! (mut layout))))))
+    (free! (mut descriptors))
     (free! (mut parameters))
     (free! (mut references))
     (if (= error "") (Ok result) (do (free! (mut result)) (Err error)))))

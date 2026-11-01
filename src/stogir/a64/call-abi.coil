@@ -3,6 +3,9 @@
 (import "stogir.graph" :as g)
 (import "stogir.node" :as n)
 (import "stogir.calls" :as calls)
+(import "stogir.a64.abi-arguments" :as arguments)
+(import "stogir.call-groups" :as groups)
+(import "stogir.strings" :as strings)
 (import "stogir.argument-value" :as argval)
 (import "stogir.alignment" :as alignment)
 (import "stogir.types" :as types)
@@ -72,7 +75,8 @@
   (free! (mut (.arguments layout))))
 
 ;;; Classify every argument in source order. Register banks exhaust independently;
-;;; Darwin unnamed variadic arguments always occupy promoted eight-byte slots.
+;;; Darwin unnamed scalars use promoted eight-byte slots; aggregate members
+;;; remain packed within one group extent.
 (defn layout [(graph g/Graph) (reference i32) (allocator (dyn Allocator))]
   (-> (Result Layout (slice u8)))
   (match (calls/validate-call graph reference)
@@ -82,8 +86,9 @@
                 (Layout
                   :arguments (ArrayList::new [Argument] allocator)
                   :stack 0)
-              (mut gp) (: 0 i32)
-              (mut fp) (: 0 i32)
+              (mut types) (ArrayList::new [u8] allocator)
+              (mut references) (ArrayList::new [i32] allocator)
+              (mut descriptors) (ArrayList::new [groups/Group] allocator)
               (mut j) (: 3 i32)
               (mut error) ""
               count (get (.arities graph) (cast i64 reference))]
@@ -94,50 +99,43 @@
                     (match (g/lookup graph value)
                       (None [] (set! error "invalid call argument"))
                       (Some [input]
-                            (let [ty (n/type-id input)
-                                  floating? (types/floating? (cast i32 ty))
-                                  unnamed?
-                                    (and (!= (& (.flags signature) 16) 0)
-                                         (>= (- j 3) (.count signature)))
-                                  size
-                                    (if unnamed?
-                                        8
-                                        (types/scalar-size (cast i32 ty) 8))
-                                  available (if floating? fp gp)
-                                  register
-                                    (if (and (not unnamed?) (< available 8))
-                                        (+ available (if floating? 32 0))
-                                        (: -1 i32))]
-                              (if (or (<= size 0)
-                                      (not (or (types/integer? (cast i32 ty))
-                                               floating?)))
-                                  (set! error
-                                        "unsupported scalar call argument type")
-                                  (do
-                                    (when (< register 0)
-                                      (set! (.stack result)
-                                            (align (.stack result)
-                                                   (cast i64 size))))
-                                    (push! (mut (.arguments result))
-                                           (Argument
-                                             :value value
-                                             :ty ty
-                                             :register register
-                                             :offset
-                                               (if (< register 0)
-                                                   (.stack result)
-                                                   -1)
-                                             :size size
-                                             :promote? (and unnamed? (= ty 13))
-                                             :copy-offset -1))
-                                    (if (< register 0)
-                                        (set! (.stack result)
-                                              (+ (.stack result)
-                                                 (cast i64 size)))
-                                        (if floating?
-                                            (set! fp (+ fp 1))
-                                            (set! gp (+ gp 1)))))))))))
+                            (push! (mut types) (n/type-id input))
+                            (push! (mut references) value)))))
             (set! j (+ j 1)))
+          (when (> (.id signature) 0)
+            (match (strings/lookup (.strings graph) (.id signature))
+              (None [] (set! error "prototype string missing"))
+              (Some [bytes]
+                    (let [(mut i) (: 0 i64)]
+                      (while (< i (groups/count bytes))
+                        (push! (mut descriptors) (groups/at bytes i))
+                        (set! i (+ i 1)))))))
+          (when (= error "")
+            (match (arguments/plan (slice types)
+                                   (cast i64 (.count signature))
+                                   (!= (& (.flags signature) 16) 0)
+                                   (slice descriptors)
+                                   allocator)
+              (Err [message] (set! error message))
+              (Ok [layout]
+                  (let [(mut layout) layout
+                        (mut i) (: 0 i64)]
+                    (set! (.stack result) (.stack layout))
+                    (for part (.parts layout)
+                      (push! (mut (.arguments result))
+                             (Argument
+                               :value (get references i)
+                               :ty (get types i)
+                               :register (.register part)
+                               :offset (.offset part)
+                               :size (.size part)
+                               :promote? (.promote? part)
+                               :copy-offset -1))
+                      (set! i (+ i 1)))
+                    (arguments/release! (mut layout))))))
+          (free! (mut types))
+          (free! (mut references))
+          (free! (mut descriptors))
           ; Each occurrence gets distinct private storage after all scalar stack
           ; arguments. Sharing an ARGVAL node must not alias two callee copies.
           (let [(mut i) (: 0 i64)]
