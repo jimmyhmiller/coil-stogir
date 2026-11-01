@@ -1,0 +1,270 @@
+(module stogir.tests.aot-hva-varargs-link)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.simd" :as v)
+
+(defstruct H8_1 [(m0 (vec u64 1))])
+
+(defstruct H8_2 [(m0 (vec u64 1)) (m1 (vec u64 1))])
+
+(defstruct H8_3 [(m0 (vec u64 1)) (m1 (vec u64 1)) (m2 (vec u64 1))])
+
+(defstruct H8_4
+  [(m0 (vec u64 1)) (m1 (vec u64 1)) (m2 (vec u64 1)) (m3 (vec u64 1))])
+
+(defstruct H16_1 [(m0 (vec u64 2))])
+
+(defstruct H16_2 [(m0 (vec u64 2)) (m1 (vec u64 2))])
+
+(defstruct H16_3 [(m0 (vec u64 2)) (m1 (vec u64 2)) (m2 (vec u64 2))])
+
+(defstruct H16_4
+  [(m0 (vec u64 2)) (m1 (vec u64 2)) (m2 (vec u64 2)) (m3 (vec u64 2))])
+
+(defn word [(index u64)] (-> u64)
+  (^ (* (+ index 1) 0x123456789ABCDEF) 0x8000000000000000))
+
+(defn lane8 [(index u64)] (-> (vec u64 1))
+  (v/vsplat [u64 1] (word index)))
+
+(defn lane16 [(index u64)] (-> (vec u64 2))
+  (v/vinsert (v/vsplat [u64 2] (word index)) 1 (word (+ index 71))))
+
+(defn wanted [(index i64) (lanes i64)] (-> u64)
+  (let [(mut position) (: 0 i64)
+        (mut member) (: 0 i64)
+        (mut count) (: 1 i64)
+        (mut result) (: 0 u64)]
+    (while (<= count 4)
+      (when (= index position) (set! result (cast u64 (+ 100 count))))
+      (set! position (+ position 1))
+      (let [(mut j) (: 0 i64)]
+        (while (< j (* count lanes))
+          (when (= index (+ position j))
+            (set! result
+                  (word (cast u64 (+ member (/ j lanes) (* (% j lanes) 71))))))
+          (set! j (+ j 1))))
+      (set! position (+ position (* count lanes)))
+      (set! member (+ member count))
+      (set! count (+ count 1)))
+    (if (= index position) (: 105 u64) result)))
+
+(defn exercise [(wide? bool) (address (ptr u8)) (capture u64)] (-> i64)
+  (let [lanes (if wide? (: 2 i64) 1)
+        words (+ (* 10 lanes) 5)
+        f (p/cast (fnptr (cc/C) [u64 u64 u64] u64) address)
+        (mut input) [(: 165 u64) 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 165]
+        (mut output)
+          [(: 165 u64)
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165]
+        (mut failures) 0
+        (mut i) (: 0 i64)]
+    (while (< i (* 10 lanes))
+      (p/store! (p/index (data input) (+ i 1))
+                (word (cast u64 (+ (/ i lanes) (* (% i lanes) 71)))))
+      (set! i (+ i 1)))
+    (when (!= (call-ptr f
+                        capture
+                        (p/cast u64 (p/index (data output) 1))
+                        (p/cast u64 (p/index (data input) 1)))
+              99)
+      (set! failures (+ failures 1)))
+    (set! i 0)
+    (while (< i 27)
+      (let [expected
+              (if (and (> i 0) (<= i words)) (wanted (- i 1) lanes) (: 165 u64))]
+        (when (!= (get output i) expected)
+          (println "variadic HVA wide{} word{} got{} expected{}"
+                   wide?
+                   i
+                   (get output i)
+                   expected)
+          (set! failures (+ failures 1))))
+      (set! i (+ i 1)))
+    (set! i 0)
+    (while (< i 22)
+      (let [expected
+              (if (and (> i 0) (<= i (* 10 lanes)))
+                  (word (cast u64
+                              (+ (/ (- i 1) lanes) (* (% (- i 1) lanes) 71))))
+                  (if (or (= i 0) (= i 21)) (: 165 u64) (: 0 u64)))]
+        (when (!= (get input i) expected) (set! failures (+ failures 1))))
+      (set! i (+ i 1)))
+    failures))
+
+(extern capture
+        :as
+        "stogir_hva_var_capture"
+        :cc
+        (cc/C)
+        [(ptr u64) u64 ...]
+        (-> u64))
+
+(defn reference [(wide? bool)] (-> i64)
+  (let [(mut output)
+          [(: 165 u64)
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165]
+        lanes (if wide? (: 2 i64) 1)
+        words (+ (* lanes 10) 5)
+        (mut failures) 0
+        (mut i) (: 0 i64)]
+    (if wide?
+        (let [(mut h1) (H16_1 :m0 (lane16 0))
+              (mut h2) (H16_2 :m0 (lane16 1) :m1 (lane16 2))
+              (mut h3)
+                (H16_3
+                  :m0 (lane16 3)
+                  :m1 (lane16 4)
+                  :m2 (lane16 5))
+              (mut h4)
+                (H16_4
+                  :m0 (lane16 6)
+                  :m1 (lane16 7)
+                  :m2 (lane16 8)
+                  :m3 (lane16 9))]
+          (when (!= (capture (p/index (data output) 1)
+                             (cast u64 words)
+                             (: 101 u64)
+                             (load (mut h1))
+                             (: 102 u64)
+                             (load (mut h2))
+                             (: 103 u64)
+                             (load (mut h3))
+                             (: 104 u64)
+                             (load (mut h4))
+                             (: 105 u64))
+                    99)
+            (set! failures (+ failures 1))))
+        (let [(mut h1) (H8_1 :m0 (lane8 0))
+              (mut h2) (H8_2 :m0 (lane8 1) :m1 (lane8 2))
+              (mut h3)
+                (H8_3
+                  :m0 (lane8 3)
+                  :m1 (lane8 4)
+                  :m2 (lane8 5))
+              (mut h4)
+                (H8_4
+                  :m0 (lane8 6)
+                  :m1 (lane8 7)
+                  :m2 (lane8 8)
+                  :m3 (lane8 9))]
+          (when (!= (capture (p/index (data output) 1)
+                             (cast u64 words)
+                             (: 101 u64)
+                             (load (mut h1))
+                             (: 102 u64)
+                             (load (mut h2))
+                             (: 103 u64)
+                             (load (mut h3))
+                             (: 104 u64)
+                             (load (mut h4))
+                             (: 105 u64))
+                    99)
+            (set! failures (+ failures 1)))))
+    (while (< i 27)
+      (let [expected
+              (if (and (> i 0) (<= i words)) (wanted (- i 1) lanes) (: 165 u64))]
+        (when (!= (get output i) expected)
+          (println "LLVM variadic HVA wide{} word{} got{} expected{}"
+                   wide?
+                   i
+                   (get output i)
+                   expected)
+          (set! failures (+ failures 1))))
+      (set! i (+ i 1)))
+    failures))
+
+(extern entry0_0 :as "stogir_hva_varargs_0_0" :cc (cc/C) [u64 u64 u64] (-> u64))
+
+(extern entry0_1 :as "stogir_hva_varargs_0_1" :cc (cc/C) [u64 u64 u64] (-> u64))
+
+(extern entry1_0 :as "stogir_hva_varargs_1_0" :cc (cc/C) [u64 u64 u64] (-> u64))
+
+(extern entry1_1 :as "stogir_hva_varargs_1_1" :cc (cc/C) [u64 u64 u64] (-> u64))
+
+(defn main [] (-> i64)
+  (let [(mut failures) (+ (reference false) (reference true))
+        address (p/cast u64 (p/cast (ptr u8) (fnptr-of capture)))]
+    (set! failures
+          (+ failures
+             (exercise false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry0_0)
+                                  (fnptr (cc/C) [u64 u64 u64] u64)))
+                       address)))
+    (set! failures
+          (+ failures
+             (exercise false
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry0_1)
+                                  (fnptr (cc/C) [u64 u64 u64] u64)))
+                       address)))
+    (set! failures
+          (+ failures
+             (exercise true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry1_0)
+                                  (fnptr (cc/C) [u64 u64 u64] u64)))
+                       address)))
+    (set! failures
+          (+ failures
+             (exercise true
+                       (p/cast (ptr u8)
+                               (: (fnptr-of entry1_1)
+                                  (fnptr (cc/C) [u64 u64 u64] u64)))
+                       address)))
+    (println "linked variadic HVA placement versus LLVM C calls: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

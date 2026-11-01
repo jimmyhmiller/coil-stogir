@@ -1,0 +1,326 @@
+(module stogir.tests.jit-hva-varargs)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.simd" :as v)
+
+(defstruct H8_1 [(m0 (vec u64 1))])
+
+(defstruct H8_2 [(m0 (vec u64 1)) (m1 (vec u64 1))])
+
+(defstruct H8_3 [(m0 (vec u64 1)) (m1 (vec u64 1)) (m2 (vec u64 1))])
+
+(defstruct H8_4
+  [(m0 (vec u64 1)) (m1 (vec u64 1)) (m2 (vec u64 1)) (m3 (vec u64 1))])
+
+(defstruct H16_1 [(m0 (vec u64 2))])
+
+(defstruct H16_2 [(m0 (vec u64 2)) (m1 (vec u64 2))])
+
+(defstruct H16_3 [(m0 (vec u64 2)) (m1 (vec u64 2)) (m2 (vec u64 2))])
+
+(defstruct H16_4
+  [(m0 (vec u64 2)) (m1 (vec u64 2)) (m2 (vec u64 2)) (m3 (vec u64 2))])
+
+(defn word [(index u64)] (-> u64)
+  (^ (* (+ index 1) 0x123456789ABCDEF) 0x8000000000000000))
+
+(defn lane8 [(index u64)] (-> (vec u64 1))
+  (v/vsplat [u64 1] (word index)))
+
+(defn lane16 [(index u64)] (-> (vec u64 2))
+  (v/vinsert (v/vsplat [u64 2] (word index)) 1 (word (+ index 71))))
+
+(defn wanted [(index i64) (lanes i64)] (-> u64)
+  (let [(mut position) (: 0 i64)
+        (mut member) (: 0 i64)
+        (mut count) (: 1 i64)
+        (mut result) (: 0 u64)]
+    (while (<= count 4)
+      (when (= index position) (set! result (cast u64 (+ 100 count))))
+      (set! position (+ position 1))
+      (let [(mut j) (: 0 i64)]
+        (while (< j (* count lanes))
+          (when (= index (+ position j))
+            (set! result
+                  (word (cast u64 (+ member (/ j lanes) (* (% j lanes) 71))))))
+          (set! j (+ j 1))))
+      (set! position (+ position (* count lanes)))
+      (set! member (+ member count))
+      (set! count (+ count 1)))
+    (if (= index position) (: 105 u64) result)))
+
+(defn exercise [(wide? bool) (address (ptr u8)) (capture u64)] (-> i64)
+  (let [lanes (if wide? (: 2 i64) 1)
+        words (+ (* 10 lanes) 5)
+        f (p/cast (fnptr (cc/C) [u64 u64 u64] u64) address)
+        (mut input) [(: 165 u64) 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 165]
+        (mut output)
+          [(: 165 u64)
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165
+           165]
+        (mut failures) 0
+        (mut i) (: 0 i64)]
+    (while (< i (* 10 lanes))
+      (p/store! (p/index (data input) (+ i 1))
+                (word (cast u64 (+ (/ i lanes) (* (% i lanes) 71)))))
+      (set! i (+ i 1)))
+    (when (!= (call-ptr f
+                        capture
+                        (p/cast u64 (p/index (data output) 1))
+                        (p/cast u64 (p/index (data input) 1)))
+              99)
+      (set! failures (+ failures 1)))
+    (set! i 0)
+    (while (< i 27)
+      (let [expected
+              (if (and (> i 0) (<= i words)) (wanted (- i 1) lanes) (: 165 u64))]
+        (when (!= (get output i) expected)
+          (println "variadic HVA wide{} word{} got{} expected{}"
+                   wide?
+                   i
+                   (get output i)
+                   expected)
+          (set! failures (+ failures 1))))
+      (set! i (+ i 1)))
+    (set! i 0)
+    (while (< i 22)
+      (let [expected
+              (if (and (> i 0) (<= i (* 10 lanes)))
+                  (word (cast u64
+                              (+ (/ (- i 1) lanes) (* (% (- i 1) lanes) 71))))
+                  (if (or (= i 0) (= i 21)) (: 165 u64) (: 0 u64)))]
+        (when (!= (get input i) expected) (set! failures (+ failures 1))))
+      (set! i (+ i 1)))
+    failures))
+
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.call-groups" :as groups)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.bytes" :as bytes)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn address! [(graph (mut g/Graph)) (base i32) (offset i32)] (-> i32)
+  (require (b/emit! (mut graph)
+                    26
+                    6
+                    [base
+                     (require (b/scalar-constant! (mut graph)
+                                                  5
+                                                  (cast u64 offset)
+                                                  8))])))
+
+(defn generate [(wide? bool)
+                (literal? bool)
+                (capture u64)
+                (name (slice u8))
+                (path (slice u8))] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        ty (if wide? (: 37 i32) 21)
+        width (if wide? (: 16 i32) 8)
+        lanes (if wide? (: 2 i32) 1)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        output (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        input (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        (mut arguments) (ArrayList::new [i32] allocator)
+        (mut descriptors) (ArrayList::new [groups/Group] allocator)
+        (mut payload) (ArrayList::new [u8] allocator)
+        (mut control) start
+        (mut member) (: 0 i32)
+        (mut count) (: 1 i32)
+        (mut failures) 0]
+    (push! (mut arguments) output)
+    (push! (mut arguments)
+           (require (b/scalar-constant! (mut graph)
+                                        5
+                                        (cast u64 (+ (* 10 lanes) 5))
+                                        8)))
+    (while (<= count 4)
+      (push! (mut arguments)
+             (require (b/scalar-constant! (mut graph)
+                                          5
+                                          (cast u64 (+ 100 count))
+                                          8)))
+      (push! (mut descriptors)
+             (groups/Group
+               :first (cast i32 (len arguments))
+               :count count
+               :alignment width))
+      (let [(mut j) (: 0 i32)]
+        (while (< j count)
+          (let [value
+                  (if literal?
+                      (do
+                        (clear! (mut payload))
+                        (let [(mut byte) (: 0 i32)]
+                          (while (< byte width)
+                            (push! (mut payload)
+                                   (cast u8
+                                         (>> (word (cast u64
+                                                         (+ member
+                                                            j
+                                                            (* (/ byte 8) 71))))
+                                             (cast u64 (* (% byte 8) 8)))))
+                            (set! byte (+ byte 1))))
+                        (require (b/vector-constant! (mut graph)
+                                                     ty
+                                                     8
+                                                     (slice payload))))
+                      (require (b/vector-load! (mut graph)
+                                               ty
+                                               8
+                                               control
+                                               (address! (mut graph)
+                                                         input
+                                                         (* (+ member j) width))
+                                               true)))]
+            (push! (mut arguments) value)
+            (when (not literal?) (set! control value)))
+          (set! j (+ j 1))))
+      (set! member (+ member count))
+      (set! count (+ count 1)))
+    (push! (mut arguments) (require (b/scalar-constant! (mut graph) 5 105 8)))
+    (match (calls/create-grouped 25
+                                 5
+                                 [(: 6 u8) 5]
+                                 (slice descriptors)
+                                 allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut prototype) prototype]
+            (set! control
+                  (require (calls/emit! (mut graph)
+                                        prototype
+                                        control
+                                        target
+                                        (slice arguments)
+                                        allocator)))
+            (calls/release! (mut prototype)))))
+    (let [ret (require (b/emit! (mut graph) 120 5 [control control (: 0 i32)]))]
+      (match (compile/object graph start [ret] name allocator)
+        (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+        (Ok [object]
+            (let [(mut object) object]
+              (match (fs/write-file allocator path (slice object))
+                (Err [_] (set! failures (+ failures 1)))
+                (Ok [_] 0))
+              (free! (mut object)))))
+      (match (compile/image graph start [ret] name allocator)
+        (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+        (Ok [source]
+            (let [(mut source) source]
+              (match (jit/map-image source allocator)
+                (Err [message]
+                     (println "{}" message)
+                     (set! failures (+ failures 1)))
+                (Ok [loaded]
+                    (let [(mut loaded) loaded]
+                      (set! failures
+                            (+ failures
+                               (exercise wide? (.base (.memory loaded)) capture)))
+                      (jit/release-image! (mut loaded)))))
+              (image/release! (mut source))))))
+    (free! (mut arguments))
+    (free! (mut descriptors))
+    (free! (mut payload))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut probe) (ArrayList::new [u8] allocator)
+        (mut failures) 0]
+    ; Entry-SP capture: mov x2,sp; ldr/str post-index; subs x1; b.ne; mov x0,99; ret.
+    ; Words independently checked with LLVM MC. Only caller-saved registers change.
+    (for word [(: 0x910003E2 u32)
+               0xF8408443
+               0xF8008403
+               0xF1000421
+               0x54FFFFA1
+               0xD2800C60
+               0xD65F03C0]
+      (bytes/append32! (mut probe) word))
+    (match (macho/text-object (slice probe) "_stogir_hva_var_capture" allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [object]
+          (let [(mut object) object]
+            (match (fs/write-file allocator
+                                  "/tmp/coil-stogir-hva-var-capture.o"
+                                  (slice object))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [_] 0))
+            (free! (mut object)))))
+    (match (jit/map-text (slice probe))
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [loaded]
+          (let [(mut loaded) loaded
+                capture (p/cast u64 (.base loaded))]
+            (set! failures
+                  (+ failures
+                     (generate false
+                               false
+                               capture
+                               "_stogir_hva_varargs_0_0"
+                               "/tmp/coil-stogir-hva-varargs-0-0.o")))
+            (set! failures
+                  (+ failures
+                     (generate false
+                               true
+                               capture
+                               "_stogir_hva_varargs_0_1"
+                               "/tmp/coil-stogir-hva-varargs-0-1.o")))
+            (set! failures
+                  (+ failures
+                     (generate true
+                               false
+                               capture
+                               "_stogir_hva_varargs_1_0"
+                               "/tmp/coil-stogir-hva-varargs-1-0.o")))
+            (set! failures
+                  (+ failures
+                     (generate true
+                               true
+                               capture
+                               "_stogir_hva_varargs_1_1"
+                               "/tmp/coil-stogir-hva-varargs-1-1.o")))
+            (jit/release! (mut loaded)))))
+    (free! (mut probe))
+    (println "variadic HVA stack capture, scalar separators and complete literals: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))
