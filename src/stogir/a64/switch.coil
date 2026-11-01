@@ -1,0 +1,84 @@
+;;; Balanced integer/range dispatch; edge copies run only in terminal stubs.
+(module stogir.a64.switch)
+(import "stogir.switch" :as switch)
+(import "stogir.a64.code" :as code)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.a64.emit" :as emit)
+(import "stogir.a64.constants" :as constants)
+(import "stogir.a64.fixups" :as fixups)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err])
+
+(defn branch! [(output (mut code/Buffer))
+               (branches (mut (ArrayList fixups/Branch)))
+               (target i32)
+               (condition i32)] (-> void)
+  (push! (mut branches)
+         (fixups/Branch
+           :offset (len (.text output))
+           :label target
+           :condition condition
+           :link false))
+  (bytes/append32! (mut (.text output)) 0))
+
+;;; x16 holds the normalized order key throughout dispatch, x17 is scratch.
+(defn compare! [(output (mut code/Buffer)) (error (mut (slice u8))) (key u64)]
+  (-> void)
+  (match (encode/add-sub-immediate true true true 31 16 (cast i64 key))
+    (Ok [word] (emit/word! (mut (.text output)) (mut error) (Ok word)))
+    (Err [_]
+         (match (constants/emit! (mut (.text output)) true 17 key)
+           (Err [message] (set! error message))
+           (Ok [_] 0))
+         (emit/word! (mut (.text output))
+                     (mut error)
+                     (encode/add-sub true true true 31 16 17)))))
+
+;;; Half-open case interval [begin,end); recursion depth is O(log n).
+(defn tree! [(output (mut code/Buffer))
+             (dispatch switch/Dispatch)
+             (stubs (ArrayList i32))
+             (fallback i32)
+             (begin i64)
+             (end i64)
+             (labels (mut (ArrayList i64)))
+             (branches (mut (ArrayList fixups/Branch)))
+             (error (mut (slice u8)))] (-> void)
+  (when (= error "")
+    (if (= begin end)
+        (branch! (mut output) (mut branches) fallback -1)
+        (let [middle (+ begin (/ (- end begin) 2))
+              item (get (.cases dispatch) middle)
+              left-label (if (= begin middle) fallback (cast i32 (len labels)))]
+          (when (!= begin middle) (push! (mut labels) -1))
+          (compare! (mut output) (mut error) (.low item))
+          (if (= (.low item) (.high item))
+              (do
+                (branch! (mut output) (mut branches) (get stubs middle) 0)
+                (when (!= begin middle)
+                  (branch! (mut output) (mut branches) left-label 3)))
+              (do
+                (branch! (mut output) (mut branches) left-label 3)
+                (compare! (mut output) (mut error) (.high item))
+                (branch! (mut output) (mut branches) (get stubs middle) 9)))
+          (tree! (mut output)
+                 dispatch
+                 stubs
+                 fallback
+                 (+ middle 1)
+                 end
+                 (mut labels)
+                 (mut branches)
+                 (mut error))
+          (when (!= begin middle)
+            (set! (mut labels) (cast i64 left-label) (len (.text output)))
+            (tree! (mut output)
+                   dispatch
+                   stubs
+                   fallback
+                   begin
+                   middle
+                   (mut labels)
+                   (mut branches)
+                   (mut error)))))))

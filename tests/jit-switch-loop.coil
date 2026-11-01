@@ -1,0 +1,123 @@
+(module stogir.tests.jit-switch-loop)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn expected [(n i64)] (-> i64)
+  (let [(mut i) 0
+        (mut sum) 0]
+    (while (< i n)
+      (set! sum (+ sum (match (% i 5) (0 i) (1 (* i 2)) (4 1) (_ (- 0 i)))))
+      (set! i (+ i 1)))
+    sum))
+
+(defn check [(ty i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        limit (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        initial (require (b/scalar-constant! (mut graph) ty 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        entry (require (b/emit! (mut graph) 114 0 [start]))
+        loop (require (b/loop-begin! (mut graph) entry))
+        index (require (b/loop-phi! (mut graph) loop zero))
+        sum (require (b/loop-phi! (mut graph) loop initial))
+        condition (require (b/emit! (mut graph) 16 1 [index limit]))
+        branch (require (b/emit! (mut graph) 116 0 [loop condition]))
+        body (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        exit (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        five (require (b/scalar-constant! (mut graph) 11 5 8))
+        tag (require (b/emit! (mut graph) 30 11 [index five body]))
+        split (require (b/switch! (mut graph) body tag))
+        two (require (b/scalar-constant! (mut graph) 11 2 8))
+        three (require (b/scalar-constant! (mut graph) 11 3 8))
+        c0 (require (b/case-value! (mut graph) split zero))
+        c1 (require (b/case-value! (mut graph) split one))
+        cr (require (b/case-range! (mut graph) split two three))
+        cd (require (b/case-default! (mut graph) split))
+        e0 (require (b/emit! (mut graph) 114 0 [c0]))
+        e1 (require (b/emit! (mut graph) 114 0 [c1]))
+        er (require (b/emit! (mut graph) 114 0 [cr]))
+        ed (require (b/emit! (mut graph) 114 0 [cd]))
+        merge (require (b/emit! (mut graph) 112 0 [e0 e1 er ed]))
+        value
+          (if (= ty 11)
+              index
+              (require (b/conversion! (mut graph) 37 ty 8 index)))
+        unit
+          (if (= ty 11) one (require (b/conversion! (mut graph) 37 ty 8 one)))
+        doubled (require (b/emit! (mut graph) 26 ty [value value]))
+        v0 (require (b/emit! (mut graph) 26 ty [sum value]))
+        v1 (require (b/emit! (mut graph) 26 ty [sum doubled]))
+        vr (require (b/emit! (mut graph) 27 ty [sum value]))
+        vd (require (b/emit! (mut graph) 26 ty [sum unit]))
+        selected (require (b/emit! (mut graph) 67 ty [merge v0 v1 vr vd]))
+        next (require (b/emit! (mut graph) 26 11 [index one]))
+        back (require (b/emit! (mut graph) 115 0 [merge]))
+        ret (require (b/emit! (mut graph) 120 ty [exit sum (: 0 i32)]))
+        (mut failures) 0]
+    (b/patch! (mut graph) loop 2 back)
+    (b/patch! (mut graph) index 3 next)
+    (b/patch! (mut graph) sum 3 selected)
+    (match (compile/object graph
+                           start
+                           [ret]
+                           (if (= ty 11)
+                               "_stogir_switch_loop_i64"
+                               "_stogir_switch_loop_f64")
+                           allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [object]
+          (let [(mut bytes) object]
+            (match (fs/write-file allocator
+                                  (if (= ty 11)
+                                      "/tmp/coil-stogir-switch-loop-i64.o"
+                                      "/tmp/coil-stogir-switch-loop-f64.o")
+                                  (slice bytes))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [_] 0))
+            (free! (mut bytes)))))
+    (match (compile/text graph start [ret] allocator)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [text]
+          (let [(mut bytes) text]
+            (match (jit/map-text (slice bytes))
+              (Err [message]
+                   (println "{}" message)
+                   (set! failures (+ failures 1)))
+              (Ok [image]
+                  (let [(mut owned) image
+                        f
+                          (primitive/cast (fnptr (cc/C) [i64] i64)
+                                          (.base owned))
+                        fp
+                          (primitive/cast (fnptr (cc/C) [i64] f64)
+                                          (.base owned))
+                        (mut n) -1]
+                    (while (<= n 100)
+                      (when (if (= ty 11)
+                                (!= (call-ptr f n) (expected n))
+                                (!= (call-ptr fp n) (cast f64 (expected n))))
+                        (println "switch loop ty={} n={}" ty n)
+                        (set! failures (+ failures 1)))
+                      (set! n (+ n 1)))
+                    (jit/release! (mut owned)))))
+            (free! (mut bytes)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures (+ (check 11) (check 12))]
+    (println "switch ranges and merged results inside scalar/FP loops: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

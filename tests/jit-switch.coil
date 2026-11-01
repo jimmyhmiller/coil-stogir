@@ -1,0 +1,213 @@
+(module stogir.tests.jit-switch)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.switch" :as switch)
+(import "stogir.types" :as types)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn maximum [(ty i32)] (-> u64)
+  (if (= ty 1)
+      1
+      (cast u64
+            (- (<< (: 1 u128) (cast u128 (* 8 (types/scalar-size ty 8)))) 1))))
+
+(defn expected [(key u64) (top u64) (empty? bool)] (-> u64)
+  (if empty?
+      700
+      (if (= key 0)
+          100
+          (if (= top 1)
+              700
+              (if (and (>= key 2) (<= key 4))
+                  200
+                  (if (= key 9)
+                      300
+                      (if (and (>= key (/ top 2)) (<= key (+ (/ top 2) 1)))
+                          400
+                          (if (= key (- top 3))
+                              500
+                              (if (= key top) 600 700)))))))))
+
+(defn check [(ty i32) (empty? bool) (constant? bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        raw (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        seed (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        top (maximum ty)
+        selector
+          (if constant?
+              (require (b/scalar-constant! (mut graph)
+                                           ty
+                                           (^ top (switch/sign-mask ty))
+                                           8))
+              (if (= ty 5)
+                  raw
+                  (require (b/conversion! (mut graph)
+                                          (if (= (types/scalar-size ty 8) 8)
+                                              36
+                                              35)
+                                          ty
+                                          8
+                                          raw))))
+        split (require (b/switch! (mut graph) start selector))
+        (mut ends) (ArrayList::new [i32] allocator)
+        (mut values) (ArrayList::new [i32] allocator)
+        (mut failures) 0]
+    ; Deliberately unsorted, including endpoints at both signed/unsigned limits.
+    (unless empty?
+      (for id [(: 6 i32) 2 5 1 4 3]
+        (when (or (!= top 1) (= id 1))
+          (let [low
+                  (match id
+                    (1 (: 0 u64))
+                    (2 2)
+                    (3 9)
+                    (4 (/ top 2))
+                    (5 (- top 3))
+                    (_ top))
+                high (if (= id 2) 4 (if (= id 4) (+ low 1) low))
+                a
+                  (require (b/scalar-constant! (mut graph)
+                                               ty
+                                               (^ low (switch/sign-mask ty))
+                                               8))
+                z
+                  (require (b/scalar-constant! (mut graph)
+                                               ty
+                                               (^ high (switch/sign-mask ty))
+                                               8))
+                projection
+                  (if (= low high)
+                      (require (b/case-value! (mut graph) split a))
+                      (require (b/case-range! (mut graph) split a z)))
+                end (require (b/emit! (mut graph) 114 0 [projection]))
+                code
+                  (require (b/scalar-constant! (mut graph)
+                                               5
+                                               (* (cast u64 id) 100)
+                                               8))]
+            (push! (mut ends) end)
+            (push! (mut values) code)))))
+    (let [fallback (require (b/case-default! (mut graph) split))
+          end (require (b/emit! (mut graph) 114 0 [fallback]))
+          code (require (b/scalar-constant! (mut graph) 5 700 8))]
+      (push! (mut ends) end)
+      (push! (mut values) code))
+    (let [merge
+            (if (= (len ends) 1)
+                (require (b/emit! (mut graph) 106 0 [(get ends 0) (: 0 i32)]))
+                (require (b/emit! (mut graph) 112 0 (slice ends))))
+          (mut inputs) (ArrayList::new [i32] allocator)]
+      (push! (mut inputs) merge)
+      (for value values (push! (mut inputs) value))
+      (let [phi
+              (if (= (len values) 1)
+                  (get values 0)
+                  (require (b/emit! (mut graph) 67 5 (slice inputs))))
+            result (require (b/emit! (mut graph) 26 5 [phi seed]))
+            ret (require (b/emit! (mut graph) 120 5 [merge result (: 0 i32)]))]
+        (when (and (not empty?) (not constant?) (or (= ty 11) (= ty 5)))
+          (match (compile/object graph
+                                 start
+                                 [ret]
+                                 (if (= ty 11)
+                                     "_stogir_switch_i64"
+                                     "_stogir_switch_u64")
+                                 allocator)
+            (Err [message]
+                 (println "{}" message)
+                 (set! failures (+ failures 1)))
+            (Ok [object]
+                (let [(mut bytes) object]
+                  (match (fs/write-file allocator
+                                        (if (= ty 11)
+                                            "/tmp/coil-stogir-switch-i64.o"
+                                            "/tmp/coil-stogir-switch-u64.o")
+                                        (slice bytes))
+                    (Err [_] (set! failures (+ failures 1)))
+                    (Ok [_] 0))
+                  (free! (mut bytes))))))
+        (match (compile/text graph start [ret] allocator)
+          (Err [message]
+               (println "switch type={} empty={} constant={}: {}"
+                        ty
+                        empty?
+                        constant?
+                        message)
+               (set! failures (+ failures 1)))
+          (Ok [text]
+              (let [(mut bytes) text]
+                (match (jit/map-text (slice bytes))
+                  (Err [message]
+                       (println "{}" message)
+                       (set! failures (+ failures 1)))
+                  (Ok [image]
+                      (let [(mut owned) image
+                            f
+                              (primitive/cast (fnptr (cc/C) [u64 u64] u64)
+                                              (.base owned))
+                            (mut probes) (ArrayList::new [u64] allocator)]
+                        (if (<= top 255)
+                            (let [(mut k) (: 0 u64)]
+                              (while (<= k top)
+                                (push! (mut probes) k)
+                                (set! k (+ k 1))))
+                            (do
+                              (for k [(: 0 u64) 1 2 3 4 5 8 9 10]
+                                (push! (mut probes) k))
+                              (for k [(- (/ top 2) 1)
+                                      (/ top 2)
+                                      (+ (/ top 2) 1)
+                                      (+ (/ top 2) 2)
+                                      (- top 4)
+                                      (- top 3)
+                                      (- top 2)
+                                      (- top 1)
+                                      top]
+                                (push! (mut probes) k))))
+                        (for key probes
+                          (let [bits (^ key (switch/sign-mask ty))
+                                got (call-ptr f bits 17)
+                                want
+                                  (+ 17
+                                     (expected (if constant? top key)
+                                               top
+                                               empty?))]
+                            (when (!= got want)
+                              (println "switch ty={} key={} got={} want={}"
+                                       ty
+                                       key
+                                       got
+                                       want)
+                              (set! failures (+ failures 1)))))
+                        (free! (mut probes))
+                        (jit/release! (mut owned)))))
+                (free! (mut bytes))))))
+      (free! (mut inputs)))
+    (free! (mut ends))
+    (free! (mut values))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for ty [(: 1 i32) 2 3 4 5 6 7 8 9 10 11]
+      (set! failures
+            (+ failures
+               (check ty false false)
+               (check ty false true)
+               (check ty true false))))
+    (println "typed singleton/range/default switch dispatch: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

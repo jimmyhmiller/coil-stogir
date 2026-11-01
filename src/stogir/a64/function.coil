@@ -1,6 +1,10 @@
 ;;; Allocated scalar function emission shared by JIT and AOT consumers.
 (module stogir.a64.function)
 (import "stogir.graph" :as g)
+(import "stogir.switch" :as switch)
+(import "stogir.a64.switch" :as switch-emit)
+(import "stogir.types" :as types)
+(import "stogir.a64.constants" :as constants)
 (import "stogir.node" :as n)
 (import "stogir.schedule" :as schedule)
 (import "stogir.a64.constraints" :as constraints)
@@ -180,19 +184,32 @@
                                              allocator)
                         (Err [msg] (set! error msg))
                         (Ok [_] 0))
-                      (if (= opcode 116)
-                          (match (conditional! (mut output)
-                                               graph
-                                               assigned
-                                               reference
-                                               position
-                                               indexed-users
-                                               selected
-                                               scheduled
-                                               analysis
-                                               (mut labels)
-                                               (mut branches)
-                                               allocator)
+                      (if (or (= opcode 116) (= opcode 117))
+                          (match (if (= opcode 117)
+                                     (switch! (mut output)
+                                              graph
+                                              assigned
+                                              reference
+                                              position
+                                              indexed-users
+                                              selected
+                                              scheduled
+                                              analysis
+                                              (mut labels)
+                                              (mut branches)
+                                              allocator)
+                                     (conditional! (mut output)
+                                                   graph
+                                                   assigned
+                                                   reference
+                                                   position
+                                                   indexed-users
+                                                   selected
+                                                   scheduled
+                                                   analysis
+                                                   (mut labels)
+                                                   (mut branches)
+                                                   allocator))
                             (Err [msg] (set! error msg))
                             (Ok [_] 0))
                           (if (= opcode 66)
@@ -350,6 +367,94 @@
     (free! (mut moves))
     (free! (mut group))
     (if (= error "") (Ok output) (do (code/release! (mut output)) (Err error)))))
+
+(defn switch! [(output (mut code/Buffer))
+               (graph g/Graph)
+               (assigned allocate/Assigned)
+               (reference i32)
+               (position i64)
+               (indexed-users uses/Uses)
+               (selected (ArrayList bool))
+               (scheduled schedule/Schedule)
+               (analysis live/Analysis)
+               (labels (mut (ArrayList i64)))
+               (branches (mut (ArrayList fixups/Branch)))
+               (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (match (switch/collect graph reference indexed-users allocator)
+    (Err [message] (Err message))
+    (Ok [dispatch]
+        (let [(mut owned) dispatch
+              (mut stubs) (ArrayList::new [i32] allocator)
+              (mut targets) (ArrayList::new [i32] allocator)
+              (mut error) ""]
+          (for item (.cases owned)
+            (push! (mut targets) (.target item)))
+          (push! (mut targets) (.fallback owned))
+          (for target targets
+            (when (not (get selected (cast i64 target)))
+              (set! error "SWITCH projection omitted by observable roots"))
+            (push! (mut stubs) (cast i32 (len labels)))
+            (push! (mut labels) -1))
+          (when (= error "")
+            (match (value/register! (mut output)
+                                    graph
+                                    (.parts assigned)
+                                    (.selector owned)
+                                    position
+                                    16
+                                    62)
+              (Err [message] (set! error message))
+              (Ok [reg]
+                  (emit/word! (mut (.text output))
+                              (mut error)
+                              (encode/extend true
+                                             false
+                                             (* 8
+                                                (types/scalar-size (.ty owned)
+                                                                   8))
+                                             16
+                                             reg))))
+            (when (!= (switch/sign-mask (.ty owned)) 0)
+              (match (constants/emit! (mut (.text output))
+                                      true
+                                      17
+                                      (switch/sign-mask (.ty owned)))
+                (Err [message] (set! error message))
+                (Ok [_] 0))
+              (emit/word! (mut (.text output))
+                          (mut error)
+                          (encode/logical-register true 2 16 16 17)))
+            (switch-emit/tree! (mut output)
+                               owned
+                               stubs
+                               (get stubs (len (.cases owned)))
+                               0
+                               (len (.cases owned))
+                               (mut labels)
+                               (mut branches)
+                               (mut error)))
+          (let [(mut i) (: 0 i64)]
+            (while (and (= error "") (< i (len targets)))
+              (let [target (get targets i)]
+                (set! (mut labels)
+                      (cast i64 (get stubs i))
+                      (len (.text output)))
+                (match (edge! (mut output)
+                              graph
+                              assigned
+                              scheduled
+                              analysis
+                              target
+                              (+ position 1)
+                              allocator)
+                  (Err [message] (set! error message))
+                  (Ok [_] 0))
+                (switch-emit/branch! (mut output) (mut branches) target -1))
+              (set! i (+ i 1))))
+          (free! (mut targets))
+          (free! (mut stubs))
+          (free! (mut (.cases owned)))
+          (if (= error "") (Ok 0) (Err error))))))
 
 (defn conditional! [(output (mut code/Buffer))
                     (graph g/Graph)

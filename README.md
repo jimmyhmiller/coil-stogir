@@ -7,7 +7,8 @@ requirements. All library and test implementation sources are Coil.
 The standalone library currently compiles a subset of scalar graphs to
 native macOS AArch64 code. It includes graph construction and local folding,
 CFG/dominance analysis, placement, scheduling, split-interval register allocation,
-spill handling, phi transfers, arithmetic, comparisons, branches, loops, memory
+spill handling, phi transfers, arithmetic, comparisons, branches, typed
+singleton/range/default switches, loops, memory
 accesses, integer/address conversions and bitcasts, scalar integer binary arithmetic/logic/shifts/rotates, MIN/MAX and conditional
 selection, checked ADD/SUB/MUL with overflow projections, scalar unary operations
 (negation, complement, absolute value, byte swap and bit counts), and direct/indirect calls with register and stack arguments.
@@ -37,7 +38,8 @@ This is an incomplete port. Full optimization and scalar/vector coverage,
 further control/intrinsic semantics, variadic argument access,
 additional special constants, object features/targets, compiler integration,
 and runtime/compile-time comparisons with LLVM and TPDE remain unfinished.
-See the [architecture and delivery plan](docs/PLAN.md), [ABI coverage](docs/ABI.md), and [image/JIT/AOT APIs](docs/IMAGES.md).
+See the [architecture and delivery plan](docs/PLAN.md), [control-flow contracts](docs/CONTROL.md),
+[ABI coverage](docs/ABI.md), and [image/JIT/AOT APIs](docs/IMAGES.md).
 
 Run a check locally, for example:
 

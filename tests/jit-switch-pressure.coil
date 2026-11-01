@@ -1,0 +1,187 @@
+(module stogir.tests.jit-switch-pressure)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn mix :cc (cc/C) [(a u64) (b u64)] (-> u64)
+  (+ (* a 3) (* b 5)))
+
+(defn mix-fp :cc (cc/C) [(a f64) (b f64)] (-> f64)
+  (+ (* a 3.0) (* b 5.0)))
+
+(defn check [(ty i32) (count i64)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        base (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        selector (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        guard (require (b/variable! (mut graph) 5 start "switch-guard" 64))
+        sentinel (require (b/scalar-constant! (mut graph) 5 321 8))
+        size (require (b/scalar-constant! (mut graph) 5 17 8))
+        allocation (require (b/stack-allocate! (mut graph) start size 64))
+        initialized
+          (require (b/emit! (mut graph) 93 0 [allocation allocation sentinel]))
+        (mut control)
+          (require (b/emit! (mut graph) 87 0 [initialized guard sentinel]))
+        (mut values) (ArrayList::new [i32] allocator)
+        (mut ends) (ArrayList::new [i32] allocator)
+        (mut results) (ArrayList::new [i32] allocator)
+        (mut integers) (ArrayList::new [u64] allocator)
+        (mut floats) (ArrayList::new [f64] allocator)
+        (mut failures) 0
+        (mut i) (: 0 i64)]
+    ; Pinned loads force forty simultaneous values at the dispatch. Every value
+    ; is used on the default path, so neither rematerialization nor sinking can
+    ; remove the GPR/SIMD pressure on case edges.
+    (while (< i 40)
+      (let [offset
+              (require (b/scalar-constant! (mut graph) 5 (cast u64 (* i 8)) 8))
+            address (require (b/emit! (mut graph) 26 6 [base offset]))
+            loaded (require (b/emit! (mut graph) 91 ty [control address]))]
+        (push! (mut values) loaded)
+        (push! (mut integers) (cast u64 (+ i 11)))
+        (push! (mut floats) (cast f64 (+ i 11)))
+        (set! control loaded))
+      (set! i (+ i 1)))
+    (let [split (require (b/switch! (mut graph) control selector))]
+      (match (calls/create 9 (cast u8 ty) [(cast u8 ty) (cast u8 ty)] allocator)
+        (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+        (Ok [prototype]
+            (let [(mut owned) prototype]
+              (set! i count)
+              (while (> i 0)
+                (set! i (- i 1))
+                (let [tag
+                        (require (b/scalar-constant! (mut graph)
+                                                     5
+                                                     (cast u64 i)
+                                                     8))
+                      projection (require (b/case-value! (mut graph) split tag))
+                      called
+                        (require (calls/emit! (mut graph)
+                                              owned
+                                              projection
+                                              target
+                                              [(get values (% i 40))
+                                               (get values (% (+ i 13) 40))]
+                                              allocator))
+                      end (require (b/emit! (mut graph) 114 0 [called]))]
+                  (push! (mut ends) end)
+                  (push! (mut results) called)))
+              (free! (mut (.parameters owned))))))
+      (let [fallback (require (b/case-default! (mut graph) split))
+            (mut sum) (get values 0)]
+        (set! i 1)
+        (while (< i 40)
+          (set! sum (require (b/emit! (mut graph) 26 ty [sum (get values i)])))
+          (set! i (+ i 1)))
+        (push! (mut ends) (require (b/emit! (mut graph) 114 0 [fallback])))
+        (push! (mut results) sum)))
+    (let [merge (require (b/emit! (mut graph) 112 0 (slice ends)))
+          (mut inputs) (ArrayList::new [i32] allocator)]
+      (push! (mut inputs) merge)
+      (for result results (push! (mut inputs) result))
+      (let [phi (require (b/emit! (mut graph) 67 ty (slice inputs)))
+            fixed (require (b/emit! (mut graph) 85 5 [merge guard]))
+            dynamic (require (b/emit! (mut graph) 91 5 [fixed allocation]))
+            guards (require (b/emit! (mut graph) 26 5 [fixed dynamic]))
+            typed-guards
+              (if (= ty 5)
+                  guards
+                  (require (b/conversion! (mut graph) 37 ty 8 guards)))
+            answer (require (b/emit! (mut graph) 26 ty [phi typed-guards]))
+            ret
+              (require (b/emit! (mut graph) 120 ty [dynamic answer (: 0 i32)]))]
+        (match (compile/object graph
+                               start
+                               [ret]
+                               (if (= ty 5)
+                                   "_stogir_switch_pressure_gp"
+                                   "_stogir_switch_pressure_fp")
+                               allocator)
+          (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+          (Ok [object]
+              (let [(mut bytes) object]
+                (match (fs/write-file allocator
+                                      (if (= ty 5)
+                                          "/tmp/coil-stogir-switch-pressure-gp.o"
+                                          "/tmp/coil-stogir-switch-pressure-fp.o")
+                                      (slice bytes))
+                  (Err [_] (set! failures (+ failures 1)))
+                  (Ok [_] 0))
+                (free! (mut bytes)))))
+        (match (compile/text graph start [ret] allocator)
+          (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+          (Ok [text]
+              (let [(mut bytes) text]
+                (match (jit/map-text (slice bytes))
+                  (Err [message]
+                       (println "{}" message)
+                       (set! failures (+ failures 1)))
+                  (Ok [image]
+                      (let [(mut owned) image
+                            f
+                              (primitive/cast (fnptr (cc/C) [u64 u64 u64] u64)
+                                              (.base owned))
+                            fp
+                              (primitive/cast (fnptr (cc/C) [u64 u64 u64] f64)
+                                              (.base owned))
+                            target
+                              (primitive/cast u64
+                                              (primitive/cast (ptr u8)
+                                                              (fnptr-of mix)))
+                            target-fp
+                              (primitive/cast u64
+                                              (primitive/cast (ptr u8)
+                                                              (fnptr-of mix-fp)))
+                            data
+                              (if (= ty 5)
+                                  (primitive/cast u64 (.data integers))
+                                  (primitive/cast u64 (.data floats)))]
+                        (set! i 0)
+                        (while (<= i (+ count 1))
+                          (let [tag
+                                  (if (> i count)
+                                      (: 0xFFFFFFFFFFFFFFFF u64)
+                                      (cast u64 i))
+                                expected
+                                  (+ 642
+                                     (if (>= tag (cast u64 count))
+                                         (: 1220 u64)
+                                         (mix (+ (% tag 40) 11)
+                                              (+ (% (+ tag 13) 40) 11))))]
+                            (when (if (= ty 5)
+                                      (!= (call-ptr f target data tag) expected)
+                                      (!= (call-ptr fp target-fp data tag)
+                                          (cast f64 expected)))
+                              (println "switch pressure ty={} tag={}" ty tag)
+                              (set! failures (+ failures 1))))
+                          (set! i (+ i 1)))
+                        (jit/release! (mut owned)))))
+                (free! (mut bytes))))))
+      (free! (mut inputs)))
+    (free! (mut values))
+    (free! (mut ends))
+    (free! (mut results))
+    (free! (mut integers))
+    (free! (mut floats))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures (+ (check 5 257) (check 12 40))]
+    (println "large switches with GP/SIMD pressure, calls and dynamic frames: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))
