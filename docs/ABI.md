@@ -498,3 +498,44 @@ output. A separately linked Mach-O fixture verifies a four-way register/stack
 cycle through large, unaligned frame slots and preserved flags. This foundation
 does not yet enable vector graph operations, allocated
 vector values, or vector/HVA signatures; those still report unsupported types.
+
+
+## Mixed-width copy and spill ownership
+
+`moves/resolve-sized` plans simultaneous raw copies with a byte extent on each
+edge. A cycle save uses the maximum extent read from its original source;
+ordinary writes retain their own edge extent. This preserves a full vector even
+when its register is also the destination of a narrower scalar write. Splitting
+a simultaneous group by width would not preserve that dependency.
+
+`a64.typed-transfers/Copy` pairs a `locations/Transfer` with size4,8 or16.
+`parallel-frame!` emits all copies through one sized plan, reserving v31 for
+cycle state, v30 for sixteen-byte memory data, x17 for scalar memory data and
+x16 for addresses. These registers cannot participate in input copies. GPR
+locations cannot carry sixteen bytes. Distinct stack identities must not overlap;
+extents and frame bounds are checked before emission. Stack overlap validation
+sorts unique offsets in O(n log n). Output bytes remain unchanged on failure.
+Scalar register destinations define only their declared low extent.
+
+`allocation/run-shaped!` takes an immutable `SpillShape` slice indexed by virtual
+parent ID. Each shape specifies byte size and alignment; every live virtual
+parent must have a positive size and power-of-two alignment. A split child uses
+its original parent's entry. Evicting an owner consults that owner's shape,
+rather than the shape of the value requesting the register. Physical reservations
+need no storage entry. `run!` remains the uniform-shape interface. Missing or
+invalid shapes reject before the allocation queue or frame is changed.
+
+The AArch64 allocation bridge now supplies a shape for each graph reference.
+Scalar slots remain eight bytes; the machinery can represent sixteen-byte
+values. Split-boundary and ordinary/Phi edge groups now derive transfer extents
+from their owning graph value and use one mixed-width plan. Byte/halfword values
+retain their normalized four-byte register form. Calls still use their current
+scalar/grouped ABI interface; vector graph/prototype types remain rejected.
+
+Validation includes729 byte-level sized-copy cases,120 native mixed GPR/SIMD/
+stack cases and a linked Mach-O mixed cycle. Native allocation tests force
+repeated eviction/reload of three values sharing one SIMD register, across all
+six4/8/16-byte size permutations and four payload seeds. They check complete
+buffers, frame padding, parent slot identity, alignment, values at all required
+uses and flags. A linked fixture repeats the shaped-spill path. No backend or
+performance conclusion follows from these correctness checks.

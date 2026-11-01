@@ -963,3 +963,50 @@ No library implementation changed during that run. Formatting and git diff check
 pass. All 321 implementation/test files remain Coil. Installed Coil d2a49bf21376
 and Homebrew LLVM MC 23.1.4 were used on this arm64 Mac. Full vector graph/ABI,
 backend and benchmark requirements remain open as described above.
+
+
+### Mixed-width cycles and per-owner spill shapes
+
+Checkpoint cdfdf14 adds a sized parallel-copy plan and native emission for mixed
+4/8/16-byte edges. Cycle sources are retained at their complete read extent;
+normal writes retain their edge width. One plan covers GPR, SIMD and stack
+locations. Independent width groups would lose dependencies between aliased SIMD
+registers. Reserved cycle, vector/scalar memory and address temporaries are
+separate. Distinct stack identities are checked for overlap after sorting.
+
+The planner passes729 byte-model cases, and native emission passes120 mixed
+cycle/fan-out/frame cases with complete live extents and flags checked. A
+separately linked Mach-O fixture crosses scalar GPR, full SIMD and unaligned
+large stack locations in one cycle. Invalid shape, scratch, overlap and late
+emission failures leave output unchanged.
+
+Checkpoint 4700ed5 adds explicit parent-indexed spill geometry to allocation.
+Every active virtual owner is checked before allocation begins. Children retain
+their parent's shape, and evictions use the evicted owner's size/alignment.
+The AArch64 bridge supplies explicit shapes; scalar storage remains eight bytes.
+Normal graph split and CFG/Phi edge emission now uses the owning value's extent
+through the mixed-width planner. Narrow values keep their normalized32-bit form.
+
+Native tests force repeated evictions among three values sharing one SIMD
+register, over all six permutations of4/8/16-byte storage and four seeds. They
+verify frame alignment/prefix/padding, shared parent slot identity, all required
+use payloads and flags. A linked fixture verifies the same spill/reload path.
+Focused existing allocation, Phi, floating loops, GP/FP switch/bulk pressure,
+aggregate results/recursion and numeric conversions pass.
+
+A further reproducer for the installed Coil inline-vector Iterable diagnostic
+was added to its existing open coil-bugs report. Iterating a bound collection
+works; no Coil compiler source changed. The vector graph builder/verifier,
+memory operations/constants, SIMD allocation class and ABI/HVA interfaces remain
+to be enabled and verified. The full library/backend/benchmark goal remains open.
+
+
+The mixed-width allocation checkpoint passes all181 standalone checks and48
+linked AOT consumers locally with debug checks and regenerated objects. Exact
+source/pass-set equality verifies complete coverage without duplicate runs;
+linked output has no warnings. Library/test sources remained unchanged throughout
+the complete run. Formatting and git diff checks pass. All326 implementation/test
+files remain Coil. Installed Coil d2a49bf21376 was used on the arm64 Mac.
+This establishes the copy/spill foundation, while vector graph/ABI support,
+remaining semantics, optimization/scaling, the actual compiler adapter and
+LLVM/TPDE runtime and compile-time measurements remain open.
