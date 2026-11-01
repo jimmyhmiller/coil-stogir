@@ -1463,3 +1463,13 @@ perform 40,000 contending increments in both JIT and linked modes, checking both
 the final count and the sum of returned old values. Full regression follows
 separately. This library change is driven by the new Coil backend worktree;
 actual backend execution and matched LLVM/TPDE benchmarks remain in progress.
+
+
+The atomic extension's unchanged-source regression passes all 211 standalone
+checks and 65 linked AOT consumers, with debug checks, regenerated objects,
+exact expected pass sets, no duplicate passes and no linked warnings. Project
+and toolchain hashes remain fixed through both passes on the isolated
+aa64e44440df snapshot. An explicit formatting pass over all 389 Coil files found
+one previously unformatted anchored-transfer fixture; formatting-only cleanup
+and its focused debug-check rerun pass. All 389 files now pass formatting; diff
+checks pass. Backend work is in Coil's stogir-backend worktree.
