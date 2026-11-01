@@ -495,9 +495,8 @@ large/unaligned offsets and frame bias, comparing complete buffers and preserved
 flags. Protected-page checks put both ends of sixteen-byte source/destination
 extents against inaccessible regions. Instruction words match LLVM MC reference
 output. A separately linked Mach-O fixture verifies a four-way register/stack
-cycle through large, unaligned frame slots and preserved flags. This foundation
-does not yet enable vector graph operations, allocated
-vector values, or vector/HVA signatures; those still report unsupported types.
+cycle through large, unaligned frame slots and preserved flags. Vector graph memory and Phi paths are now connected to this transport layer
+(see below). Vector constants, arithmetic and vector/HVA signatures remain open.
 
 
 ## Mixed-width copy and spill ownership
@@ -530,7 +529,8 @@ Scalar slots remain eight bytes; the machinery can represent sixteen-byte
 values. Split-boundary and ordinary/Phi edge groups now derive transfer extents
 from their owning graph value and use one mixed-width plan. Byte/halfword values
 retain their normalized four-byte register form. Calls still use their current
-scalar/grouped ABI interface; vector graph/prototype types remain rejected.
+scalar/grouped ABI interface. Vector memory/Phi graph values are now supported;
+vector prototypes remain rejected until their ABI paths are implemented.
 
 Validation includes729 byte-level sized-copy cases,120 native mixed GPR/SIMD/
 stack cases and a linked Mach-O mixed cycle. Native allocation tests force
@@ -539,3 +539,38 @@ six4/8/16-byte size permutations and four payload seeds. They check complete
 buffers, frame padding, parent slot identity, alignment, values at all required
 uses and flags. A linked fixture repeats the shaped-spill path. No backend or
 performance conclusion follows from these correctness checks.
+
+
+## Vector memory and Phi graph values
+
+The structural builder/verifier accepts valid upstream vector type codes.
+`builder/vector-load!` and `vector-store!` validate vector types, target pointer
+width, an open control chain and an ADDR value before adding a node. Ordinary
+and volatile forms use the existing LOAD/LOAD_v and STORE/STORE_v opcodes.
+The vector semantic validator checks data operands separately from control
+edges: a scalar return controlled by a vector load does not consume its vector
+payload. Unsupported vector operations or ABI uses reject before scheduling,
+including dead invalid uses. Phi incoming types must agree exactly.
+
+AArch64 supports memory/Phi transport for eight- and sixteen-byte vector extents.
+They use SIMD register classes, correctly sized/aligned spills and mixed-width
+split/edge copies. Larger vector shapes remain representable but target emission
+rejects their unsupported extent. Vector constants and arithmetic, vector local
+objects and vector/HVA parameter/result signatures are not yet implemented.
+Scalar arguments/results may surround internal vector computations and calls.
+
+Phi results are defined simultaneously at block entry. Their live ranges start
+there, their edge destinations are looked up there, and they have no artificial
+register requirement at a later textual Phi position. A Phi result may enter in
+its own stack slot and acquire a register at a real data use. This rule applies
+to scalar and vector values and avoids duplicate edge destinations under pressure.
+
+Native coverage includes 52 ordinary/volatile branch graphs over all 26 supported
+base/lane shapes, eight vector loop/call-pressure graphs and a scalar f64 pressure
+regression. Pressure cases retain forty SIMD and forty GPR values through calls
+that overwrite every allocatable caller-saved bank, swap twenty vector pairs
+through loop Phis, and verify fixed/dynamic guards at 16/4096-byte frame alignment.
+Payload comparisons cover signed zero, infinities, NaN payloads and arbitrary
+bits, with aligned/unaligned sources and destinations. Four profiles also run
+both source/destination boundary placements and branch choices against protected
+pages. Eight Mach-O fixtures execute the branch and pressure paths after linking.

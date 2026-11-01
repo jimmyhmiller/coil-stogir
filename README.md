@@ -46,6 +46,12 @@ placement, including bank exhaustion and variadic packing. Explicit result-stora
 roles support integer and homogeneous floating register results and x8 indirect
 results. Additional classification/vector coverage remains unfinished.
 
+
+Internal 64/128-bit vector loads/stores and branch/loop Phi values now preserve
+complete SIMD payloads through spills, clobbering calls and aligned dynamic
+frames in JIT and linked AOT. Vector constants, arithmetic and vector/HVA call
+interfaces remain unfinished.
+
 Native copy, overlap-safe move and zero builders expand into existing memory
 and control nodes. Fixed small transfers use exact-width accesses; larger and
 dynamic operations use bounded loops. See the [bulk memory API](docs/MEMORY.md).

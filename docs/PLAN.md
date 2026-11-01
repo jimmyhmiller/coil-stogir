@@ -1010,3 +1010,49 @@ files remain Coil. Installed Coil d2a49bf21376 was used on the arm64 Mac.
 This establishes the copy/spill foundation, while vector graph/ABI support,
 remaining semantics, optimization/scaling, the actual compiler adapter and
 LLVM/TPDE runtime and compile-time measurements remain open.
+
+
+### Vector graph transport and simultaneous Phi definitions
+
+Checkpoint `6fcf587` connects vector memory and Phi values to graph construction,
+structural/semantic checks, SIMD classes, per-parent allocation and native memory
+emission. Checked load/store helpers reject malformed inputs before graph
+mutation. Vector data use is distinct from control-chain dependency. Unsupported
+vector arithmetic/ABI roles reject explicitly, even when dead. Native transport
+supports 8/16-byte vectors; wider valid representations produce a target error.
+
+Pressure testing exposed a preexisting scalar Phi defect, reproduced with forty
+f64 Phis before the fix. Ranges, constraints and edge lookup treated each Phi's
+textual schedule position as a separate register definition. Later definitions
+could reuse earlier registers, although edge copies are simultaneous. The group
+then contained multiple writes to v29. Phi ranges/destinations now use common
+block entry, and a Phi may start in its own spill slot instead of requiring a
+register at its textual position. Real uses still require registers. The scalar
+reproducer and vector matrix pass; the physical-Phi unit also distinguishes its
+entry stack slot from its later register location. Evidence is in the project pad.
+
+Native checks pass 52 branch graphs (all 26 supported shapes, ordinary/volatile),
+eight vector pressure graphs and the scalar f64 reproducer. They retain forty
+SIMD and forty GPR values across register-clobbering calls, swap twenty vector
+pairs through loops and check fixed/dynamic guards with 16/4096-byte frames.
+Exact bytes include signed zeros, infinities and NaN payloads. Eight linked
+Mach-O objects pass the branch/pressure interfaces. Checkpoint `c39735` adds 32
+protected source/destination/branch placements and explicit wider-target rejection.
+Aligned/unaligned source and destination checks accompany those boundary tests.
+
+Next: upstream-shaped LONG_CONST storage/interning/materialization, vector
+operations and vector/HVA argument/result roles. Compiler layout classification,
+remaining wide/atomic/intrinsic/variadic-access semantics, optimizer/scaling,
+actual backend integration and equivalent LLVM/TPDE runtime/compile-time
+measurements remain open. No performance conclusion follows from these checks.
+
+
+The vector graph checkpoint passes all 183 standalone checks and 49 linked AOT
+consumers locally with debug checks and regenerated objects. Exact source/pass-set
+equality confirms coverage without duplicate runs; linked output has no warnings.
+Library implementation stayed fixed during the complete run. The aligned/source-
+unaligned test refinement was verified before the run reached that producer, and
+the final source passed in the complete run. Formatting and git diff checks pass.
+All 330 implementation/test files remain Coil. Validation used installed Coil
+d2a49bf21376 on the local arm64 Mac. The Phi correction, vector transport coverage
+and remaining full-goal gates are recorded in the project pad.
