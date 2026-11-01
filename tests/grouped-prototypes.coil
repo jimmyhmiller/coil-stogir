@@ -5,6 +5,7 @@
 (import "stogir.call-groups" :as groups)
 (import "stogir.a64.compile" :as compile)
 (import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
 (import "coil.result" :use [Result Ok Err])
 
 (defn require [(r (Result i32 (slice u8)))] (-> i32)
@@ -115,6 +116,43 @@
                                               allocator))))
               (when (!= before (len (.instructions graph)))
                 (set! failures (+ failures 1))))
+            (calls/release! (mut prototype)))))
+    ; A corrupted 256-byte parameter vector can masquerade as a valid SGAG
+    ; trailer when its one-byte scalar count wraps. Validate the owned model,
+    ; not just the serialized interpretation, before touching graph metadata.
+    (match (calls/create 25 5 [] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut prototype) prototype
+                (mut descriptors) (ArrayList::new [groups/Group] allocator)
+                (mut i) (: 0 i32)]
+            (while (< i 31)
+              (push! (mut descriptors)
+                     (groups/Group
+                       :first i
+                       :count 1
+                       :alignment 4))
+              (set! i (+ i 1)))
+            (groups/append! (mut (.parameters prototype)) (slice descriptors))
+            (let [(mut encoded) (calls/encode prototype allocator)
+                  before (len (.instructions graph))]
+              (when (or (!= (len (.parameters prototype)) 256)
+                        (not (calls/valid-bytes? (slice encoded))))
+                (set! failures (+ failures 1)))
+              (set! failures
+                    (+ failures
+                       (rejected (calls/attach! (mut graph)
+                                                prototype
+                                                target
+                                                allocator))
+                       (rejected (calls/function! (mut graph)
+                                                  prototype
+                                                  allocator))))
+              (when (or (!= before (len (.instructions graph)))
+                        (!= (.function-prototype graph) 0))
+                (set! failures (+ failures 1)))
+              (free! (mut encoded)))
+            (free! (mut descriptors))
             (calls/release! (mut prototype)))))
     (g/release! (mut graph))
     (println "grouped prototype retention, rejected construction and raw mutation checks: {} failures"
