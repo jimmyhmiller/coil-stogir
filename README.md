@@ -106,3 +106,9 @@ validation inputs. It adds LLVM-MC-checked constant shift encodings, 208 constan
 shift/multiply JIT graphs, and conversion checks with the original operand live.
 Full optimized-pipeline parity is still missing; the architecture audit in
 [PLAN.md](docs/PLAN.md) lists the upstream pass order and current gaps.
+
+The `dc90b58` construction checkpoint also passes the complete 211 standalone /
+65 linked AOT regression on unchanged inputs and a fixed toolchain. Commutative
+operand ordering and truncation-of-extension folding now follow pinned upstream
+construction rules. SCCP, persistent matching/fusion before liveness, coalescing
+and block-scheduling parity remain open architectural work.

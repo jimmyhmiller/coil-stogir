@@ -52,6 +52,8 @@ line-for-line translation of each upstream pass or equivalent behavior.
 
 | Constant shift and copy selection | AArch64 `IR_SHIFT_CONST`, `IR_MUL_PWR2` and copy/reuse cases in pinned `ir_aarch64.dasc` are the reference. Coil selection avoids rematerializing constant shift registers; encoder words are checked against LLVM MC. Known canonical unsigned producer results and same-register integer bitcasts avoid redundant copies. This does not establish full matching/reuse/coalescing parity. |
 
+| Construction canonicalization and extension-chain folding | Operand ordering follows pinned `ir_fold.h`'s lower-reference-to-op2 convention, including checked ADD/MUL. `TRUNC(ZEXT/SEXT)` uses upstream's four width cases and restart semantics. Construction tests cover integer type combinations at both pointer widths; dynamic JIT checks preserve original operand liveness and malformed chains are rejected. |
+
 The current graph uses separate contiguous arrays for instructions and constants.
 The current allocator, fold rules, target coverage, verifier, and optimization
 pipeline remain incomplete. See [PLAN.md](PLAN.md) for the delivery gates.
