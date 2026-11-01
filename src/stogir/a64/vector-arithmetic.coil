@@ -14,10 +14,114 @@
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.result" :use [Result Ok Err])
 
+(defn lane-expanded? [(opcode i32) (ty i32)] (-> bool)
+  (and (types/integer? (types/base-type ty))
+       (or (= opcode 29)
+           (= opcode 30)
+           (and (= opcode 28) (= (types/scalar-size (types/base-type ty) 8) 8)))))
+
+;;; Signed byte/halfword lanes extend to W; 32-bit signed division interprets
+;;; the same W bits as UMOV. A 64-bit lane always uses the X form.
+(defn lane-extract [(signed? bool) (element i32) (lane i32) (rd i32) (rn i32)]
+  (-> (Result u32 (slice u8)))
+  (if (or (not (or (= element 1) (= element 2) (= element 4) (= element 8)))
+          (< lane 0)
+          (>= lane (/ 16 element))
+          (< rd 0)
+          (> rd 30)
+          (< rn 0)
+          (> rn 31))
+      (Err "invalid SIMD lane extraction")
+      (Ok (| (if (and signed? (< element 4))
+                 (: 0x0E002C00 u32)
+                 (: 0x0E003C00 u32))
+             (if (= element 8) (: 0x40000000 u32) (: 0 u32))
+             (<< (cast u32 (+ (* lane element 2) element)) 16)
+             (<< (cast u32 rn) 5)
+             (cast u32 rd)))))
+
+(defn lane-insert [(element i32) (lane i32) (rd i32) (rn i32)]
+  (-> (Result u32 (slice u8)))
+  (if (or (not (or (= element 1) (= element 2) (= element 4) (= element 8)))
+          (< lane 0)
+          (>= lane (/ 16 element))
+          (< rd 0)
+          (> rd 31)
+          (< rn 0)
+          (> rn 30))
+      (Err "invalid SIMD lane insertion")
+      (Ok (| (: 0x4E001C00 u32)
+             (<< (cast u32 (+ (* lane element 2) element)) 16)
+             (<< (cast u32 rn) 5)
+             (cast u32 rd)))))
+
+(defn word! [(out (mut (ArrayList u8)))
+             (error (mut (slice u8)))
+             (word (Result u32 (slice u8)))] (-> void)
+  (match word
+    (Err [message] (set! error message))
+    (Ok [bits] (bytes/append32! (mut out) bits))))
+
+;;; Only x16/x17 are used. MOD re-extracts its original dividend after quotient
+;;; multiplication, so neither x30 nor another allocated register is clobbered.
+;;; Insert only after both lane reads; every SIMD source/destination alias is legal.
+(defn integer-sequence! [(output (mut (ArrayList u8)))
+                         (opcode i32)
+                         (ty i32)
+                         (rd i32)
+                         (rn i32)
+                         (rm i32)]
+  (-> (Result i32 (slice u8)))
+  (if (or (not (vector/valid-type? opcode ty))
+          (not (types/short-vector? ty 8))
+          (not (lane-expanded? opcode ty))
+          (< rd 0)
+          (> rd 31)
+          (< rn 0)
+          (> rn 31)
+          (< rm 0)
+          (> rm 31))
+      (Err "unsupported expanded integer vector operation")
+      (let [(mut temporary) (ArrayList::new [u8] (.alc output))
+            base (types/base-type ty)
+            element (types/scalar-size base 8)
+            signed? (types/signed? base)
+            wide? (= element 8)
+            (mut lane) (: 0 i32)
+            (mut error) ""]
+        (while (< lane (types/lanes ty))
+          (word! (mut temporary)
+                 (mut error)
+                 (lane-extract signed? element lane 16 rn))
+          (word! (mut temporary)
+                 (mut error)
+                 (lane-extract signed? element lane 17 rm))
+          (word! (mut temporary)
+                 (mut error)
+                 (if (= opcode 28)
+                     (encode/multiply wide? 16 16 17)
+                     (encode/divide wide? signed? 16 16 17)))
+          (when (= opcode 30)
+            (word! (mut temporary) (mut error) (encode/multiply wide? 16 16 17))
+            (word! (mut temporary)
+                   (mut error)
+                   (lane-extract signed? element lane 17 rn))
+            (word! (mut temporary)
+                   (mut error)
+                   (encode/add-sub wide? true false 16 17 16)))
+          (word! (mut temporary) (mut error) (lane-insert element lane rd 16))
+          (set! lane (+ lane 1)))
+        (let [count (cast i32 (len temporary))]
+          (when (= error "")
+            (extend! (mut output) (.data temporary) (len temporary)))
+          (free! (mut temporary))
+          (if (= error "") (Ok count) (Err error))))))
+
 (defn instruction [(opcode i32) (ty i32) (rd i32) (rn i32) (rm i32)]
   (-> (Result u32 (slice u8)))
   (if (or (not (vector/valid-type? opcode ty))
           (not (types/short-vector? ty 8))
+          (lane-expanded? opcode ty)
           (< rd 0)
           (> rd 31)
           (< rn 0)
@@ -52,15 +156,17 @@
                                 (27 (: 0x0EA0D400 u32))
                                 (28 (: 0x2E20DC00 u32))
                                 (_ (: 0x2E20FC00 u32))))
-                           (if (and (= width 8) (= element 8))
-                               (if (= opcode 26)
-                                   (: 0x5EE08400 u32)
-                                   (: 0x7EE08400 u32))
-                               (| q
-                                  (<< size 22)
-                                  (if (= opcode 26)
-                                      (: 0x0E208400 u32)
-                                      (: 0x2E208400 u32))))))))))))
+                           (if (= opcode 28)
+                               (| q (<< size 22) (: 0x0E209C00 u32))
+                               (if (and (= width 8) (= element 8))
+                                   (if (= opcode 26)
+                                       (: 0x5EE08400 u32)
+                                       (: 0x7EE08400 u32))
+                                   (| q
+                                      (<< size 22)
+                                      (if (= opcode 26)
+                                          (: 0x0E208400 u32)
+                                          (: 0x2E208400 u32)))))))))))))
 
 (defn emit! [(output (mut code/Buffer))
              (graph g/Graph)
@@ -104,13 +210,22 @@
             (Err [message] (set! error message))
             (Ok [reg] (set! right (- reg 32))))
           (when (= error "")
-            (match (instruction (cast i32 (n/opcode node))
-                                ty
-                                destination
-                                left
-                                right)
-              (Err [message] (set! error message))
-              (Ok [word] (bytes/append32! (mut (.text temporary)) word))))
+            (if (lane-expanded? (cast i32 (n/opcode node)) ty)
+                (match (integer-sequence! (mut (.text temporary))
+                                          (cast i32 (n/opcode node))
+                                          ty
+                                          destination
+                                          left
+                                          right)
+                  (Err [message] (set! error message))
+                  (Ok [_] 0))
+                (match (instruction (cast i32 (n/opcode node))
+                                    ty
+                                    destination
+                                    left
+                                    right)
+                  (Err [message] (set! error message))
+                  (Ok [word] (bytes/append32! (mut (.text temporary)) word)))))
           (let [count (cast i32 (len (.text temporary)))]
             (when (and (= error "") (not (code/append! (mut output) temporary)))
               (set! error "invalid vector binary code references"))
