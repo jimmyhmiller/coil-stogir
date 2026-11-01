@@ -1,6 +1,7 @@
 ;;; Explicit groups of scalar ABI pieces; this metadata is a Coil extension.
 (module stogir.call-groups)
 (import "stogir.types" :as types)
+(import "stogir.call-results" :as results)
 (import "coil.arraylist" :use [ArrayList])
 
 ;;; Ordinals index flattened scalar parameters. Integer pairs have two 64-bit
@@ -50,17 +51,32 @@
 
 ;;; After the unchanged flags/result/count/type prefix: SGAG, version1, zero,
 ;;; u16 count, then records {u16 first,u8 count,u8 alignment,u32 reserved=0}.
-(defn append! [(bytes (mut (ArrayList u8))) (groups (slice Group))] (-> void)
-  (when (> (len groups) 0)
-    (for byte [(: 83 u8) 71 65 71 1 0] (push! (mut bytes) byte))
+(defn append-result! [(bytes (mut (ArrayList u8)))
+                      (groups (slice Group))
+                      (result results/Spec)] (-> void)
+  (when (or (> (len groups) 0) (!= (.kind result) 0))
+    (for byte [(: 83 u8) 71 65 71] (push! (mut bytes) byte))
+    (push! (mut bytes) (if (= (.kind result) 0) (: 1 u8) (: 2 u8)))
+    (push! (mut bytes) (cast u8 (.kind result)))
     (push! (mut bytes) (cast u8 (& (len groups) 255)))
     (push! (mut bytes) (cast u8 (>> (len groups) 8)))
+    (when (!= (.kind result) 0)
+      (push! (mut bytes) (.ty result))
+      (push! (mut bytes) (cast u8 (.count result)))
+      (for byte [(: 0 u8) 0 0 0 0 0] (push! (mut bytes) byte)))
     (for group groups
       (push! (mut bytes) (cast u8 (& (.first group) 255)))
       (push! (mut bytes) (cast u8 (>> (.first group) 8)))
       (push! (mut bytes) (cast u8 (.count group)))
       (push! (mut bytes) (cast u8 (.alignment group)))
       (for byte [(: 0 u8) 0 0 0] (push! (mut bytes) byte)))))
+
+(defn append! [(bytes (mut (ArrayList u8))) (groups (slice Group))] (-> void)
+  (append-result! (mut bytes) groups (results/ordinary)))
+
+(defn header-size [(bytes (slice u8))] (-> i64)
+  (let [base (+ 3 (cast i64 (get bytes 2)))]
+    (if (= (get bytes (+ base 4)) 1) 8 16)))
 
 ;;; Accessors require a validated complete prototype (including its prefix).
 (defn count [(bytes (slice u8))] (-> i64)
@@ -71,7 +87,7 @@
            (<< (cast i64 (get bytes (+ base 7))) 8)))))
 
 (defn at [(bytes (slice u8)) (index i64)] (-> Group)
-  (let [base (+ 11 (cast i64 (get bytes 2)) (* index 8))]
+  (let [base (+ 3 (cast i64 (get bytes 2)) (header-size bytes) (* index 8))]
     (Group
       :first
         (+ (cast i32 (get bytes base)) (<< (cast i32 (get bytes (+ base 1))) 8))
@@ -86,35 +102,54 @@
             true
             (if (< (len bytes) (+ base 8))
                 false
-                (if (or (!= (get bytes base) 83)
-                        (!= (get bytes (+ base 1)) 71)
-                        (!= (get bytes (+ base 2)) 65)
-                        (!= (get bytes (+ base 3)) 71)
-                        (!= (get bytes (+ base 4)) 1)
-                        (!= (get bytes (+ base 5)) 0))
-                    false
-                    (let [count (count bytes)
-                          (mut end) (: 0 i32)
-                          (mut good?) (> count 0)
-                          (mut i) (: 0 i64)]
-                      (when (!= (len bytes) (+ base 8 (* count 8)))
-                        (set! good? false))
-                      (while (and good? (< i count))
-                        (let [group (at bytes i)
-                              offset (+ base 8 (* i 8))]
-                          (when (or (not (valid? parameters [group]))
-                                    (and (= (& (get bytes 0) 16) 0)
-                                         (> (cast i64
-                                                  (+ (.first group)
-                                                     (.count group)))
-                                            (len parameters)))
-                                    (< (.first group) end)
-                                    (!= (get bytes (+ offset 4)) 0)
-                                    (!= (get bytes (+ offset 5)) 0)
-                                    (!= (get bytes (+ offset 6)) 0)
-                                    (!= (get bytes (+ offset 7)) 0))
-                            (set! good? false))
-                          (when good?
-                            (set! end (+ (.first group) (.count group)))))
-                        (set! i (+ i 1)))
-                      good?)))))))
+                (let [version (get bytes (+ base 4))
+                      header
+                        (if (= version 1)
+                            (: 8 i64)
+                            (if (= version 2) (: 16 i64) (: 0 i64)))]
+                  (if (or (= header 0)
+                          (< (len bytes) (+ base header))
+                          (!= (get bytes base) 83)
+                          (!= (get bytes (+ base 1)) 71)
+                          (!= (get bytes (+ base 2)) 65)
+                          (!= (get bytes (+ base 3)) 71))
+                      false
+                      (let [count (count bytes)
+                            result (results/decode bytes)
+                            (mut end) (: 0 i32)
+                            (mut i) (: 0 i64)
+                            (mut good?)
+                              (and (= (len bytes) (+ base header (* count 8)))
+                                   (if (= version 1)
+                                       (and (> count 0)
+                                            (= (get bytes (+ base 5)) 0))
+                                       (and (!= (.kind result) 0)
+                                            (results/valid? (get bytes 1)
+                                                            parameters
+                                                            result))))]
+                        (when (= version 2)
+                          (set! i 10)
+                          (while (< i 16)
+                            (when (!= (get bytes (+ base i)) 0)
+                              (set! good? false))
+                            (set! i (+ i 1))))
+                        (set! i 0)
+                        (while (and good? (< i count))
+                          (let [group (at bytes i)
+                                offset (+ base header (* i 8))]
+                            (when (or (not (valid? parameters [group]))
+                                      (and (= (& (get bytes 0) 16) 0)
+                                           (> (cast i64
+                                                    (+ (.first group)
+                                                       (.count group)))
+                                              (len parameters)))
+                                      (< (.first group) end)
+                                      (!= (get bytes (+ offset 4)) 0)
+                                      (!= (get bytes (+ offset 5)) 0)
+                                      (!= (get bytes (+ offset 6)) 0)
+                                      (!= (get bytes (+ offset 7)) 0))
+                              (set! good? false))
+                            (when good?
+                              (set! end (+ (.first group) (.count group)))))
+                          (set! i (+ i 1)))
+                        good?))))))))
