@@ -643,3 +643,9 @@ and preserves a live scalar across the call. This is initial interoperability
 coverage: one through four members, stack/bank boundaries, variadic placement,
 returning generated functions and linked AOT still need dedicated vector ABI
 fixtures. Existing scalar and aggregate fixtures remain regression checks.
+
+The short-vector plumbing checkpoint passes all 186 standalone tests and all 50
+existing linked AOT consumers with debug checks. Test-set equality is checked,
+objects are regenerated, and linked output contains no warnings. The new vector
+ABI fixture is a JIT caller test; this regression count does not imply the
+dedicated vector ABI cases listed above are complete.
