@@ -465,3 +465,36 @@ exact logical field bits. Protected-page checks cover all twelve register-result
 shapes, with both ends of source/destination extents abutting inaccessible pages
 and complete surrounding-byte comparisons. Vector results and compiler-specific
 classification/marshaling remain open.
+
+
+## Short-vector transport foundation
+
+`types/vector-type(base, count)` constructs the upstream byte encoding: scalar
+base in bits0..3 and log2(count)+1 in bits4..6, for power-of-two counts1..64.
+`vector?`, `valid?`, `base-type`, `lanes` and `size` validate/decode that geometry;
+`size` takes the target pointer width. Void has zero lanes. The existing
+`valid-scalar?`, scalar predicates and `scalar-size` retain their behavior.
+Representation validity does not imply that an operation or target accepts that
+shape. `short-vector?` identifies vector extents of eight or sixteen bytes.
+
+The native transfer layer now accepts sixteen-byte payloads in SIMD registers
+or stack slots. Full-width register moves use ORR Vd.16B,Vn.16B,Vn.16B, rather
+than scalar FMOV, and memory operations use Q-register loads/stores. Scaled
+immediates and materialized large/unaligned addresses share the checked frame
+access path. A sixteen-byte GPR or cross-bank transfer is rejected, including
+an identity transfer through a GPR. Invalid transfers preserve output bytes.
+
+A sixteen-byte memory-to-memory transfer needs a caller-owned SIMD data scratch,
+separate from a GPR address scratch. `parallel-frame!` uses reserved v31 for the
+cycle value, v30 for memory data and x16 for addresses. Scalar groups retain
+their existing scratch policy. Every simultaneous group has one raw width and
+distinct stack identities must describe nonoverlapping storage extents.
+
+Forty-eight native cases exercise register, stack and mixed cycles, fan-out,
+large/unaligned offsets and frame bias, comparing complete buffers and preserved
+flags. Protected-page checks put both ends of sixteen-byte source/destination
+extents against inaccessible regions. Instruction words match LLVM MC reference
+output. A separately linked Mach-O fixture verifies a four-way register/stack
+cycle through large, unaligned frame slots and preserved flags. This foundation
+does not yet enable vector graph operations, allocated
+vector values, or vector/HVA signatures; those still report unsupported types.

@@ -915,3 +915,51 @@ linked output has no warnings. Formatting and git diff checks pass. All 319
 implementation/test files remain Coil. The library implementation is unchanged
 from 71ec270; these additions expand execution coverage and preserve the remaining
 backend and benchmark gates. Logs and commits are indexed in the project pad.
+
+
+### Short-vector type and transport foundation
+
+Checkpoint da7b1f5 adds checked upstream vector geometry while preserving scalar
+identifiers and APIs. All thirteen value base types and seven lane counts are
+checked at both pointer widths, with explicit invalid encodings and construction
+inputs. Storage extents retain complete vector widths; target restrictions are
+separate from representation validity.
+
+Checkpoint 2bfd320 extends the physical transfer path to sixteen-byte SIMD
+values. Q loads/stores and full-width ORR moves preserve upper halves. Register,
+stack and mixed cycles use separate reserved v31 cycle and v30 memory scratches,
+with x16 for large addresses. GPR/cross-bank sixteen-byte values are rejected
+without output mutation. Existing scalar scratch behavior is unchanged.
+
+Focused native checks pass forty-eight cycle/fan-out/frame cases, including
+65536-byte and unaligned65539-byte offsets and 4096-byte frame bias. Whole-buffer
+comparisons check both halves and surrounding bytes; flags are retained. Four
+protected source/destination boundary pairs verify exact accesses. Seven encoded
+words match independent LLVM MC 23.1.4 output. Existing scalar transfers, anchored
+and large-offset cycles, floating calls and aggregate results/recursion pass.
+
+The next implementation gate is connecting actual vector values to graph
+construction/validation, memory/phi operations, width-aware allocation and ABI
+placement/results. Current graph/prototype interfaces continue to reject vector
+types explicitly. This checkpoint is transport support, not an end-to-end vector
+or compiler-backend claim. Optimization/scaling, remaining semantics, backend
+integration and equivalent LLVM/TPDE measurements remain open.
+
+
+Checkpoint ac1c094 writes one native Q-transfer wrapper as a Mach-O object and
+executes it after linking from a separate Coil consumer. The four-way cycle
+v0 -> unaligned slotA -> unaligned slotB -> v1 -> v0 uses offsets beyond the
+Q-register immediate range and a 4096-byte frame bias. Complete buffer and flags
+checks pass. The producer was rerun after adding object output; no library
+implementation changed during the full regression run.
+
+
+The vector transport checkpoint passes all 179 standalone checks and 46 linked
+AOT consumers locally with debug checks and regenerated objects. Exact test-set
+comparison verifies complete coverage without duplicates; linked output has no
+warnings. The final AOT-output addition to the vector producer was verified by a
+focused rerun during the complete standalone run, followed by all linked tests.
+No library implementation changed during that run. Formatting and git diff checks
+pass. All 321 implementation/test files remain Coil. Installed Coil d2a49bf21376
+and Homebrew LLVM MC 23.1.4 were used on this arm64 Mac. Full vector graph/ABI,
+backend and benchmark requirements remain open as described above.
