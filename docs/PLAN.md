@@ -1126,3 +1126,22 @@ and runtime measurements remain open.
 Vector-local regression: all 191 standalone and 54 linked consumers pass with
 debug checks, exact coverage, regenerated objects and no linked warnings. All
 344 implementation/test files remain Coil. Formatting/diff checks pass.
+
+
+### Vector binary arithmetic checkpoint
+
+Integer vector ADD/SUB and logical AND/OR/XOR, plus floating ADD/SUB/MUL/DIV,
+now have checked construction/verification, SIMD allocation requirements and native
+AArch64 D/Q emission. Single 64-bit lanes use legal scalar SIMD/FP forms. Complete
+constants use shared images. Validation covers 224 independent LLVM MC instruction
+words, 610 matrix graphs and eight result/original-operand call-pressure graphs;
+73 objects repeat representative paths through linked AOT.
+
+Remaining vector operations include integer multiplication/division, shifts,
+extrema/comparisons, unary/lane/shuffle/conversion families. Remaining ABI cases,
+full optimization/verification/scaling, target/object features, actual Coil backend
+and equivalent LLVM/TPDE runtime and compile-time measurements remain open.
+
+Vector-binary regression: all 193 standalone checks and 55 linked consumers pass
+with debug checks, exact coverage, regenerated objects and no linked warnings.
+All 349 implementation/test files remain Coil; formatting/diff checks pass.

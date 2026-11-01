@@ -558,7 +558,8 @@ AArch64 supports memory/Phi transport for eight- and sixteen-byte vector extents
 They use SIMD register classes, correctly sized/aligned spills and mixed-width
 split/edge copies. Larger vector shapes remain representable but target emission
 rejects their unsupported value extent. Vector local storage supports the paths
-described below; vector arithmetic remains unfinished. Short-vector signatures have native coverage
+described below. Selected vector arithmetic is implemented as described below;
+remaining operations are unfinished. Short-vector signatures have native coverage
 as described below. Vector constants use the path below.
 Scalar arguments/results may surround internal vector computations and calls.
 
@@ -747,3 +748,60 @@ and no linked warnings. The 344 implementation/test source files remain Coil.
 Formatting and diff checks pass. Vector arithmetic, remaining semantics and ABI
 cases, full optimization/scaling, compiler integration and LLVM/TPDE runtime and
 compile-time comparisons remain unfinished.
+
+
+## Vector binary arithmetic
+
+`builder/vector-binary!(graph, opcode, type, left, right, guard)` validates before
+appending. Both inputs must have the exact vector result type and denote values,
+rather than VAR storage. Current families are integer ADD/SUB and AND/OR/XOR,
+and floating ADD/SUB/MUL/DIV. Integer ADD/SUB wrap independently at each lane's
+width; BOOL lanes support only the logical families. Address lanes use the target
+pointer width. Logical operations preserve every raw payload bit. FP operations
+use ordinary IEEE instructions without fast-math, contraction or scalar coercion.
+Only DIV accepts a nonzero guard, which must be an existing block start or guard.
+The explicit DIV guard operand is retained in the ordinary three-operand IR form.
+
+Semantic verification covers these operations separately from scalar integer and
+floating validators. The target uses SIMD register constraints for both operands
+and the result. Native AArch64 supports eight-/sixteen-byte vectors, using the
+correct Q bit and lane-size fields. A single 64-bit integer lane uses scalar SIMD
+ADD/SUB; a single f64 lane uses scalar FP instructions. Wider arrangements use
+AdvSIMD forms. Other valid vector widths remain representable but reject during
+target allocation/emission. Integer MUL/DIV, shifts, extrema, comparisons, unary
+operations, lane extraction/replacement, shuffles and vector conversions remain
+unfinished. Unsupported vector uses still reject, including dead invalid uses.
+
+Operand constants load complete aligned private image payloads into reserved
+v30/v31, independently of the allocated input/result registers. Emission appends
+temporary code and pending image references atomically only after validation and
+encoding succeed. Existing per-parent spill shapes and sized edge/Phi copies
+preserve complete arithmetic results and original operand values.
+
+`tests/vector-arithmetic.coil` checks construction/validation failures without
+partial graph mutation and 224 instruction words obtained independently with
+LLVM MC, including D/Q arrangements, register boundaries and source/result
+alias cases. `tests/jit-vector-arithmetic.coil` runs 610 matrix graphs:
+all supported native type/opcode combinations, register/register, constant-left,
+constant-right, both-constant and identical-input forms. Eleven input patterns
+include lane overflow, distinct high halves, signed zeros, subnormals, finite
+extrema, infinities and quiet/signaling NaNs. Integer lanes use an independent
+u128 masked arithmetic oracle; FP lanes use scalar operations. NaN results are
+compared by IEEE classification rather than assuming one payload-selection rule.
+Original operand bytes, input immutability and untouched output bytes are checked.
+
+Eight more graphs force forty arithmetic results and forty original vector
+operands live across a callback that overwrites every allocatable caller-saved
+bank. Volatile local stores keep the computations before the call. Output checks
+cover every result lane and original byte, private constant data, separate local
+and spill storage, fixed guards and live dynamic allocations in 16/4096-byte
+frames. `tests/aot-vector-arithmetic-link.coil` repeats representative matrix and
+all pressure cases through 73 separately linked objects. Both paths pass with
+debug checks.
+
+The vector-binary checkpoint passes all 193 standalone tests and all 55 linked
+consumers with debug checks, exact source/pass-set equality, regenerated objects
+and no linked warnings. All 349 implementation/test source files remain Coil.
+Formatting and diff checks pass. Remaining vector/scalar semantics, full
+optimization/verification/scaling, additional targets and object features, actual
+Coil backend integration and LLVM/TPDE compile/runtime benchmarks remain open.
