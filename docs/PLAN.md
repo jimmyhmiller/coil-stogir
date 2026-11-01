@@ -1425,3 +1425,12 @@ do not yet close forced register-alias, spill/call-pressure or typed return cove
 for this family. The full regression checkpoint follows separately. Remaining
 vector numeric/integer conversions, shuffle, broader library requirements, actual
 Coil backend integration and runtime/compile-time LLVM/TPDE benchmarks remain open.
+
+
+The unchanged-source bitcast regression passes all 209 standalone checks and 64
+linked AOT consumers with debug checks and newly regenerated producer objects.
+Expected source/consumer pass sets match exactly, with no duplicate passes or
+linked warnings. The existing fixed aa64e44440df compiler/stdlib/SDK/unit snapshot
+and all project input hashes remain unchanged across both passes. All 383
+implementation/test files are Coil; formatting and diff checks pass. Evidence is
+recorded in the project pad. Only documentation changes follow these passes.

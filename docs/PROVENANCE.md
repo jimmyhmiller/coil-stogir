@@ -47,6 +47,7 @@ line-for-line translation of each upstream pass or equivalent behavior.
 | Bulk memory construction | Independent Coil expansion into the upstream-shaped LOAD/STORE, loop, branch and PHI nodes. Exact-width chunks, small-move snapshots and bounded forward/backward loops are implemented here; no upstream or TPDE bulk-copy implementation is imported. |
 | Module image composition | Independent Coil implementation over the shared image model: public definition binding, private namespace isolation, stable per-input ID maps, section/relocation/text-data rebasing, per-section alignment propagation and immutable input validation. |
 | JIT images, relocation planning, Mach-O writer | Coil implementations of a shared text/data image with symbol binding, ABS64/branch/page relocations, and Mach-O serialization; format references are Apple SDK headers and LLVM MC object output, with no SDK or LLVM source vendored. Data-in-code spans preserve relative jump-table metadata, with MH_OBJECT VM-offset entries and u16 length splitting. Aligned section VM layout was checked against LLVM MC output; checked reservation/protection layout and original-mapping release tracking are Coil implementations. Named FUNC/SYM/STR graph lowering uses shared image relocations; additional formats/features remain unfinished |
+| Vector bitcasts | Shared BITCAST opcode and type geometry reference pinned IR. Independent Coil validation compares complete storage extents for explicit pointer widths; literal folding copies little-endian bytes and native D/Q casts reuse typed register transfers. Named addresses retain relocations. Coil byte oracles check JIT and linked objects. No external-language implementation is shipped. |
 
 The current graph uses separate contiguous arrays for instructions and constants.
 The current allocator, fold rules, target coverage, verifier, and optimization
@@ -71,5 +72,3 @@ vendor/import step must carry these files into Coil along with the source.
 Keep this map current as more upstream modules are ported or
 other source is reused. Attribute algorithm and design references separately from
 copied or translated source so their roles remain clear.
-
-| Vector bitcasts | Shared BITCAST opcode and type geometry reference pinned IR. Independent Coil validation compares complete storage extents for explicit pointer widths; literal folding copies little-endian bytes and native D/Q casts reuse typed register transfers. Named addresses retain relocations. Coil byte oracles check JIT and linked objects. No external-language implementation is shipped. |
