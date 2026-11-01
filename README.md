@@ -53,7 +53,8 @@ frames in JIT and linked AOT. Vector constants follow the upstream LONG_CONST
 layout and use aligned private image data. Short-vector/HVA call plumbing now
 preserves complete SIMD argument/result pieces. Native JIT and linked AOT checks
 cover one through four members, bank exhaustion, stack/literal arguments and
-Darwin variadic packing against LLVM C calls. Vector ADD/SUB, integer AND/OR/XOR and floating ADD/SUB/MUL/DIV now have
+Darwin variadic packing against LLVM C calls. Vector integer ADD/SUB/MUL/DIV/MOD and AND/OR/XOR, plus floating
+ADD/SUB/MUL/DIV, now have
 native and linked coverage. Remaining vector operations and broader ABI coverage
 are unfinished.
 

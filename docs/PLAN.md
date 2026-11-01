@@ -1145,3 +1145,22 @@ and equivalent LLVM/TPDE runtime and compile-time measurements remain open.
 Vector-binary regression: all 193 standalone checks and 55 linked consumers pass
 with debug checks, exact coverage, regenerated objects and no linked warnings.
 All 349 implementation/test files remain Coil; formatting/diff checks pass.
+
+
+### Integer vector multiply/divide/remainder checkpoint
+
+Integer MUL/DIV/MOD now extend the existing typed vector binary interface. Native
+byte/halfword/word MUL uses AdvSIMD; 64-bit MUL and integer DIV/MOD expand per lane
+using only reserved x16/x17. MOD re-extracts the original dividend and never
+requires x30 or a hidden helper. Guard metadata and source/destination aliasing
+are preserved. Staged emission remains transactional.
+
+Independent checks cover 254 single-instruction and 1,905 expanded/lane words,
+1,030 matrix graphs plus 44 call-pressure graphs, and 241 linked objects. Wider
+integer oracles check signed extrema, overflow and zero divisors without host
+undefined behavior. Remaining vector shifts/extrema/comparisons, unary/lane/
+shuffle/conversion families, wider standalone semantics/optimization/scaling,
+actual compiler integration and LLVM/TPDE runtime/compile-time measurements remain
+open. Full regression passes all 193 standalone and 55 linked consumers, with
+debug checks, exact coverage, regenerated objects and no linked warnings. All
+349 implementation/test sources remain Coil; formatting/diff checks pass.

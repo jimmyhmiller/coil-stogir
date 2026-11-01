@@ -754,13 +754,13 @@ compile-time comparisons remain unfinished.
 
 `builder/vector-binary!(graph, opcode, type, left, right, guard)` validates before
 appending. Both inputs must have the exact vector result type and denote values,
-rather than VAR storage. Current families are integer ADD/SUB and AND/OR/XOR,
-and floating ADD/SUB/MUL/DIV. Integer ADD/SUB wrap independently at each lane's
+rather than VAR storage. Current families are integer ADD/SUB/MUL/DIV/MOD and AND/OR/XOR,
+and floating ADD/SUB/MUL/DIV. Integer ADD/SUB/MUL wrap independently at each lane's
 width; BOOL lanes support only the logical families. Address lanes use the target
 pointer width. Logical operations preserve every raw payload bit. FP operations
 use ordinary IEEE instructions without fast-math, contraction or scalar coercion.
-Only DIV accepts a nonzero guard, which must be an existing block start or guard.
-The explicit DIV guard operand is retained in the ordinary three-operand IR form.
+Only DIV/MOD accept a nonzero guard, which must be an existing block start or guard.
+Their explicit guard operand is retained in the ordinary three-operand IR form.
 
 Semantic verification covers these operations separately from scalar integer and
 floating validators. The target uses SIMD register constraints for both operands
@@ -768,7 +768,7 @@ and the result. Native AArch64 supports eight-/sixteen-byte vectors, using the
 correct Q bit and lane-size fields. A single 64-bit integer lane uses scalar SIMD
 ADD/SUB; a single f64 lane uses scalar FP instructions. Wider arrangements use
 AdvSIMD forms. Other valid vector widths remain representable but reject during
-target allocation/emission. Integer MUL/DIV, shifts, extrema, comparisons, unary
+target allocation/emission. Shifts, extrema, comparisons, unary
 operations, lane extraction/replacement, shuffles and vector conversions remain
 unfinished. Unsupported vector uses still reject, including dead invalid uses.
 
@@ -779,24 +779,27 @@ encoding succeed. Existing per-parent spill shapes and sized edge/Phi copies
 preserve complete arithmetic results and original operand values.
 
 `tests/vector-arithmetic.coil` checks construction/validation failures without
-partial graph mutation and 224 instruction words obtained independently with
+partial graph mutation and 254 single-instruction words obtained independently with
 LLVM MC, including D/Q arrangements, register boundaries and source/result
-alias cases. `tests/jit-vector-arithmetic.coil` runs 610 matrix graphs:
+alias cases, plus 1,905 expanded-sequence/lane words.
+`tests/jit-vector-arithmetic.coil` runs 1,030 matrix graphs:
 all supported native type/opcode combinations, register/register, constant-left,
-constant-right, both-constant and identical-input forms. Eleven input patterns
+constant-right, both-constant and identical-input forms. Integer MUL/DIV/MOD add
+minimum-signed/all-one and zero-divisor literal cases. Eleven input patterns
 include lane overflow, distinct high halves, signed zeros, subnormals, finite
 extrema, infinities and quiet/signaling NaNs. Integer lanes use an independent
-u128 masked arithmetic oracle; FP lanes use scalar operations. NaN results are
+u128 masked arithmetic oracle with i128 signed quotient/remainder calculations;
+FP lanes use scalar operations. NaN results are
 compared by IEEE classification rather than assuming one payload-selection rule.
 Original operand bytes, input immutability and untouched output bytes are checked.
 
-Eight more graphs force forty arithmetic results and forty original vector
+Forty-four more graphs force forty arithmetic results and forty original vector
 operands live across a callback that overwrites every allocatable caller-saved
 bank. Volatile local stores keep the computations before the call. Output checks
 cover every result lane and original byte, private constant data, separate local
 and spill storage, fixed guards and live dynamic allocations in 16/4096-byte
 frames. `tests/aot-vector-arithmetic-link.coil` repeats representative matrix and
-all pressure cases through 73 separately linked objects. Both paths pass with
+all pressure cases through 241 separately linked objects. Both paths pass with
 debug checks.
 
 The vector-binary checkpoint passes all 193 standalone tests and all 55 linked
@@ -805,3 +808,37 @@ and no linked warnings. All 349 implementation/test source files remain Coil.
 Formatting and diff checks pass. Remaining vector/scalar semantics, full
 optimization/verification/scaling, additional targets and object features, actual
 Coil backend integration and LLVM/TPDE compile/runtime benchmarks remain open.
+
+
+Integer byte/halfword/word MUL uses one AdvSIMD instruction. The target expands
+64-bit MUL and all integer DIV/MOD into per-lane native operations. Signed narrow
+lanes use SMOV to W registers; word lanes retain their W bit patterns, and 64-bit
+lanes use X registers. DIV truncates signed quotients toward zero. MOD is computed
+as dividend minus quotient times divisor, with the dividend's sign. Only reserved
+x16/x17 are used: MOD re-extracts the original dividend after quotient
+multiplication. It does not consume x30 or require a hidden runtime helper.
+Each lane is inserted only after its needed sources have been read, preserving
+all source/destination alias combinations and upper lanes awaiting computation.
+
+For unguarded exceptional divisions, these native AArch64 paths retain the scalar
+target policy: a zero divisor produces quotient zero and remainder equal to the
+dividend; minimum signed divided by minus one wraps at the lane width, with zero
+remainder. These are checked target behaviors, not a portable LLVM promise for
+IR operations outside their defined arithmetic domain. Semantic guards are kept
+as explicit graph dependencies; callers must supply their language's required
+checks. Integer boundary oracles use wider arithmetic, avoiding host signed
+integer overflow or zero-division behavior. Both ordinary and 4096-byte pressure
+frames are exercised for signed/unsigned expanded results and original operands.
+
+`integer-sequence!` stages all instruction bytes before appending. Unsupported
+shapes/registers leave the destination untouched. Independent LLVM MC checks
+cover lane extraction/insertion across every legal index and narrow signedness,
+as well as complete expanded sequences with distinct registers, each result/source
+alias, identical inputs and all three registers identical.
+
+The integer-vector extension passes the complete 193-test standalone suite and
+all 55 linked consumers with debug checks, exact source/pass-set equality,
+regenerated objects and no linked warnings. All 349 implementation/test files
+remain Coil. Formatting and diff checks pass. This completes the supported D/Q
+MUL/DIV/MOD paths, while remaining vector/scalar semantics, optimization/scaling,
+compiler integration and equivalent LLVM/TPDE performance measurements remain open.
