@@ -1164,3 +1164,23 @@ actual compiler integration and LLVM/TPDE runtime/compile-time measurements rema
 open. Full regression passes all 193 standalone and 55 linked consumers, with
 debug checks, exact coverage, regenerated objects and no linked warnings. All
 349 implementation/test sources remain Coil; formatting/diff checks pass.
+
+
+### Vector unary checkpoint
+
+NEG/ABS/NOT, BSWAP and lane CTLZ/CTTZ/CTPOP now use checked unary construction,
+one SIMD input constraint and complete D/Q native emission. FP sign operations
+preserve exact payload bits. Counts preserve element boundaries and widths;
+64-bit zero counts use reserved x16 lane transfers. Shared lane primitives retain
+existing binary APIs and avoid duplicated encoders.
+
+Checks cover 528 register cases/940 independent LLVM MC words, 396 matrix graphs,
+24 result/original-operand call-pressure graphs and 168 linked objects. The pinned
+upstream AArch64 emitter's vector ABS NIY is recorded as a source capability gap.
+Remaining vector shifts/extrema/comparisons, lane/shuffle/conversion families,
+further standalone semantics/ABI/optimization/scaling, targets/object features,
+actual Coil backend and equivalent LLVM/TPDE compile/runtime comparisons remain
+open. Full regression passes all 195 standalone and 56 linked consumers with
+debug checks, exact coverage, regenerated objects and no linked warnings. The
+final strengthened unary literal corpus also passes focused JIT/AOT reruns. All
+354 implementation/test sources remain Coil; formatting/diff checks pass.

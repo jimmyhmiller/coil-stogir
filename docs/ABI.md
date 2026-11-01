@@ -768,8 +768,8 @@ and the result. Native AArch64 supports eight-/sixteen-byte vectors, using the
 correct Q bit and lane-size fields. A single 64-bit integer lane uses scalar SIMD
 ADD/SUB; a single f64 lane uses scalar FP instructions. Wider arrangements use
 AdvSIMD forms. Other valid vector widths remain representable but reject during
-target allocation/emission. Shifts, extrema, comparisons, unary
-operations, lane extraction/replacement, shuffles and vector conversions remain
+target allocation/emission. Unary operations are described below. Shifts, extrema,
+comparisons, lane extraction/replacement, shuffles and vector conversions remain
 unfinished. Unsupported vector uses still reject, including dead invalid uses.
 
 Operand constants load complete aligned private image payloads into reserved
@@ -842,3 +842,66 @@ regenerated objects and no linked warnings. All 349 implementation/test files
 remain Coil. Formatting and diff checks pass. This completes the supported D/Q
 MUL/DIV/MOD paths, while remaining vector/scalar semantics, optimization/scaling,
 compiler integration and equivalent LLVM/TPDE performance measurements remain open.
+
+
+## Vector unary operations
+
+`builder/vector-unary!(graph, opcode, type, input)` checks one matching vector
+value before appending. It supports NEG (31), ABS (32), NOT (45), BSWAP (54),
+CTLZ (55), CTTZ (56) and CTPOP (57). Integer element restrictions match the scalar
+families: NEG excludes BOOL/ADDR, ABS requires a signed element, NOT accepts raw
+integer payloads, and byte swap requires a multi-byte integer element. Counts
+exclude BOOL. Floating elements support NEG/ABS only. The binary builder rejects
+unary opcodes explicitly. VAR storage is not an operand value.
+
+Integer NEG and ABS use wrapping lane-width arithmetic, including the minimum
+signed bit pattern. Vector NOT inverts every stored integer bit, including BOOL
+mask bytes. Floating NEG/ABS change only the sign bit: signed zero and signaling/
+quiet NaN payloads are preserved exactly. BSWAP reverses bytes independently in
+each element. Counts return the bit count in each original element width; signed
+counts inspect the raw bit pattern. Native zero-input CTLZ/CTTZ return the element
+bit width, matching scalar AArch64 behavior; this target result is not a portable
+promise for source operations whose zero input is undefined.
+
+AArch64 D/Q NEG/ABS/NOT/BSWAP and byte/halfword/word CLZ use direct instructions;
+a single 64-bit lane uses scalar SIMD/FP where required. CTPOP applies CNT to the
+bytes and widens with UADDLP until each result has the original lane width, without
+mixing adjacent elements. CTTZ reverses bits within bytes, reverses byte order
+within each wider element, then counts leading zeros. For 64-bit CLZ/CTTZ, the
+emitter extracts each lane through reserved x16, applies native GPR operations,
+and inserts it after all required reads. Neither allocated GPRs nor x30 are used.
+All source/result aliases are supported, and output staging is transactional.
+
+The existing binary capture path now dispatches typed unary operations and gives
+them exactly one SIMD use constraint. Shared `a64.simd-lanes` primitives retain the
+binary module's previous public wrappers, so integer MUL/DIV/MOD encoding checks
+and the full binary matrix continue to pass. Unsupported vector widths still
+produce explicit target diagnostics.
+
+`tests/vector-unary.coil` checks generic representation contracts, rejected
+construction without partial mutation, and 528 register cases containing 940
+instruction words independently obtained from LLVM MC. Native coverage in
+`tests/jit-vector-unary.coil` comprises 396 matrix graphs and 24 pressure graphs.
+The matrix covers every supported D/Q type/opcode combination with loaded,
+complete-literal and dying-source forms, using eleven bit patterns and exact
+integer/FP payload oracles. Output padding, source preservation and input
+immutability are checked. Pressure keeps forty results plus forty original
+operands live across a callback that clobbers every allocatable caller-saved bank,
+with volatile locals, fixed guards and dynamic storage in 16/4096-byte frames.
+`tests/aot-vector-unary-link.coil` repeats all type/opcode pairs, representative
+literal paths and every pressure case through 168 separate Mach-O objects.
+
+The pinned upstream AArch64 `ir_emit_vector_op` explicitly asserts NIY for vector
+ABS. Coil's native ABS/count families use independently checked instruction
+selection and extend that reference's implemented unary target coverage. The gap
+is recorded in the project pad; no upstream or Coil compiler source is changed.
+
+The unary checkpoint passes all 195 standalone tests and 56 linked consumers
+with debug checks, exact source/pass-set equality, regenerated objects and no
+linked warnings. A final literal-corpus improvement is separately rerun through
+the unary producer and linked consumer: D-width literals include signaling NaNs,
+and Q-width literals include quiet/signaling NaNs and signed zeros. Exact payload
+checks pass. All 354 implementation/test sources remain Coil; formatting/diff
+checks pass. Remaining vector families, standalone semantics/optimization/scaling,
+actual compiler integration and LLVM/TPDE runtime/compile-time benchmarks remain
+unfinished.
