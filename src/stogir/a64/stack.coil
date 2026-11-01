@@ -23,12 +23,13 @@
 
 ;;; Count normalization and rounding are identical for ALLOCA and AFREE. Invalid
 ;;; runtime counts trap before SP changes, including negative signed operands.
-(defn dynamic! [(output (mut code/Buffer))
-                (graph g/Graph)
-                (parts (ArrayList allocation/Part))
-                (size i32)
-                (position i64)
-                (subtract? bool)] (-> (Result i32 (slice u8)))
+(defn dynamic-aligned! [(output (mut code/Buffer))
+                        (graph g/Graph)
+                        (parts (ArrayList allocation/Part))
+                        (size i32)
+                        (position i64)
+                        (subtract? bool)
+                        (alignment i64)] (-> (Result i32 (slice u8)))
   (match (g/lookup graph size)
     (None [] (Err "dynamic stack count missing"))
     (Some [input]
@@ -53,7 +54,10 @@
                                              16
                                              reg))))
             (when (and (= error "") (or (= width 8) (types/signed? ty)))
-              (constant! (mut output) (mut error) 0x7FFFFFFFFFFFFFF0)
+              (constant! (mut output)
+                         (mut error)
+                         (cast u64
+                               (- (: 0x7FFFFFFFFFFFFFFF i64) (- alignment 1))))
               (emit/word! (mut (.text output))
                           (mut error)
                           (encode/add-sub true true true 31 16 17))
@@ -65,13 +69,27 @@
                           (mut error)
                           (Ok (: 0xD4200000 u32))))
             (when (= error "")
-              (emit/word! (mut (.text output))
-                          (mut error)
-                          (encode/add-sub-immediate true false false 16 16 15))
-              (constant! (mut output) (mut error) 0xFFFFFFFFFFFFFFF0)
-              (emit/word! (mut (.text output))
-                          (mut error)
-                          (encode/logical-register true 0 16 16 17))
+              (match (encode/add-sub-immediate true
+                                               false
+                                               false
+                                               16
+                                               16
+                                               (- alignment 1))
+                (Ok [word]
+                    (emit/word! (mut (.text output)) (mut error) (Ok word)))
+                (Err [_]
+                     (constant! (mut output)
+                                (mut error)
+                                (cast u64 (- alignment 1)))
+                     (emit/word! (mut (.text output))
+                                 (mut error)
+                                 (encode/add-sub true false false 16 16 17))))
+              (match (frame/alignment-shift alignment)
+                (Err [message] (set! error message))
+                (Ok [bits]
+                    (emit/word! (mut (.text output))
+                                (mut error)
+                                (encode/clear-low-bits 16 16 bits))))
               (emit/word! (mut (.text output))
                           (mut error)
                           (encode/add-sub-extended subtract? 31 31 16)))
@@ -81,13 +99,14 @@
 
 ;;; The function reserves an outgoing prefix below every active dynamic object.
 ;;; Allocate d bytes: newSP=oldSP-d, result=newSP+outgoing. Fixed slots use x29.
-(defn emit! [(output (mut code/Buffer))
-             (graph g/Graph)
-             (parts (ArrayList allocation/Part))
-             (reference i32)
-             (position i64)
-             (base frame/Base)
-             (outgoing i64)] (-> (Result i32 (slice u8)))
+(defn emit-aligned! [(output (mut code/Buffer))
+                     (graph g/Graph)
+                     (parts (ArrayList allocation/Part))
+                     (reference i32)
+                     (position i64)
+                     (base frame/Base)
+                     (outgoing i64)
+                     (alignment i64)] (-> (Result i32 (slice u8)))
   (match (stack/validate graph reference)
     (Err [message] (Err message))
     (Ok [_]
@@ -97,15 +116,19 @@
               (mut error) ""]
           (if (or (not (frame/valid-base? base))
                   (!= (.reg base) 29)
+                  (< alignment 16)
+                  (!= (& alignment (- alignment 1)) 0)
                   (< outgoing 0)
-                  (!= (% outgoing 16) 0)
+                  (!= (% outgoing alignment) 0)
                   (> outgoing (.bias base))
                   (not (or (= (n/opcode node) 81) (= (n/opcode node) 82)))
-                  (and allocating? (> (.op3 node) 16)))
+                  (and allocating? (> (cast i64 (.op3 node)) alignment)))
               (set! error
                     "dynamic stack requires anchored frame and supported alignment")
               (if (< (.op2 node) 0)
-                  (match (stack/constant-size graph (.op2 node))
+                  (match (stack/constant-size-aligned graph
+                                                      (.op2 node)
+                                                      alignment)
                     (Err [message] (set! error message))
                     (Ok [size]
                         (match (frame/adjust! (mut (.text temporary))
@@ -114,12 +137,13 @@
                                               16)
                           (Err [message] (set! error message))
                           (Ok [_] 0))))
-                  (match (dynamic! (mut temporary)
-                                   graph
-                                   parts
-                                   (.op2 node)
-                                   position
-                                   allocating?)
+                  (match (dynamic-aligned! (mut temporary)
+                                           graph
+                                           parts
+                                           (.op2 node)
+                                           position
+                                           allocating?
+                                           alignment)
                     (Err [message] (set! error message))
                     (Ok [_] 0))))
           (when (and (= error "") allocating?)
@@ -141,3 +165,20 @@
               (set! error "invalid dynamic stack code references"))
             (code/release! (mut temporary))
             (if (= error "") (Ok count) (Err error)))))))
+
+(defn emit! [(output (mut code/Buffer))
+             (graph g/Graph)
+             (parts (ArrayList allocation/Part))
+             (reference i32)
+             (position i64)
+             (base frame/Base)
+             (outgoing i64)] (-> (Result i32 (slice u8)))
+  (emit-aligned! (mut output) graph parts reference position base outgoing 16))
+
+(defn dynamic! [(output (mut code/Buffer))
+                (graph g/Graph)
+                (parts (ArrayList allocation/Part))
+                (size i32)
+                (position i64)
+                (subtract? bool)] (-> (Result i32 (slice u8)))
+  (dynamic-aligned! (mut output) graph parts size position subtract? 16))

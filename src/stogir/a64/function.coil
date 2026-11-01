@@ -83,7 +83,7 @@
         (set! j (+ j 1))))
     (for reference (.nodes scheduled)
       (set! (mut selected) (cast i64 reference) true))
-    (match (frame/aligned-size (.frame assigned) 16)
+    (match (frame/aligned-size (.frame assigned) (.alignment assigned))
       (Err [msg] (set! error msg))
       (Ok [size] (set! frame-size size)))
     (for move moves
@@ -91,37 +91,9 @@
                  (not (and (= (.kind (.source move)) 0)
                            (= (.kind (.destination move)) 1))))
         (set! error "odd split boundary needs instruction-specific lowering")))
-    (when (and (= error "") (> frame-size 0))
-      (match (frame-address/adjust! (mut (.text output)) true frame-size 16)
-        (Err [msg] (set! error msg))
-        (Ok [_] 0)))
-    ; Non-leaf functions link a frame record containing previous x29 and x30.
-    (when (and (= error "") (>= (.link-slot assigned) 0))
-      (match (frame-memory/access! (mut (.text output))
-                                   false
-                                   8
-                                   29
-                                   31
-                                   (- (.link-slot assigned) 8)
-                                   false
-                                   16)
-        (Err [msg] (set! error msg))
-        (Ok [_] 0))
-      (match (frame-memory/access! (mut (.text output))
-                                   false
-                                   8
-                                   30
-                                   31
-                                   (.link-slot assigned)
-                                   false
-                                   16)
-        (Err [msg] (set! error msg))
-        (Ok [_] 0))
-      (match (frame-address/address! (mut (.text output))
-                                     29
-                                     31
-                                     (- (.link-slot assigned) 8))
-        (Err [msg] (set! error msg))
+    (when (= error "")
+      (match (prologue! (mut output) assigned frame-size)
+        (Err [message] (set! error message))
         (Ok [_] 0)))
     (while (and (= error "") (< i (len (.nodes scheduled))))
       (let [reference (get (.nodes scheduled) i)
@@ -151,14 +123,15 @@
                 (Ok [_] 0)))
             (set! phase (+ phase 1))))
         (when (and (= error "") (= opcode 71))
-          (match (incoming/emit-at! (mut (.text output))
-                                    graph
-                                    (.parts assigned)
-                                    (.parameter (at requirements
-                                                    (cast i64 reference)))
-                                    position
-                                    frame-size
-                                    (.base assigned))
+          (match (incoming/emit-entry! (mut (.text output))
+                                       graph
+                                       (.parts assigned)
+                                       (.parameter (at requirements
+                                                       (cast i64 reference)))
+                                       position
+                                       frame-size
+                                       (.base assigned)
+                                       (.entry-slot assigned))
             (Err [msg] (set! error msg))
             (Ok [_] 0)))
         (when (= error "")
@@ -190,41 +163,8 @@
                                            0)
                       (Err [msg] (set! error msg))
                       (Ok [_] 0))
-                    (match (frame-address/restore! (mut (.text output))
-                                                   (.base assigned))
-                      (Err [msg] (set! error msg))
-                      (Ok [_] 0))
-                    (when (>= (.link-slot assigned) 0)
-                      (match (frame-memory/access! (mut (.text output))
-                                                   true
-                                                   8
-                                                   29
-                                                   31
-                                                   (- (.link-slot assigned)
-                                                      8)
-                                                   false
-                                                   16)
-                        (Err [msg] (set! error msg))
-                        (Ok [_] 0))
-                      (match (frame-memory/access! (mut (.text output))
-                                                   true
-                                                   8
-                                                   30
-                                                   31
-                                                   (.link-slot assigned)
-                                                   false
-                                                   16)
-                        (Err [msg] (set! error msg))
-                        (Ok [_] 0)))
-                    (when (> frame-size 0)
-                      (match (frame-address/adjust! (mut (.text output))
-                                                    false
-                                                    frame-size
-                                                    16)
-                        (Err [msg] (set! error msg))
-                        (Ok [_] 0)))
-                    (match (word! (mut output) (encode/ret 30))
-                      (Err [msg] (set! error msg))
+                    (match (epilogue! (mut output) assigned frame-size)
+                      (Err [message] (set! error message))
                       (Ok [_] 0)))
                   (if (or (= opcode 114) (= opcode 115))
                       (match (unconditional! (mut output)
@@ -264,13 +204,14 @@
                                 (Err [msg] (set! error msg))
                                 (Ok [_] 0))
                               (if (or (= opcode 81) (= opcode 82))
-                                  (match (stackemit/emit! (mut output)
-                                                          graph
-                                                          (.parts assigned)
-                                                          reference
-                                                          position
-                                                          (.base assigned)
-                                                          (.outgoing-size assigned))
+                                  (match (stackemit/emit-aligned! (mut output)
+                                                                  graph
+                                                                  (.parts assigned)
+                                                                  reference
+                                                                  position
+                                                                  (.base assigned)
+                                                                  (.outgoing-size assigned)
+                                                                  (.alignment assigned))
                                     (Err [msg] (set! error msg))
                                     (Ok [_] 0))
                                   (if (= opcode 40)
@@ -304,13 +245,14 @@
                                             (Ok [_] 0))
                                           (if (locals/operation? (cast i32
                                                                        opcode))
-                                              (match (local/emit-at! (mut output)
-                                                                     graph
-                                                                     (.parts assigned)
-                                                                     (.frame assigned)
-                                                                     reference
-                                                                     position
-                                                                     (.base assigned))
+                                              (match (local/emit-aligned! (mut output)
+                                                                          graph
+                                                                          (.parts assigned)
+                                                                          (.frame assigned)
+                                                                          reference
+                                                                          position
+                                                                          (.base assigned)
+                                                                          (.alignment assigned))
                                                 (Err [msg] (set! error msg))
                                                 (Ok [_] 0))
                                               (if (and (>= opcode 91)
@@ -646,3 +588,114 @@
                                                  (cast i32 (.value destination))
                                                  29
                                                  0)))))))
+
+(defn accept! [(error (mut (slice u8))) (result (Result i32 (slice u8)))]
+  (-> void)
+  (match result
+    (Err [message] (when (= error "") (set! error message)))
+    (Ok [_] 0)))
+
+;;; Over-aligned frames keep original entry SP in x16 until its owned slot is
+;;; installed. Every intervening address calculation uses x17 or x29 itself.
+(defn prologue! [(output (mut code/Buffer))
+                 (assigned allocate/Assigned)
+                 (size i64)]
+  (-> (Result i32 (slice u8)))
+  (let [saved? (>= (.entry-slot assigned) 0)
+        begin (len (.text output))
+        (mut error) ""]
+    (when saved?
+      (accept! (mut error)
+               (word! (mut output)
+                      (encode/add-sub-immediate true false false 16 31 0))))
+    (accept! (mut error)
+             (frame-address/adjust! (mut (.text output))
+                                    true
+                                    size
+                                    (if saved? 17 16)))
+    (accept! (mut error)
+             (frame-address/align-stack! (mut (.text output))
+                                         (.alignment assigned)))
+    (when (>= (.link-slot assigned) 0)
+      (accept! (mut error)
+               (frame-memory/access! (mut (.text output))
+                                     false
+                                     8
+                                     29
+                                     31
+                                     (- (.link-slot assigned) 8)
+                                     false
+                                     (if saved? 17 16)))
+      (accept! (mut error)
+               (frame-memory/access! (mut (.text output))
+                                     false
+                                     8
+                                     30
+                                     31
+                                     (.link-slot assigned)
+                                     false
+                                     (if saved? 17 16)))
+      (accept! (mut error)
+               (frame-address/address! (mut (.text output))
+                                       29
+                                       31
+                                       (- (.link-slot assigned) 8))))
+    (when saved?
+      (accept! (mut error)
+               (frame-memory/access! (mut (.text output))
+                                     false
+                                     8
+                                     16
+                                     31
+                                     (.entry-slot assigned)
+                                     false
+                                     17)))
+    (if (= error "") (Ok (cast i32 (- (len (.text output)) begin))) (Err error))))
+
+;;; Reconstruct fixed SP first. Saved entry SP stays in x17 while x16 addresses
+;;; the previous FP/LR, then replaces SP exactly, including realignment padding.
+(defn epilogue! [(output (mut code/Buffer))
+                 (assigned allocate/Assigned)
+                 (size i64)]
+  (-> (Result i32 (slice u8)))
+  (let [begin (len (.text output))
+        (mut error) ""]
+    (accept! (mut error)
+             (frame-address/restore! (mut (.text output)) (.base assigned)))
+    (when (>= (.entry-slot assigned) 0)
+      (accept! (mut error)
+               (frame-memory/access! (mut (.text output))
+                                     true
+                                     8
+                                     17
+                                     31
+                                     (.entry-slot assigned)
+                                     false
+                                     16)))
+    (when (>= (.link-slot assigned) 0)
+      (accept! (mut error)
+               (frame-memory/access! (mut (.text output))
+                                     true
+                                     8
+                                     29
+                                     31
+                                     (- (.link-slot assigned) 8)
+                                     false
+                                     16))
+      (accept! (mut error)
+               (frame-memory/access! (mut (.text output))
+                                     true
+                                     8
+                                     30
+                                     31
+                                     (.link-slot assigned)
+                                     false
+                                     16)))
+    (if (>= (.entry-slot assigned) 0)
+        (accept! (mut error)
+                 (word! (mut output)
+                        (encode/add-sub-immediate true false false 31 17 0)))
+        (accept! (mut error)
+                 (frame-address/adjust! (mut (.text output)) false size 16)))
+    (accept! (mut error) (word! (mut output) (encode/ret 30)))
+    (if (= error "") (Ok (cast i32 (- (len (.text output)) begin))) (Err error))))

@@ -171,9 +171,10 @@ frontend lowering rather than blindly using the IR Boolean storage byte.
 
 `builder/variable!` creates a named VAR in a block-start region. Its scalar type
 sets the object size. Alignment zero means natural scalar alignment; explicit
-power-of-two alignment is in bytes. The AArch64 target currently establishes
-alignment through sixteen bytes and rejects larger requests. The generic shape
-retains larger alignment requests for future aligned frame lowering.
+power-of-two alignment is in bytes. The AArch64 target selects a frame alignment
+A equal to the maximum of sixteen and selected VAR/ALLOCA requests, then aligns
+the actual SP to A. Relative slot alignment therefore establishes actual address
+alignment even when the caller guarantees only sixteen bytes.
 
 `builder/variable-address!` creates an ADDR-valued VADDR. VAR itself denotes
 storage and cannot serve as an ordinary register-value operand. It contributes
@@ -192,8 +193,8 @@ alignment, integer/FP loops, 24 local addresses live through a mutating call wit
 forced spills, and 1,100 local objects in an 8.8 KB frame. Linked objects cover
 Boolean/integer/floating storage, loops and the large frame.
 
-Over-aligned frames remain separate frame-lowering work. Large scalar spill and
-outgoing-call offsets now have explicit address materialization as described below.
+Large scalar spill and outgoing-call offsets have explicit address materialization
+as described below. Over-aligned frames use saved entry SP as described next.
 
 ## Anchored fixed frames
 
@@ -210,8 +211,18 @@ edge stores, incoming arguments, locals and call operand capture. Outgoing call
 argument stores use current SP. Existing low-level emission APIs retain their
 SP-based behavior; their `-at!` forms accept an explicit frame base.
 
-At every anchored return, SP is restored from x29 before the saved frame
-registers are loaded. Native tests verify prior-frame linkage and saved LR,
+Frames with A greater than sixteen add a saved original entry-SP field at x29+16
+and reserve a 32-byte record. The prologue captures entry SP in x16, subtracts the
+fixed frame using x17 when a scratch is needed, then aligns SP down through x17.
+Frame-record stores preserve x16 until its saved slot is installed. Incoming
+stack arguments load through that saved pointer rather than assuming a constant
+entry-to-frame displacement. `incoming/emit-entry!` provides this low-level path;
+the existing `emit-at!` path retains the constant-displacement behavior.
+
+At every anchored return, fixed SP is restored from x29 before the saved frame
+registers are loaded. Over-aligned returns retain saved entry SP in x17 while x16
+addresses the record, then restore SP exactly, including alignment padding.
+Native tests verify prior-frame linkage and saved LR,
 both scalar widths and register classes under forced spills, incoming stack
 parameters, FP phi cycles and local storage in ordinary and anchored modes.
 A separate native test moves SP by 256 bytes and verifies GPR/SIMD/memory
@@ -222,21 +233,22 @@ anchor and the outgoing-area policy below.
 
 `builder/stack-allocate!` emits ALLOCA with control, integer byte-count value and
 alignment metadata. `builder/stack-free!` emits AFREE with control and byte count.
-Both use the same `round_up(count, 16)` size. Counts can use any scalar integer
+Both use the same `round_up(count, A)` size, where A is the function frame
+alignment and is at least sixteen. Counts can use any scalar integer
 storage type, including ADDR. Signed counts must be nonnegative; all counts must
-be at most `0x7ffffffffffffff0` so rounding fits. Invalid constants are diagnosed
-before graph mutation. Dynamic counts normalize their declared width/signedness
-and trap before SP changes when outside that domain. Available stack capacity
+be at most `i64::MAX - (A-1)` so rounding fits. Construction checks constants using
+the request's known minimum alignment; target lowering rechecks against the final
+function alignment. Dynamic counts normalize their declared width/signedness
+and trap before allocation/free changes SP when outside that domain. Available stack capacity
 remains a platform limit.
 
-Alignment zero selects sixteen; explicit powers of two through sixteen are
-supported. Larger requests are retained by the generic shape but rejected by the
-current target. A zero-size operation moves SP by zero. AFREE must match the byte
+Alignment zero requests the sixteen-byte minimum; larger power-of-two requests
+raise the function's alignment. A zero-size operation moves SP by zero. AFREE must match the byte
 count of the most recent live allocation; its original unrounded count is valid.
 Function return restores the frame anchor and discards any remaining objects.
 
 Every function with ALLOCA/AFREE uses x29 for fixed storage. Let N be its maximum
-outgoing argument area, rounded to sixteen. `[SP, SP+N)` stays reserved for calls.
+outgoing argument area, rounded to A. `[SP, SP+N)` stays reserved for calls.
 Allocating d rounded bytes subtracts d from SP and returns `SP+N`. The new object
 occupies `[newSP+N, oldSP+N)`, below older objects and the anchored frame record.
 Outgoing stack arguments therefore cannot overwrite live dynamic data. Fixed
@@ -249,6 +261,14 @@ stack arguments, FP pressure with a live dynamic count freed after the call,
 incoming arguments, integer/FP memory-state loops with changing allocation sizes,
 and distinct returns at different stack depths. Linked objects cover dynamic
 call objects, both loop result classes and branch-dependent restoration.
+
+Over-alignment evidence includes 1,664 scalar local-storage variants through 4 KB,
+2,640 nested allocation/free variants through 8 KB, large aligned GP/FP call
+pressure, and an external callback checking 24 dynamic addresses at 4 KB alignment
+with the outgoing area expanded to match. A separate caller sweeps all 278
+sixteen-aligned entry-SP positions modulo 32/64/256/4096 and checks incoming
+mixed-width stack values, fixed/dynamic addresses, calls, free and exact SP
+restoration. Linked 64-byte and 4 KB frame fixtures execute too.
 
 ## Large scalar frame accesses
 

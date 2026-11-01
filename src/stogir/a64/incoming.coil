@@ -135,13 +135,14 @@
 
 ;;; Stack parameters load from the caller's area above the finalized local frame.
 ;;; Allocation requires a register at this definition; later splits may spill it.
-(defn emit-at! [(output (mut (ArrayList u8)))
-                (graph g/Graph)
-                (parts (ArrayList allocation/Part))
-                (parameter Parameter)
-                (position i64)
-                (frame-size i64)
-                (base frame/Base)] (-> (Result i32 (slice u8)))
+(defn emit-entry! [(output (mut (ArrayList u8)))
+                   (graph g/Graph)
+                   (parts (ArrayList allocation/Part))
+                   (parameter Parameter)
+                   (position i64)
+                   (frame-size i64)
+                   (base frame/Base)
+                   (entry-slot i64)] (-> (Result i32 (slice u8)))
   (if (not (frame/valid-base? base))
       (Err "invalid incoming frame base")
       (if (or (= (.kind parameter) 0) (= (.kind parameter) 2))
@@ -150,7 +151,11 @@
                   (< (.offset parameter) 0)
                   (not (frame/valid-base? base))
                   (< frame-size (.bias base))
-                  (> (.offset parameter) (- 0x7FFFFFFFFFFFFFFF frame-size)))
+                  (> (.offset parameter) (- 0x7FFFFFFFFFFFFFFF frame-size))
+                  (and (>= entry-slot 0)
+                       (or (!= (.reg base) 29)
+                           (< entry-slot (.bias base))
+                           (> entry-slot (- frame-size 8)))))
               (Err "invalid incoming stack parameter")
               (match (locations/lookup parts
                                        (.reference parameter)
@@ -175,15 +180,48 @@
                                                                (n/type-id node))
                                                          8)))
                               (Err "incoming parameter class or width mismatch")
-                              (memory/access! (mut output)
-                                              true
-                                              size
-                                              reg
-                                              (.reg base)
-                                              offset
-                                              (types/signed? (cast i32
-                                                                   (n/type-id node)))
-                                              16))))))))))
+                              (if (< entry-slot 0)
+                                  (memory/access! (mut output)
+                                                  true
+                                                  size
+                                                  reg
+                                                  (.reg base)
+                                                  offset
+                                                  (types/signed? (cast i32
+                                                                       (n/type-id node)))
+                                                  16)
+                                  (match (memory/access! (mut output)
+                                                         true
+                                                         8
+                                                         16
+                                                         (.reg base)
+                                                         (- entry-slot
+                                                            (.bias base))
+                                                         false
+                                                         17)
+                                    (Err [message] (Err message))
+                                    (Ok [count]
+                                        (match (memory/access! (mut output)
+                                                               true
+                                                               size
+                                                               reg
+                                                               16
+                                                               (.offset parameter)
+                                                               (types/signed? (cast i32
+                                                                                    (n/type-id node)))
+                                                               17)
+                                          (Err [message] (Err message))
+                                          (Ok [more] (Ok (+ count more))))))))))))))))
+
+(defn emit-at! [(output (mut (ArrayList u8)))
+                (graph g/Graph)
+                (parts (ArrayList allocation/Part))
+                (parameter Parameter)
+                (position i64)
+                (frame-size i64)
+                (base frame/Base)]
+  (-> (Result i32 (slice u8)))
+  (emit-entry! (mut output) graph parts parameter position frame-size base -1))
 
 (defn emit! [(output (mut (ArrayList u8)))
              (graph g/Graph)

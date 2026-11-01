@@ -23,7 +23,9 @@
    (frame frame/Frame)
    (link-slot i64)
    (base address/Base)
-   (outgoing-size i64)])
+   (outgoing-size i64)
+   (alignment i64)
+   (entry-slot i64)])
 
 (defn release! [(assigned (mut Assigned))] (-> void)
   (let [(mut i) 0]
@@ -48,7 +50,9 @@
             :frame (frame/create allocator)
             :link-slot -1
             :base (address/stack-base)
-            :outgoing-size 0)
+            :outgoing-size 0
+            :alignment 16
+            :entry-slot -1)
         (mut i) 1
         (mut frame-error) ""
         (mut anchored?) false
@@ -84,15 +88,25 @@
                                    allocator)))))
       (set! i (+ i 1)))
     (for reference (.nodes scheduled)
-      (when (stack/operation? (cast i32
-                                    (n/opcode (get (.instructions graph)
-                                                   (cast i64 reference)))))
-        (set! anchored? true)))
+      (let [node (get (.instructions graph) (cast i64 reference))
+            opcode (cast i32 (n/opcode node))]
+        (when (stack/operation? opcode) (set! anchored? true))
+        (when (or (= opcode 72) (= opcode 81))
+          (let [requested (cast i64 (.op3 node))]
+            (when (> requested (.alignment assigned))
+              (if (frame/valid-alignment? requested)
+                  (set! (.alignment assigned) requested)
+                  (set! frame-error "invalid frame object alignment")))))))
+    (when (> (.alignment assigned) 16) (set! anchored? true))
     (match (call-abi/outgoing-size graph scheduled)
       (Err [msg] (set! frame-error msg))
       (Ok [size]
           (set! (.size (.frame assigned)) size)
-          (set! (.outgoing-size assigned) size)))
+          (match (frame/aligned-size (.frame assigned) (.alignment assigned))
+            (Err [message] (set! frame-error message))
+            (Ok [aligned]
+                (set! (.size (.frame assigned)) aligned)
+                (set! (.outgoing-size assigned) aligned)))))
     (let [calls
             (call-abi/reserve! (mut (.parts assigned))
                                graph
@@ -100,10 +114,15 @@
                                (= register-count 64)
                                allocator)]
       (when (or anchored? (> calls 0))
-        (match (frame/spill-slot! (mut (.frame assigned)) 0 16 16)
+        (match (frame/spill-slot! (mut (.frame assigned))
+                                  0
+                                  (if (> (.alignment assigned) 16) 32 16)
+                                  16)
           (Err [msg] (set! frame-error msg))
           (Ok [offset]
               (set! (.link-slot assigned) (+ offset 8))
+              (when (> (.alignment assigned) 16)
+                (set! (.entry-slot assigned) (+ offset 16)))
               (when anchored?
                 (set! (.base assigned) (address/Base :reg 29 :bias offset)))))))
     (for reference (.nodes scheduled)

@@ -23,28 +23,39 @@
 (defn operation? [(opcode i32)] (-> bool)
   (or (= opcode 66) (= opcode 81) (= opcode 82)))
 
-;;; Allocation and free use the same sixteen-byte rounded byte count. Counts
-;;; must be nonnegative and leave room for rounding without signed overflow.
+;;; Allocation and free round to the same function alignment. Counts must be
+;;; nonnegative and leave room for rounding without signed overflow.
+(defn constant-size-aligned [(graph g/Graph) (reference i32) (alignment i64)]
+  (-> (Result i64 (slice u8)))
+  (if (or (< alignment 16) (not (frame/valid-alignment? alignment)))
+      (Err "invalid stack rounding alignment")
+      (match (g/lookup graph reference)
+        (None [] (Err "stack byte count missing"))
+        (Some [node]
+              (let [ty (cast i32 (n/type-id node))
+                    width (types/scalar-size ty 8)
+                    bits (n/constant-bits node)]
+                (if (or (>= reference 0)
+                        (not (types/integer? ty))
+                        (not (symbols/numeric? node))
+                        (<= width 0)
+                        (and (< width 8)
+                             (!= (>> bits (cast u64 (* width 8))) 0))
+                        (and (types/signed? ty)
+                             (!= (& bits
+                                    (<< (: 1 u64) (cast u64 (- (* width 8) 1))))
+                                 0))
+                        (> bits
+                           (cast u64
+                                 (- (: 0x7FFFFFFFFFFFFFFF i64) (- alignment 1)))))
+                    (Err "invalid or overflowing constant stack byte count")
+                    (Ok (cast i64
+                              (& (+ bits (cast u64 (- alignment 1)))
+                                 (cast u64 (- (: 0 i64) alignment)))))))))))
+
 (defn constant-size [(graph g/Graph) (reference i32)]
   (-> (Result i64 (slice u8)))
-  (match (g/lookup graph reference)
-    (None [] (Err "stack byte count missing"))
-    (Some [node]
-          (let [ty (cast i32 (n/type-id node))
-                width (types/scalar-size ty 8)
-                bits (n/constant-bits node)]
-            (if (or (>= reference 0)
-                    (not (types/integer? ty))
-                    (not (symbols/numeric? node))
-                    (<= width 0)
-                    (and (< width 8) (!= (>> bits (cast u64 (* width 8))) 0))
-                    (and (types/signed? ty)
-                         (!= (& bits
-                                (<< (: 1 u64) (cast u64 (- (* width 8) 1))))
-                             0))
-                    (> bits (: 0x7FFFFFFFFFFFFFF0 u64)))
-                (Err "invalid or overflowing constant stack byte count")
-                (Ok (cast i64 (& (+ bits 15) (: 0xFFFFFFFFFFFFFFF0 u64)))))))))
+  (constant-size-aligned graph reference 16))
 
 (defn validate-inputs [(graph g/Graph)
                        (opcode i32)
@@ -74,7 +85,15 @@
                                   (= (n/opcode input) 72))
                               (Err "stack byte count must be an integer value")
                               (if (< size 0)
-                                  (match (constant-size graph size)
+                                  (match (constant-size-aligned graph
+                                                                size
+                                                                (if (and (= opcode
+                                                                            81)
+                                                                         (> alignment
+                                                                            16))
+                                                                    (cast i64
+                                                                          alignment)
+                                                                    16))
                                     (Err [message] (Err message))
                                     (Ok [_]
                                         (Ok (types/scalar-size (cast i32

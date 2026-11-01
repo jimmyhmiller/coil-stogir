@@ -1,0 +1,240 @@
+(module stogir.tests.jit-overaligned)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.frame-address" :as frame)
+(import "stogir.a64.frame-memory" :as memory)
+(import "stogir.a64.constants" :as constants)
+(import "stogir.a64.encode" :as e)
+(import "stogir.bytes" :as bytes)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn combine :cc (cc/C) [(a i64) (b i64)] (-> i64)
+  (+ (* a 3) (* b 5)))
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn checked [(result (Result i32 (slice u8)))] (-> i64)
+  (match result (Ok [_] 0) (Err [message] (println "{}" message) 1)))
+
+(defn word! [(out (mut (ArrayList u8))) (result (Result u32 (slice u8)))]
+  (-> i64)
+  (match result
+    (Ok [word] (bytes/append32! (mut out) word) 0)
+    (Err [message] (println "{}" message) 1)))
+
+;;; This caller sweeps every sixteen-aligned entry-SP residue modulo alignment.
+;;; It supplies a mixed-width stack area and checks exact SP restoration before
+;;; repairing SP from its own frame, so a restoration mismatch is an assertion.
+(defn wrapper! [(out (mut (ArrayList u8))) (phase i64)] (-> i64)
+  (let [record (+ phase 32)
+        size (+ phase 48)
+        (mut failures) 0]
+    (set! failures
+          (+ failures
+             (checked (frame/adjust! (mut out) true size 17))
+             (checked (memory/access! (mut out) false 8 29 31 record false 17))
+             (checked (memory/access! (mut out)
+                                      false
+                                      8
+                                      30
+                                      31
+                                      (+ record 8)
+                                      false
+                                      17))
+             (checked (frame/address! (mut out) 29 31 record))
+             (word! (mut out) (e/logical-register true 1 16 31 0))
+             (word! (mut out) (e/logical-register true 1 0 31 1))))
+    (for reg [(: 1 i32) 2 3 4 5 6 7]
+      (set! failures
+            (+ failures
+               (checked (constants/emit! (mut out)
+                                         true
+                                         reg
+                                         (if (= reg 1) (: 7 u64) 0))))))
+    ; x16 owns the target pointer; x15 is the independent address scratch.
+    (set! failures
+          (+ failures
+             (checked (constants/emit! (mut out) false 17 0xFFFFFFFD))
+             (checked (memory/access! (mut out) false 4 17 31 0 false 15))
+             (checked (constants/emit! (mut out) false 17 0))
+             (checked (memory/access! (mut out) false 4 17 31 4 false 15))
+             (checked (constants/emit! (mut out) true 17 11))
+             (checked (memory/access! (mut out) false 8 17 31 8 false 15))
+             (checked (constants/emit! (mut out) false 17 0))
+             (checked (memory/access! (mut out) false 4 17 31 16 false 15))
+             (checked (constants/emit! (mut out) true 17 13))
+             (checked (memory/access! (mut out) false 8 17 31 24 false 15))
+             (word! (mut out) (e/call-register 16))
+             (checked (frame/address! (mut out) 16 31 record))
+             (word! (mut out) (e/add-sub true true true 31 16 29))
+             (word! (mut out) (e/conditional-select true 0 0 31 0))
+             (checked (frame/restore! (mut out)
+                                      (frame/Base :reg 29 :bias record)))
+             (checked (memory/access! (mut out) true 8 29 31 record false 16))
+             (checked (memory/access! (mut out)
+                                      true
+                                      8
+                                      30
+                                      31
+                                      (+ record 8)
+                                      false
+                                      16))
+             (checked (frame/adjust! (mut out) false size 16))
+             (word! (mut out) (e/ret 30))))
+    failures))
+
+(defn check [(alignment i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        a (require (b/emit! (mut graph) 71 10 [start (: 0 i32) 8]))
+        c (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 10]))
+        z (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 12]))
+        wide-a (require (b/emit! (mut graph) 33 11 [a]))
+        variable (require (b/variable! (mut graph) 5 start "aligned" alignment))
+        sentinel (require (b/scalar-constant! (mut graph) 5 321 8))
+        initialized
+          (require (b/emit! (mut graph) 87 0 [start variable sentinel]))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        baseline (require (b/stack-allocate! (mut graph) initialized zero 0))
+        allocated (require (b/stack-allocate! (mut graph) baseline c alignment))
+        stored (require (b/emit! (mut graph) 93 0 [allocated allocated a]))
+        variable-address (require (b/variable-address! (mut graph) variable))
+        mask
+          (require (b/scalar-constant! (mut graph)
+                                       5
+                                       (cast u64 (- alignment 1))
+                                       8))
+        variable-bits (require (b/emit! (mut graph) 36 5 [variable-address]))
+        allocated-bits (require (b/emit! (mut graph) 36 5 [allocated]))
+        variable-low (require (b/emit! (mut graph) 47 5 [variable-bits mask]))
+        allocated-low (require (b/emit! (mut graph) 47 5 [allocated-bits mask]))
+        variable-ok (require (b/emit! (mut graph) 14 1 [variable-low zero]))
+        allocated-ok (require (b/emit! (mut graph) 14 1 [allocated-low zero]))
+        (mut failures) 0]
+    (match (calls/create 0
+                         11
+                         [(: 6 u8) 11 11 11 11 11 11 11 10 10 11 10 11]
+                         allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [signature]
+          (let [(mut owned) signature]
+            (require (calls/function! (mut graph) owned allocator))
+            (calls/release! (mut owned)))))
+    (match (calls/create 0 11 [(: 11 u8) 11] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [signature]
+          (let [(mut owned) signature
+                call
+                  (require (calls/emit! (mut graph)
+                                        owned
+                                        stored
+                                        target
+                                        [wide-a c]
+                                        allocator))
+                loaded (require (b/emit! (mut graph) 91 10 [call allocated]))
+                value-ok (require (b/emit! (mut graph) 14 1 [loaded a]))
+                guard (require (b/emit! (mut graph) 85 5 [loaded variable]))
+                guard-ok (require (b/emit! (mut graph) 14 1 [guard sentinel]))
+                freed (require (b/stack-free! (mut graph) guard c))
+                marker (require (b/stack-allocate! (mut graph) freed zero 0))
+                restored (require (b/emit! (mut graph) 14 1 [marker baseline]))
+                good1
+                  (require (b/emit! (mut graph) 47 1 [variable-ok allocated-ok]))
+                good2 (require (b/emit! (mut graph) 47 1 [value-ok guard-ok]))
+                good3 (require (b/emit! (mut graph) 47 1 [good1 good2]))
+                good (require (b/emit! (mut graph) 47 1 [good3 restored]))
+                sum1 (require (b/emit! (mut graph) 26 11 [call x]))
+                sum (require (b/emit! (mut graph) 26 11 [sum1 z]))
+                bad (require (b/scalar-constant! (mut graph) 11 0 8))
+                result (require (b/emit! (mut graph) 60 11 [good sum bad]))
+                ret
+                  (require (b/emit! (mut graph)
+                                    120
+                                    11
+                                    [marker result (: 0 i32)]))]
+            (when (or (= alignment 64) (= alignment 4096))
+              (match (compile/object graph
+                                     start
+                                     [ret]
+                                     (if (= alignment 64)
+                                         "_stogir_overaligned_64"
+                                         "_stogir_overaligned_4096")
+                                     allocator)
+                (Err [message]
+                     (println "{}" message)
+                     (set! failures (+ failures 1)))
+                (Ok [object]
+                    (let [(mut bytes) object]
+                      (match (fs/write-file allocator
+                                            (if (= alignment 64)
+                                                "/tmp/coil-stogir-overaligned-64.o"
+                                                "/tmp/coil-stogir-overaligned-4096.o")
+                                            (slice bytes))
+                        (Err [_] (set! failures (+ failures 1)))
+                        (Ok [_] 0))
+                      (free! (mut bytes))))))
+            (match (compile/text graph start [ret] allocator)
+              (Err [message]
+                   (println "{}" message)
+                   (set! failures (+ failures 1)))
+              (Ok [text]
+                  (let [(mut bytes) text]
+                    (match (jit/map-text (slice bytes))
+                      (Err [_] (set! failures (+ failures 1)))
+                      (Ok [image]
+                          (let [(mut mapped) image
+                                (mut phase) (: 0 i64)]
+                            (while (< phase (cast i64 alignment))
+                              (let [(mut wrapper)
+                                      (ArrayList::new [u8] allocator)]
+                                (set! failures
+                                      (+ failures
+                                         (wrapper! (mut wrapper) phase)))
+                                (match (jit/map-text (slice wrapper))
+                                  (Err [_] (set! failures (+ failures 1)))
+                                  (Ok [caller]
+                                      (let [(mut mapped-caller) caller
+                                            f
+                                              (primitive/cast (fnptr (cc/C)
+                                                                     [u64 u64]
+                                                                     i64)
+                                                              (.base mapped-caller))
+                                            got
+                                              (call-ptr f
+                                                        (primitive/cast u64
+                                                                        (.base mapped))
+                                                        (primitive/cast u64
+                                                                        (primitive/cast (ptr u8)
+                                                                                        (fnptr-of combine))))]
+                                        (when (!= got 66)
+                                          (println "overaligned frame alignment={} phase={} got={}"
+                                                   alignment
+                                                   phase
+                                                   got)
+                                          (set! failures (+ failures 1)))
+                                        (jit/release! (mut mapped-caller)))))
+                                (free! (mut wrapper)))
+                              (set! phase (+ phase 16)))
+                            (jit/release! (mut mapped)))))
+                    (free! (mut bytes)))))
+            (calls/release! (mut owned)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures (+ (check 32) (check 64) (check 256) (check 4096))]
+    (println "overaligned locals, incoming stack, calls/free and 278 caller SP residues: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

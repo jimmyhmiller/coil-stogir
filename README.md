@@ -23,11 +23,11 @@ branch, and page relocations. Named function/data references and binary string
 literals compile through this shared image, including recursive calls.
 
 Scalar local storage supports VAR, VADDR, VLOAD/VSTORE and their volatile
-variants, with typed views that fit the declared object and alignment up to
-16 bytes. Local objects have separate identities from register spills; addresses
+variants, with typed views that fit the declared object and power-of-two
+alignment. Local objects have separate identities from register spills; addresses
 can survive calls and spilling. ALLOCA/AFREE support constant and dynamic byte
-counts with matching sixteen-byte rounding, nested objects and calls. Over-aligned
-frames still require further frame lowering.
+counts with matching frame-alignment rounding, nested objects and calls.
+Over-aligned frames preserve entry SP for incoming arguments and exact restoration.
 FRAME_ADDR establishes a real frame record, including in leaf functions; fixed
 storage accesses then use an explicit x29-based frame context.
 

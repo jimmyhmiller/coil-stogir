@@ -501,3 +501,23 @@ After large-memory access and variadic-count fixes, all 147 standalone tests
 and 32 linked AOT consumers pass locally with debug checks. The standalone
 passing set exactly matches the test files; linked consumers use regenerated
 objects. Compiler integration and performance comparisons remain unfinished.
+
+Over-aligned frames now select the maximum requested alignment, realign actual
+SP and preserve original entry SP in the frame record. Incoming stack parameters
+use the saved pointer; return restores it exactly. Outgoing prefixes and every
+ALLOCA/AFREE count round to that same function alignment, keeping dynamic objects
+aligned and separated from outgoing arguments. Ordinary sixteen-byte frames keep
+their existing layout and constant-displacement incoming path.
+
+Focused checks cover 1,664 scalar local variants through 4 KB, 2,640 nested stack
+variants through 8 KB, alignment-dependent count overflow, large aligned GP/FP
+pressure and outgoing-area expansion. An independent caller sweeps all 278
+sixteen-aligned SP residues modulo 32/64/256/4096 and verifies incoming mixed-width
+arguments, addresses, calls/free and exact restoration. Linked aligned fixtures
+execute too. Full regression and commits are tracked in the project pad.
+
+All 148 standalone tests and 33 linked AOT consumers pass locally with debug
+checks. The standalone file set is fully covered. A focused rerun also passes
+the 4,105-argument dynamic-call fixture after raising its alignment to 64 bytes,
+exercising saved entry SP and frame-record accesses beyond 32 KB. Its linked
+consumer passes too. Alignment-mask encoding landed separately as cc458b3.
