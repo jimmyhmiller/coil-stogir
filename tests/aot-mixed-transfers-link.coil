@@ -1,0 +1,42 @@
+(module stogir.tests.aot-mixed-transfers-link)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as p)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+
+(extern transfer :as "stogir_mixed_transfers" :cc (cc/C) [(ptr u8)] (-> u64))
+
+(defn pattern [(i i64)] (-> u8)
+  (cast u8 (% (+ (* i 37) (/ i 7) 19) 251)))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut cells) (ArrayList::new [u8] allocator)
+        (mut failures) 0
+        (mut i) (: 0 i64)]
+    (while (< i 65635)
+      (push! (mut cells) (pattern i))
+      (set! i (+ i 1)))
+    (when (!= (transfer (.data cells)) 1) (set! failures (+ failures 1)))
+    ; Simultaneous cycle: v0(16) -> A; A(4) -> x4; x4(4) -> v1; v1(16) -> v0.
+    ; A is unaligned and beyond the Q immediate range. Scalar destinations
+    ; define only their declared low extent; full vector destinations define16.
+    (set! i 0)
+    (while (< i (len cells))
+      (let [known (not (or (and (>= i 84) (< i 96)) (and (>= i 148) (< i 152))))
+            source
+              (cond (and (>= i 64) (< i 80)) (+ 16 (- i 64))
+                    (and (>= i 80) (< i 84)) (+ 128 (- i 80))
+                    (and (>= i 96) (< i 112)) (+ 32 (- i 96))
+                    (and (>= i 112) (< i 128)) (+ 48 (- i 112))
+                    (and (>= i 144) (< i 148)) (+ 65539 (- i 144))
+                    (and (>= i 152) (< i 160)) (+ 136 (- i 152))
+                    (and (>= i 65539) (< i 65555)) (- i 65539)
+                    :else i)]
+        (when (and known (!= (get cells i) (pattern source)))
+          (set! failures (+ failures 1))))
+      (set! i (+ i 1)))
+    (free! (mut cells))
+    (println "linked mixed-width simultaneous copies and exact live extents: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))
