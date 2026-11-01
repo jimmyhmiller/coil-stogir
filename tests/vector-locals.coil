@@ -1,0 +1,136 @@
+(module stogir.tests.vector-locals)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.types" :as types)
+(import "stogir.node" :as n)
+(import "stogir.locals" :as local)
+(import "stogir.vector" :as vector)
+(import "stogir.verify" :as verify)
+(import "stogir.a64.compile" :as compile)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
+
+(defn rejected [(result (Result i32 (slice u8)))] (-> i64)
+  (match result (Err [_] 0) (Ok [_] 1)))
+
+(defn shape-check [(ty i32) (pointer-bytes i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        width (types/size ty pointer-bytes)
+        (mut failures) 0]
+    (for alignment [(: 0 i32) 1 width (* width 2)]
+      (let [variable
+              (require (b/variable! (mut graph) ty start "vector" alignment))
+            address (require (b/variable-address! (mut graph) variable))
+            loaded (require (b/emit! (mut graph) 85 ty [start variable]))
+            stored (require (b/emit! (mut graph) 87 0 [loaded variable loaded]))
+            volatile (require (b/emit! (mut graph) 86 ty [stored variable]))
+            stored-v
+              (require (b/emit! (mut graph) 88 0 [volatile variable volatile]))]
+        (match (local/shape graph variable pointer-bytes)
+          (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+          (Ok [shape]
+              (when (or (!= (.size shape) (cast i64 width))
+                        (!= (.alignment shape)
+                            (cast i64 (if (= alignment 0) width alignment))))
+                (set! failures (+ failures 1)))))
+        (for reference [variable address loaded stored volatile stored-v]
+          (match (vector/validate graph reference pointer-bytes)
+            (Err [message]
+                 (println "{}" message)
+                 (set! failures (+ failures 1)))
+            (Ok [size]
+                (when (!= size (if (= reference address) pointer-bytes width))
+                  (set! failures (+ failures 1)))))
+          (match (local/validate graph reference pointer-bytes)
+            (Err [message]
+                 (println "ty{} pointer{}: {}" ty pointer-bytes message)
+                 (set! failures (+ failures 1)))
+            (Ok [size]
+                (when (!= size (if (= reference address) pointer-bytes width))
+                  (set! failures (+ failures 1))))))))
+    (match (verify/integer-operations graph)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [_] 0))
+    (g/release! (mut graph))
+    failures))
+
+(defn invalid-views [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        small (require (b/variable! (mut graph) 21 start "eight" 0))
+        large (require (b/variable! (mut graph) 37 start "sixteen" 0))
+        value (require (b/emit! (mut graph) 85 37 [start large]))
+        narrower (require (b/emit! (mut graph) 85 21 [start large]))
+        scalar (require (b/scalar-constant! (mut graph) 5 7 8))
+        invalid (require (b/emit! (mut graph) 85 37 [start large]))
+        (mut failures) 0]
+    (set! (mut (.instructions graph))
+          (cast i64 invalid)
+          (n/make 85 128 0 start large 0))
+    (match (local/validate graph narrower 8)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [size] (when (!= size 8) (set! failures (+ failures 1)))))
+    (for bad [(require (b/emit! (mut graph) 85 37 [start small]))
+              (require (b/emit! (mut graph) 87 0 [start small value]))
+              (require (b/emit! (mut graph) 88 0 [start small value]))
+              (require (b/emit! (mut graph) 86 37 [start small]))
+              (require (b/emit! (mut graph) 85 0 [start large]))
+              invalid
+              (require (b/emit! (mut graph) 87 37 [start large value]))
+              (require (b/emit! (mut graph) 87 0 [scalar large value]))
+              (require (b/emit! (mut graph) 87 0 [start large large]))]
+      (set! failures (+ failures (rejected (local/validate graph bad 8)))))
+    (set! failures
+          (+ failures
+             (rejected (b/variable! (mut graph) 0 start "void" 0))
+             (rejected (b/variable! (mut graph) 128 start "invalid" 0))
+             (rejected (b/variable! (mut graph) -1 start "invalid" 0))
+             (rejected (b/variable! (mut graph) 37 value "region" 0))
+             (rejected (b/variable! (mut graph) 37 start "alignment" 3))
+             (rejected (local/validate graph large 3))))
+    (g/release! (mut graph))
+    failures))
+
+(defn wide-access [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        variable (require (b/variable! (mut graph) 53 start "wide" 0))
+        loaded (require (b/emit! (mut graph) 85 53 [start variable]))
+        address (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        stored
+          (require (b/vector-store! (mut graph) 8 loaded address loaded false))
+        ret (require (b/emit! (mut graph) 120 0 [stored (: 0 i32) 0]))
+        (mut failures) 0]
+    (match (verify/integer-operations graph)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [_] 0))
+    (match (compile/text graph start [ret] allocator)
+      (Err [_] 0)
+      (Ok [text]
+          (let [(mut text) text]
+            (free! (mut text))
+            (set! failures (+ failures 1)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) (+ (invalid-views) (wide-access))
+        (mut ty) (: 16 i32)
+        (mut cases) 0]
+    (while (< ty 128)
+      (when (types/vector? ty)
+        (for pointer-bytes [(: 4 i32) 8]
+          (set! failures (+ failures (shape-check ty pointer-bytes)))
+          (set! cases (+ cases 1))))
+      (set! ty (+ ty 1)))
+    (println "vector local geometry at both pointer widths: {} cases, {} failures"
+             cases
+             failures)
+    (if (= failures 0) 0 1)))
