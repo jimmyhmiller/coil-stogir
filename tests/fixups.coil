@@ -1,5 +1,7 @@
 (module stogir.tests.fixups)
 (import "stogir.a64.fixups" :as f)
+(import "stogir.a64.code" :as code)
+(import "stogir.text-data" :as data)
 (import "stogir.bytes" :as b)
 (import "stogir.relocate" :as read)
 (import "coil.arraylist" :use [ArrayList])
@@ -71,12 +73,122 @@
     (free! (mut records))
     failures))
 
+;;; Expanding the second branch pushes the first past its exact positive limit.
+;;; All address-bearing metadata must follow the resulting fixed-point layout.
+(defn relaxed-metadata [(invalid bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut output) (code/create allocator)
+        (mut labels) (ArrayList::new [i64] allocator)
+        (mut branches) (ArrayList::new [f/Branch] allocator)
+        (mut relatives) (ArrayList::new [f/Relative] allocator)
+        size (: 1048600 i64)
+        (mut failures) 0]
+    (while (< (len (.text output)) size) (b/append32! (mut (.text output)) 0))
+    (push! (mut labels) 1048572)
+    (push! (mut labels) 1048580)
+    (push! (mut labels) -1)
+    (push! (mut branches)
+           (f/Branch
+             :offset 0
+             :label 0
+             :condition 0
+             :link false))
+    (push! (mut branches)
+           (f/Branch
+             :offset 4
+             :label 1
+             :condition 1
+             :link false))
+    (push! (mut (.references output))
+           (code/Reference
+             :offset 16
+             :kind 2
+             :target -1))
+    (push! (mut (.text-data output))
+           (data/Range
+             :offset 32
+             :length 8
+             :kind 4))
+    (push! (mut relatives)
+           (f/Relative
+             :offset 32
+             :base 32
+             :label (if invalid 99 1)))
+    (match (f/relax! (mut output) (mut labels) (mut branches) (mut relatives))
+      (Err [_] (when (not invalid) (set! failures (+ failures 1))))
+      (Ok [count]
+          (when (or invalid (!= count 2)) (set! failures (+ failures 1)))))
+    (if invalid
+        (when (or (!= (len (.text output)) size)
+                  (!= (read/read32 (.text output) 0) 0)
+                  (!= (get labels 0) 1048572)
+                  (!= (.offset (get branches 1)) 4)
+                  (!= (.offset (get (.references output) 0)) 16)
+                  (!= (.offset (get (.text-data output) 0)) 32)
+                  (!= (.base (get relatives 0)) 32))
+          (set! failures (+ failures 1)))
+        (do
+          (when (or (!= (len (.text output)) (+ size 8))
+                    (!= (read/read32 (.text output) 0) 0x54000041)
+                    (!= (read/read32 (.text output) 8) 0x54000040)
+                    (!= (get labels 0) 1048580)
+                    (!= (get labels 1) 1048588)
+                    (!= (get labels 2) -1)
+                    (!= (.offset (get branches 0)) 4)
+                    (!= (.offset (get branches 1)) 12)
+                    (!= (.offset (get (.references output) 0)) 24)
+                    (!= (.offset (get (.text-data output) 0)) 40)
+                    (!= (.length (get (.text-data output) 0)) 8)
+                    (!= (.offset (get relatives 0)) 40)
+                    (!= (.base (get relatives 0)) 40)
+                    (!= (read/read32 (.text output) 40) 1048548))
+            (set! failures (+ failures 1)))))
+    (code/release! (mut output))
+    (free! (mut labels))
+    (free! (mut branches))
+    (free! (mut relatives))
+    failures))
+
+(defn relaxed-boundary [(offset i64) (target i64) (expected i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut output) (code/create allocator)
+        (mut labels) (ArrayList::new [i64] allocator)
+        (mut branches) (ArrayList::new [f/Branch] allocator)
+        (mut relatives) (ArrayList::new [f/Relative] allocator)
+        size (+ (if (> offset target) offset target) 4)
+        (mut failures) 0]
+    (while (< (len (.text output)) size) (b/append32! (mut (.text output)) 0))
+    (push! (mut labels) target)
+    (push! (mut branches)
+           (f/Branch
+             :offset offset
+             :label 0
+             :condition 0
+             :link false))
+    (match (f/relax! (mut output) (mut labels) (mut branches) (mut relatives))
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [count] (when (!= count expected) (set! failures (+ failures 1)))))
+    (when (!= (len (.text output)) (+ size (* (cast i64 expected) 4)))
+      (set! failures (+ failures 1)))
+    (code/release! (mut output))
+    (free! (mut labels))
+    (free! (mut branches))
+    (free! (mut relatives))
+    failures))
+
 (defn main [] (-> i64)
   (let [a (malloc-allocator)
         (mut output) (ArrayList::new [u8] a)
         (mut labels) (ArrayList::new [i64] a)
         (mut branches) (ArrayList::new [f/Branch] a)
-        (mut failures) (relative-check)]
+        (mut failures)
+          (+ (relative-check)
+             (relaxed-metadata false)
+             (relaxed-metadata true)
+             (relaxed-boundary 0 1048572 0)
+             (relaxed-boundary 0 1048576 1)
+             (relaxed-boundary 1048576 0 0)
+             (relaxed-boundary 1048580 0 1))]
     (b/append32! (mut output) 0)
     (b/append32! (mut output) 0)
     (push! (mut labels) 0)

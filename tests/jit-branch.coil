@@ -1,6 +1,8 @@
 (module stogir.tests.jit-branch)
 (import "stogir.jit.darwin" :as jit)
 (import "stogir.a64.encode" :as e)
+(import "stogir.a64.code" :as code)
+(import "stogir.a64.fixups" :as f)
 (import "stogir.graph" :as g)
 (import "stogir.calls" :as calls)
 (import "stogir.builder" :as b)
@@ -8,6 +10,7 @@
 (import "stogir.a64.emit" :as emit)
 (import "stogir.a64.compile" :as compile)
 (import "stogir.bytes" :as bytes)
+(import "stogir.relocate" :as read)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.primitive" :as primitive)
@@ -16,6 +19,74 @@
 
 (defn require [(result (Result i32 (slice u8)))] (-> i32)
   (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defn relaxed-execution [(backward bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut output) (code/create allocator)
+        (mut labels) (ArrayList::new [i64] allocator)
+        (mut branches) (ArrayList::new [f/Branch] allocator)
+        (mut relatives) (ArrayList::new [f/Relative] allocator)
+        far (: 1048592 i64)
+        (mut failures) 0]
+    (bytes/append32! (mut (.text output)) (if backward 0 0xF100001F))  ; CMP x0,#0
+    (bytes/append32! (mut (.text output)) (if backward 0xD2800540 0))  ; MOV x0,#42
+    (bytes/append32! (mut (.text output)) (if backward 0xD65F03C0 0xD28000E0))  ; RET / MOV x0,#7
+    (bytes/append32! (mut (.text output)) 0xD65F03C0)
+    (while (< (len (.text output)) far)
+      (bytes/append32! (mut (.text output)) 0xD503201F))
+    (if backward
+        (do
+          (bytes/append32! (mut (.text output)) 0xF100001F)
+          (bytes/append32! (mut (.text output)) 0)
+          (bytes/append32! (mut (.text output)) 0xD28000E0)
+          (bytes/append32! (mut (.text output)) 0xD65F03C0))
+        (do
+          (bytes/append32! (mut (.text output)) 0xD2800540)
+          (bytes/append32! (mut (.text output)) 0xD65F03C0)))
+    (push! (mut labels) (if backward 4 far))
+    (when backward
+      (push! (mut labels) far)
+      (push! (mut branches)
+             (f/Branch
+               :offset 0
+               :label 1
+               :condition -1
+               :link false)))
+    (push! (mut branches)
+           (f/Branch
+             :offset (if backward (+ far 4) 4)
+             :label 0
+             :condition 0
+             :link false))
+    (match (f/relax! (mut output) (mut labels) (mut branches) (mut relatives))
+      (Err [message] (do (println "{}" message) (set! failures 1)))
+      (Ok [count]
+          (when (!= count 1) (set! failures (+ failures 1)))
+          (when (!= (read/read32 (.text output) (if backward (+ far 4) 4))
+                    0x54000041)
+            (set! failures (+ failures 1)))
+          (match (jit/map-text (slice (.text output)))
+            (Err [message]
+                 (do (println "{}" message) (set! failures (+ failures 1))))
+            (Ok [image]
+                (let [(mut owned) image
+                      function
+                        (primitive/cast (fnptr (cc/C) [i64] i64) (.base owned))]
+                  (when (!= (call-ptr function 0) 42)
+                    (set! failures (+ failures 1)))
+                  (for input [(: -1 i64) 1 9223372036854775807]
+                    (when (!= (call-ptr function input) 7)
+                      (set! failures (+ failures 1))))
+                  (when (not (jit/release! (mut owned)))
+                    (set! failures (+ failures 1))))))))
+    (match (f/relax! (mut output) (mut labels) (mut branches) (mut relatives))
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [count] (when (!= count 0) (set! failures (+ failures 1)))))
+    (code/release! (mut output))
+    (free! (mut labels))
+    (free! (mut branches))
+    (free! (mut relatives))
+    failures))
 
 ;;; The branch operands must survive a caller-clobbering call after matching.
 (defn clobber :cc (cc/C) [(x i64) (y i64)] (-> i64)
@@ -65,6 +136,9 @@
       (Err [message] (do (println "{}" message) (set! failures 1)))
       (Ok [compiled]
           (let [(mut text) compiled]
+            (for [word 0 (/ (len text) 4)]
+              (when (= (read/read32 text (* word 4)) 0x14000001)
+                (set! failures (+ failures 1))))
             (match (jit/map-text (slice text))
               (Err [message] (do (println "{}" message) (set! failures 1)))
               (Ok [image]
@@ -113,7 +187,7 @@
 
 (defn main [] (-> i64)
   (let [(mut text) (ArrayList::new [u8] (malloc-allocator))
-        (mut failures) 0]
+        (mut failures) (+ (relaxed-execution false) (relaxed-execution true))]
     (let [(mut graph) (g/create (malloc-allocator))
           start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
           p (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))

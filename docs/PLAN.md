@@ -1523,3 +1523,40 @@ Structural checks cover explicit roots, shared comparisons, omitted result
 intervals and redirected branch operand uses. Existing narrow/32-bit, floating,
 SIMD and pressure fixtures retain their ordinary paths. Full target fusion and
 reuse parity remains open; these checks do not establish it.
+
+## Fallthrough emission checkpoint — 2026-11-01
+
+Pinned `ir_aarch64.dasc:ir_emit_jcc` reverses the predicate when the true block
+is next, omits the second jump when false is next, and emits END/LOOP_END jumps
+only when the target differs from the next emitted block. The Coil emitter now
+uses those rules over its current schedule. Nonempty edge-copy sequences remain
+path-specific via deferred stubs; empty copies permit direct branches.
+Allocation indices, graph references and Phi edge positions remain unchanged.
+
+Direct conditional branches use their normal one-word encoding when in range.
+Distant predicates expand to an inverted local branch over a normal B. A
+monotone prefix-layout computation handles cascading expansions and rebases
+labels, graph references, inline data and relative table offsets together.
+The far path commits transactionally; the near path allocates nothing. This is
+independent Coil assembler machinery, not a claim of DynASM/veneer parity.
+
+Physical block-chain ordering is still unported. The upstream policy is bottom-up
+Pettis-Hansen at ≤256 blocks for reducible CFGs, and top-down for larger or
+irreducible CFGs (`ir_cfg.c:ir_schedule_blocks`). Implement that selection and its
+frequency/empty-block handling explicitly; do not replace it with an unrelated
+trace heuristic or renumber allocation positions after allocation.
+
+
+Validation: all 211 standalone checks and all 65 linked AOT consumers pass.
+The standalone run regenerated the object fixtures; the linked run verifies
+that every consumed object was written after the final-source snapshot. Frozen
+compiler/SDK and project inputs are unchanged around validation. Evidence:
+`/tmp/stogir-fallthrough-project.json`, `/tmp/stogir-fallthrough-suite.log`,
+`/tmp/stogir-fallthrough-linked.log`, and their detailed output logs.
+
+Existing fixup tests now cover exact positive/negative conditional reach limits,
+cascading relaxation with graph-reference/DICE/table rebasing and transactional
+failure. Existing native branch tests execute forward and backward relaxed
+branches beyond 1 MiB and reject avoidable B-to-next words in predicate fixtures.
+Scalar/floating/vector, checked, switch-table, pressure, call and stack JIT/AOT
+coverage remains green. Original performance baseline files remain unchanged.
