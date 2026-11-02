@@ -2032,3 +2032,13 @@ parts and transfer order. Full 236 programs /72 linked consumers pass; all 5406
 AOT objects match 0fc663a byte-for-byte. Focused ASAN 31752 queries and native
 stencil/Phi/switch/allocation checks pass. Actual Coil measurement pending.
 See LOCATION_INDEX.md and validation/location-index-*.
+
+### Confirmed fixed-workload performance target
+
+The final location-index integration (Coil f9f0b602, pushed report a9b15305)
+meets the agreed IR-to-object target on the frozen Mac workload: 5.3756x faster
+than LLVM O3 and 5.8% slower runtime. Both independent comparable runs meet the
+median thresholds; the confirming observed ranges also meet both. A saturated
+external-Node run is retained with explicit rejection. Full native/AOT, FAST and
+installed SDK checks pass. See LOCATION_INDEX.md and the Coil benchmark report.
+This checkpoint does not claim whole-CLI speed or full upstream pass parity.
