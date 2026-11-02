@@ -1894,3 +1894,20 @@ performance gain. The previous accepted workload, samples and timing boundary
 remain unchanged. Performance acceptance remains unmet. Raw data and delivery
 proof live in Coil's docs/benchmarks/STOGIR_SCCP_MODES.md and
 docs/validation/stogir-sccp-pipeline-installed.json.
+
+
+## Isolated runtime dependence guard
+
+Vectorizer development merges the delivered SCCP base in 9b9ba80, reconciling
+the earlier graph-duplication patch with its byte-identical main implementation.
+The new loop-guard module groups affine footprints and emits a sufficient
+lower-48-bit no-wrap/non-alias predicate as ordinary scalar IR. Writing groups
+with differing offsets are rejected; distinct bases require runtime disjointness
+instead of an assumed no-alias property. The guard does not dereference memory.
+
+32 native configurations pass 75,328 checks against wide mathematical intervals
+and explicit positive/alias examples; linked AOT passes 13 boundary checks.
+AddressSanitizer passes. Details: docs/LOOP_GUARDS.md and
+docs/validation/loop-guard.json. The guard remains isolated; vector bodies,
+version dispatch and scalar cleanup are still pending. No runtime improvement
+or performance acceptance is claimed.
