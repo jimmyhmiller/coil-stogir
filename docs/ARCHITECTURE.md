@@ -49,17 +49,19 @@ must pass compiler delivery gates before being described as installed.
 ## Extensions and sequencing
 
 Automatic loop vectorization is an independent extension, not a ported feature
-of the pinned upstream pipeline. Its current analysis work is isolated in
-`.worktrees/loop-vectorizer` and is not connected to the delivered compiler.
+of the pinned upstream pipeline. The library O3 options API now selects guarded
+integer vector prefixes after SCCP and before final matching/liveness. Coil
+backend worktree delivery is in progress. See LOOP_VECTORIZATION.md.
 It must not substitute for completing the missing upstream optimizer stages.
 
 The rooted SCCP pipeline and explicit library mode API now have full standalone
 compatibility coverage: 228 programs and 69 linked consumers at executable source
-`799bba6`. Compiler integration validation is next, followed by the remaining
+`799bba6`. That SCCP compiler integration is delivered; vector extension validation is in
+progress, followed by the remaining
 fold/restart, promotion, control cleanup, matching, coalescing and allocation gaps. Each stage needs semantic execution tests and,
 where practical, differential checks against the pinned implementation.
 
-Any future vector transformation must operate on the same graph before final
+Every vector transformation must operate on the same graph before final
 matching/liveness, rebuild invalidated analysis, prove memory dependence safety
 (or guard it at runtime), preserve scalar fallback and tails, and pass both JIT
 and linked AOT execution tests. Analysis-only fixtures do not establish a safe
