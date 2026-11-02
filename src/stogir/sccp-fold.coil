@@ -20,13 +20,19 @@
 (import "stogir.bitqueue" :as q)
 (import "coil.result" :use [Result Ok Err Option Some None])
 
-;;; Decisions correspond to upstream EMIT, CONST and COPY outcomes. They are
+;;; Decisions distinguish upstream EMIT, CONST, COPY and CSE outcomes. They are
 ;;; transient rule results, not an additional graph or expression representation.
 (defstruct Decision [(kind i32) (constant n/Node) (source i32)])
 
 (defn emit [] (-> Decision)
   (Decision
     :kind 0
+    :constant (n/make 0 0 0 0 0 0)
+    :source 0))
+
+(defn cse [] (-> Decision)
+  (Decision
+    :kind 3
     :constant (n/make 0 0 0 0 0 0)
     :source 0))
 
@@ -61,7 +67,7 @@
        (types/valid-scalar? (cast i32 (n/type-id value)))))
 
 (defn optional [(ty i32) (bits (Option u64))] (-> Decision)
-  (match bits (None [] (emit)) (Some [result] (scalar ty result))))
+  (match bits (None [] (cse)) (Some [result] (scalar ty result))))
 
 (defn evaluate [(graph g/Graph)
                 (domain v/Domain)
@@ -77,18 +83,18 @@
     (cond (= opcode 68) (Ok (if (copies/hard? node) (emit) (copy left)))
           ;;; These families have no literal rule in pinned ir_fold.h. Its
           ;;; default CSE outcome becomes Bottom in ir_sccp_fold, just as EMIT.
-          (or (= opcode 40) (= opcode 65) (= opcode 66)) (Ok (emit))
+          (or (= opcode 40) (= opcode 65) (= opcode 66)) (Ok (cse))
           (= opcode 60)
             (let [yes (v/identity domain (.op2 node))
                   no (v/identity domain (.op3 node))]
               (if (= yes no)
                   (Ok (copy yes))
                   (match (conditional/truth-value first)
-                    (None [] (Ok (emit)))
+                    (None [] (Ok (cse)))
                     (Some [truth] (Ok (copy (if truth yes no)))))))
           (= opcode 44)
             (Ok (if (checked/operation? (cast i32 (n/opcode first)))
-                    (emit)
+                    (cse)
                     (scalar 1 0)))
           (types/vector? ty) (Err "SCCP vector fold family is not implemented")
           (conversion/operation? opcode)
@@ -99,7 +105,7 @@
                                                    ty
                                                    pointer-bytes
                                                    (n/constant-bits first)))
-                    (emit)))
+                    (cse)))
           (or (binary/operation? opcode)
               (and (>= opcode 14) (<= opcode 25))
               (checked/operation? opcode))
@@ -107,7 +113,8 @@
                   second (value graph domain (.op2 node))]
               (cond (and (= left right) (or (= opcode 58) (= opcode 59)))
                       (Ok (copy left))
-                    (not (and (numeric? first) (numeric? second))) (Ok (emit))
+                    (not (and (numeric? first) (numeric? second)))
+                      (Ok (if (checked/operation? opcode) (emit) (cse)))
                     (types/floating? from)
                       (Ok (optional ty
                                     (floating/evaluate opcode
@@ -133,12 +140,16 @@
                                                           (n/constant-bits first)
                                                           (n/constant-bits second))))
                     :else
-                      (Ok (optional ty
-                                    (fold/integer-binary opcode
-                                                         ty
-                                                         pointer-bytes
-                                                         (n/constant-bits first)
-                                                         (n/constant-bits second))))))
+                      (Ok (match (fold/integer-binary opcode
+                                                      ty
+                                                      pointer-bytes
+                                                      (n/constant-bits first)
+                                                      (n/constant-bits second))
+                            (Some [bits] (scalar ty bits))
+                            (None []
+                                  (if (or (= opcode 29) (= opcode 30))
+                                      (emit)
+                                      (cse)))))))
           (unary/operation? opcode)
             (Ok (if (numeric? first)
                     (optional ty
@@ -151,7 +162,7 @@
                                                       ty
                                                       pointer-bytes
                                                       (n/constant-bits first))))
-                    (emit)))
+                    (cse)))
           :else (Err "SCCP fold family is not implemented"))))
 
 (defn meet-reference! [(graph g/Graph)
@@ -200,6 +211,7 @@
                 (set! changed
                       (match (.kind decision)
                         (0 (v/make-bottom! (mut domain) edges reference) true)
+                        (3 (v/make-bottom! (mut domain) edges reference) true)
                         (1 (v/meet-constant! (mut domain)
                                              edges
                                              reference
