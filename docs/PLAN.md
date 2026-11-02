@@ -1985,3 +1985,19 @@ indexed pressure discovery, sparse initial parts and persistent vector doubling.
 Focused ASAN/oracle and allocator-only byte identity evidence remains recorded
 in PRESSURE_INDEX.md and VECTOR_DOUBLING.md. Coil integration and unchanged
 workload measurements follow. No performance target is claimed yet.
+
+
+## Reusable allocator pressure storage
+
+Isolated pressure-buffer worktree reuses three per-register arrays throughout
+each validated nonempty allocation run. Every query resets all entries; the
+owned compatibility query and original independent oracle remain. Focused ASAN
+passes fresh/reused comparisons at41,216 query positions,5,255,040 fields total,
+plus allocator/native pressure and empty-work programs. Captured O3 object bytes
+remain identical. Full235/72 validation is next before merge and Coil integration.
+See PRESSURE_BUFFER.md; no timing improvement is claimed yet.
+
+
+Reusable pressure-buffer sourcee158d3c now passes the full235 standalone
+programs and72 linked consumers with frozen inputs and fresh-object checks.
+Integration and production timings follow; runtime policy is unchanged.
