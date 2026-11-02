@@ -2001,3 +2001,14 @@ See PRESSURE_BUFFER.md; no timing improvement is claimed yet.
 Reusable pressure-buffer sourcee158d3c now passes the full235 standalone
 programs and72 linked consumers with frozen inputs and fresh-object checks.
 Integration and production timings follow; runtime policy is unchanged.
+
+
+## Canonical loop-aware order before allocation
+
+The diagnostic identifies Phi 59's per-iteration spill/reload as a block-position
+issue: plain RPO puts its vector latch after a use outside that loop. Pinned
+ir_gcm.c scheduling removes the pair through allocation and ordinary edge
+reconciliation. No source matching or emission-only spill fix is used. 325
+reference CFG cases and focused native ASAN checks pass. Full 236/72 compatibility
+validation is running before integration and production measurement.
+See LOOP_BLOCK_ORDER.md.
