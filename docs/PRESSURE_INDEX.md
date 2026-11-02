@@ -32,8 +32,8 @@ Focused validation passes with AddressSanitizer:
   baseline: 2053 bytes, SHA-256
   dcf4143d6dd61bd7b93481dd99febbaf29a911b3aa2de95a8d355da20a1c911c.
 
-This is isolated in .worktrees/pressure-index. Full compatibility validation passes all 234 standalone programs and all 71
-linked AOT consumers with frozen source/toolchain and fresh-object checks. It is not merged, vendored or installed, and
+Development used .worktrees/pressure-index; this source is now merged to main. Full compatibility validation passes all 234 standalone programs and all 71
+linked AOT consumers with frozen source/toolchain and fresh-object checks. It is not yet vendored or installed in Coil, and
 no production compile-time or runtime improvement is claimed yet.
 
 
@@ -51,3 +51,9 @@ Focused ASAN pressure, mixed-spill, call/switch/floating and stencil checks pass
 The captured O3 object remains byte-identical (2053 bytes, same hash above).
 The combined full compatibility run is required before this additional change
 is delivered. The previous 234/71 broad result covers pressure indexing alone.
+
+
+Combined validation with sparse records and vector doubling now passes all
+235 standalone programs and 72 linked AOT consumers. Object identity checks
+above isolate allocator changes; vector doubling intentionally changes code.
+See validation/tuned-backend-suite.json. Production measurements follow.

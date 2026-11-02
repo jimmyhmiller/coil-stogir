@@ -24,5 +24,7 @@ Focused validation passes:
 - Six linked AOT cases check 64-bit overflow and red zones through the same image
   path. Captured stencil 60 checksum checks pass with AddressSanitizer.
 
-Full combined compatibility and Coil integration remain pending. No production
+Full combined compatibility passes 235 standalone programs and 72 linked AOT
+consumers with frozen source/toolchain and fresh-object checks. Coil integration
+and production measurements remain pending. No production
 runtime improvement is claimed before the unchanged benchmark is rerun.

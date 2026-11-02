@@ -1975,3 +1975,13 @@ Pressure-index compatibility validation completed: 234 standalone programs and
 71 linked AOT consumers pass with frozen source/toolchain and fresh-object
 checks. Public/native pressure decisions and the captured object remain exact.
 Compiler integration and production measurements remain pending.
+
+
+## Combined allocator and vector matching validation
+
+Executable source5296d0d passes all235 standalone programs and72 linked AOT
+consumers with frozen source/toolchain and fresh-object checks. This includes
+indexed pressure discovery, sparse initial parts and persistent vector doubling.
+Focused ASAN/oracle and allocator-only byte identity evidence remains recorded
+in PRESSURE_INDEX.md and VECTOR_DOUBLING.md. Coil integration and unchanged
+workload measurements follow. No performance target is claimed yet.
