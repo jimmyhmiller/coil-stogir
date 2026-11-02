@@ -32,6 +32,6 @@ Focused validation passes with AddressSanitizer:
   baseline: 2053 bytes, SHA-256
   dcf4143d6dd61bd7b93481dd99febbaf29a911b3aa2de95a8d355da20a1c911c.
 
-This is isolated in .worktrees/pressure-index. Full standalone and linked AOT
-compatibility validation is next. It is not merged, vendored or installed, and
+This is isolated in .worktrees/pressure-index. Full compatibility validation passes all 234 standalone programs and all 71
+linked AOT consumers with frozen source/toolchain and fresh-object checks. It is not merged, vendored or installed, and
 no production compile-time or runtime improvement is claimed yet.
