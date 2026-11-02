@@ -34,5 +34,6 @@ algorithm. Canonical order, reachability and change results are checked. Native
 stencil 60 checks and Phi/switch-pressure/branch programs pass. Disassembly confirms
 a direct vector backedge without the Phi 59 hot-loop transfer pair.
 
-Full compatibility validation is running from executable source 7801b60. Compiler
+Full compatibility validation passes 236 programs and 72 linked AOT consumers
+from executable source 7801b60, with frozen inputs and fresh objects. Compiler
 integration and unchanged-workload measurements remain required before acceptance.

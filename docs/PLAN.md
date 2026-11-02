@@ -2012,3 +2012,9 @@ reconciliation. No source matching or emission-only spill fix is used. 325
 reference CFG cases and focused native ASAN checks pass. Full 236/72 compatibility
 validation is running before integration and production measurement.
 See LOOP_BLOCK_ORDER.md.
+
+
+Canonical scheduling source7801b60 passes all236 standalone programs and72
+linked AOT consumers with frozen inputs and fresh objects. Reusable pressure
+storage is included and validated. Coil integration and fixed-workload timing
+are next; no performance acceptance claim yet.
