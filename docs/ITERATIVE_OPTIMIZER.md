@@ -51,3 +51,10 @@ COPY roots, 25 original JIT plus 25 optimized JIT and 25 linked AOT answers,
 second-run stability, tail-only Phi edits, and ASAN ownership regressions.
 These checks establish this stage connection, not complete upstream optimizer
 coverage or performance acceptance. Mode policy and Coil delivery remain open.
+
+Standalone image/object mode policy is now exposed through explicit options;
+see [OPTIMIZATION_MODES.md](OPTIMIZATION_MODES.md). Levels 2 and 3 connect the
+current SCCP pipeline before native preparation; level 1 retains the legacy
+path. O0 explicitly rejects until its separate fast path exists. This supersedes
+the pending standalone mode-API status above. Coil flag transport, complete
+optimizer/allocator parity, delivery and performance acceptance remain open.

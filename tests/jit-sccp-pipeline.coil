@@ -3,6 +3,7 @@
 (import "stogir.builder" :as b)
 (import "stogir.node" :as n)
 (import "stogir.sccp" :as sccp)
+(import "stogir.options" :as options)
 (import "stogir.sccp-analysis" :as analysis)
 (import "stogir.sccp-rewrite" :as rewrite)
 (import "stogir.bitqueue" :as q)
@@ -34,6 +35,111 @@
             (jit/release-image! (mut loaded)))))
     failures))
 
+;;; Compare the public JIT/AOT option paths with explicit stage composition.
+(defn check-modes [(source g/Graph) (roots (slice i32))] (-> i64)
+  (let [a (malloc-allocator)
+        (mut failures) 0]
+    (for level [(: 1 i32) 2 3]
+      (let [configuration
+              (if (= level 1) (options/defaults) (options/Options :level level))]
+        (match (compile/image-with-options source
+                                           1
+                                           roots
+                                           "_mode"
+                                           configuration
+                                           a)
+          (Err [message] (panic "mode {}: {}" level message))
+          (Ok [output]
+              (let [(mut output) output]
+                (set! failures (+ failures (execute output)))
+                (match (macho/image-object output a)
+                  (Err [message] (panic "{}" message))
+                  (Ok [expected]
+                      (let [(mut expected) expected]
+                        (match (compile/object-with-options source
+                                                            1
+                                                            roots
+                                                            "_mode"
+                                                            configuration
+                                                            a)
+                          (Err [message] (panic "{}" message))
+                          (Ok [actual]
+                              (let [(mut actual) actual]
+                                (when (!= (len actual) (len expected))
+                                  (set! failures (+ failures 1)))
+                                (when (= (len actual) (len expected))
+                                  (for [i 0 (len actual)]
+                                    (when (!= (get actual i) (get expected i))
+                                      (set! failures (+ failures 1)))))
+                                (when (= level 3)
+                                  (match (fs/write-file a
+                                                        "/tmp/coil-stogir-options.o"
+                                                        (slice actual))
+                                    (Err [_] (panic "object write failed"))
+                                    (Ok [_] 0)))
+                                (free! (mut actual)))))
+                        (free! (mut expected)))))
+                ; O1 must equal the legacy path; O2/O3 must equal explicit SCCP
+                ; followed by the same matcher/liveness/allocation/emitter.
+                (let [reference
+                        (if (= level 1)
+                            (compile/image source 1 roots "_mode" a)
+                            (match (sccp/optimize source 8 roots a)
+                              (Err [message]
+                                   (Err [image/Image (slice u8)] message))
+                              (Ok [working]
+                                  (let [(mut working) working
+                                        code
+                                          (compile/image (.graph working)
+                                                         1
+                                                         (slice (.roots working))
+                                                         "_mode"
+                                                         a)]
+                                    (rewrite/release! (mut working))
+                                    code))))]
+                  (match reference
+                    (Err [message] (panic "{}" message))
+                    (Ok [reference]
+                        (let [(mut reference) reference]
+                          (when (!= (len (.text output))
+                                    (len (.text reference)))
+                            (set! failures (+ failures 1)))
+                          (when (= (len (.text output)) (len (.text reference)))
+                            (for [i 0 (len (.text output))]
+                              (when (!= (get (.text output) i)
+                                        (get (.text reference) i))
+                                (set! failures (+ failures 1)))))
+                          (image/release! (mut reference))))))
+                (image/release! (mut output)))))))
+    (for level [(: -1 i32) 0 4]
+      (match (compile/image-with-options source
+                                         1
+                                         roots
+                                         "_mode"
+                                         (options/Options :level level)
+                                         a)
+        (Err [message]
+             (when (and (= level 0)
+                        (!= message "AArch64 O0 pipeline is not implemented"))
+               (set! failures (+ failures 1))))
+        (Ok [unexpected]
+            (let [(mut unexpected) unexpected]
+              (set! failures (+ failures 1))
+              (image/release! (mut unexpected)))))
+      (match (compile/object-with-options source
+                                          1
+                                          roots
+                                          "_mode"
+                                          (options/Options :level level)
+                                          a)
+        (Err [_] 0)
+        (Ok [unexpected]
+            (let [(mut unexpected) unexpected]
+              (set! failures (+ failures 1))
+              (free! (mut unexpected))))))
+    (println "public optimization-mode checks: {} failures" failures)
+    failures))
+
 (defn main [] (-> i64)
   (let [a (malloc-allocator)
         (mut source) (g/create a)
@@ -55,6 +161,7 @@
         done (require (b/emit! (mut source) 120 11 [merge sum (: 0 i32)]))
         roots [done phi second]
         (mut failures) 0]
+    (set! failures (+ failures (check-modes source roots)))
     (match (compile/image source start roots "_sccp_pipeline_before" a)
       (Err [message] (panic "{}" message))
       (Ok [code]
