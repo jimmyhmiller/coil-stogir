@@ -1996,3 +1996,8 @@ passes fresh/reused comparisons at41,216 query positions,5,255,040 fields total,
 plus allocator/native pressure and empty-work programs. Captured O3 object bytes
 remain identical. Full235/72 validation is next before merge and Coil integration.
 See PRESSURE_BUFFER.md; no timing improvement is claimed yet.
+
+
+Reusable pressure-buffer sourcee158d3c now passes the full235 standalone
+programs and72 linked consumers with frozen inputs and fresh-object checks.
+Integration and production timings follow; runtime policy is unchanged.

@@ -25,7 +25,8 @@ Focused AddressSanitizer evidence:
   972e555d8c3c655d9eb42cafad2b611c81f041efb64e01576d2b1175ef74d881.
 
 This change is isolated in .worktrees/pressure-buffer, unmerged, unvendored and
-uninstalled. Full 235-program / 72-linked compatibility validation is next. No
+uninstalled. Full 235-program / 72-linked compatibility validation passes with frozen
+source/toolchain and fresh-object checks. No
 production compile-time gain is claimed until that validation and a Coil build
 and unchanged-workload comparison complete. Runtime code should remain unchanged;
 this does not close the remaining runtime target by itself.
