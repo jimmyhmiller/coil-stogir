@@ -1849,3 +1849,25 @@ library image API inside the existing ir-codegen timing span. Candidate build
 and compiler delivery validation are in progress; global install and push have
 not occurred at this checkpoint. No fresh benchmark result is claimed. The
 runtime/compile-time performance goal remains unmet.
+
+
+## Coil delivery confirmation
+
+Compiler source `3baa1650` is now installed globally with its matching SDK;
+Coil validation commit `d1acc9d5` is pushed to `feature/stogir-backend`. Candidate
+build, full FAST 49/49 (343.1 seconds, time and 1.60 GB memory warnings),
+LLVM/TPDE/stogir O3 off-checkout object/link/run checks and new SDK namespace
+imports pass. All 127 installed modules match standalone source. The native
+fixture and stencil passes 1/2/17/257 agree for stogir O1/O2/O3 against LLVM O3
+and TPDE. Stogir's corpus remains 6/9 with the same pinned-shim, narrow-bit/i128
+and deep-tail-recursion limitations. O0 explicitly reports its missing fast
+allocation path.
+
+A fixed five-sample timing attempt records provisional medians: LLVM O3 codegen
+25.790 ms/runtime 361.365 ms; TPDE 0.122 ms/4002.083 ms; stogir 5.963 ms/2990.253
+ms. Concurrent Turbopack/Rust compilations occurred in 8 of 24 monitoring
+observations, so these are not a replacement accepted baseline or proof of a
+performance gain. The previous accepted workload, samples and timing boundary
+remain unchanged. Performance acceptance remains unmet. Raw data and delivery
+proof live in Coil's docs/benchmarks/STOGIR_SCCP_MODES.md and
+docs/validation/stogir-sccp-pipeline-installed.json.
