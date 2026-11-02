@@ -143,3 +143,18 @@ state/queue agreement with the pinned reference, including dependent copy
 partition splits and exact constant payloads. This is a prerequisite for SCCP;
 it does not enable SCCP in the compiler. Analysis, rewriting and follow-up
 iterative optimization remain pending.
+
+Whole-node graph rewrites keep existing references fixed, clear construction
+CSE, and expose released continuation cells as NOPs. They reject requests that
+do not fit the original allocation. The owning optimizer must remap incoming
+edges/roots and rebuild analysis caches. SCCP is not enabled by these APIs.
+
+Native pressure coverage includes simultaneous Phi definitions with reverse
+use order, checking spilled prefixes on both branch paths. Its AOT fixture is
+consumed together with the existing pressure cases:
+
+```sh
+coil run tests/jit-pressure.coil --debug-checks
+coil run tests/jit-switch-pressure.coil --debug-checks
+coil run tests/aot-switch-pressure-link.coil --debug-checks --link-flag /tmp/coil-stogir-switch-pressure-gp.o --link-flag /tmp/coil-stogir-switch-pressure-fp.o --link-flag /tmp/coil-stogir-phi-pressure.o
+```
