@@ -12,15 +12,18 @@ and [LICENSE](../LICENSE).
 | --- | --- |
 | Construction folding/CSE, def-use lists | Compact graph, builder/fold modules and uses. Implemented coverage does not imply all upstream folds. |
 | Optional mem2ssa, then reset CFG | Not implemented. |
-| SCCP at optimization levels above one | Lattice and worklist prerequisites exist. Analyzer, rewriting and iterative optimization are not enabled. |
+| SCCP at optimization levels above one | Rooted analysis, owned rewriting and incremental scalar fold/CSE/DCE run through explicit image/object options at levels 2/3. Fold/restart coverage, promotion and CFG/control/load cleanup remain incomplete. See `OPTIMIZATION_MODES.md`. |
 | CFG, dominators, loops, GCM, scheduling | `pipeline.prepare` orchestrates CFG, dominance, loop depth, placement and scheduling. Full upstream algorithm parity remains unverified. |
 | Target matching | `a64.compile.generate` builds a persistent `a64.match.Plan` before register analysis. Fusion and reuse coverage remain incomplete. |
 | Virtual registers, live ranges, coalescing, allocation | Matched operands feed register liveness, ranges and constraints, then split-interval allocation. Explicit upstream coalescing and full allocation-policy parity remain open. |
 | Block scheduling and emission | Post-allocation block ordering and native emission. The scheduling core has a pinned-upstream differential; this does not establish whole-pipeline equivalence. |
 
-The current entry point has one preparation/allocation path. It does not yet
-implement upstream's distinct O0/O1/O2+ option and flag policy. Accepting `-O3`
-in the Coil CLI must not be described as enabling the missing upstream passes.
+Explicit library options now select the existing native path at level 1 and add
+SCCP before it at levels 2/3, following the pinned positive-level gate. O0
+explicitly rejects until the distinct de-SSA/fast-allocation path exists. This is
+not complete upstream flag, optimizer or allocator parity. Legacy entry points
+retain their existing behavior. Coil flag transport is committed separately and
+must pass compiler delivery gates before being described as installed.
 
 ## Invariants for further work
 
@@ -50,9 +53,10 @@ of the pinned upstream pipeline. Its current analysis work is isolated in
 `.worktrees/loop-vectorizer` and is not connected to the delivered compiler.
 It must not substitute for completing the missing upstream optimizer stages.
 
-The next upstream implementation priority is the SCCP analyzer and rewrite
-pipeline, followed by explicit mode policy and the remaining matching,
-coalescing and allocation gaps. Each stage needs semantic execution tests and,
+The rooted SCCP pipeline and explicit library mode API now have full standalone
+compatibility coverage: 228 programs and 69 linked consumers at executable source
+`799bba6`. Compiler integration validation is next, followed by the remaining
+fold/restart, promotion, control cleanup, matching, coalescing and allocation gaps. Each stage needs semantic execution tests and,
 where practical, differential checks against the pinned implementation.
 
 Any future vector transformation must operate on the same graph before final

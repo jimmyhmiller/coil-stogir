@@ -1825,3 +1825,27 @@ each edit. Successful single-edge replacements and missing-edge no-ops are also
 checked. The fixture passes AddressSanitizer; focused use/domain/native-control
 regressions pass. Evidence: `validation/mutable-uses.json`.
 The iterative folding/control driver and mode integration remain pending.
+
+
+## SCCP pipeline and native modes: full compatibility checkpoint
+
+Executable source `799bba6` is merged into main in `406be5b`. It adds rooted
+analysis, owned rewriting, incremental scalar fold/CSE/DCE, affected-node
+candidate transport and explicit image/object options. Positive levels above
+one run SCCP before native preparation; level 1 retains the legacy path; level 0
+explicitly rejects until its distinct upstream fast-allocation path exists.
+
+All 228 standalone programs and 69 linked AOT consumers pass. Object freshness
+and frozen source/toolchain hashes are checked. The run takes 421.05 seconds for
+standalone programs and 66.83 seconds for linked consumers. Evidence:
+`docs/validation/sccp-full-regressions.json`. Selected oracle, cross-pass CSE,
+JIT/AOT, positive-root and constant-pool ownership tests remain qualified in the
+component reports. These are not full upstream optimizer/allocator parity.
+
+Coil integration is committed separately at `3baa1650` in its stogir backend
+worktree. It vendors 127 byte-identical modules, regenerates the SDK manifest,
+and transports the CLI optimization level explicitly through job state to the
+library image API inside the existing ir-codegen timing span. Candidate build
+and compiler delivery validation are in progress; global install and push have
+not occurred at this checkpoint. No fresh benchmark result is claimed. The
+runtime/compile-time performance goal remains unmet.
