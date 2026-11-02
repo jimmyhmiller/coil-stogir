@@ -1,0 +1,90 @@
+(module stogir.tests.pressure-index)
+(import "stogir.allocation" :as a)
+(import "stogir.constraints" :as c)
+(import "stogir.interval" :as range)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+
+(defn compare [(parts (ArrayList a/Part))
+               (fixed a/PressureIndex)
+               (registers i32)]
+  (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut failures) 0]
+    (for [i 0 (len parts)]
+      (when (> (len (.ranges (get parts i))) 0)
+        (let [(mut expected) (a/pressure parts (cast i32 i) registers allocator)
+              (mut actual)
+                (a/pressure-indexed parts
+                                    (cast i32 i)
+                                    registers
+                                    fixed
+                                    allocator)]
+          (for [r 0 (cast i64 registers)]
+            (when (or (!= (get (.free expected) r) (get (.free actual) r))
+                      (!= (get (.next-use expected) r)
+                          (get (.next-use actual) r))
+                      (!= (get (.fixed-at expected) r)
+                          (get (.fixed-at actual) r)))
+              (set! failures (+ failures 1))))
+          (a/release-pressure! (mut expected))
+          (a/release-pressure! (mut actual)))))
+    failures))
+
+(defn check [(seed i64) (registers i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut parts) (ArrayList::new [a/Part] allocator)
+        (mut fixed)
+          (a/PressureIndex :known 0 :parts (ArrayList::new [i32] allocator))
+        (mut failures) 0]
+    (for [i 0 32]
+      (let [(mut part) (a/create (cast i32 i) allocator)
+            start (% (+ (* i 7) seed) 32)]
+        (push! (mut (.ranges part)) (range/Range :start start :end (+ start 8)))
+        (push! (mut (.ranges part))
+               (range/Range :start (+ start 16) :end (+ start 32)))
+        (when (= (% i 3) 0)
+          (set! (.register part) (cast i32 (% i (cast i64 registers)))))
+        (for [j 0 12]
+          (let [position (+ (* j 5) (% (+ seed i) 4))
+                fixed?
+                  (or (= (% seed 3) 0)
+                      (and (= (% seed 3) 2) (= (% i 4) 0)))
+                kind (if (and fixed? (= (% j 3) 0)) 2 (cast i32 (% j 2)))
+                reg
+                  (if (= kind 2) (cast i32 (% (+ i j) (cast i64 registers))) -1)]
+            (when (not (c/add! (mut (.uses part)) position kind reg))
+              (panic "inconsistent test use"))))
+        (push! (mut parts) part)))
+    (a/refresh-pressure! (mut fixed) parts)
+    (when (!= (len (.parts fixed))
+              (if (= (% seed 3) 0) 32 (if (= (% seed 3) 1) 0 8)))
+      (set! failures (+ failures 1)))
+    (set! failures (+ failures (compare parts fixed registers)))
+    ; Split indexed prefixes. Moved fixed uses must be found in appended children.
+    (for [i 0 32]
+      (let [part (elem (mut parts) i)
+            cut (+ (.start (get (.ranges part) 0)) (if (= (% i 2) 0) 4 20))
+            child (a/split! part cut allocator)]
+        (push! (mut parts) child)))
+    (a/refresh-pressure! (mut fixed) parts)
+    (set! failures (+ failures (compare parts fixed registers)))
+    ; A later reservation and repeated refresh cannot omit or duplicate effects.
+    (a/reserve! (mut parts) (- registers 1) 3 47 allocator)
+    (a/refresh-pressure! (mut fixed) parts)
+    (let [count (len (.parts fixed))]
+      (a/refresh-pressure! (mut fixed) parts)
+      (when (or (!= count (len (.parts fixed))) (!= (.known fixed) (len parts)))
+        (set! failures (+ failures 1))))
+    (set! failures (+ failures (compare parts fixed registers)))
+    (for [i 0 (len parts)] (a/release! (elem (mut parts) i)))
+    (free! (mut parts))
+    (free! (mut (.parts fixed)))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for registers [(: 1 i32) 4 16 64]
+      (for [seed 0 64] (set! failures (+ failures (check seed registers)))))
+    (println "indexed pressure oracle checks: {} failures" failures)
+    (if (= failures 0) 0 1)))
