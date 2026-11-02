@@ -166,3 +166,13 @@ spilled and its future required-use suffix is requeued. A register-required use
 at that position remains an error. The independent allocator still does not
 claim parity for optimal split positions, register reuse/coalescing or all
 upstream allocation policies.
+
+### Loop-vectorization development
+
+`stogir.loop-shape` and `stogir.loop-affine` are new optimizer analyses over the
+existing compact graph, scheduled CFG and dominator metadata. They recognize
+single-path natural counted loops and checked unit-stride affine footprints.
+No automatic vectorizer is claimed from pinned upstream. Unsupported control,
+loop-carried state or memory operations keep their scalar graph. Numeric
+constant handling excludes symbolic relocatable constants. Pointer/base identity
+is not treated as a no-alias guarantee; versioning must check footprints.

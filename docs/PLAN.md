@@ -1680,3 +1680,26 @@ The linked pressure consumer uses both switch-pressure objects and the new
 phi-pressure object. Final graph/CSE checks also pass under TPDE. Logs and source
 snapshot: `/tmp/stogir-rewrite-suite.log`, `/tmp/stogir-rewrite-linked.log`,
 `/tmp/stogir-rewrite-tpde.log`, `/tmp/stogir-rewrite-project.json`.
+
+## Loop vectorization — development analysis
+
+In the isolated loop-vectorizer worktree, generic natural-loop recognition and
+checked affine footprint analysis now identify the two memory-map loops in the
+accepted compiler input. The captured graph has 177 cells. A temporary generic
+dump of all functions, using serial emission, produced a byte-identical object
+to the delivered checkpoint; instrumentation was removed and the delivered
+candidate restored. The local snapshot/probe is ignored under build/ and is
+not an optimization pattern or a shipped workload rewrite.
+
+Forty-eight independent analysis cases pass across element widths 1/2/4/8 and
+initial values 0/1, covering ordinary maps and rejection of volatile memory,
+reductions, mixed widths, nonunit stride and nonlinear addressing. The source
+read offsets -4/0/+4 and destination offset 0 are recovered from the real kernel
+without source-name or fixed-trip-count recognition. Multiple carried values
+and nested internal control are excluded by the current legality analysis.
+
+This is not yet a vector transformation or performance result. Next: validate
+low-width wrap-preserving data lifting (the compiler uses u64 containers around
+u32 truncations), runtime alias/range guards, finite vector prefix and scalar
+cleanup, then shared JIT/AOT emission. All optimization work must remain inside
+the measured IR-to-machine-code boundary; original benchmark files stay fixed.
