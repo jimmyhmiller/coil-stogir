@@ -1,0 +1,187 @@
+(module stogir.tests.jit-address-matching)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.types" :as types)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.a64.match" :as matching)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.memory" :as memory)
+(import "stogir.a64.code" :as code)
+(import "stogir.allocation" :as allocation)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+;;; Expected encoding ranges are independent of the selector implementation.
+(defn encodable? [(bytes i32) (offset i64)] (-> bool)
+  (or (and (>= offset -256) (< offset 256))
+      (and (>= offset 0)
+           (= (% offset (cast i64 bytes)) 0)
+           (< offset (* (cast i64 bytes) 4096)))))
+
+;;; Variant 0: ordinary shared address; 1: rooted address; 2: HARD COPY barrier;
+;;; 3: address escapes as return; 4: mixed-width memory sharing.
+(defn check [(ty i32) (offset i64) (variant i32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        source (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        destination (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        delta (require (b/scalar-constant! (mut graph) 5 (cast u64 offset) 8))
+        address (require (b/emit! (mut graph) 26 6 [source delta]))
+        target (require (b/emit! (mut graph) 26 6 [destination delta]))
+        actual-address
+          (if (= variant 2)
+              (require (b/emit! (mut graph) 68 6 [address (: 1 i32)]))
+              address)
+        loaded (require (b/emit! (mut graph) 91 ty [start actual-address]))
+        extra
+          (if (= variant 4)
+              (require (b/emit! (mut graph) 91 2 [loaded address]))
+              loaded)
+        stored (require (b/emit! (mut graph) 93 0 [extra target loaded]))
+        result
+          (if (= variant 3)
+              (require (b/conversion! (mut graph) 36 5 8 address))
+              (require (b/scalar-constant! (mut graph) 5 0 8)))
+        returned (require (b/emit! (mut graph) 120 5 [stored result (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)
+        bytes (types/size ty 8)
+        selected (and (!= variant 2) (encodable? bytes offset))
+        omitted
+          (and (!= variant 1)
+               (!= variant 2)
+               (!= variant 3)
+               (encodable? bytes offset)
+               (or (!= variant 4) (encodable? 1 offset)))
+        (mut failures) 0]
+    (push! (mut roots) returned)
+    (when (= variant 1) (push! (mut roots) address))
+    (match (pipeline/prepare graph start (slice roots) a)
+      (Err [message] (panic "{}" message))
+      (Ok [prepared]
+          (let [(mut prepared) prepared]
+            (match (matching/build graph
+                                   (.schedule prepared)
+                                   (slice roots)
+                                   true
+                                   a)
+              (Err [message] (panic "{}" message))
+              (Ok [plan]
+                  (let [(mut plan) plan
+                        range (get (.ranges (.operands plan)) (cast i64 loaded))]
+                    (when (!= (> (get (.addresses plan) (cast i64 loaded)) 0)
+                              selected)
+                      (set! failures (+ failures 1)))
+                    (when (!= (get (.omitted (.operands plan))
+                                   (cast i64 address))
+                              omitted)
+                      (set! failures (+ failures 1)))
+                    (when (!= (.count range) 1) (set! failures (+ failures 1)))
+                    (when (!= (get (.inputs (.operands plan)) (.offset range))
+                              (if selected source actual-address))
+                      (set! failures (+ failures 1)))
+                    (when selected
+                      (when (!= (get (.offsets plan) (cast i64 loaded)) offset)
+                        (set! failures (+ failures 1))))
+                    (matching/release! (mut plan)))))
+            (pipeline/release! (mut prepared)))))
+    (match (compile/text graph start (slice roots) a)
+      (Err [message] (panic "{}" message))
+      (Ok [text]
+          (let [(mut text) text]
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "{}" message))
+              (Ok [mapped]
+                  (let [(mut mapped) mapped
+                        function
+                          (p/cast (fnptr (cc/C) [(ptr u8) (ptr u8)] u64)
+                                  (.base mapped))
+                        (mut input) (ArrayList::new [u8] a)
+                        (mut output) (ArrayList::new [u8] a)]
+                    (for [i 0 66064]
+                      (push! (mut input) (cast u8 (+ (* i 137) 253)))
+                      (push! (mut output) (: 0xA5 u8)))
+                    (let [src (p/index (.data input) 512)
+                          dst (p/index (.data output) 512)
+                          answer (function src dst)]
+                      (when (!= answer
+                                (if (= variant 3)
+                                    (cast u64
+                                          (+ (cast i64 (p/cast u64 src)) offset))
+                                    (: 0 u64)))
+                        (set! failures (+ failures 1)))
+                      (for [i 0 66064]
+                        (let [inside
+                                (and (>= i (+ 512 offset))
+                                     (< i (+ (+ 512 offset) (cast i64 bytes))))]
+                          (when (!= (get output i)
+                                    (if inside (get input i) (: 0xA5 u8)))
+                            (set! failures (+ failures 1))))))
+                    (free! (mut input))
+                    (free! (mut output))
+                    (jit/release! (mut mapped)))))
+            (free! (mut text)))))
+    (free! (mut roots))
+    (g/release! (mut graph))
+    (when (!= failures 0)
+      (println "address ty={} offset={} variant={} failures={}"
+               ty
+               offset
+               variant
+               failures))
+    failures))
+
+(defn invalid-references [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut output) (code/create a)
+        (mut parts) (ArrayList::new [allocation/Part] a)
+        (mut failures) 0]
+    (for reference [(: 0 i32) -1 999]
+      (match (memory/emit! (mut output) graph parts reference 0)
+        (Err [_] 0)
+        (Ok [_] (set! failures (+ failures 1)))))
+    (when (!= (len (.text output)) 0) (set! failures (+ failures 1)))
+    (free! (mut parts))
+    (code/release! (mut output))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) (invalid-references)]
+    (for ty [(: 2 i32)
+             3
+             4
+             5
+             8
+             9
+             10
+             11
+             12
+             13
+             (types/vector-type 2 16)
+             (types/vector-type 3 8)
+             (types/vector-type 4 4)
+             (types/vector-type 5 2)]
+      (let [bytes (cast i64 (types/size ty 8))]
+        (for offset [(: -257 i64)
+                     -256
+                     -1
+                     0
+                     1
+                     255
+                     256
+                     257
+                     (* bytes 4095)
+                     (* bytes 4096)]
+          (for variant [(: 0 i32) 1 2 3 4]
+            (set! failures (+ failures (check ty offset variant)))))))
+    (println "matched memory address checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

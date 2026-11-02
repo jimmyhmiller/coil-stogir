@@ -1942,3 +1942,19 @@ Structural facts are shared across rejected candidates; a successful edit ends
 the epoch and releases/rebuilds all facts. Empty candidate sets need no prepare.
 ASAN stencil (60 checks), matrix (17,640 cases), SCCP and shape regressions pass.
 Compiler corpus revalidation is required before repaired delivery.
+
+
+## Matching-time base/offset memory selection
+
+Ported the pinned AArch64 address-fusion decision into persistent target
+metadata. Machine uses and constraints redirect to selected bases before
+liveness; shared, rooted and escaping address definitions remain when required.
+Scaled unsigned12 and unscaled signed9 forms support scalar/signed/FP/SIMD
+loads/stores, without traversing COPY barriers or changing memory order.
+95 independent assembler encodings, 700 native matrix cases, broad233 standalone
+programs and71 linked consumers pass. A subsequent wrapper error-path repair
+passes3 invalid-reference cases and5 focused ASAN programs on final source.
+See ADDRESS_MATCHING.md and validation/address-matching.json. Diagnostic O3
+compilation sampling points to pressure scans, constraint-use iteration and
+location lookup as follow-up compile-time costs. Coil integration and fixed
+workload comparisons are next; the performance goal remains unmet.
