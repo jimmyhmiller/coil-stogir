@@ -1680,3 +1680,14 @@ The linked pressure consumer uses both switch-pressure objects and the new
 phi-pressure object. Final graph/CSE checks also pass under TPDE. Logs and source
 snapshot: `/tmp/stogir-rewrite-suite.log`, `/tmp/stogir-rewrite-linked.log`,
 `/tmp/stogir-rewrite-tpde.log`, `/tmp/stogir-rewrite-project.json`.
+
+## SCCP analysis development branch
+
+The ignored .worktrees/sccp-analysis checkout begins feasible-input Phi analysis
+over the original graph and compact value domain. Initial 100 cases cover
+constant agreement/conflicts, distinct/same overdefined source identities,
+self inputs and all predecessor feasibility masks. They pass. Long/symbol
+constants, previous copy partitions, backward top discovery, loop transitions
+and a pinned-C differential are still required before treating the transfer as
+verified. The whole SCCP analyzer, transformation and iteration remain pending.
+This branch is not merged into main, vendored, or enabled in the compiler.

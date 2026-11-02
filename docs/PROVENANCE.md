@@ -166,3 +166,11 @@ spilled and its future required-use suffix is requeued. A register-required use
 at that position remains an error. The independent allocator still does not
 claim parity for optimal split positions, register reuse/coalescing or all
 upstream allocation policies.
+
+### Feasible Phi analysis — development branch
+
+`stogir.sccp-phi` adapts pinned `ir_sccp.c:ir_sccp_analyze_phi`, meeting only
+feasible predecessor inputs, ignoring self identities, discovering top inputs
+backward and reusing the combined copy/constant lattice. This module is under
+development in the isolated analysis worktree. Its initial metadata tests are
+not a differential proof or a complete SCCP pass; it is not wired to codegen.
