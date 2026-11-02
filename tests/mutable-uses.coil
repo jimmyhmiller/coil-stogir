@@ -1,0 +1,97 @@
+(module stogir.tests.mutable-uses)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.uses" :as uses)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+;;; Compare complete edge multisets with a fresh graph walk, including each
+;;; repeated operand. Storage order may differ after redirection appends.
+(defn check [(graph g/Graph) (actual uses/Uses)] (-> i64)
+  (let [(mut expected) (uses/build graph (malloc-allocator))
+        (mut failures) 0]
+    (for [r 1 (len (.instructions graph))]
+      (let [want (get (.ranges expected) r)
+            got (get (.ranges actual) r)]
+        (when (!= (.count want) (.count got)) (set! failures (+ failures 1)))
+        (for [i (.offset want) (+ (.offset want) (.count want))]
+          (let [edge (get (.edges expected) i)
+                (mut count) 0]
+            (for [j (.offset got) (+ (.offset got) (.count got))]
+              (let [candidate (get (.edges actual) j)]
+                (when (and (= (.user edge) (.user candidate))
+                           (= (.operand edge) (.operand candidate)))
+                  (set! count (+ count 1)))))
+            (when (!= count 1) (set! failures (+ failures 1)))))))
+    (uses/release! (mut expected))
+    failures))
+
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        y (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        z (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        first (require (b/emit! (mut graph) 26 11 [x x]))
+        second (require (b/emit! (mut graph) 26 11 [y z]))
+        (mut users) (ArrayList::new [i32] a)
+        (mut failures) 0]
+    (push! (mut users) first)
+    (push! (mut users) second)
+    (for [i 0 128]
+      (push! (mut users) (require (b/emit! (mut graph) 26 11 [x x]))))
+    (let [(mut lists) (uses/build graph a)]
+      (set! failures (+ failures (check graph lists)))
+      (let [length (len (.edges lists))]
+        (when (not (uses/replace! (mut lists)
+                                  x
+                                  (uses/Use :user first :operand 1)
+                                  (uses/Use :user second :operand 1)))
+          (set! failures (+ failures 1)))
+        (when (not (uses/replace! (mut lists)
+                                  y
+                                  (uses/Use :user second :operand 1)
+                                  (uses/Use :user first :operand 1)))
+          (set! failures (+ failures 1)))
+        (require (b/patch! (mut graph) first 1 y))
+        (require (b/patch! (mut graph) second 1 x))
+        (when (!= length (len (.edges lists))) (set! failures (+ failures 1)))
+        (set! failures (+ failures (check graph lists))))
+
+      ; Alternate buckets so additions exercise both trailing append and relocation.
+      (for [step 0 1000]
+        (let [user (get users (% step (len users)))
+              operand (if (= (% step 3) 0) (: 1 i32) 2)
+              old
+                (match (g/operand graph user operand)
+                  (Some [r] r)
+                  (None [] (panic "missing operand")))
+              next (get [x y z] (% step 3))
+              edge (uses/Use :user user :operand operand)]
+          (when (!= old next)
+            (when (not (uses/remove! (mut lists) old edge))
+              (set! failures (+ failures 1)))
+            (uses/add! (mut lists) next edge)
+            (require (b/patch! (mut graph) user operand next)))
+          (set! failures (+ failures (check graph lists)))))
+      (let [missing (uses/Use :user first :operand 99)
+            length (len (.edges lists))]
+        (when (uses/remove! (mut lists) x missing)
+          (set! failures (+ failures 1)))
+        (when (uses/replace! (mut lists)
+                             x
+                             missing
+                             (uses/Use :user second :operand 1))
+          (set! failures (+ failures 1)))
+        (when (!= length (len (.edges lists))) (set! failures (+ failures 1)))
+        (set! failures (+ failures (check graph lists))))
+      (uses/release! (mut lists)))
+    (free! (mut users))
+    (g/release! (mut graph))
+    (println "mutable use-list checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

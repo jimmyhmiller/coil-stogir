@@ -1810,3 +1810,18 @@ AddressSanitizer. Detailed scope and hashes: `validation/sccp-rewrite-native.jso
 Remaining folding, iterative cleanup, optimization mode policy, full regression
 and compiler delivery are pending. The unchanged stencil benchmark has no new
 accepted timing result and the performance objective remains unmet.
+
+## Incremental use-list updates — development
+
+The follow-up worklist optimizer needs to update consumers without rebuilding
+the entire graph after each edit. Mutable operations now extend the existing
+flat use-list representation using the pinned allocation/removal policy.
+Reference and operand-position pairs identify exact edges; range offsets must
+be re-read after mutations that can relocate a bucket.
+
+One thousand redirects across 130 users, including repeated operands and high
+fan-out, match complete use multisets rebuilt independently from the graph after
+each edit. Successful single-edge replacements and missing-edge no-ops are also
+checked. The fixture passes AddressSanitizer; focused use/domain/native-control
+regressions pass. Evidence: `validation/mutable-uses.json`.
+The iterative folding/control driver and mode integration remain pending.

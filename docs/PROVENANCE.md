@@ -249,3 +249,13 @@ component, not full SCCP iteration or an enabled optimized compiler backend.
 Its refreshed comparisons include 59 control-flow graphs and 820 folding graphs,
 including both hard-copy cases. The same 32 existing fold extensions remain
 explicit; no unexplained reference differences were found.
+
+### Mutable def-use lists — development branch
+
+`uses.add!`, `remove!` and `replace!` adapt pinned `ir.c`'s use-list mutation
+policy: reuse trailing zero slots, append at the pool end, relocate blocked
+buckets, preserve removal order and update one matching edge. Coil keeps the
+operand position alongside each user reference, so repeated operands remain
+distinguishable. Callers must re-read ranges after mutation. This extends the
+existing use-list representation for the iterative optimizer; it does not create
+another semantic IR. Validation: `validation/mutable-uses.json`.
