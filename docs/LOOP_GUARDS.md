@@ -35,9 +35,9 @@ No address is dereferenced by the guard.
 The input validation precedes graph appends. Construction errors return through
 an emitter error state; an owning transform must discard partially built output
 on error. The current API supports element widths 1/2/4/8 and chunk sizes 2–64.
-It does not yet create a vector body, dispatch control flow, pointer Phis or
-scalar cleanup. Those transformations must preserve the root/ownership contract
-and rebuild structural analysis before matching/liveness.
+The owning vector-prefix transform now creates dispatch, vector bodies, pointer
+Phis and scalar cleanup; see [LOOP_VECTORIZATION.md](LOOP_VECTORIZATION.md).
+Structural analysis is rebuilt before matching/liveness.
 
 Validation: 32 native guard configurations (unsigned/signed index types, four
 element widths and four chunk sizes), 75,264 wide-integer-oracle comparisons and

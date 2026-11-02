@@ -1911,3 +1911,13 @@ AddressSanitizer passes. Details: docs/LOOP_GUARDS.md and
 docs/validation/loop-guard.json. The guard remains isolated; vector bodies,
 version dispatch and scalar cleanup are still pending. No runtime improvement
 or performance acceptance is claimed.
+
+
+## Guarded vector-prefix correctness checkpoint
+
+The isolated loop-vectorizer branch now constructs owned compact-graph vector
+prefixes and original-loop scalar cleanup. Demanded-width legality, runtime
+alias guards, HARD COPY preservation, reversed predecessor order, JIT and linked
+AOT execution are covered. 17,640 native cases, 132 linked cases and 36 captured
+stencil checks pass. See LOOP_VECTORIZATION.md and validation/loop-vector-prefix.json.
+Automatic compiler integration and controlled performance acceptance remain open.
