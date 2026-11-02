@@ -1,0 +1,233 @@
+(module stogir.tests.jit-vector-doubling)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.types" :as types)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.a64.match" :as matching)
+(import "stogir.a64.select" :as select)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn byte [(index i64) (seed i64)] (-> u8)
+  (cast u8 (+ (* index 137) (* seed 71) 253)))
+
+;;; Ordinary, commuted, rooted SPLAT, shared SPLAT, HARD vector COPY, factor3,
+;;; HARD data COPY, HARD scalar COPY into SPLAT, and both operands same SPLAT.
+(defn check [(base i32) (lanes i32) (mode i32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        ty (types/vector-type base lanes)
+        width (types/size ty 8)
+        element (types/scalar-size base 8)
+        factor (if (= mode 5) 3 2)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        src (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        dst (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        loaded (require (b/emit! (mut graph) 91 ty [start src]))
+        literal
+          (require (b/scalar-constant! (mut graph) base (cast u64 factor) 8))
+        scalar
+          (if (= mode 7)
+              (require (b/emit! (mut graph) 68 base [literal (: 1 i32)]))
+              literal)
+        broadcast (require (b/emit! (mut graph) 63 ty [scalar]))
+        constant
+          (if (= mode 4)
+              (require (b/emit! (mut graph) 68 ty [broadcast (: 1 i32)]))
+              broadcast)
+        data
+          (if (= mode 8)
+              broadcast
+              (if (= mode 6)
+                  (require (b/emit! (mut graph) 68 ty [loaded (: 1 i32)]))
+                  loaded))
+        product
+          (require (b/emit! (mut graph)
+                            28
+                            ty
+                            [(if (= mode 1) constant data)
+                             (if (= mode 1) data constant)]))
+        stored (require (b/emit! (mut graph) 93 0 [loaded dst product]))
+        last
+          (if (= mode 3)
+              (let [offset (require (b/scalar-constant! (mut graph) 5 48 8))
+                    target (require (b/emit! (mut graph) 26 6 [dst offset]))]
+                (require (b/emit! (mut graph) 93 0 [stored target broadcast])))
+              stored)
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        returned (require (b/emit! (mut graph) 120 5 [last zero (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)
+        selected (not (or (= mode 4) (= mode 5) (= mode 7)))
+        omitted (and selected (!= mode 2) (!= mode 3) (!= mode 8))
+        (mut failures) 0]
+    (push! (mut roots) returned)
+    (when (= mode 2) (push! (mut roots) broadcast))
+    (when (!= (select/doubling-source graph product) (if selected data 0))
+      (set! failures (+ failures 1)))
+    (match (pipeline/prepare graph start (slice roots) a)
+      (Err [message] (panic "{}" message))
+      (Ok [prepared]
+          (let [(mut prepared) prepared]
+            (for fuse [false true]
+              (match (matching/build graph
+                                     (.schedule prepared)
+                                     (slice roots)
+                                     fuse
+                                     a)
+                (Err [message] (panic "{}" message))
+                (Ok [plan]
+                    (let [(mut plan) plan
+                          source (get (.doubles plan) (cast i64 product))
+                          range
+                            (get (.ranges (.operands plan)) (cast i64 product))]
+                      (when (!= source (if (and fuse selected) data 0))
+                        (set! failures (+ failures 1)))
+                      (when (!= (get (.omitted (.operands plan))
+                                     (cast i64 broadcast))
+                                (and fuse omitted))
+                        (set! failures (+ failures 1)))
+                      (when (and fuse selected)
+                        (when (or (!= (.count range) 2)
+                                  (!= (get (.inputs (.operands plan))
+                                           (.offset range))
+                                      data)
+                                  (!= (get (.inputs (.operands plan))
+                                           (+ (.offset range) 1))
+                                      data))
+                          (set! failures (+ failures 1))))
+                      (when (and (= mode 6)
+                                 (get (.omitted (.operands plan))
+                                      (cast i64 data)))
+                        (set! failures (+ failures 1)))
+                      (matching/release! (mut plan))))))
+            (pipeline/release! (mut prepared)))))
+    (when (and (= base 5) (= lanes 2) (= mode 0))
+      (match (compile/object graph start (slice roots) "_vector_double_u64" a)
+        (Err [message] (panic "{}" message))
+        (Ok [object]
+            (let [(mut object) object]
+              (match (fs/write-file a
+                                    "/tmp/coil-stogir-vector-double.o"
+                                    (slice object))
+                (Err [_] (panic "write failed"))
+                (Ok [_] 0))
+              (free! (mut object))))))
+    (match (compile/text graph start (slice roots) a)
+      (Err [message] (panic "{}" message))
+      (Ok [text]
+          (let [(mut text) text]
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "{}" message))
+              (Ok [mapped]
+                  (let [(mut mapped) mapped
+                        function
+                          (p/cast (fnptr (cc/C) [(ptr u8) (ptr u8)] u64)
+                                  (.base mapped))
+                        (mut input) (ArrayList::new [u8] a)
+                        (mut output) (ArrayList::new [u8] a)]
+                    (for [i 0 96]
+                      (push! (mut input) (: 0 u8))
+                      (push! (mut output) (: 0 u8)))
+                    (for [seed 0 11]
+                      (for [i 0 96]
+                        (set! (mut input) i (byte i seed))
+                        (set! (mut output) i (: 0xA5 u8)))
+                      (when (!= (function (p/index (.data input) 16)
+                                          (p/index (.data output) 16))
+                                0)
+                        (set! failures (+ failures 1)))
+                      (for [i 0 96]
+                        (let [(mut expected) (: 0xA5 u8)]
+                          (when (and (>= i 16) (< i (+ 16 (cast i64 width))))
+                            (let [position (- i 16)
+                                  lane (/ position (cast i64 element))
+                                  (mut value) (: 0 u64)]
+                              (for [j 0 (cast i64 element)]
+                                (set! value
+                                      (| value
+                                         (<< (cast u64
+                                                   (byte (+ 16
+                                                            (* lane
+                                                               (cast i64
+                                                                     element))
+                                                            j)
+                                                         seed))
+                                             (cast u64 (* j 8))))))
+                              (let [answer
+                                      (if (= mode 8)
+                                          (: 4 u64)
+                                          (p/imul value (cast u64 factor)))]
+                                (set! expected
+                                      (cast u8
+                                            (>> answer
+                                                (cast u64
+                                                      (* (% position
+                                                            (cast i64 element))
+                                                         8))))))))
+                          (when (and (= mode 3)
+                                     (>= i 64)
+                                     (< i (+ 64 (cast i64 width))))
+                            (set! expected
+                                  (if (= (% (- i 64) (cast i64 element)) 0)
+                                      (: 2 u8)
+                                      (: 0 u8))))
+                          (when (!= (get output i) expected)
+                            (set! failures (+ failures 1)))
+                          (when (!= (get input i) (byte i seed))
+                            (set! failures (+ failures 1))))))
+                    (free! (mut input))
+                    (free! (mut output))
+                    (jit/release! (mut mapped)))))
+            (free! (mut text)))))
+    (free! (mut roots))
+    (g/release! (mut graph))
+    (when (!= failures 0)
+      (println "doubling base={} lanes={} mode={} failures={}"
+               base
+               lanes
+               mode
+               failures))
+    failures))
+
+(defn floating-rejected [(base i32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        ty (types/vector-type base (if (= base 12) 2 4))
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        pointer (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        loaded (require (b/emit! (mut graph) 91 ty [start pointer]))
+        literal
+          (require (b/scalar-constant! (mut graph)
+                                       base
+                                       (if (= base 12)
+                                           (: 0x4000000000000000 u64)
+                                           (: 0x40000000 u64))
+                                       8))
+        broadcast (require (b/emit! (mut graph) 63 ty [literal]))
+        product (require (b/emit! (mut graph) 28 ty [loaded broadcast]))
+        failures (if (= (select/doubling-source graph product) 0) 0 1)]
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) (+ (floating-rejected 12) (floating-rejected 13))
+        (mut configurations) 0]
+    (for base [(: 2 i32) 3 4 5 6 7 8 9 10 11]
+      (let [element (types/scalar-size base 8)]
+        (for bytes [(: 8 i32) 16]
+          (for mode [(: 0 i32) 1 2 3 4 5 6 7 8]
+            (set! failures (+ failures (check base (/ bytes element) mode)))
+            (set! configurations (+ configurations 1))))))
+    (println "vector doubling {} configurations: {} failures"
+             configurations
+             failures)
+    (if (= failures 0) 0 1)))
