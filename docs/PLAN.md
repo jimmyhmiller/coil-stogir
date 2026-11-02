@@ -2027,8 +2027,8 @@ oracle passes ASAN. Diagnostic image compile time falls 14.37%; this is not
 acceptance evidence. See OPCODE_METADATA.md and validation/opcode-metadata-*.
 
 ### Finalized split-child location index
-Source4ff76d2 builds per-value CSR metadata after final allocation, preserving
-parts and transfer order. Full236 programs/72 linked consumers pass; all5406
-AOT objects match0fc663a byte-for-byte. Focused ASAN31752 queries and native
+Source 4ff76d2 builds per-value CSR metadata after final allocation, preserving
+parts and transfer order. Full 236 programs /72 linked consumers pass; all 5406
+AOT objects match 0fc663a byte-for-byte. Focused ASAN 31752 queries and native
 stencil/Phi/switch/allocation checks pass. Actual Coil measurement pending.
 See LOCATION_INDEX.md and validation/location-index-*.
