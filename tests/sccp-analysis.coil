@@ -1,0 +1,294 @@
+(module stogir.tests.sccp-analysis)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.sccp-analysis" :as analysis)
+(import "stogir.sccp-values" :as v)
+(import "stogir.bitqueue" :as q)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "stogir.symbols" :as symbols)
+(import "coil.result" :use [Result Ok Err])
+(import "coil.args" :as args)
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn graph-trace [(graph g/Graph)] (-> void)
+  (println "GRAPH {} {}" (len (.instructions graph)) (len (.constants graph)))
+  (for [i 1 (len (.instructions graph))]
+    (let [node (get (.instructions graph) i)]
+      (println "NODE {} {} {} {} {}"
+               i
+               (.header node)
+               (.op1 node)
+               (.op2 node)
+               (.op3 node))))
+  (for [i 0 (len (.constants graph))]
+    (let [node (get (.constants graph) i)]
+      (println "NODE {} {} {} {} {}"
+               (- -1 i)
+               (.header node)
+               (.op1 node)
+               (.op2 node)
+               (.op3 node))))
+  (println "READY"))
+
+(defn snapshot [(facts analysis/Analysis) (oracle bool)] (-> void)
+  (when oracle
+    (println "ANALYZE")
+    (for [i 1 (len (.values (.domain facts)))]
+      (let [value (v/at (.domain facts) (cast i32 i))
+            kind (v/state-kind value)
+            partition
+              (or (= kind 68) (and (= kind 131) (= (.op1 value) (cast i32 i))))
+            constant
+              (or (and (>= kind 1) (<= kind 13))
+                  (and (>= kind 73) (<= kind 77)))]
+        (println "STATE {} {} {} {} {} {} {} {} {} {}"
+                 i
+                 kind
+                 (if (or (= kind 0) (= kind 112) (= kind 116) partition)
+                     (.op1 value)
+                     (if (= kind 78) (.op2 value) 0))
+                 (if partition (.op2 value) 0)
+                 (if partition (.op3 value) 0)
+                 (if (or constant (= kind 78)) (& (.header value) 65535) 0)
+                 (if constant (n/constant-bits value) (: 0 u64))
+                 (q/contains? (.pending (.domain facts)) i)
+                 (q/contains? (.iteration facts) i)
+                 (v/identity (.domain facts) (cast i32 i)))))))
+
+(defn branch [(mode i32) (ty i32) (bits u64) (oracle bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        parameter (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        literal (require (b/scalar-constant! (mut graph) ty bits 8))
+        condition
+          (if (= mode 0)
+              literal
+              (if (= mode 1)
+                  parameter
+                  (require (b/emit! (mut graph) 68 ty [parameter (: 0 i32)]))))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        two (require (b/scalar-constant! (mut graph) 11 2 8))
+        split (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        yes-end (require (b/emit! (mut graph) 114 0 [yes]))
+        no-end (require (b/emit! (mut graph) 114 0 [no]))
+        merge (require (b/emit! (mut graph) 112 0 [yes-end no-end]))
+        result (require (b/emit! (mut graph) 67 11 [merge one two]))
+        done (require (b/emit! (mut graph) 120 0 [merge result (: 0 i32)]))
+        (mut failures) 0]
+    (when oracle (graph-trace graph))
+    (match (analysis/analyze graph a)
+      (Err [message] (panic "{}" message))
+      (Ok [facts]
+          (let [(mut owned) facts
+                domain (.domain owned)
+                truth
+                  (if (= ty 12)
+                      (!= (& bits 0x7FFFFFFFFFFFFFFF) 0)
+                      (if (= ty 13) (!= (& bits 0x7FFFFFFF) 0) (!= bits 0)))]
+            (snapshot owned oracle)
+            (when (or (not (v/reachable? domain done))
+                      (if (= mode 0)
+                          (or (not (v/top? domain (if truth no yes)))
+                              (!= (v/state-kind (v/at domain result)) 11)
+                              (!= (n/constant-bits (v/at domain result))
+                                  (if truth (: 1 u64) 2)))
+                          (or (not (v/reachable? domain yes))
+                              (not (v/reachable? domain no))
+                              (not (v/bottom? domain result)))))
+              (set! failures (+ failures 1)))
+            (analysis/release! (mut owned)))))
+    (g/release! (mut graph))
+    failures))
+
+;;; The true backedge adds a conflicting Phi input; the branch must widen from
+;;; a single selected edge to both, making the formerly dead return reachable.
+(defn loop-check [(oracle bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        parameter (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        entry (require (b/emit! (mut graph) 114 0 [start]))
+        header (require (b/emit! (mut graph) 113 0 [entry entry]))
+        result (require (b/emit! (mut graph) 67 11 [header one parameter]))
+        split (require (b/emit! (mut graph) 116 0 [header result]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        back (require (b/emit! (mut graph) 115 0 [yes]))
+        done (require (b/emit! (mut graph) 120 0 [no result (: 0 i32)]))
+        (mut failures) 0]
+    (require (b/patch! (mut graph) header 2 back))
+    (when oracle (graph-trace graph))
+    (match (analysis/analyze graph a)
+      (Err [message] (panic "{}" message))
+      (Ok [facts]
+          (let [(mut owned) facts
+                domain (.domain owned)]
+            (snapshot owned oracle)
+            (when (or (not (v/bottom? domain header))
+                      (not (v/bottom? domain result))
+                      (not (v/bottom? domain split))
+                      (not (v/reachable? domain done)))
+              (set! failures (+ failures 1)))
+            (analysis/release! (mut owned)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn switch-check [(ty i32) (mode i32) (bits u64) (oracle bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        parameter (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        literal (require (b/scalar-constant! (mut graph) ty bits 8))
+        low
+          (require (b/scalar-constant! (mut graph)
+                                       ty
+                                       (if (= ty 11)
+                                           (: 0xFFFFFFFFFFFFFFFE u64)
+                                           2)
+                                       8))
+        high
+          (require (b/scalar-constant! (mut graph)
+                                       ty
+                                       (if (= ty 11) (: 2 u64) 4)
+                                       8))
+        seven (require (b/scalar-constant! (mut graph) ty 7 8))
+        split
+          (require (b/switch! (mut graph)
+                              start
+                              (if (= mode 0) literal parameter)))
+        ; Default deliberately precedes matching cases in the use list.
+        fallback (require (b/case-default! (mut graph) split))
+        range (require (b/case-range! (mut graph) split low high))
+        single (require (b/case-value! (mut graph) split seven))
+        a-return
+          (require (b/emit! (mut graph) 120 0 [fallback literal (: 0 i32)]))
+        b-return (require (b/emit! (mut graph) 120 0 [range literal (: 0 i32)]))
+        c-return
+          (require (b/emit! (mut graph) 120 0 [single literal (: 0 i32)]))
+        selected
+          (if (= bits 7)
+              single
+              (if (if (= ty 11)
+                      (and (>= (cast i64 bits) -2) (<= (cast i64 bits) 2))
+                      (and (>= bits 2) (<= bits 4)))
+                  range
+                  fallback))
+        (mut failures) 0]
+    (when oracle (graph-trace graph))
+    (match (analysis/analyze graph a)
+      (Err [message] (panic "{}" message))
+      (Ok [facts]
+          (let [(mut owned) facts]
+            (snapshot owned oracle)
+            (for target [fallback range single]
+              (when (!= (v/reachable? (.domain owned) target)
+                        (or (= mode 1) (= target selected)))
+                (set! failures (+ failures 1))))
+            (analysis/release! (mut owned)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn effect-check [(count i32) (oracle bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        (mut inputs) (ArrayList::new [i32] a)
+        (mut failures) 0]
+    (push! (mut inputs) start)
+    (for [i 0 (cast i64 count)]
+      (push! (mut inputs)
+             (require (b/emit! (mut graph) 71 11 [start (: 0 i32) (cast i32 i)]))))
+    (let [effect (require (b/emit! (mut graph) 103 0 (slice inputs)))
+          done (require (b/emit! (mut graph) 120 0 [effect (: 0 i32) 0]))]
+      (when oracle (graph-trace graph))
+      (match (analysis/analyze graph a)
+        (Err [message] (panic "{}" message))
+        (Ok [facts]
+            (let [(mut owned) facts]
+              (snapshot owned oracle)
+              (for [tail 0 (+ 1 (/ (+ (cast i64 count) 1) 4))]
+                (when (not (v/bottom? (.domain owned)
+                                      (+ effect (cast i32 tail))))
+                  (set! failures (+ failures 1))))
+              (when (not (v/reachable? (.domain owned) done))
+                (set! failures (+ failures 1)))
+              (analysis/release! (mut owned))))))
+    (free! (mut inputs))
+    (g/release! (mut graph))
+    failures))
+
+;;; The library resolver allows a named address to resolve to zero. Keep both
+;;; branches feasible; this intentionally differs from upstream's symbol truth.
+(defn unresolved-symbol [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        symbol (require (symbols/symbol! (mut graph) "_possibly_zero"))
+        branch (require (b/emit! (mut graph) 116 0 [start symbol]))
+        yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        a-return (require (b/emit! (mut graph) 120 0 [yes (: 0 i32) 0]))
+        b-return (require (b/emit! (mut graph) 120 0 [no (: 0 i32) 0]))
+        (mut failures) 0]
+    (match (analysis/analyze graph a)
+      (Err [message] (panic "{}" message))
+      (Ok [facts]
+          (let [(mut owned) facts]
+            (when (or (not (v/reachable? (.domain owned) a-return))
+                      (not (v/reachable? (.domain owned) b-return)))
+              (set! failures 1))
+            (analysis/release! (mut owned)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn rejects-unported-fold [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        sum (require (b/emit! (mut graph) 26 11 [x x]))
+        done (require (b/emit! (mut graph) 120 0 [start sum (: 0 i32)]))
+        (mut failures) 0]
+    (match (analysis/analyze graph a)
+      (Err [message]
+           (when (!= message "SCCP general fold transfer is not implemented")
+             (set! failures 1)))
+      (Ok [facts]
+          (let [(mut owned) facts] (analysis/release! (mut owned)))
+          (set! failures 1)))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (args/init! argc argv)
+  (let [oracle (args/has? "--oracle")
+        (mut failures) 0]
+    (for mode [(: 0 i32) 1 2]
+      (for bits [(: 0 u64) 1 42]
+        (set! failures (+ failures (branch mode 11 bits oracle)))))
+    (for bits [(: 0 u64)
+               0x8000000000000000
+               0x3FF0000000000000
+               0x7FF8000000000001]
+      (set! failures (+ failures (branch 0 12 bits oracle))))
+    (for bits [(: 0 u64) 0x80000000 0x3F800000 0x7FC00001]
+      (set! failures (+ failures (branch 0 13 bits oracle))))
+    (for ty [(: 5 i32) 11]
+      (for mode [(: 0 i32) 1]
+        (for bits [(: 0 u64) 1 2 3 4 7 8 0xFFFFFFFFFFFFFFFE 0xFFFFFFFFFFFFFFFF]
+          (set! failures (+ failures (switch-check ty mode bits oracle))))))
+    (for count [(: 3 i32) 4 7 16 65]
+      (set! failures (+ failures (effect-check count oracle))))
+    (set! failures (+ failures (loop-check oracle)))
+    (set! failures (+ failures (unresolved-symbol)))
+    (set! failures (+ failures (rejects-unported-fold)))
+    (println "SCCP worklist checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

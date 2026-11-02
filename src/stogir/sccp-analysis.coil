@@ -1,0 +1,133 @@
+;;; Worklist orchestration adapted from pinned ir_sccp.c:ir_sccp_analyze.
+;;; Development: general folding and mem2ssa policy are not yet implemented.
+(module stogir.sccp-analysis)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.verify" :as verify)
+(import "stogir.switch" :as switch)
+(import "stogir.sccp-values" :as v)
+(import "stogir.sccp-phi" :as phi)
+(import "stogir.sccp-control" :as control)
+(import "stogir.bitqueue" :as q)
+(import "stogir.uses" :as uses)
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defstruct Analysis [(domain v/Domain) (iteration q/Queue)])
+
+(defn release! [(analysis (mut Analysis))] (-> void)
+  (v/release! (mut (.domain analysis)))
+  (q/release! (mut (.iteration analysis))))
+
+(defn data? [(opcode i32)] (-> bool)
+  (let [shape (op/shape opcode)
+        kind (get shape 0)]
+    (or (= kind #\d) (= kind #\p) (= kind #\r))))
+
+;;; COPY is a foldable instruction whose transfer needs no graph mutation.
+;;; Other folds must be ported, not silently replaced by an overdefined fact.
+(defn copy! [(graph g/Graph)
+             (domain (mut v/Domain))
+             (edges uses/Uses)
+             (reference i32)] (-> bool)
+  (let [source (.op1 (get (.instructions graph) (cast i64 reference)))
+        identity (v/identity domain source)]
+    (if (v/top? domain source)
+        (do (v/add-input! (mut domain) source) false)
+        (if (< identity 0)
+            (let [constant (phi/constant graph identity)]
+              (if (= (n/opcode constant) 78)
+                  (v/meet-long! (mut domain) edges reference identity constant)
+                  (v/meet-constant! (mut domain) edges reference constant)))
+            (let [value (v/at domain identity)
+                  kind (v/state-kind value)]
+              (if (= kind (op/count))
+                  (v/meet-copy! (mut domain) edges reference identity)
+                  (if (= kind 78)
+                      (v/meet-long! (mut domain)
+                                    edges
+                                    reference
+                                    (.op2 value)
+                                    (phi/constant graph (.op2 value)))
+                      (v/meet-constant! (mut domain) edges reference value))))))))
+
+;;; Preconditions: fresh analysis, verified graph and Phi shapes; entry START
+;;; is reference one. MEM2SSA immediate-Phi policy is not yet supported.
+;;; Edges must describe this exact graph. The caller owns analysis and may inspect
+;;; iteration candidates, but no graph rewrite has been applied by this function.
+(defn run! [(graph g/Graph) (edges uses/Uses) (analysis (mut Analysis))]
+  (-> (Result i32 (slice u8)))
+  (let [(mut error) ""
+        (mut reference) (: 0 i64)]
+    (q/add! (mut (.pending (.domain analysis))) 1)
+    (set! reference (q/pop! (mut (.pending (.domain analysis)))))
+    (while (and (>= reference 0) (= error ""))
+      (let [r (cast i32 reference)
+            node (get (.instructions graph) reference)
+            opcode (cast i32 (n/opcode node))
+            (mut changed) false]
+        (when (v/bottom? (.domain analysis) r)
+          (panic "bottom SCCP worklist entry {}" r))
+        (if (data? opcode)
+            (when (> (.count (get (.ranges edges) reference)) 0)
+              (cond (= opcode 67)
+                      (set! changed
+                            (phi/transfer! graph
+                                           (mut (.domain analysis))
+                                           edges
+                                           r))
+                    (= opcode 68)
+                      (set! changed
+                            (copy! graph (mut (.domain analysis)) edges r))
+                    (and (>= opcode 14) (<= opcode 66))
+                      (set! error
+                            "SCCP general fold transfer is not implemented")
+                    :else
+                      (do
+                        (v/make-bottom! (mut (.domain analysis)) edges r)
+                        (let [count (op/input-count opcode)]
+                          (for [index 1 (+ (cast i64 count) 1)]
+                            (let [source (phi/input graph r (cast i32 index))]
+                              (when (and (> source 0)
+                                         (v/top? (.domain analysis) source))
+                                (v/add-input! (mut (.domain analysis)) source)))))
+                        (set! changed true))))
+            (set! changed
+                  (control/transfer! graph
+                                     (mut (.domain analysis))
+                                     edges
+                                     (mut (.iteration analysis))
+                                     r)))
+        (when changed (v/add-uses! (mut (.domain analysis)) edges r)))
+      (when (= error "")
+        (set! reference (q/pop! (mut (.pending (.domain analysis)))))))
+    (if (= error "") (Ok 0) (Err error))))
+
+(defn create [(size i64) (a (dyn Allocator))] (-> Analysis)
+  (Analysis :domain (v/create size a) :iteration (q/create size a)))
+
+(defn analyze [(graph g/Graph) (a (dyn Allocator))]
+  (-> (Result Analysis (slice u8)))
+  (match (verify/structure graph)
+    (Err [message] (Err message))
+    (Ok [_]
+        (match (verify/phis graph)
+          (Err [message] (Err message))
+          (Ok [_]
+              (match (switch/verify graph a)
+                (Err [message] (Err message))
+                (Ok [_]
+                    (if (or (<= (len (.instructions graph)) 1)
+                            (!= (n/opcode (get (.instructions graph) 1)) 104))
+                        (Err "SCCP requires START at reference one")
+                        (let [(mut edges) (uses/build graph a)
+                              (mut result)
+                                (create (len (.instructions graph)) a)
+                              status (run! graph edges (mut result))]
+                          (uses/release! (mut edges))
+                          (match status
+                            (Err [message]
+                                 (release! (mut result))
+                                 (Err message))
+                            (Ok [_] (Ok result))))))))))))

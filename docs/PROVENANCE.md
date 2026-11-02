@@ -179,3 +179,24 @@ feasibility, discovery, copy-partition splitting and direct/propagated scalar,
 symbolic and long constants. See `validation/sccp-phi-oracle.json` for exact
 scope and source hashes. This component differential does not establish a
 complete SCCP analyzer, rewriting pass or optimized backend pipeline.
+
+### SCCP worklist/control analysis — development branch
+
+`stogir.sccp-analysis` and `stogir.sccp-control` adapt the worklist order,
+reachability facts, selected projections, merge counts, continuation retention
+and iterative-candidate discovery from pinned `ir_sccp.c:ir_sccp_analyze`.
+The original graph remains immutable; analysis owns the combined domain and
+queues. General folding returns an explicit development error rather than
+silently substituting overdefined results. MEM2SSA immediate-Phi policy and
+graph transformation are not implemented.
+
+Fifty-nine control-flow cases match 641 normalized final-state observations
+against that unmodified function, including loop-edge widening and switches.
+This differential covers those cases, not all control/call/load operations or
+the complete analyzer. Evidence: `validation/sccp-analysis-oracle.json`.
+
+SCCP reuses the constructor's numeric truth helper. Named symbol truth stays
+unknown because the shared image resolver permits address zero; this deliberately
+retains the library's existing contract instead of upstream's nonzero-symbol
+assumption. Signed narrow switch ranges use the graph's width-aware order keys;
+the differential switch cases use full-width signed/unsigned selectors.

@@ -1702,6 +1702,35 @@ analyzer, graph/control rewrite with root remapping, iteration and optimization
 mode policy are still required. No runtime or compilation-time improvement is
 claimed from these component checks.
 
+## SCCP worklist and control propagation — development
+
+The isolated worktree now has an owned analysis result with the combined domain
+and iterative-candidate queue. Its runner follows upstream's minimum-reference
+worklist, def-use notifications and Phi/COPY propagation. Control transfer tracks
+partial MERGE feasibility, selected IF/SWITCH projections, reachable effects and
+multi-cell storage. A loop regression widens a previously constant IF after its
+backedge adds a conflicting Phi input, reaching the formerly infeasible exit.
+
+General fold transfer is still an explicit error. MEM2SSA immediate-Phi policy,
+external-root handling for transformation, control/data rewriting, iteration and
+optimization-level transport remain open. The runner is not enabled in the
+delivered compiler. In particular, iterative candidates are analysis metadata;
+no load or other instruction has been deleted based on these facts.
+
+The constructor's scalar truth logic is shared with SCCP. It preserves numeric
+floating signed-zero/NaN behavior and keeps unresolved named addresses unknown,
+as required by this library's resolver contract. This differs intentionally from
+pinned upstream's assumption that symbolic addresses are nonzero.
+
+Fifty-nine complete control-flow analysis cases match 641 normalized state,
+identity, pending-queue and iterative-queue observations against unmodified
+`ir_sccp_analyze`. Separate checks cover unresolved-symbol truth and rejection of
+unported folds. All runner cases pass AddressSanitizer and debug checks; focused
+Phi, value-domain, bitset, constructor and native conditional regressions pass.
+Evidence and source hashes: `docs/validation/sccp-analysis-oracle.json`.
+These checks establish this development component's covered behavior, not an
+enabled optimizing backend or a change in accepted benchmark results.
+
 ## SCCP analysis development branch
 
 The ignored .worktrees/sccp-analysis checkout begins feasible-input Phi analysis
