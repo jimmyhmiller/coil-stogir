@@ -1931,3 +1931,14 @@ final matching/liveness, with owned graphs alive through image finish. O2 is
 unchanged. Captured stencil now passes 60 ASAN checksum checks, including
 automatic and public O3 paths. Guard, vector matrix, shape and SCCP regressions
 pass. Coil vendoring, installed delivery and performance comparisons follow.
+
+
+## Selector continuation cells and shared analysis
+
+The first compiler corpus check caught automatic selection reading opcode-like
+bits in packed continuation cells as headers. Selection now requires node-start
+arity metadata. No pointer/reference-number heuristic substitutes for that check.
+Structural facts are shared across rejected candidates; a successful edit ends
+the epoch and releases/rebuilds all facts. Empty candidate sets need no prepare.
+ASAN stencil (60 checks), matrix (17,640 cases), SCCP and shape regressions pass.
+Compiler corpus revalidation is required before repaired delivery.
