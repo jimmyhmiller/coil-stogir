@@ -20,5 +20,7 @@ invalid parent bounds. Contiguous transfers match the original oracle in order.
 Native ASAN stencil, switch pressure, Phi, edge moves and allocation integration
 pass. Rotated diagnostic medians over five processes, each compiling 2000 images:
 2324.674ms before and 2121.446ms after (8.74% lower). This captured graph
-is diagnostic only, not the actual Coil acceptance boundary. Full standalone,
-linked AOT identity and actual compiler measurements remain required.
+is diagnostic only, not the actual Coil acceptance boundary. Full validation passes
+236 standalone programs and 72 linked AOT consumers. All 5406 generated AOT
+objects are byte-identical to library 0fc663a. Actual compiler integration and
+measurements remain required.
