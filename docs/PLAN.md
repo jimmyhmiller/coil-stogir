@@ -1616,3 +1616,11 @@ an explicit value cast (installed compiler 60174544). Minimal reproduction and
 full diagnostic are recorded in `coil-bugs#primitive-ctz-mutable`. The bitset
 explicitly reads the u64 value before invoking the primitive. No Coil compiler
 fix is included in this library checkpoint.
+
+Final-source regression for 3463e54: all 213 standalone programs and all 65
+linked AOT consumers pass. Object freshness and frozen project/compiler/SDK
+hashes were checked. Logs: `/tmp/stogir-sccp-suite.log` and
+`/tmp/stogir-sccp-linked.log`; project snapshot:
+`/tmp/stogir-sccp-project.json`. Coil vendor 257bbf57 has all 118 source modules
+byte-matching the standalone implementation. Candidate validation and the
+shared-bitset timing comparison are pending.
