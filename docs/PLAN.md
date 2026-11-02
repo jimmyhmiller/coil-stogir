@@ -1681,6 +1681,27 @@ phi-pressure object. Final graph/CSE checks also pass under TPDE. Logs and sourc
 snapshot: `/tmp/stogir-rewrite-suite.log`, `/tmp/stogir-rewrite-linked.log`,
 `/tmp/stogir-rewrite-tpde.log`, `/tmp/stogir-rewrite-project.json`.
 
+## Isolated SCCP Phi transfer validation
+
+The analysis worktree now retains continuation cells of reachable multi-cell
+Phis, matching pinned `ir_sccp_analyze_phi`. The previous implementation fails
+78 assertions in the new transition fixture; the corrected implementation
+passes. Twelve predecessor-count cases cross graph-cell and worklist-word
+boundaries. Thirty-two additional cases cover direct/propagated integer, NaN
+payload, symbol and vector long constants, with equal and conflicting inputs.
+
+The temporary reference oracle invokes the unmodified pinned C function on the
+same compact graph and lattice transitions. All 4,110 normalized return/state,
+identity and pending-worklist observations agree. Structural and Phi verification
+run before the fixtures construct use lists. The original 100 Phi cases, combined
+value-domain checks and bitset checks also pass with debug checks enabled.
+Evidence: `docs/validation/sccp-phi-oracle.json`.
+
+This remains analysis development, unmerged and uninstalled. The enclosing SCCP
+analyzer, graph/control rewrite with root remapping, iteration and optimization
+mode policy are still required. No runtime or compilation-time improvement is
+claimed from these component checks.
+
 ## SCCP analysis development branch
 
 The ignored .worktrees/sccp-analysis checkout begins feasible-input Phi analysis

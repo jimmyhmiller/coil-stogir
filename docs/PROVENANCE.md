@@ -172,5 +172,10 @@ upstream allocation policies.
 `stogir.sccp-phi` adapts pinned `ir_sccp.c:ir_sccp_analyze_phi`, meeting only
 feasible predecessor inputs, ignoring self identities, discovering top inputs
 backward and reusing the combined copy/constant lattice. This module is under
-development in the isolated analysis worktree. Its initial metadata tests are
-not a differential proof or a complete SCCP pass; it is not wired to codegen.
+development in the isolated analysis worktree and is not wired to codegen.
+The transition tests now compare 4,110 normalized observations with the
+unmodified pinned function, including long Phi operand retention, changing
+feasibility, discovery, copy-partition splitting and direct/propagated scalar,
+symbolic and long constants. See `validation/sccp-phi-oracle.json` for exact
+scope and source hashes. This component differential does not establish a
+complete SCCP analyzer, rewriting pass or optimized backend pipeline.
