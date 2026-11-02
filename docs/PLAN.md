@@ -1673,3 +1673,10 @@ already empty, avoiding repeated capacity scans during batches of rewrites.
 Successful rewrites still invalidate cached expressions; rejected rewrites
 preserve the cache. Full standalone and compiler integration regressions for
 this final source are pending.
+
+Final 8111f09 validation: 213 standalone programs and 65 linked AOT consumers
+pass against frozen project/compiler/SDK inputs, with fresh object fixtures.
+The linked pressure consumer uses both switch-pressure objects and the new
+phi-pressure object. Final graph/CSE checks also pass under TPDE. Logs and source
+snapshot: `/tmp/stogir-rewrite-suite.log`, `/tmp/stogir-rewrite-linked.log`,
+`/tmp/stogir-rewrite-tpde.log`, `/tmp/stogir-rewrite-project.json`.
