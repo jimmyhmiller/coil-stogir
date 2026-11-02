@@ -1,7 +1,7 @@
 # Guarded vector prefixes
 
 This isolated library extension is additional to pinned dstogov/ir; upstream has
-no equivalent vectorizer. It is not enabled in Coil and does not close the
+no equivalent vectorizer. It is enabled in the library O3 options path; Coil delivery is pending. It does not close the
 remaining upstream optimizer and allocator gaps.
 
 `loop-vectorize.vectorize` accepts a compact graph, entry, observable roots,
@@ -24,8 +24,9 @@ the covered induction value. Thus the original loop handles alias fallback,
 short trips and the exact remainder. Construction errors discard the working
 graph; the ordinary pipeline rebuilds CFG, scheduling, matching and liveness.
 
-One invocation transforms one selected header. Automatic loop selection and
-avoiding repeated transformation of scalar cleanup remain integration work.
+The selected-header API transforms one loop. The automatic API visits each
+original header once, excludes appended headers, and rebuilds facts after edits.
+O3 invokes this after SCCP; O2 retains scalar optimization.
 Repeated preparation/validation and instruction selection need measurement.
 No performance acceptance claim follows from these correctness tests.
 
@@ -38,8 +39,8 @@ Validation on macOS AArch64:
   image changes only the original scalar store, proving vector execution and
   exact cleanup rather than allowing a vacuous always-scalar result.
 - Linked AOT passes 132 cases using an independent bytewise scalar oracle.
-- The captured stencil regression passes 36 checksum cases across initialization,
-  inner-loop and combined transformations. Fixture source graph SHA-256:
+- The captured stencil regression passes 60 checksum cases across initialization,
+  inner-loop, combined, automatic and public O3 transformations. Fixture source graph SHA-256:
   `99d6d13746c0e947c33fd60b83033eccfc34b6a36599996a862843b980d8891f`.
   It reconstructs semantic cells without original interner caches and is a
   correctness fixture, not a compile-time benchmark or an optimizer special case.

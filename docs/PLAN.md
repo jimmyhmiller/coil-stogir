@@ -1921,3 +1921,13 @@ alias guards, HARD COPY preservation, reversed predecessor order, JIT and linked
 AOT execution are covered. 17,640 native cases, 132 linked cases and 36 captured
 stencil checks pass. See LOOP_VECTORIZATION.md and validation/loop-vector-prefix.json.
 Automatic compiler integration and controlled performance acceptance remain open.
+
+
+## Automatic vector selection and public O3
+
+Original headers are visited once; appended vector headers and already visited
+cleanup loops cannot be revisited. O3 invokes the extension after SCCP and before
+final matching/liveness, with owned graphs alive through image finish. O2 is
+unchanged. Captured stencil now passes 60 ASAN checksum checks, including
+automatic and public O3 paths. Guard, vector matrix, shape and SCCP regressions
+pass. Coil vendoring, installed delivery and performance comparisons follow.
