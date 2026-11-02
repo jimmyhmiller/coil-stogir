@@ -1958,3 +1958,20 @@ See ADDRESS_MATCHING.md and validation/address-matching.json. Diagnostic O3
 compilation sampling points to pressure scans, constraint-use iteration and
 location lookup as follow-up compile-time costs. Coil integration and fixed
 workload comparisons are next; the performance goal remains unmet.
+
+
+## Indexed fixed-constraint discovery
+
+Isolated pressure-index worktree maintains a conservative append-aware index of
+parts containing fixed-register uses, refreshing after split/eviction appends.
+Current use positions and live-range holes are still read exactly. The legacy
+query is retained as oracle:41,216 queries /2,627,520 compared fields agree.
+Focused ASAN allocator/native pressure checks pass; captured O3 stencil object
+is byte-identical. Full compatibility validation remains required before merge
+and Coil integration. See PRESSURE_INDEX.md. No timing gain is claimed yet.
+
+
+Pressure-index compatibility validation completed: 234 standalone programs and
+71 linked AOT consumers pass with frozen source/toolchain and fresh-object
+checks. Public/native pressure decisions and the captured object remain exact.
+Compiler integration and production measurements remain pending.
