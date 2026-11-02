@@ -66,6 +66,10 @@
        (> (n/type-id value) 0)
        (types/valid-scalar? (cast i32 (n/type-id value)))))
 
+(defn integer-literal? [(value n/Node)] (-> bool)
+  (let [kind (cast i32 (n/opcode value))]
+    (or (and (>= kind 2) (<= kind 6)) (and (>= kind 8) (<= kind 11)))))
+
 (defn optional [(ty i32) (bits (Option u64))] (-> Decision)
   (match bits (None [] (cse)) (Some [result] (scalar ty result))))
 
@@ -97,6 +101,12 @@
                     (cse)
                     (scalar 1 0)))
           (types/vector? ty) (Err "SCCP vector fold family is not implemented")
+          (and (= opcode 36) (= from ty) (not (numeric? first)))
+            (Ok (copy left))
+          (and (or (= opcode 31) (= opcode 45) (= opcode 54))
+               (= (cast i32 (n/opcode first)) opcode))
+            (Ok (copy (v/identity domain (.op1 first))))
+          (and (= opcode 32) (= (n/opcode first) 32)) (Ok (copy left))
           (conversion/operation? opcode)
             (Ok (if (numeric? first)
                     (optional ty
@@ -110,9 +120,60 @@
               (and (>= opcode 14) (<= opcode 25))
               (checked/operation? opcode))
             (let [right (v/identity domain (.op2 node))
-                  second (value graph domain (.op2 node))]
-              (cond (and (= left right) (or (= opcode 58) (= opcode 59)))
+                  second (value graph domain (.op2 node))
+                  literals? (and (numeric? first) (numeric? second))]
+              ;;; Same-reference rules are generic in pinned ir_fold.h. Only
+              ;;; integer comparisons/subtraction may disregard NaN/signed zero.
+              (cond (and (not literals?)
+                         (= left right)
+                         (or (= opcode 46)
+                             (= opcode 47)
+                             (= opcode 58)
+                             (= opcode 59)))
                       (Ok (copy left))
+                    (and (= left right)
+                         (types/integer? from)
+                         (or (= opcode 27) (= opcode 42) (= opcode 48)))
+                      (Ok (scalar ty 0))
+                    (and (= left right)
+                         (types/integer? from)
+                         (>= opcode 14)
+                         (<= opcode 23))
+                      (Ok (scalar 1
+                                  (if (or (= opcode 14)
+                                          (= opcode 17)
+                                          (= opcode 18)
+                                          (= opcode 21)
+                                          (= opcode 22))
+                                      1
+                                      0)))
+                    ;;; Literal identity families exclude BOOL/CHAR in upstream.
+                    ;;; Exact result-type checks avoid erasing required bitcasts
+                    ;;; in mixed address/integer arithmetic.
+                    (and (not literals?)
+                         (integer-literal? second)
+                         (= (n/constant-bits second) 0)
+                         (= from ty)
+                         (or (= opcode 26)
+                             (= opcode 27)
+                             (= opcode 41)
+                             (= opcode 42)))
+                      (Ok (copy left))
+                    (and (= opcode 26)
+                         (integer-literal? first)
+                         (= (n/constant-bits first) 0)
+                         (= (cast i32 (n/type-id second)) ty))
+                      (Ok (copy right))
+                    (and (= opcode 28)
+                         (integer-literal? second)
+                         (= (cast i32 (n/type-id second)) ty)
+                         (<= (n/constant-bits second) 1))
+                      (Ok (copy (if (= (n/constant-bits second) 0) right left)))
+                    (and (= opcode 28)
+                         (integer-literal? first)
+                         (= from ty)
+                         (<= (n/constant-bits first) 1))
+                      (Ok (copy (if (= (n/constant-bits first) 0) left right)))
                     (not (and (numeric? first) (numeric? second)))
                       (Ok (if (checked/operation? opcode) (emit) (cse)))
                     (types/floating? from)

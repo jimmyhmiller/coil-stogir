@@ -21,3 +21,18 @@ Focused decision-oracle, use-list, JIT/AOT and AddressSanitizer evidence is in
 oracle checks 16 selected outcomes, not complete fold-rule or transformed-graph
 parity. Full standalone and compiler validation remain pending. No new
 performance measurement or improvement is claimed.
+
+Selected scalar algebraic rules now cover integer same-reference comparisons,
+subtraction and bitwise identities; zero/one arithmetic identities; nested unary
+cancellation/idempotence; and scalar identity BITCAST. Literal folds run before
+applicable generic identities. Floating counterexamples and mixed-type cases
+requiring a restart remain expressions. The expanded native fixture exercises
+chained rewrites and verifies 25 JIT and 25 linked AOT answers under the same
+worklist and root-preservation contract.
+
+[validation/algebraic-fold.json](validation/algebraic-fold.json) records 272
+selected normalized upstream results, including exact constant type/payload or
+positive copy target and floating cases that must remain unfurled. Normalization
+accounts explicitly for upstream's reserved TRUE/FALSE constant references.
+This extends the kernel's rule coverage; it does not complete upstream folding,
+connect SCCP candidate transport, or enable optimization in Coil.
