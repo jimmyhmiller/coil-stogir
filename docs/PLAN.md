@@ -2018,3 +2018,10 @@ Canonical scheduling source7801b60 passes all236 standalone programs and72
 linked AOT consumers with frozen inputs and fresh objects. Reusable pressure
 storage is included and validated. Coil integration and fixed-workload timing
 are next; no performance acceptance claim yet.
+
+### Indexed opcode metadata
+Source 0fc663a replaces repeated linear shape/operand dispatch with packed
+indexed metadata, preserving public string results. Full 236-program /72-linked
+validation passes; all 5406 AOT objects are byte-identical to 7801b60. Opcode
+oracle passes ASAN. Diagnostic image compile time falls 14.37%; this is not
+acceptance evidence. See OPCODE_METADATA.md and validation/opcode-metadata-*.
