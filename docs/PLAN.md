@@ -1624,3 +1624,20 @@ hashes were checked. Logs: `/tmp/stogir-sccp-suite.log` and
 `/tmp/stogir-sccp-project.json`. Coil vendor 257bbf57 has all 118 source modules
 byte-matching the standalone implementation. Candidate validation and the
 shared-bitset timing comparison are pending.
+
+## Stable graph rewriting — in progress
+
+The graph now supports whole-node rewrites that fit within the existing cell
+allocation. Header, operand and arity metadata are rewritten together; released
+tail cells become standalone zero-arity NOPs. Existing valid references and
+later nodes stay fixed. Invalid references or requests beyond allocation fail
+before mutation. Construction CSE is cleared on success; callers must rebuild
+external use/analysis caches and remap incoming references/roots.
+
+The 81 shape/size combinations and CSE invalidation cases pass with LLVM and
+TPDE. Testing the same valid program with stogir exposes an existing allocator
+failure in tests/graph.coil's rewrites function (`illegal eviction point or
+simultaneous register use`). It is recorded in the project pad under
+allocator-rewrite-pressure and is being investigated against pinned ir_ra.c.
+The test will not be weakened to avoid pressure. These APIs are not yet
+vendored, installed, or connected to SCCP.

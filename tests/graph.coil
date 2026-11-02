@@ -2,7 +2,85 @@
 (import "stogir.graph" :as g)
 (import "stogir.node" :as n)
 (import "coil.alloc" :use [malloc-allocator])
-(import "coil.result" :use [Some None])
+(import "coil.arraylist" :use [ArrayList])
+(import "stogir.verify" :as verify)
+(import "coil.result" :use [Option Some None Ok Err])
+
+(defn require-ref [(value (Option i32))] (-> i32)
+  (match value (Some [r] r) (None [] 0)))
+
+(defn rewrites [(old-count i64) (new-count i64)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require-ref (g/append-inputs! (mut graph) 104 0 [(: 0 i32)]))
+        end (require-ref (g/append-inputs! (mut graph) 114 0 [start]))
+        constant (require-ref (g/intern-scalar! (mut graph) 11 42))
+        (mut inputs) (ArrayList::new [i32] a)
+        (mut failures) 0]
+    (for [i 0 old-count] (push! (mut inputs) end))
+    (let [reference
+            (require-ref (g/append-inputs! (mut graph) 112 0 (slice inputs)))
+          marker
+            (require-ref (g/append-inputs! (mut graph)
+                                           68
+                                           11
+                                           [constant (: 0 i32)]))
+          total (len (.instructions graph))
+          cells (/ (+ old-count 4) 4)
+          new-cells (/ (+ new-count 4) 4)
+          expected (<= new-cells cells)]
+      (clear! (mut inputs))
+      (for [i 0 new-count] (push! (mut inputs) end))
+      (let [rewritten
+              (if (= new-count 0)
+                  (g/make-nop! (mut graph) reference)
+                  (g/rewrite-inputs! (mut graph) reference 112 0 (slice inputs)))
+            actual-count (if expected new-count old-count)
+            actual-cells (if expected new-cells cells)]
+        (when (!= rewritten expected) (set! failures (+ failures 1)))
+        (when (!= (len (.instructions graph)) total)
+          (set! failures (+ failures 1)))
+        (when (!= (get (.arities graph) (cast i64 reference))
+                  (cast i32 actual-count))
+          (set! failures (+ failures 1)))
+        (for [i 1 (+ actual-count 1)]
+          (when (!= (require-ref (g/operand graph reference (cast i32 i))) end)
+            (set! failures (+ failures 1))))
+        (for [i 1 actual-cells]
+          (when (g/contains? graph (+ reference (cast i32 i)))
+            (set! failures (+ failures 1))))
+        (when expected
+          (for [i actual-cells cells]
+            (let [padding (+ reference (cast i32 i))]
+              (match (g/lookup graph padding)
+                (None [] (set! failures (+ failures 1)))
+                (Some [node]
+                      (when (or (!= (.header node) 0)
+                                (!= (.op1 node) 0)
+                                (!= (.op2 node) 0)
+                                (!= (.op3 node) 0)
+                                (!= (get (.arities graph) (cast i64 padding)) 0))
+                        (set! failures (+ failures 1))))))))
+        (match (g/lookup graph marker)
+          (Some [node]
+                (when (or (!= (n/opcode node) 68) (!= (.op1 node) constant))
+                  (set! failures (+ failures 1))))
+          (None [] (set! failures (+ failures 1))))
+        (match (verify/structure graph)
+          (Err [message]
+               (do
+                 (println "rewrite structure: {}" message)
+                 (set! failures (+ failures 1))))
+          (Ok [_] 0))
+        (for invalid [(: 0 i32) -1 2147483647]
+          (when (g/make-nop! (mut graph) invalid)
+            (set! failures (+ failures 1))))
+        (when (and (> actual-cells 1)
+                   (g/make-nop! (mut graph) (+ reference 1)))
+          (set! failures (+ failures 1)))))
+    (free! (mut inputs))
+    (g/release! (mut graph))
+    failures))
 
 (defn main [] (-> i64)
   (let [(mut graph) (g/create (malloc-allocator))
@@ -32,5 +110,8 @@
     (when (g/contains? graph 4097) (set! failures (+ failures 1)))
     (when (g/contains? graph -4097) (set! failures (+ failures 1)))
     (g/release! (mut graph))
+    (for old [1 3 4 7 8 15 16 63 64]
+      (for new [0 1 3 4 7 8 16 64 80]
+        (set! failures (+ failures (rewrites old new)))))
     (println "graph checks: {} failures" failures)
     (if (= failures 0) 0 1)))
