@@ -1703,3 +1703,194 @@ low-width wrap-preserving data lifting (the compiler uses u64 containers around
 u32 truncations), runtime alias/range guards, finite vector prefix and scalar
 cleanup, then shared JIT/AOT emission. All optimization work must remain inside
 the measured IR-to-machine-code boundary; original benchmark files stay fixed.
+
+## Isolated SCCP Phi transfer validation
+
+The analysis worktree now retains continuation cells of reachable multi-cell
+Phis, matching pinned `ir_sccp_analyze_phi`. The previous implementation fails
+78 assertions in the new transition fixture; the corrected implementation
+passes. Twelve predecessor-count cases cross graph-cell and worklist-word
+boundaries. Thirty-two additional cases cover direct/propagated integer, NaN
+payload, symbol and vector long constants, with equal and conflicting inputs.
+
+The temporary reference oracle invokes the unmodified pinned C function on the
+same compact graph and lattice transitions. All 4,110 normalized return/state,
+identity and pending-worklist observations agree. Structural and Phi verification
+run before the fixtures construct use lists. The original 100 Phi cases, combined
+value-domain checks and bitset checks also pass with debug checks enabled.
+Evidence: `docs/validation/sccp-phi-oracle.json`.
+
+This remains analysis development, unmerged and uninstalled. The enclosing SCCP
+analyzer, graph/control rewrite with root remapping, iteration and optimization
+mode policy are still required. No runtime or compilation-time improvement is
+claimed from these component checks.
+
+## SCCP worklist and control propagation — development
+
+The isolated worktree now has an owned analysis result with the combined domain
+and iterative-candidate queue. Its runner follows upstream's minimum-reference
+worklist, def-use notifications and Phi/COPY propagation. Control transfer tracks
+partial MERGE feasibility, selected IF/SWITCH projections, reachable effects and
+multi-cell storage. A loop regression widens a previously constant IF after its
+backedge adds a conflicting Phi input, reaching the formerly infeasible exit.
+
+General fold transfer is still an explicit error. MEM2SSA immediate-Phi policy,
+external-root handling for transformation, control/data rewriting, iteration and
+optimization-level transport remain open. The runner is not enabled in the
+delivered compiler. In particular, iterative candidates are analysis metadata;
+no load or other instruction has been deleted based on these facts.
+
+The constructor's scalar truth logic is shared with SCCP. It preserves numeric
+floating signed-zero/NaN behavior and keeps unresolved named addresses unknown,
+as required by this library's resolver contract. This differs intentionally from
+pinned upstream's assumption that symbolic addresses are nonzero.
+
+Fifty-nine complete control-flow analysis cases match 641 normalized state,
+identity, pending-queue and iterative-queue observations against unmodified
+`ir_sccp_analyze`. Separate checks cover unresolved-symbol truth and rejection of
+unported folds. All runner cases pass AddressSanitizer and debug checks; focused
+Phi, value-domain, bitset, constructor and native conditional regressions pass.
+Evidence and source hashes: `docs/validation/sccp-analysis-oracle.json`.
+These checks establish this development component's covered behavior, not an
+enabled optimizing backend or a change in accepted benchmark results.
+
+## Scalar SCCP folding bridge — development
+
+The runner now applies lattice-aware scalar folding through the same evaluators
+used during construction, rather than rejecting every arithmetic expression.
+It preserves upstream's backward discovery and direct-replacement benefit gate,
+then meets constant or copy results into the combined domain. Conversion
+iteration candidates and checked overflow behavior follow the pinned pipeline.
+Algebraic restarts, remaining structural/vector families and PROTO are not yet
+ported; eligible unimplemented families still return explicit errors.
+
+Target pointer width is an explicit analysis input, validated before graph
+constant checks. The same graph produces address wrap at 32 bits and a 2^32
+result at 64 bits. Invalid widths and out-of-width literals are rejected.
+Analysis remains read-only over the graph.
+
+818 reference graphs produce 4,973 compared observations: 4,941 exact matches,
+32 verified existing Coil rule-coverage extensions and no unexplained
+differences. The extensions are literal bit counts and same-type signed extrema;
+known-answer assertions remain in the tests. The oracle preserves reserved C
+constant slots by remapping references and normalizes signed narrow payloads.
+It invokes unmodified pinned analysis/folding functions. Evidence and exact
+scope: `docs/validation/sccp-fold-oracle.json`.
+
+The fold suite passes AddressSanitizer and debug checks. Existing worklist/Phi,
+combined-domain and conditional construction/native regressions pass. A captured
+frozen stencil graph also analyzes successfully, finding zero new constant or
+copy facts (`docs/validation/sccp-stencil-analysis.json`). This provides no
+runtime improvement; the stencil's SIMD gap still requires a general extension
+after the missing original optimizer stages. Graph/control rewriting, external
+roots, iteration, mode policy and backend delivery remain unfinished.
+
+## Initial SCCP analysis development checkpoint — 4db06ec
+
+The ignored .worktrees/sccp-analysis checkout begins feasible-input Phi analysis
+over the original graph and compact value domain. Initial 100 cases cover
+constant agreement/conflicts, distinct/same overdefined source identities,
+self inputs and all predecessor feasibility masks. They pass. Long/symbol
+constants, previous copy partitions, backward top discovery, loop transitions
+and a pinned-C differential are still required before treating the transfer as
+verified. The whole SCCP analyzer, transformation and iteration remain pending.
+This branch is not merged into main, vendored, or enabled in the compiler.
+
+## Rooted SCCP transformation and native COPY — development
+
+Analysis now accepts explicit observable roots, including data with no ordinary
+uses. Source typing uses an explicit target pointer width; the earlier analysis
+fixtures' RETURN types were corrected to pass the stronger type gate. The native
+entry points retain their eight-byte-address wrapper.
+
+The new transformation operates on an owned duplicate of the compact graph,
+including constants, long-constant spans, strings/prototypes and interning caches.
+It replaces data facts, removes unreachable instructions, compresses regions and
+Phi operands in parallel, retains selected control as END/BEGIN, and repairs
+terminal-list heads/links. Explicit data roots keep positive COPY references.
+Output verification and error cleanup leave source instructions, constants and
+CSE untouched. Analysis caches must be rebuilt for the returned graph.
+
+Native testing exposed missing COPY lowering. COPY now validates exact source
+and result types, supplies register-class constraints before allocation, and uses
+existing GP/SIMD capture/transfer machinery. Literal and register COPY payloads
+are observable in memory for all thirteen scalar types and three vector shapes;
+source loads stay live across COPY, NaN payloads differ from constants, and
+independent byte/canary answers cover the complete buffers. Source and working
+graphs are released before image mapping. The linked consumer checks the same
+shared-image output through four fresh Mach-O fixtures.
+
+The upstream audit also found the missing IR_COPY_HARD fold barrier. Two new
+reference cases retain it; the prior implementation fails three assertions.
+Actual node/edge edits now drive the change count. Reapplying analysis/rewrite to
+the covered stabilized fixtures reports zero changes instead of endlessly
+counting already canonical rooted COPYs.
+
+Focused validation covers native original/transformed functions, wide region/Phi
+cell boundaries, terminal chains, error cleanup, legacy graph/verifier/vector
+transport and register pressure. New native and rejection fixtures pass
+AddressSanitizer. Detailed scope and hashes: `validation/sccp-rewrite-native.json`.
+Remaining folding, iterative cleanup, optimization mode policy, full regression
+and compiler delivery are pending. The unchanged stencil benchmark has no new
+accepted timing result and the performance objective remains unmet.
+
+## Incremental use-list updates — development
+
+The follow-up worklist optimizer needs to update consumers without rebuilding
+the entire graph after each edit. Mutable operations now extend the existing
+flat use-list representation using the pinned allocation/removal policy.
+Reference and operand-position pairs identify exact edges; range offsets must
+be re-read after mutations that can relocate a bucket.
+
+One thousand redirects across 130 users, including repeated operands and high
+fan-out, match complete use multisets rebuilt independently from the graph after
+each edit. Successful single-edge replacements and missing-edge no-ops are also
+checked. The fixture passes AddressSanitizer; focused use/domain/native-control
+regressions pass. Evidence: `validation/mutable-uses.json`.
+The iterative folding/control driver and mode integration remain pending.
+
+
+## SCCP pipeline and native modes: full compatibility checkpoint
+
+Executable source `799bba6` is merged into main in `406be5b`. It adds rooted
+analysis, owned rewriting, incremental scalar fold/CSE/DCE, affected-node
+candidate transport and explicit image/object options. Positive levels above
+one run SCCP before native preparation; level 1 retains the legacy path; level 0
+explicitly rejects until its distinct upstream fast-allocation path exists.
+
+All 228 standalone programs and 69 linked AOT consumers pass. Object freshness
+and frozen source/toolchain hashes are checked. The run takes 421.05 seconds for
+standalone programs and 66.83 seconds for linked consumers. Evidence:
+`docs/validation/sccp-full-regressions.json`. Selected oracle, cross-pass CSE,
+JIT/AOT, positive-root and constant-pool ownership tests remain qualified in the
+component reports. These are not full upstream optimizer/allocator parity.
+
+Coil integration is committed separately at `3baa1650` in its stogir backend
+worktree. It vendors 127 byte-identical modules, regenerates the SDK manifest,
+and transports the CLI optimization level explicitly through job state to the
+library image API inside the existing ir-codegen timing span. Candidate build
+and compiler delivery validation are in progress; global install and push have
+not occurred at this checkpoint. No fresh benchmark result is claimed. The
+runtime/compile-time performance goal remains unmet.
+
+
+## Coil delivery confirmation
+
+Compiler source `3baa1650` is now installed globally with its matching SDK;
+Coil validation commit `d1acc9d5` is pushed to `feature/stogir-backend`. Candidate
+build, full FAST 49/49 (343.1 seconds, time and 1.60 GB memory warnings),
+LLVM/TPDE/stogir O3 off-checkout object/link/run checks and new SDK namespace
+imports pass. All 127 installed modules match standalone source. The native
+fixture and stencil passes 1/2/17/257 agree for stogir O1/O2/O3 against LLVM O3
+and TPDE. Stogir's corpus remains 6/9 with the same pinned-shim, narrow-bit/i128
+and deep-tail-recursion limitations. O0 explicitly reports its missing fast
+allocation path.
+
+A fixed five-sample timing attempt records provisional medians: LLVM O3 codegen
+25.790 ms/runtime 361.365 ms; TPDE 0.122 ms/4002.083 ms; stogir 5.963 ms/2990.253
+ms. Concurrent Turbopack/Rust compilations occurred in 8 of 24 monitoring
+observations, so these are not a replacement accepted baseline or proof of a
+performance gain. The previous accepted workload, samples and timing boundary
+remain unchanged. Performance acceptance remains unmet. Raw data and delivery
+proof live in Coil's docs/benchmarks/STOGIR_SCCP_MODES.md and
+docs/validation/stogir-sccp-pipeline-installed.json.

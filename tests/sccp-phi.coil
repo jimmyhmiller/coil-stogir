@@ -1,0 +1,84 @@
+(module stogir.tests.sccp-phi)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.verify" :as verify)
+(import "stogir.uses" :as uses)
+(import "stogir.sccp-values" :as values)
+(import "stogir.sccp-phi" :as phi)
+(import "stogir.bitqueue" :as queue)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn check [(left-tag i32) (right-tag i32) (feasible i32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        y (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        two (require (b/scalar-constant! (mut graph) 11 2 8))
+        split (require (b/emit! (mut graph) 116 0 [start x]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        yes-end (require (b/emit! (mut graph) 114 0 [yes]))
+        no-end (require (b/emit! (mut graph) 114 0 [no]))
+        merge (require (b/emit! (mut graph) 112 0 [yes-end no-end]))
+        result (require (b/emit! (mut graph) 67 11 [merge x y]))
+        left (match left-tag (0 one) (1 two) (2 x) (3 y) (_ result))
+        right (match right-tag (0 one) (1 two) (2 x) (3 y) (_ result))
+        (mut failures) 0]
+    (b/patch! (mut graph) result 2 left)
+    (b/patch! (mut graph) result 3 right)
+    (match (verify/phis graph)
+      (Err [message] (panic "{}" message))
+      (Ok [_] 0))
+    (let [(mut edges) (uses/build graph a)
+          (mut domain) (values/create (len (.instructions graph)) a)]
+      (values/make-bottom! (mut domain) edges x)
+      (values/make-bottom! (mut domain) edges y)
+      (when (!= feasible 0) (values/kind! (mut domain) merge (op/count)))
+      (when (!= (& feasible 1) 0)
+        (values/kind! (mut domain) yes-end (op/count)))
+      (when (!= (& feasible 2) 0) (values/kind! (mut domain) no-end (op/count)))
+      (phi/transfer! graph (mut domain) edges result)
+      (let [first (if (!= (& feasible 1) 0) left-tag 4)
+            second (if (!= (& feasible 2) 0) right-tag 4)
+            picked (if (= first 4) second first)
+            conflict (and (!= first 4) (!= second 4) (!= first second))
+            value (values/at domain result)
+            expected-kind
+              (if conflict
+                  (op/count)
+                  (if (= picked 4) 0 (if (< picked 2) 11 68)))]
+        (when (!= (values/state-kind value) expected-kind)
+          (println "Phi {},{},{}: kind {} expected {}"
+                   left-tag
+                   right-tag
+                   feasible
+                   (values/state-kind value)
+                   expected-kind)
+          (set! failures (+ failures 1)))
+        (when (and (= expected-kind 11)
+                   (!= (n/constant-bits value) (cast u64 (+ picked 1))))
+          (set! failures (+ failures 1)))
+        (when (and (= expected-kind 68)
+                   (!= (values/identity domain result) (if (= picked 2) x y)))
+          (set! failures (+ failures 1))))
+      (values/release! (mut domain))
+      (uses/release! (mut edges)))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for left [(: 0 i32) 1 2 3 4]
+      (for right [(: 0 i32) 1 2 3 4]
+        (for feasible [(: 0 i32) 1 2 3]
+          (set! failures (+ failures (check left right feasible))))))
+    (println "SCCP Phi transfer checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

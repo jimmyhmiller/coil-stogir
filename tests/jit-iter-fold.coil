@@ -1,0 +1,208 @@
+(module stogir.tests.jit-iter-fold)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.iter-fold" :as iter)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.uses" :as uses)
+(import "stogir.bitqueue" :as q)
+(import "stogir.bitset" :as bits)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+;;; Rebuilt exact-position edge multisets must match the maintained lists.
+(defn check-uses [(graph g/Graph) (actual uses/Uses)] (-> i64)
+  (let [(mut expected) (uses/build graph (malloc-allocator))
+        (mut failures) 0]
+    (for [r 1 (len (.instructions graph))]
+      (let [want (get (.ranges expected) r)
+            got (get (.ranges actual) r)]
+        (when (!= (.count want) (.count got)) (set! failures (+ failures 1)))
+        (for [i (.offset want) (+ (.offset want) (.count want))]
+          (let [edge (get (.edges expected) i)
+                (mut count) 0]
+            (for [j (.offset got) (+ (.offset got) (.count got))]
+              (let [other (get (.edges actual) j)]
+                (when (and (= (.user edge) (.user other))
+                           (= (.operand edge) (.operand other)))
+                  (set! count (+ count 1)))))
+            (when (!= count 1) (set! failures (+ failures 1)))))))
+    (uses/release! (mut expected))
+    failures))
+
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        y (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        first (require (b/emit! (mut graph) 26 11 [x y]))
+        second (require (b/emit! (mut graph) 26 11 [x y]))
+        hard1 (require (b/emit! (mut graph) 68 11 [first (: 1 i32)]))
+        hard2 (require (b/emit! (mut graph) 68 11 [first (: 1 i32)]))
+        pair (require (b/emit! (mut graph) 26 11 [first second]))
+        identity (require (b/emit! (mut graph) 47 11 [pair pair]))
+        negative (require (b/emit! (mut graph) 31 11 [identity]))
+        double-negative (require (b/emit! (mut graph) 31 11 [negative]))
+        hard-pair (require (b/emit! (mut graph) 26 11 [hard1 hard2]))
+        forward (require (b/emit! (mut graph) 26 11 [x seven]))
+        equal (require (b/emit! (mut graph) 14 1 [x x]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        selected (require (b/emit! (mut graph) 60 11 [equal seven zero]))
+        copied (require (b/emit! (mut graph) 68 11 [selected (: 0 i32)]))
+        multiplied (require (b/emit! (mut graph) 28 11 [hard-pair one]))
+        cancelled (require (b/emit! (mut graph) 27 11 [x x]))
+        exclusive (require (b/emit! (mut graph) 48 11 [y y]))
+        sum (require (b/emit! (mut graph) 26 11 [double-negative multiplied]))
+        answer (require (b/emit! (mut graph) 26 11 [sum forward]))
+        dead-input (require (b/emit! (mut graph) 26 11 [x seven]))
+        dead (require (b/emit! (mut graph) 31 11 [dead-input]))
+        observed (require (b/emit! (mut graph) 68 11 [seven (: 0 i32)]))
+        with-cancelled (require (b/emit! (mut graph) 26 11 [answer cancelled]))
+        with-exclusive
+          (require (b/emit! (mut graph) 26 11 [with-cancelled exclusive]))
+        done
+          (require (b/emit! (mut graph) 120 11 [start with-exclusive (: 0 i32)]))
+        roots [done second observed]
+        seeds
+          [forward copied second hard1 hard2 dead observed identity
+           double-negative multiplied cancelled exclusive equal]
+        (mut failures) 0]
+    ; Stress repeated edges and bucket relocation during replacement.
+    (for [i 0 128]
+      (require (b/emit! (mut graph) 26 11 [second second])))
+    ; A lower-reference user is visited before the later COPY is replaced.
+    (g/set-operand! (mut graph) forward 1 copied)
+    (let [scalar-value (require (b/scalar-constant! (mut graph) 5 7 8))
+          vector (require (b/emit! (mut graph) 63 37 [scalar-value]))]
+      ; This deliberately unported fold must fail after processing an earlier
+      ; COPY, discarding all partial edits rather than changing the source.
+      (match (iter/optimize graph 8 [done vector] [copied vector] a)
+        (Err [message]
+             (when (!= message "SCCP vector fold family is not implemented")
+               (panic "unexpected rejection: {}" message)))
+        (Ok [unexpected]
+            (let [(mut unexpected) unexpected]
+              (set! failures (+ failures 1))
+              (rewrite/release! (mut unexpected))))))
+    (when (or (!= (n/opcode (get (.instructions graph) (cast i64 copied))) 68)
+              (!= (.op1 (get (.instructions graph) (cast i64 forward))) copied))
+      (set! failures (+ failures 1)))
+    (match (iter/optimize graph 3 roots seeds a)
+      (Err [message]
+           (when (!= message "iterative pointer width must be four or eight")
+             (set! failures (+ failures 1))))
+      (Ok [unexpected]
+          (let [(mut unexpected) unexpected]
+            (set! failures (+ failures 1))
+            (rewrite/release! (mut unexpected)))))
+    (let [(mut snapshot) (g/duplicate graph a)]
+      (match (iter/optimize graph 8 roots seeds a)
+        (Err [message] (panic "{}" message))
+        (Ok [result]
+            (let [(mut result) result]
+              (for [i 0 (len (.instructions graph))]
+                (let [before (get (.instructions snapshot) i)
+                      after (get (.instructions graph) i)]
+                  (when (or (!= (.header before) (.header after))
+                            (!= (.op1 before) (.op1 after))
+                            (!= (.op2 before) (.op2 after))
+                            (!= (.op3 before) (.op3 after))
+                            (!= (get (.arities snapshot) i)
+                                (get (.arities graph) i)))
+                    (set! failures (+ failures 1)))))
+              (when (!= (len (.constants snapshot)) (len (.constants graph)))
+                (set! failures (+ failures 1)))
+              (rewrite/release! (mut result)))))
+      (g/release! (mut snapshot)))
+    (let [(mut working) (g/duplicate graph a)
+          (mut lists) (uses/build working a)
+          (mut queue) (q/create (len (.instructions working)) a)
+          (mut protected) (bits/create (len (.instructions working)) a)]
+      (for root roots (bits/add! (mut protected) (cast i64 root)))
+      (for seed seeds (q/add! (mut queue) (cast i64 seed)))
+      (let [changes
+              (require (iter/run! (mut working)
+                                  (mut lists)
+                                  (mut queue)
+                                  protected
+                                  8
+                                  a))]
+        (when (< changes 5) (set! failures (+ failures 1))))
+      (set! failures (+ failures (check-uses working lists)))
+      (for r [dead dead-input copied forward identity negative double-negative
+              multiplied cancelled exclusive equal selected]
+        (when (!= (n/opcode (get (.instructions working) (cast i64 r))) 0)
+          (set! failures (+ failures 1))))
+      (for r [hard1 hard2]
+        (let [node (get (.instructions working) (cast i64 r))]
+          (when (or (!= (n/opcode node) 68) (!= (.op2 node) 1))
+            (set! failures (+ failures 1)))))
+      (when (or (!= (.op1 (get (.instructions working) (cast i64 second)))
+                    first)
+                (!= (n/opcode (get (.instructions working) (cast i64 second)))
+                    68))
+        (set! failures (+ failures 1)))
+      (require (rewrite/validate working 8 a))
+      (for seed seeds (q/add! (mut queue) (cast i64 seed)))
+      (when (!= (require (iter/run! (mut working)
+                                    (mut lists)
+                                    (mut queue)
+                                    protected
+                                    8
+                                    a))
+                0)
+        (set! failures (+ failures 1)))
+      (uses/release! (mut lists))
+      (q/release! (mut queue))
+      (bits/release! (mut protected))
+      (g/release! (mut working)))
+    (match (iter/optimize graph 8 roots seeds a)
+      (Err [message] (panic "{}" message))
+      (Ok [result]
+          (let [(mut result) result]
+            (match (compile/image (.graph result) start roots "_iter_fold" a)
+              (Err [message] (panic "{}" message))
+              (Ok [output]
+                  (let [(mut output) output]
+                    (rewrite/release! (mut result))
+                    (match (macho/image-object output a)
+                      (Err [message] (panic "{}" message))
+                      (Ok [object]
+                          (let [(mut object) object]
+                            (match (fs/write-file a
+                                                  "/tmp/coil-stogir-iter-fold.o"
+                                                  (slice object))
+                              (Err [_] (panic "object write failed"))
+                              (Ok [_] 0))
+                            (free! (mut object)))))
+                    (match (jit/map-image output a)
+                      (Err [message] (panic "{}" message))
+                      (Ok [loaded]
+                          (let [(mut loaded) loaded
+                                function
+                                  (p/cast (fnptr (cc/C) [i64 i64] i64)
+                                          (.base (.memory loaded)))]
+                            (for x [-100 -7 0 3 29]
+                              (for y [-99 -1 0 17 53]
+                                (when (!= (function x y) (+ (* 4 (+ x y)) 14))
+                                  (set! failures (+ failures 1)))))
+                            (jit/release-image! (mut loaded)))))
+                    (image/release! (mut output))))))))
+    (when (!= (n/opcode (get (.instructions graph) (cast i64 second))) 26)
+      (set! failures (+ failures 1)))
+    (g/release! (mut graph))
+    (println "incremental fold/CSE/JIT checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

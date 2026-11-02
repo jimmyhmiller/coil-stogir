@@ -1,0 +1,125 @@
+(module stogir.tests.jit-optimization-owned-image)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn check [(level i32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        destination (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        literal
+          (require (b/vector-constant! (mut graph)
+                                       37
+                                       8
+                                       [(: 1 u8)
+                                        2
+                                        3
+                                        4
+                                        5
+                                        6
+                                        7
+                                        8
+                                        9
+                                        10
+                                        11
+                                        12
+                                        13
+                                        14
+                                        15
+                                        16]))
+        barrier (require (b/emit! (mut graph) 68 37 [literal (: 1 i32)]))
+        store (require (b/emit! (mut graph) 93 0 [start destination barrier]))
+        done (require (b/emit! (mut graph) 120 0 [store (: 0 i32) 0]))
+        (mut failures) 0]
+    (match (compile/image-with-options graph
+                                       start
+                                       [done]
+                                       "_mode_payload"
+                                       (options/Options :level level)
+                                       a)
+      (Err [message] (panic "{}" message))
+      (Ok [code]
+          (let [(mut code) code]
+            ; Both the caller graph and the wrapper's optimized working graph
+            ; are gone before object serialization and JIT mapping.
+            (g/release! (mut graph))
+            (when (= level 3)
+              (match (macho/image-object code a)
+                (Err [message] (panic "{}" message))
+                (Ok [object]
+                    (let [(mut object) object]
+                      (match (fs/write-file a
+                                            "/tmp/coil-stogir-options-payload.o"
+                                            (slice object))
+                        (Err [_] (panic "object write failed"))
+                        (Ok [_] 0))
+                      (free! (mut object))))))
+            (match (jit/map-image code a)
+              (Err [message] (panic "{}" message))
+              (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        function
+                          (p/cast (fnptr (cc/C) [(ptr u8)] void)
+                                  (.base (.memory loaded)))
+                        (mut buffer)
+                          [(: 0xA5 u8)
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5
+                           0xA5]]
+                    (function (p/index (p/cast (ptr u8) (mut buffer)) 8))
+                    (for [i 0 32]
+                      (let [expected
+                              (if (and (>= i 8) (< i 24))
+                                  (cast u8 (- i 7))
+                                  0xA5)]
+                        (when (!= (get buffer i) expected)
+                          (set! failures (+ failures 1)))))
+                    (jit/release-image! (mut loaded)))))
+            (image/release! (mut code)))))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures (+ (check 2) (check 3))]
+    (println "optimized image ownership checks: {} failures" failures)
+    (if (= failures 0) 0 1)))
