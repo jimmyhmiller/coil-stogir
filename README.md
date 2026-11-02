@@ -130,3 +130,16 @@ coil run tests/macho-image.coil --debug-checks
 coil run tests/jit-branch.coil --debug-checks
 coil run tests/aot-image-link.coil --debug-checks --link-flag /tmp/coil-stogir-image.o --link-flag /tmp/coil-stogir-long-relocated-branch.o
 ```
+
+The SCCP value-domain port can be checked independently:
+
+```sh
+coil run tests/sccp-values.coil --debug-checks
+coil run tests/sccp-values.coil -- --oracle
+```
+
+The [value-domain comparison](docs/validation/sccp-values-oracle.json) records
+state/queue agreement with the pinned reference, including dependent copy
+partition splits and exact constant payloads. This is a prerequisite for SCCP;
+it does not enable SCCP in the compiler. Analysis, rewriting and follow-up
+iterative optimization remain pending.
