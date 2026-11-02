@@ -9,6 +9,7 @@
 (import "stogir.sccp-phi" :as phi)
 (import "stogir.uses" :as uses)
 (import "stogir.bitset" :as bits)
+(import "stogir.bitqueue" :as q)
 (import "stogir.verify" :as verify)
 (import "stogir.terminal" :as terminal)
 (import "stogir.calls" :as calls)
@@ -17,11 +18,13 @@
 (import "coil.alloc" :use [Allocator])
 (import "coil.result" :use [Result Ok Err Some None])
 
-(defstruct Rewritten [(graph g/Graph) (roots (ArrayList i32)) (changes i32)])
+(defstruct Rewritten
+  [(graph g/Graph) (roots (ArrayList i32)) (changes i32) (iteration q/Queue)])
 
 (defn release! [(result (mut Rewritten))] (-> void)
   (g/release! (mut (.graph result)))
-  (free! (mut (.roots result))))
+  (free! (mut (.roots result)))
+  (q/release! (mut (.iteration result))))
 
 (defn data-edge? [(kind (slice u8))] (-> bool)
   (or (= kind "def") (= kind "ref") (= kind "arg")))
@@ -125,6 +128,49 @@
                             (Ok [_]
                                 (switch/verify graph a))))))))))))
 
+;;; Transport rewrite effects into the upstream-style iterative worklist.
+;;; Original users and former inputs remain relevant even when their defining
+;;; node became NOP. Compare every operand of variable-length instructions, not
+;;; just their first compact cell. A single linear scan completes this bulk
+;;; transformation; the subsequent iterative optimizer maintains uses in place.
+(defn seed-iteration! [(source g/Graph)
+                       (graph g/Graph)
+                       (edges uses/Uses)
+                       (facts analysis/Analysis)
+                       (queue (mut q/Queue))]
+  (-> void)
+  (let [(mut r) (: 1 i64)]
+    (while (< r (len (.instructions source)))
+      (let [before (get (.instructions source) r)
+            after (get (.instructions graph) r)
+            old-count (get (.arities source) r)
+            new-count (get (.arities graph) r)
+            (mut changed)
+              (or (!= (.header before) (.header after))
+                  (!= old-count new-count))]
+        (when (= old-count new-count)
+          (for [i 1 (+ (cast i64 old-count) 1)]
+            (when (!= (phi/input source (cast i32 r) (cast i32 i))
+                      (phi/input graph (cast i32 r) (cast i32 i)))
+              (set! changed true))))
+        (when (or changed (q/contains? (.iteration facts) r))
+          (q/add! (mut queue) r))
+        (when changed
+          (let [range (get (.ranges edges) r)]
+            (for [i (.offset range) (+ (.offset range) (.count range))]
+              (q/add! (mut queue) (cast i64 (.user (get (.edges edges) i))))))
+          (for [i 1 (+ (cast i64 old-count) 1)]
+            (when (uses/edge-kind? (op/operand-kind (cast i32 (n/opcode before))
+                                                    (cast i32 i)))
+              (let [input (phi/input source (cast i32 r) (cast i32 i))]
+                (when (> input 0) (q/add! (mut queue) (cast i64 input))))))
+          (for [i 1 (+ (cast i64 new-count) 1)]
+            (when (uses/edge-kind? (op/operand-kind (cast i32 (n/opcode after))
+                                                    (cast i32 i)))
+              (let [input (phi/input graph (cast i32 r) (cast i32 i))]
+                (when (> input 0) (q/add! (mut queue) (cast i64 input)))))))
+        (set! r (+ r (/ (+ (cast i64 old-count) 4) 4)))))))
+
 ;;; Preconditions: analysis belongs to this exact immutable source graph and was
 ;;; produced with these roots observed. Mutations occur only in an owned copy;
 ;;; failed validation releases that copy and leaves all source storage untouched.
@@ -153,6 +199,7 @@
               (mut mapping) (ArrayList::new [i32] a)
               (mut removed) (bits/create size a)
               (mut result-roots) (ArrayList::new [i32] a)
+              (mut iteration) (q/create size a)
               (mut edges) (uses/build source a)
               (mut changes) (: 0 i32)
               (mut r) (: 1 i64)]
@@ -301,6 +348,8 @@
             (match (validate graph (.pointer-bytes facts) a)
               (Err [message] (set! error message))
               (Ok [_] 0)))
+          (when (= error "")
+            (seed-iteration! source graph edges facts (mut iteration)))
           (free! (mut mapping))
           (bits/release! (mut removed))
           (uses/release! (mut edges))
@@ -308,8 +357,10 @@
               (Ok (Rewritten
                     :graph graph
                     :roots result-roots
-                    :changes changes))
+                    :changes changes
+                    :iteration iteration))
               (do
                 (g/release! (mut graph))
                 (free! (mut result-roots))
+                (q/release! (mut iteration))
                 (Err error)))))))
