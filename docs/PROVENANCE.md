@@ -211,7 +211,7 @@ overflow projection and conditional selection reuse Coil's established scalar
 rules. Overflowing checked operations remain instructions. Analysis explicitly
 owns the target pointer width; constants are validated against that width.
 
-The current scalar comparison covers 818 graphs and 4,973 observations: 4,941
+The scalar folding checkpoint covered 818 graphs and 4,973 observations: 4,941
 match exactly. The remaining 32 are recorded rule-coverage extensions, not
 discarded cases: the existing Coil evaluator folds literal bit counts and
 same-type signed extrema absent from the pinned matching rules. Those results
@@ -223,3 +223,29 @@ This is not full upstream folding parity. Algebraic restart/structural rules,
 PROTO and remaining vector families are unfinished. Eligible unported families
 return explicit errors in this development runner. No graph transformation or
 production optimizer integration is enabled.
+
+### Rooted graph transformation and native COPY — development branch
+
+`stogir.sccp-rewrite` adapts `ir_sccp_transform`, region/Phi compression and
+terminal-list unlinking from the pinned `ir_sccp.c`. Selected IF/SWITCH paths use
+its retained END/BEGIN form. This port keeps that form to preserve protected
+references; redundant-block cleanup is still pending. A working graph duplicates
+the same compact representation and interning tables, with all original IDs
+unchanged. Failure releases the working copy, preserving the input and its caches.
+External data roots stay positive via COPY nodes; unreachable control roots are
+removed from the returned root list. New uses/CFG/schedule/matching are required.
+
+Typed native COPY covers GP, floating and 64/128-bit vector identities using
+existing capture/transfer emission. Operand/definition constraints precede
+allocation. The pinned target selects `IR_COPY_INT/FP | IR_MAY_REUSE`; full reuse
+hint/coalescing parity is not claimed. The pinned `IR_COPY_HARD` bit prevents
+folding, while still permitting native register reuse. Its new reproducer fails
+three assertions without the barrier check and passes with it.
+
+Native original/transformed execution, linked AOT payloads, wide Phi extents,
+terminal chains, source/cache ownership, no-change detection and rejected-rewrite
+cleanup are covered in `validation/sccp-rewrite-native.json`. This is a development
+component, not full SCCP iteration or an enabled optimized compiler backend.
+Its refreshed comparisons include 59 control-flow graphs and 820 folding graphs,
+including both hard-copy cases. The same 32 existing fold extensions remain
+explicit; no unexplained reference differences were found.

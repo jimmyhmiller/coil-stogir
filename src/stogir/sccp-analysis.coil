@@ -11,15 +11,21 @@
 (import "stogir.sccp-control" :as control)
 (import "stogir.sccp-fold" :as folding)
 (import "stogir.bitqueue" :as q)
+(import "stogir.bitset" :as bits)
 (import "stogir.uses" :as uses)
 (import "coil.alloc" :use [Allocator])
 (import "coil.result" :use [Result Ok Err])
 
-(defstruct Analysis [(domain v/Domain) (iteration q/Queue) (pointer-bytes i32)])
+(defstruct Analysis
+  [(domain v/Domain)
+   (iteration q/Queue)
+   (pointer-bytes i32)
+   (observed bits/Bits)])
 
 (defn release! [(analysis (mut Analysis))] (-> void)
   (v/release! (mut (.domain analysis)))
-  (q/release! (mut (.iteration analysis))))
+  (q/release! (mut (.iteration analysis)))
+  (bits/release! (mut (.observed analysis))))
 
 (defn data? [(opcode i32)] (-> bool)
   (let [shape (op/shape opcode)
@@ -34,6 +40,11 @@
   (-> (Result i32 (slice u8)))
   (let [(mut error) ""
         (mut reference) (: 0 i64)]
+    (let [(mut root) (bits/next-set (.observed analysis) 1)]
+      (while (>= root 0)
+        (when (data? (cast i32 (n/opcode (get (.instructions graph) root))))
+          (v/add-input! (mut (.domain analysis)) (cast i32 root)))
+        (set! root (bits/next-set (.observed analysis) (+ root 1)))))
     (q/add! (mut (.pending (.domain analysis))) 1)
     (set! reference (q/pop! (mut (.pending (.domain analysis)))))
     (while (and (>= reference 0) (= error ""))
@@ -44,7 +55,8 @@
         (when (v/bottom? (.domain analysis) r)
           (panic "bottom SCCP worklist entry {}" r))
         (if (data? opcode)
-            (when (> (.count (get (.ranges edges) reference)) 0)
+            (when (or (> (.count (get (.ranges edges) reference)) 0)
+                      (bits/contains? (.observed analysis) reference))
               (cond (= opcode 67)
                       (set! changed
                             (phi/transfer! graph
@@ -85,16 +97,20 @@
   (Analysis
     :domain (v/create size a)
     :iteration (q/create size a)
-    :pointer-bytes pointer-bytes))
+    :pointer-bytes pointer-bytes
+    :observed (bits/create size a)))
 
-(defn analyze [(graph g/Graph) (pointer-bytes i32) (a (dyn Allocator))]
+(defn analyze-rooted [(graph g/Graph)
+                      (pointer-bytes i32)
+                      (roots (slice i32))
+                      (a (dyn Allocator))]
   (-> (Result Analysis (slice u8)))
   (if (not (or (= pointer-bytes 4) (= pointer-bytes 8)))
       (Err "invalid SCCP target pointer width")
       (match (verify/constants graph pointer-bytes)
         (Err [message] (Err message))
         (Ok [_]
-            (match (verify/structure graph)
+            (match (verify/integer-operations-target graph pointer-bytes)
               (Err [message] (Err message))
               (Ok [_]
                   (match (verify/phis graph)
@@ -113,10 +129,31 @@
                                           (create (len (.instructions graph))
                                                   pointer-bytes
                                                   a)
-                                        status (run! graph edges (mut result))]
+                                        (mut status) (Ok [i32 (slice u8)] 0)]
+                                    (for root roots
+                                      (let [valid
+                                              (and (> root 0)
+                                                   (g/contains? graph root))]
+                                        (when valid
+                                          (bits/add! (mut (.observed result))
+                                                     (cast i64 root)))
+                                        (when (not valid)
+                                          (set! status
+                                                (Err [i32 (slice u8)]
+                                                     "invalid SCCP observable root")))))
+                                    (match status
+                                      (Err [_] 0)
+                                      (Ok [_]
+                                          (set! status
+                                                (run! graph edges (mut result)))))
                                     (uses/release! (mut edges))
                                     (match status
                                       (Err [message]
                                            (release! (mut result))
                                            (Err message))
                                       (Ok [_] (Ok result)))))))))))))))
+
+;;; Legacy unrooted analysis uses the graph's control exits and data use lists.
+(defn analyze [(graph g/Graph) (pointer-bytes i32) (a (dyn Allocator))]
+  (-> (Result Analysis (slice u8)))
+  (analyze-rooted graph pointer-bytes [] a))

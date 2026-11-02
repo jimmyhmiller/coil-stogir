@@ -1,0 +1,472 @@
+(module stogir.tests.jit-sccp-rewrite)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.calls" :as calls)
+(import "stogir.sccp-analysis" :as analysis)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn stable? [(result rewrite/Rewritten)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut failures) 0]
+    (match (analysis/analyze-rooted (.graph result) 8 (slice (.roots result)) a)
+      (Err [message] (panic "second analysis: {}" message))
+      (Ok [facts]
+          (let [(mut facts) facts]
+            (match (rewrite/rewrite (.graph result)
+                                    facts
+                                    (slice (.roots result))
+                                    a)
+              (Err [message] (panic "second rewrite: {}" message))
+              (Ok [again]
+                  (let [(mut again) again]
+                    (when (!= (.changes again) 0) (set! failures 1))
+                    (rewrite/release! (mut again)))))
+            (analysis/release! (mut facts)))))
+    failures))
+
+(defn check [(mode i32) (symbol (slice u8)) (path (slice u8))] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        c (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        y (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        literal
+          (require (b/scalar-constant! (mut graph)
+                                       11
+                                       (if (= mode 1) (: 0 u64) 1)
+                                       8))
+        condition
+          (if (= mode 0)
+              c
+              (require (b/emit! (mut graph) 68 11 [literal (: 0 i32)])))
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))
+        ninety-nine (require (b/scalar-constant! (mut graph) 11 99 8))
+        observed (require (b/emit! (mut graph) 68 11 [ninety-nine (: 0 i32)]))
+        dead-data (require (b/integer-binary! (mut graph) 48 11 8 x y))
+        branch (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        yes-end (require (b/emit! (mut graph) 114 0 [yes]))
+        no-end (require (b/emit! (mut graph) 114 0 [no]))
+        merge (require (b/emit! (mut graph) 112 0 [yes-end no-end]))
+        phi (require (b/emit! (mut graph) 67 11 [merge x y]))
+        sum (require (b/emit! (mut graph) 26 11 [phi seven]))
+        done (require (b/emit! (mut graph) 120 11 [merge sum (: 0 i32)]))
+        roots [done branch yes-end no-end phi observed]
+        (mut failures) 0]
+    (match (calls/create 0 11 [(: 11 u8) 11 11] a)
+      (Err [message] (panic "{}" message))
+      (Ok [prototype]
+          (let [(mut owned) prototype]
+            (require (calls/function! (mut graph) owned a))
+            (calls/release! (mut owned)))))
+    (match (compile/image graph start roots "_sccp_before" a)
+      (Err [message] (panic "baseline: {}" message))
+      (Ok [original-image]
+          (let [(mut baseline) original-image]
+            (match (analysis/analyze-rooted graph 8 roots a)
+              (Err [message] (panic "analysis: {}" message))
+              (Ok [facts]
+                  (let [(mut owned-facts) facts]
+                    (match (rewrite/rewrite graph owned-facts roots a)
+                      (Err [message] (panic "rewrite mode {}: {}" mode message))
+                      (Ok [result]
+                          (let [(mut rewritten) result]
+                            (set! failures (+ failures (stable? rewritten)))
+                            ; Source caches, references and Phi shapes remain untouched.
+                            (when (or (!= (n/opcode (get (.instructions graph)
+                                                         (cast i64 branch)))
+                                          116)
+                                      (!= (n/opcode (get (.instructions graph)
+                                                         (cast i64 phi)))
+                                          67)
+                                      (!= dead-data
+                                          (require (b/integer-binary! (mut graph)
+                                                                      48
+                                                                      11
+                                                                      8
+                                                                      x
+                                                                      y))))
+                              (set! failures (+ failures 1)))
+                            (when (or (!= (n/opcode (get (.instructions (.graph rewritten))
+                                                         (cast i64 observed)))
+                                          68)
+                                      (!= (n/opcode (get (.instructions (.graph rewritten))
+                                                         (cast i64 dead-data)))
+                                          0))
+                              (set! failures (+ failures 1)))
+                            (when (!= mode 0)
+                              (when (or (!= (n/opcode (get (.instructions (.graph rewritten))
+                                                           (cast i64 branch)))
+                                            114)
+                                        (!= (n/opcode (get (.instructions (.graph rewritten))
+                                                           (cast i64 phi)))
+                                            68)
+                                        (!= (len (.roots rewritten))
+                                            (- (len roots) 1)))
+                                (set! failures (+ failures 1))))
+                            (g/release! (mut graph))
+                            (match (compile/image (.graph rewritten)
+                                                  1
+                                                  (slice (.roots rewritten))
+                                                  symbol
+                                                  a)
+                              (Err [message]
+                                   (panic "optimized mode {}: {}" mode message))
+                              (Ok [optimized-image]
+                                  (let [(mut optimized) optimized-image]
+                                    (rewrite/release! (mut rewritten))
+                                    ; Image owns all graph-derived storage before either mapping.
+                                    (match (macho/image-object optimized a)
+                                      (Err [message]
+                                           (panic "object: {}" message))
+                                      (Ok [object]
+                                          (let [(mut bytes) object]
+                                            (match (fs/write-file a
+                                                                  path
+                                                                  (slice bytes))
+                                              (Err [_]
+                                                   (panic "object write failed"))
+                                              (Ok [_] 0))
+                                            (free! (mut bytes)))))
+                                    (match (jit/map-image baseline a)
+                                      (Err [message]
+                                           (panic "baseline mapping: {}"
+                                                  message))
+                                      (Ok [before]
+                                          (let [(mut before) before]
+                                            (match (jit/map-image optimized a)
+                                              (Err [message]
+                                                   (panic "optimized mapping: {}"
+                                                          message))
+                                              (Ok [after]
+                                                  (let [(mut after) after
+                                                        f
+                                                          (p/cast (fnptr (cc/C)
+                                                                         [i64
+                                                                          i64
+                                                                          i64]
+                                                                         i64)
+                                                                  (.base (.memory before)))
+                                                        h
+                                                          (p/cast (fnptr (cc/C)
+                                                                         [i64
+                                                                          i64
+                                                                          i64]
+                                                                         i64)
+                                                                  (.base (.memory after)))]
+                                                    (for condition [-9 0 1 17]
+                                                      (for left [-100 -1 0 42
+                                                                 100]
+                                                        (for right [-100 -1 0 42
+                                                                    100]
+                                                          (let [expected
+                                                                  (+ (if (if (= mode
+                                                                                0)
+                                                                             (!= condition
+                                                                                 0)
+                                                                             (= mode
+                                                                                2))
+                                                                         left
+                                                                         right)
+                                                                     7)]
+                                                            (when (or (!= (f condition
+                                                                             left
+                                                                             right)
+                                                                          expected)
+                                                                      (!= (h condition
+                                                                             left
+                                                                             right)
+                                                                          expected))
+                                                              (set! failures
+                                                                    (+ failures
+                                                                       1)))))))
+                                                    (jit/release-image! (mut after)))))
+                                            (jit/release-image! (mut before)))))
+                                    (println "SCCP mode {}: text {} -> {} bytes"
+                                             mode
+                                             (len (.text baseline))
+                                             (len (.text optimized)))
+                                    (image/release! (mut optimized))))))))
+                    (analysis/release! (mut owned-facts)))))
+            (image/release! (mut baseline)))))
+    failures))
+
+(defn input-byte [(ty i32) (index i64)] (-> u8)
+  (cond (= ty 1) (: 1 u8)
+        (= ty 13) (get [(: 0x99 u8) 0 0xC0 0x7F] index)
+        (= ty 12) (get [(: 0x99 u8) 0 0 0 0 0 0xF8 0x7F] index)
+        :else (cast u8 (+ 3 (* index 17)))))
+
+(defn constant-byte [(ty i32) (bits u64) (index i64)] (-> u8)
+  (if (types/vector? ty)
+      (cast u8 (- 240 (* index 15)))
+      (cast u8 (>> bits (cast u64 (* index 8))))))
+
+(defn payload [(ty i32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        output (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        size (types/size ty 8)
+        scalar-bits
+          (if (= ty 1)
+              (: 0 u64)
+              (if (= size 1)
+                  (: 0x80 u64)
+                  (if (= size 2)
+                      (: 0x8042 u64)
+                      (if (= size 4) (: 0x7FC00042 u64) 0x7FF8000000000042))))
+        literal
+          (if (types/vector? ty)
+              (if (= size 8)
+                  (require (b/vector-constant! (mut graph)
+                                               ty
+                                               8
+                                               [(: 240 u8)
+                                                225
+                                                210
+                                                195
+                                                180
+                                                165
+                                                150
+                                                135]))
+                  (require (b/vector-constant! (mut graph)
+                                               ty
+                                               8
+                                               [(: 240 u8)
+                                                225
+                                                210
+                                                195
+                                                180
+                                                165
+                                                150
+                                                135
+                                                120
+                                                105
+                                                90
+                                                75
+                                                60
+                                                45
+                                                30
+                                                15])))
+              (require (b/scalar-constant! (mut graph) ty scalar-bits 8)))
+        constant-copy (require (b/emit! (mut graph) 68 ty [literal (: 1 i32)]))
+        loaded (require (b/emit! (mut graph) 91 ty [start output]))
+        soft-copy (require (b/emit! (mut graph) 68 ty [loaded (: 0 i32)]))
+        register-copy
+          (require (b/emit! (mut graph) 68 ty [soft-copy (: 1 i32)]))
+        offset (require (b/scalar-constant! (mut graph) 5 16 8))
+        destination (require (b/emit! (mut graph) 26 6 [output offset]))
+        stored
+          (require (b/emit! (mut graph) 93 0 [loaded destination register-copy]))
+        offset32 (require (b/scalar-constant! (mut graph) 5 32 8))
+        offset48 (require (b/scalar-constant! (mut graph) 5 48 8))
+        destination32 (require (b/emit! (mut graph) 26 6 [output offset32]))
+        destination48 (require (b/emit! (mut graph) 26 6 [output offset48]))
+        second
+          (require (b/emit! (mut graph) 93 0 [stored destination32 loaded]))
+        third
+          (require (b/emit! (mut graph)
+                            93
+                            0
+                            [second destination48 constant-copy]))
+        done (require (b/emit! (mut graph) 120 0 [third (: 0 i32) 0]))
+        roots [done stored constant-copy register-copy]
+        (mut failures) 0]
+    (match (calls/create 0 0 [(: 6 u8)] a)
+      (Err [message] (panic "{}" message))
+      (Ok [prototype]
+          (let [(mut owned) prototype]
+            (require (calls/function! (mut graph) owned a))
+            (calls/release! (mut owned)))))
+    (match (analysis/analyze-rooted graph 8 roots a)
+      (Err [message] (panic "payload analysis: {}" message))
+      (Ok [facts]
+          (let [(mut facts) facts]
+            (match (rewrite/rewrite graph facts roots a)
+              (Err [message] (panic "payload rewrite: {}" message))
+              (Ok [result]
+                  (let [(mut rewritten) result]
+                    (when (<= (.changes rewritten) 0)
+                      (set! failures (+ failures 1)))
+                    (g/release! (mut graph))
+                    (match (compile/image (.graph rewritten)
+                                          1
+                                          (slice (.roots rewritten))
+                                          "_sccp_copy_payload"
+                                          a)
+                      (Err [message]
+                           (panic "payload compile {}: {}" ty message))
+                      (Ok [compiled]
+                          (let [(mut compiled) compiled]
+                            (rewrite/release! (mut rewritten))
+                            (when (= ty 52)
+                              (match (macho/image-object compiled a)
+                                (Err [message] (panic "{}" message))
+                                (Ok [object]
+                                    (let [(mut object) object]
+                                      (match (fs/write-file a
+                                                            "/tmp/coil-stogir-sccp-payload.o"
+                                                            (slice object))
+                                        (Err [_]
+                                             (panic "payload object write failed"))
+                                        (Ok [_] 0))
+                                      (free! (mut object))))))
+                            (match (jit/map-image compiled a)
+                              (Err [message] (panic "payload map: {}" message))
+                              (Ok [mapped]
+                                  (let [(mut mapped) mapped
+                                        (mut buffer)
+                                          [(: 0xA5 u8)
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5
+                                           0xA5]
+                                        f
+                                          (p/cast (fnptr (cc/C) [(ptr u8)] void)
+                                                  (.base (.memory mapped)))]
+                                    (for [i 0 (cast i64 size)]
+                                      (set! (mut buffer)
+                                            (+ 8 i)
+                                            (input-byte ty i)))
+                                    (f (p/index (p/cast (ptr u8) (mut buffer))
+                                                8))
+                                    (for [i 0 80]
+                                      (let [expected
+                                              (cond (and (>= i 8)
+                                                         (< i
+                                                            (+ 8
+                                                               (cast i64 size))))
+                                                      (input-byte ty (- i 8))
+                                                    (and (>= i 24)
+                                                         (< i
+                                                            (+ 24
+                                                               (cast i64 size))))
+                                                      (input-byte ty (- i 24))
+                                                    (and (>= i 40)
+                                                         (< i
+                                                            (+ 40
+                                                               (cast i64 size))))
+                                                      (input-byte ty (- i 40))
+                                                    (and (>= i 56)
+                                                         (< i
+                                                            (+ 56
+                                                               (cast i64 size))))
+                                                      (constant-byte ty
+                                                                     scalar-bits
+                                                                     (- i 56))
+                                                    :else (: 0xA5 u8))]
+                                        (when (!= (get buffer i) expected)
+                                          (set! failures (+ failures 1)))))
+                                    (jit/release-image! (mut mapped)))))
+                            (image/release! (mut compiled))))))))
+            (analysis/release! (mut facts)))))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (set! failures
+          (+ failures
+             (check 0 "_sccp_rewrite_dynamic" "/tmp/coil-stogir-sccp-dynamic.o")))
+    (set! failures
+          (+ failures
+             (check 1 "_sccp_rewrite_false" "/tmp/coil-stogir-sccp-false.o")))
+    (set! failures
+          (+ failures
+             (check 2 "_sccp_rewrite_true" "/tmp/coil-stogir-sccp-true.o")))
+    (for ty [(: 1 i32) 2 3 4 5 6 7 8 9 10 11 12 13 21 37 52]
+      (set! failures (+ failures (payload ty))))
+    (println "native SCCP rewrite checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

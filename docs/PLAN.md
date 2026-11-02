@@ -1762,7 +1762,7 @@ runtime improvement; the stencil's SIMD gap still requires a general extension
 after the missing original optimizer stages. Graph/control rewriting, external
 roots, iteration, mode policy and backend delivery remain unfinished.
 
-## SCCP analysis development branch
+## Initial SCCP analysis development checkpoint — 4db06ec
 
 The ignored .worktrees/sccp-analysis checkout begins feasible-input Phi analysis
 over the original graph and compact value domain. Initial 100 cases cover
@@ -1772,3 +1772,41 @@ constants, previous copy partitions, backward top discovery, loop transitions
 and a pinned-C differential are still required before treating the transfer as
 verified. The whole SCCP analyzer, transformation and iteration remain pending.
 This branch is not merged into main, vendored, or enabled in the compiler.
+
+## Rooted SCCP transformation and native COPY — development
+
+Analysis now accepts explicit observable roots, including data with no ordinary
+uses. Source typing uses an explicit target pointer width; the earlier analysis
+fixtures' RETURN types were corrected to pass the stronger type gate. The native
+entry points retain their eight-byte-address wrapper.
+
+The new transformation operates on an owned duplicate of the compact graph,
+including constants, long-constant spans, strings/prototypes and interning caches.
+It replaces data facts, removes unreachable instructions, compresses regions and
+Phi operands in parallel, retains selected control as END/BEGIN, and repairs
+terminal-list heads/links. Explicit data roots keep positive COPY references.
+Output verification and error cleanup leave source instructions, constants and
+CSE untouched. Analysis caches must be rebuilt for the returned graph.
+
+Native testing exposed missing COPY lowering. COPY now validates exact source
+and result types, supplies register-class constraints before allocation, and uses
+existing GP/SIMD capture/transfer machinery. Literal and register COPY payloads
+are observable in memory for all thirteen scalar types and three vector shapes;
+source loads stay live across COPY, NaN payloads differ from constants, and
+independent byte/canary answers cover the complete buffers. Source and working
+graphs are released before image mapping. The linked consumer checks the same
+shared-image output through four fresh Mach-O fixtures.
+
+The upstream audit also found the missing IR_COPY_HARD fold barrier. Two new
+reference cases retain it; the prior implementation fails three assertions.
+Actual node/edge edits now drive the change count. Reapplying analysis/rewrite to
+the covered stabilized fixtures reports zero changes instead of endlessly
+counting already canonical rooted COPYs.
+
+Focused validation covers native original/transformed functions, wide region/Phi
+cell boundaries, terminal chains, error cleanup, legacy graph/verifier/vector
+transport and register pressure. New native and rejection fixtures pass
+AddressSanitizer. Detailed scope and hashes: `validation/sccp-rewrite-native.json`.
+Remaining folding, iterative cleanup, optimization mode policy, full regression
+and compiler delivery are pending. The unchanged stencil benchmark has no new
+accepted timing result and the performance objective remains unmet.

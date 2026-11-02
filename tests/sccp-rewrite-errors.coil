@@ -1,0 +1,82 @@
+(module stogir.tests.sccp-rewrite-errors)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.sccp-analysis" :as analysis)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn rejected [(value (Result rewrite/Rewritten (slice u8)))] (-> i64)
+  (match value
+    (Err [_] 0)
+    (Ok [owned] (let [(mut owned) owned] (rewrite/release! (mut owned))) 1)))
+
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        literal (require (b/scalar-constant! (mut graph) 11 42 8))
+        observed (require (b/emit! (mut graph) 68 11 [literal (: 0 i32)]))
+        cached (require (b/integer-binary! (mut graph) 48 11 8 x literal))
+        sum (require (b/emit! (mut graph) 26 11 [x observed]))
+        done (require (b/emit! (mut graph) 120 11 [start sum (: 0 i32)]))
+        roots [done observed]
+        size (len (.instructions graph))
+        constants (len (.constants graph))
+        (mut failures) 0]
+    (match (analysis/analyze-rooted graph 8 roots a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+          (let [(mut facts) owned]
+            (set! failures
+                  (+ failures (rejected (rewrite/rewrite graph facts [] a))))
+            (set! failures
+                  (+ failures
+                     (rejected (rewrite/rewrite graph facts [done x] a))))
+            ; Fault injection: a stale or invalid lattice fact would produce an
+            ; ill-typed observable COPY. Output verification must reject it after
+            ; mutation of the working copy, without modifying source or its caches.
+            (set! (mut (.values (.domain facts)))
+                  (cast i64 observed)
+                  (n/constant 5 5 0 42))
+            (set! failures
+                  (+ failures (rejected (rewrite/rewrite graph facts roots a))))
+            (analysis/release! (mut facts)))))
+    (let [(mut mismatch) (analysis/create 1 8 a)]
+      (set! failures
+            (+ failures (rejected (rewrite/rewrite graph mismatch roots a))))
+      (analysis/release! (mut mismatch)))
+    (when (or (!= (len (.instructions graph)) size)
+              (!= (len (.constants graph)) constants)
+              (!= (n/opcode (get (.instructions graph) (cast i64 observed))) 68)
+              (!= (.op1 (get (.instructions graph) (cast i64 observed)))
+                  literal)
+              (!= (.op2 (get (.instructions graph) (cast i64 sum))) observed)
+              (!= cached
+                  (require (b/integer-binary! (mut graph) 48 11 8 x literal))))
+      (set! failures (+ failures 1)))
+    (match (compile/text graph 1 roots a)
+      (Err [message]
+           (panic "original graph after rejected rewrite: {}" message))
+      (Ok [text]
+          (let [(mut text) text]
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "{}" message))
+              (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        f (p/cast (fnptr (cc/C) [i64] i64) (.base loaded))]
+                    (when (!= (f 5) 47) (set! failures (+ failures 1)))
+                    (jit/release! (mut loaded)))))
+            (free! (mut text)))))
+    (g/release! (mut graph))
+    (println "SCCP rejected rewrite checks: {} failures" failures)
+    (if (= failures 0) 0 1)))
