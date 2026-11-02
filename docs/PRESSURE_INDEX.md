@@ -35,3 +35,19 @@ Focused validation passes with AddressSanitizer:
 This is isolated in .worktrees/pressure-index. Full compatibility validation passes all 234 standalone programs and all 71
 linked AOT consumers with frozen source/toolchain and fresh-object checks. It is not merged, vendored or installed, and
 no production compile-time or runtime improvement is claimed yet.
+
+
+## Sparse initial allocation records
+
+The AArch64 allocator now omits initial parts with neither ranges nor uses.
+Parts with constraints remain even if their ranges are empty. Spill geometry
+continues to be indexed by graph reference; each retained part keeps that
+explicit parent reference. Instruction positions, register masks, frame geometry,
+physical reservations and relative ordering of retained parts remain unchanged.
+Empty records were never queued or capable of covering a location. Removing them
+reduces allocation, pressure and location-lookup work without changing decisions.
+
+Focused ASAN pressure, mixed-spill, call/switch/floating and stencil checks pass.
+The captured O3 object remains byte-identical (2053 bytes, same hash above).
+The combined full compatibility run is required before this additional change
+is delivered. The previous 234/71 broad result covers pressure indexing alone.
