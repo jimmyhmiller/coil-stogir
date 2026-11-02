@@ -1,0 +1,249 @@
+(module stogir.tests.jit-loop-guard)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.loop-affine" :as affine)
+(import "stogir.loop-guard" :as guard)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+;;; Independent wide mathematical interval oracle; no wrapping address arithmetic.
+(defn expected [(bytes i32)
+                (chunk i32)
+                (first u64)
+                (last u64)
+                (source u64)
+                (destination u64)] (-> bool)
+  (let [limit (: 281474976710656 i128)
+        initial (* (cast i128 first) (cast i128 bytes))
+        end (* (cast i128 last) (cast i128 bytes))
+        read-low (- (+ (cast i128 source) initial) (cast i128 bytes))
+        read-high (+ (+ (cast i128 source) end) (cast i128 bytes))
+        write-low (+ (cast i128 destination) initial)
+        write-high (+ (cast i128 destination) end)]
+    (and (>= (cast i128 last) (+ (cast i128 first) (cast i128 chunk)))
+         (<= initial limit)
+         (<= end limit)
+         (< (cast i128 source) limit)
+         (< (cast i128 destination) limit)
+         (>= read-low 0)
+         (< read-low limit)
+         (<= read-high limit)
+         (>= write-low 0)
+         (< write-low limit)
+         (<= write-high limit)
+         (or (<= read-high write-low) (<= write-high read-low)))))
+
+(defn check [(ty i32) (bytes i32) (chunk i32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        initial (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        bound (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 1]))
+        source (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        destination (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 3]))
+        accesses
+          [(affine/Access
+             :reference 1
+             :base source
+             :offset (- (cast i64 bytes))
+             :write false)
+           (affine/Access
+             :reference 2
+             :base source
+             :offset 0
+             :write false)
+           (affine/Access
+             :reference 3
+             :base source
+             :offset (cast i64 bytes)
+             :write false)
+           (affine/Access
+             :reference 4
+             :base destination
+             :offset 0
+             :write true)]
+        (mut failures) 0]
+    (match (guard/build accesses bytes a)
+      (None [] (panic "legal footprint rejected"))
+      (Some [plan]
+            (let [(mut plan) plan
+                  before (len (.instructions graph))]
+              (when (or (!= (len (.groups plan)) 2)
+                        (!= (.minimum (get (.groups plan) 0))
+                            (- (cast i64 bytes)))
+                        (!= (.maximum (get (.groups plan) 0)) (cast i64 bytes))
+                        (.write (get (.groups plan) 0))
+                        (not (.write (get (.groups plan) 1))))
+                (set! failures (+ failures 1)))
+              (match (guard/emit! (mut graph) plan 99999 bound chunk a)
+                (Err [_] 0)
+                (Ok [_] (set! failures (+ failures 1))))
+              (match (guard/emit! (mut graph) plan initial bound 0 a)
+                (Err [_] 0)
+                (Ok [_] (set! failures (+ failures 1))))
+              (when (!= before (len (.instructions graph)))
+                (set! failures (+ failures 1)))
+              (let [predicate
+                      (require (guard/emit! (mut graph)
+                                            plan
+                                            initial
+                                            bound
+                                            chunk
+                                            a))
+                    done
+                      (require (b/emit! (mut graph)
+                                        120
+                                        1
+                                        [start predicate (: 0 i32)]))]
+                (match (compile/image graph start [done] "_vector_guard" a)
+                  (Err [message] (panic "{}" message))
+                  (Ok [code]
+                      (let [(mut code) code]
+                        (g/release! (mut graph))
+                        (when (and (= ty 5) (= bytes 4) (= chunk 4))
+                          (match (macho/image-object code a)
+                            (Err [message] (panic "{}" message))
+                            (Ok [object]
+                                (let [(mut object) object]
+                                  (match (fs/write-file a
+                                                        "/tmp/coil-stogir-vector-guard.o"
+                                                        (slice object))
+                                    (Err [_] (panic "object write failed"))
+                                    (Ok [_] 0))
+                                  (free! (mut object))))))
+                        (match (jit/map-image code a)
+                          (Err [message] (panic "{}" message))
+                          (Ok [loaded]
+                              (let [(mut loaded) loaded
+                                    function
+                                      (p/cast (fnptr (cc/C)
+                                                     [u64 u64 u64 u64]
+                                                     bool)
+                                              (.base (.memory loaded)))]
+                                (when (or (not (function 1
+                                                         (+ (: 1 u64)
+                                                            (cast u64 chunk))
+                                                         4096
+                                                         8192))
+                                          (function 1
+                                                    (+ (: 1 u64)
+                                                       (cast u64 chunk))
+                                                    4096
+                                                    4096))
+                                  (set! failures (+ failures 1)))
+                                (for first [(: 0 u64)
+                                            1
+                                            3
+                                            7
+                                            70368744177664
+                                            0xFFFFFFFFFFFFFFFF]
+                                  (for count [(: 0 u64) 1 3 4 5 17 65]
+                                    (let [last (p/iadd first count)]
+                                      (for source [(: 0 u64)
+                                                   1
+                                                   4096
+                                                   281474976710556
+                                                   281474976710652
+                                                   281474976710656
+                                                   0xFFFFFFFFFFFFFFFF]
+                                        (for destination [(: 0 u64)
+                                                          source
+                                                          (p/iadd source
+                                                                  (: 16 u64))
+                                                          (p/iadd source
+                                                                  (: 20 u64))
+                                                          (p/iadd source
+                                                                  (: 24 u64))
+                                                          8192
+                                                          281474976710624
+                                                          0xFFFFFFFFFFFFFFFF]
+                                          (when (!= (function first
+                                                              last
+                                                              source
+                                                              destination)
+                                                    (expected bytes
+                                                              chunk
+                                                              first
+                                                              last
+                                                              source
+                                                              destination))
+                                            (set! failures (+ failures 1))))))))
+                                (jit/release-image! (mut loaded)))))
+                        (image/release! (mut code))))))
+              (guard/release! (mut plan)))))
+    ; A writing base with different read/write offsets may carry dependencies.
+    (match (guard/build [(affine/Access
+                           :reference 1
+                           :base source
+                           :offset 0
+                           :write false)
+                         (affine/Access
+                           :reference 2
+                           :base source
+                           :offset 4
+                           :write true)]
+                        4
+                        a)
+      (None [] 0)
+      (Some [unexpected]
+            (let [(mut unexpected) unexpected]
+              (set! failures (+ failures 1))
+              (guard/release! (mut unexpected)))))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for ty [(: 5 i32) 11]
+      (for bytes [(: 1 i32) 2 4 8]
+        (for chunk [(: 2 i32) 4 16 64]
+          (set! failures (+ failures (check ty bytes chunk))))))
+    (let [a (malloc-allocator)]
+      (match (guard/build [(affine/Access
+                             :reference 1
+                             :base 2
+                             :offset 0
+                             :write false)
+                           (affine/Access
+                             :reference 2
+                             :base 2
+                             :offset 0
+                             :write true)]
+                          4
+                          a)
+        (None [] (set! failures (+ failures 1)))
+        (Some [pointwise]
+              (let [(mut pointwise) pointwise]
+                (when (or (!= (len (.groups pointwise)) 1)
+                          (not (.write (get (.groups pointwise) 0))))
+                  (set! failures (+ failures 1)))
+                (guard/release! (mut pointwise)))))
+      (match (guard/build [(affine/Access
+                             :reference 1
+                             :base 2
+                             :offset 281474976710657
+                             :write true)]
+                          4
+                          a)
+        (None [] 0)
+        (Some [unexpected]
+              (let [(mut unexpected) unexpected]
+                (set! failures (+ failures 1))
+                (guard/release! (mut unexpected)))))
+      (match (guard/build [] 4 a)
+        (None [] 0)
+        (Some [unexpected]
+              (let [(mut unexpected) unexpected]
+                (set! failures (+ failures 1))
+                (guard/release! (mut unexpected))))))
+    (println "native vector memory guard checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

@@ -1,0 +1,322 @@
+(module stogir.tests.jit-loop-vectorize)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.loop-vectorize" :as vectorize)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn image! [(value (Result image/Image (slice u8)))] (-> image/Image)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+;;; Independent bytewise scalar interpreter. The probe replaces only the old
+;;; scalar STORE with zero: correct prefix/tail selection then becomes visible.
+(defn execute [(before image/Image)
+               (after image/Image)
+               (bytes i32)
+               (chunk i32)
+               (probe bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut failures) 0
+        (mut original)
+          (match (jit/map-image before a)
+            (Err [message] (panic "{}" message))
+            (Ok [r] r))
+        (mut optimized)
+          (match (jit/map-image after a)
+            (Err [message] (panic "{}" message))
+            (Ok [r] r))
+        f
+          (p/cast (fnptr (cc/C) [(ptr u8) (ptr u8) u64 u64] u64)
+                  (.base (.memory original)))
+        h
+          (p/cast (fnptr (cc/C) [(ptr u8) (ptr u8) u64 u64] u64)
+                  (.base (.memory optimized)))
+        stride (cast i64 bytes)]
+    (for initial [(: 0 u64) 1 3]
+      (for bound [(: 0 u64)
+                  1
+                  2
+                  3
+                  7
+                  8
+                  9
+                  10
+                  17
+                  19
+                  20
+                  (cast u64 chunk)
+                  (+ (cast u64 chunk) 1)
+                  (+ (cast u64 chunk) 2)
+                  (+ (* (cast u64 chunk) 2) 3)]
+        (for destination [(- (: 16 i64) stride)
+                          (: 16 i64)
+                          (+ (: 16 i64) stride)
+                          288]
+          (let [(mut first) (ArrayList::new [u8] a)
+                (mut second) (ArrayList::new [u8] a)
+                (mut reference) (ArrayList::new [u8] a)]
+            (for [i 0 512]
+              (let [value (cast u8 (+ (* i 157) 241))]
+                (push! (mut first) value)
+                (push! (mut second) value)
+                (push! (mut reference) value)))
+            (let [covered
+                    (if (and (= destination 288) (> bound initial))
+                        (+ initial
+                           (* (/ (- bound initial) (cast u64 chunk))
+                              (cast u64 chunk)))
+                        initial)
+                  (mut i) initial]
+              (while (< i bound)
+                (let [(mut input) (: 0 u64)]
+                  (for [j 0 stride]
+                    (set! input
+                          (| input
+                             (<< (cast u64
+                                       (get reference
+                                            (+ 16 (+ (* (cast i64 i) stride) j))))
+                                 (cast u64 (* j 8))))))
+                  (let [result
+                          (if (and probe (>= i covered))
+                              (: 0 u64)
+                              (p/iadd (p/imul input (: 2 u64)) i))]
+                    (for [j 0 stride]
+                      (set! (mut reference)
+                            (+ destination (+ (* (cast i64 i) stride) j))
+                            (cast u8 (>> result (cast u64 (* j 8))))))))
+                (set! i (+ i 1))))
+            (let [x
+                    (f (p/index (.data first) 16)
+                       (p/index (.data first) destination)
+                       initial
+                       bound)
+                  y
+                    (h (p/index (.data second) 16)
+                       (p/index (.data second) destination)
+                       initial
+                       bound)
+                  final (if (> bound initial) bound initial)]
+              (when (or (!= x final) (!= y final))
+                (set! failures (+ failures 1))))
+            (for [i 0 512]
+              (when (or (and (not probe) (!= (get first i) (get reference i)))
+                        (!= (get second i) (get reference i)))
+                (println "mismatch width={} chunk={} probe={} n={} dest={} byte={} got={} want={}"
+                         bytes
+                         chunk
+                         probe
+                         bound
+                         destination
+                         i
+                         (get second i)
+                         (get reference i))
+                (set! failures (+ failures 1))))
+            (free! (mut first))
+            (free! (mut second))
+            (free! (mut reference))))))
+    (jit/release-image! (mut optimized))
+    (jit/release-image! (mut original))
+    failures))
+
+(defn check [(bytes i32)
+             (unroll i32)
+             (signed bool)
+             (shifted bool)
+             (reverse bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        ty
+          (cast i32
+                (if signed
+                    (match bytes (1 8) (2 9) (4 10) (_ 11))
+                    (match bytes (1 2) (2 3) (4 4) (_ 5))))
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        src (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        dst (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        initial (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        bound (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 3]))
+        entry (require (b/emit! (mut graph) 114 0 [start]))
+        header (require (b/loop-begin! (mut graph) entry))
+        one (require (b/scalar-constant! (mut graph) 5 1 8))
+        two (require (b/scalar-constant! (mut graph) 5 2 8))
+        factor (require (b/scalar-constant! (mut graph) 5 (cast u64 bytes) 8))
+        iv (require (b/loop-phi! (mut graph) header initial))
+        compare (require (b/emit! (mut graph) 20 1 [iv bound]))
+        branch (require (b/emit! (mut graph) 116 0 [header compare]))
+        body (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        exit (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        offset (require (b/emit! (mut graph) 28 5 [iv factor]))
+        source (require (b/emit! (mut graph) 26 6 [src offset]))
+        destination (require (b/emit! (mut graph) 26 6 [dst offset]))
+        loaded (require (b/emit! (mut graph) 91 ty [body source]))
+        wide
+          (if (= bytes 8)
+              (if signed
+                  (require (b/conversion! (mut graph) 36 5 8 loaded))
+                  loaded)
+              (require (b/conversion! (mut graph) (if signed 33 34) 5 8 loaded)))
+        multiplied
+          (require (b/emit! (mut graph)
+                            (if shifted 49 28)
+                            5
+                            [wide (if shifted one two)]))
+        barrier (require (b/emit! (mut graph) 68 5 [multiplied (: 1 i32)]))
+        sum (require (b/emit! (mut graph) 26 5 [barrier iv]))
+        narrowed
+          (if (= bytes 8)
+              (if signed (require (b/conversion! (mut graph) 36 ty 8 sum)) sum)
+              (require (b/conversion! (mut graph) 35 ty 8 sum)))
+        store (require (b/emit! (mut graph) 93 0 [loaded destination narrowed]))
+        next (require (b/emit! (mut graph) 26 5 [iv one]))
+        back (require (b/emit! (mut graph) 115 0 [store]))
+        done (require (b/emit! (mut graph) 120 5 [exit iv (: 0 i32)]))
+        (mut failures) 0]
+    (require (b/patch! (mut graph) header 2 back))
+    (require (b/patch! (mut graph) iv 3 next))
+    (when reverse
+      (when (or (not (g/rewrite-inputs! (mut graph) header 112 0 [back entry]))
+                (not (g/rewrite-inputs! (mut graph) back 114 0 [store])))
+        (panic "reverse region rewrite failed"))
+      (require (b/patch! (mut graph) iv 2 next))
+      (require (b/patch! (mut graph) iv 3 initial)))
+    ; Shifting a wide intermediate right may import bits discarded by lane
+    ; narrowing. This legal scalar loop must retain its original implementation.
+    (let [(mut unsupported) (g/duplicate graph a)]
+      (when (not (g/rewrite-inputs! (mut unsupported) sum 50 5 [multiplied one]))
+        (panic "test rewrite failed"))
+      (match (vectorize/vectorize unsupported start [done] header unroll a)
+        (Err [message] (panic "unsupported-loop check: {}" message))
+        (Ok [optional]
+            (match optional
+              (None [] 0)
+              (Some [unexpected]
+                    (let [(mut unexpected) unexpected]
+                      (set! failures (+ failures 1))
+                      (g/release! (mut unexpected)))))))
+      (g/release! (mut unsupported)))
+    (let [(mut oversized) (g/duplicate graph a)
+          count
+            (if (= bytes 8)
+                bound
+                (require (b/scalar-constant! (mut oversized)
+                                             5
+                                             (cast u64 (* bytes 8))
+                                             8)))]
+      (when (not (g/rewrite-inputs! (mut oversized) sum 49 5 [multiplied count]))
+        (panic "oversized shift rewrite failed"))
+      (match (vectorize/vectorize oversized start [done] header unroll a)
+        (Err [message] (panic "oversized shift check: {}" message))
+        (Ok [optional]
+            (match optional
+              (None [] 0)
+              (Some [unexpected]
+                    (let [(mut unexpected) unexpected]
+                      (set! failures (+ failures 1))
+                      (g/release! (mut unexpected)))))))
+      (g/release! (mut oversized)))
+    (let [(mut before) (image! (compile/image graph start [done] "_scalar" a))]
+      (match (vectorize/vectorize graph start [done] header unroll a)
+        (Err [message] (panic "transform: {}" message))
+        (Ok [optional]
+            (match optional
+              (None [] (panic "supported loop was not transformed"))
+              (Some [working]
+                    (let [(mut working) working
+                          (mut copies) (: 0 i32)
+                          (mut loads) (: 0 i32)]
+                      (for [i
+                            (len (.instructions graph))
+                            (len (.instructions working))]
+                        (when (>= (get (.arities working) i) 0)
+                          (let [node (get (.instructions working) i)]
+                            (when (and (= (n/opcode node) 68) (= (.op2 node) 1))
+                              (set! copies (+ copies 1)))
+                            (when (and (= (n/opcode node) 91)
+                                       (types/vector? (cast i32
+                                                            (n/type-id node))))
+                              (set! loads (+ loads 1))))))
+                      (when (or (!= copies unroll) (!= loads unroll))
+                        (set! failures (+ failures 1)))
+                      (when (or (!= (n/opcode (get (.instructions graph)
+                                                   (cast i64 entry)))
+                                    114)
+                                (!= (match (g/operand graph iv (if reverse 3 2))
+                                      (Some [r] r)
+                                      (None [] 0))
+                                    initial))
+                        (set! failures (+ failures 1)))
+                      (let [(mut after)
+                              (image! (compile/image working
+                                                     start
+                                                     [done]
+                                                     "_vector_prefix"
+                                                     a))
+                            scalar-zero
+                              (require (b/scalar-constant! (mut working) ty 0 8))]
+                        (require (b/patch! (mut working) store 3 scalar-zero))
+                        (let [(mut probe)
+                                (image! (compile/image working
+                                                       start
+                                                       [done]
+                                                       "_vector_probe"
+                                                       a))]
+                          (g/release! (mut working))
+                          (when (and (= bytes 4)
+                                     (= unroll 2)
+                                     (not signed)
+                                     (not shifted)
+                                     (not reverse))
+                            (match (macho/image-object after a)
+                              (Err [message] (panic "{}" message))
+                              (Ok [object]
+                                  (let [(mut object) object]
+                                    (match (fs/write-file a
+                                                          "/tmp/coil-stogir-vector-prefix.o"
+                                                          (slice object))
+                                      (Err [_] (panic "object write failed"))
+                                      (Ok [_] 0))
+                                    (free! (mut object))))))
+                          (set! failures
+                                (+ failures
+                                   (execute before
+                                            after
+                                            bytes
+                                            (* (/ (: 16 i32) bytes) unroll)
+                                            false)))
+                          (set! failures
+                                (+ failures
+                                   (execute before
+                                            probe
+                                            bytes
+                                            (* (/ (: 16 i32) bytes) unroll)
+                                            true)))
+                          (image/release! (mut probe)))
+                        (image/release! (mut after))))))))
+      (image/release! (mut before)))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for bytes [(: 1 i32) 2 4 8]
+      (for unroll [(: 1 i32) 2 4]
+        (for signed [false true]
+          (for shifted [false true]
+            (set! failures
+                  (+ failures (check bytes unroll signed shifted false)))))))
+    (set! failures (+ failures (check 4 2 false false true)))
+    (println "guarded vector-prefix checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

@@ -1681,6 +1681,29 @@ phi-pressure object. Final graph/CSE checks also pass under TPDE. Logs and sourc
 snapshot: `/tmp/stogir-rewrite-suite.log`, `/tmp/stogir-rewrite-linked.log`,
 `/tmp/stogir-rewrite-tpde.log`, `/tmp/stogir-rewrite-project.json`.
 
+## Loop vectorization — development analysis
+
+In the isolated loop-vectorizer worktree, generic natural-loop recognition and
+checked affine footprint analysis now identify the two memory-map loops in the
+accepted compiler input. The captured graph has 177 cells. A temporary generic
+dump of all functions, using serial emission, produced a byte-identical object
+to the delivered checkpoint; instrumentation was removed and the delivered
+candidate restored. The local snapshot/probe is ignored under build/ and is
+not an optimization pattern or a shipped workload rewrite.
+
+Forty-eight independent analysis cases pass across element widths 1/2/4/8 and
+initial values 0/1, covering ordinary maps and rejection of volatile memory,
+reductions, mixed widths, nonunit stride and nonlinear addressing. The source
+read offsets -4/0/+4 and destination offset 0 are recovered from the real kernel
+without source-name or fixed-trip-count recognition. Multiple carried values
+and nested internal control are excluded by the current legality analysis.
+
+This is not yet a vector transformation or performance result. Next: validate
+low-width wrap-preserving data lifting (the compiler uses u64 containers around
+u32 truncations), runtime alias/range guards, finite vector prefix and scalar
+cleanup, then shared JIT/AOT emission. All optimization work must remain inside
+the measured IR-to-machine-code boundary; original benchmark files stay fixed.
+
 ## Isolated SCCP Phi transfer validation
 
 The analysis worktree now retains continuation cells of reachable multi-cell
@@ -1871,3 +1894,40 @@ performance gain. The previous accepted workload, samples and timing boundary
 remain unchanged. Performance acceptance remains unmet. Raw data and delivery
 proof live in Coil's docs/benchmarks/STOGIR_SCCP_MODES.md and
 docs/validation/stogir-sccp-pipeline-installed.json.
+
+
+## Isolated runtime dependence guard
+
+Vectorizer development merges the delivered SCCP base in 9b9ba80, reconciling
+the earlier graph-duplication patch with its byte-identical main implementation.
+The new loop-guard module groups affine footprints and emits a sufficient
+lower-48-bit no-wrap/non-alias predicate as ordinary scalar IR. Writing groups
+with differing offsets are rejected; distinct bases require runtime disjointness
+instead of an assumed no-alias property. The guard does not dereference memory.
+
+32 native configurations pass 75,328 checks against wide mathematical intervals
+and explicit positive/alias examples; linked AOT passes 13 boundary checks.
+AddressSanitizer passes. Details: docs/LOOP_GUARDS.md and
+docs/validation/loop-guard.json. The guard remains isolated; vector bodies,
+version dispatch and scalar cleanup are still pending. No runtime improvement
+or performance acceptance is claimed.
+
+
+## Guarded vector-prefix correctness checkpoint
+
+The isolated loop-vectorizer branch now constructs owned compact-graph vector
+prefixes and original-loop scalar cleanup. Demanded-width legality, runtime
+alias guards, HARD COPY preservation, reversed predecessor order, JIT and linked
+AOT execution are covered. 17,640 native cases, 132 linked cases and 36 captured
+stencil checks pass. See LOOP_VECTORIZATION.md and validation/loop-vector-prefix.json.
+Automatic compiler integration and controlled performance acceptance remain open.
+
+
+## Automatic vector selection and public O3
+
+Original headers are visited once; appended vector headers and already visited
+cleanup loops cannot be revisited. O3 invokes the extension after SCCP and before
+final matching/liveness, with owned graphs alive through image finish. O2 is
+unchanged. Captured stencil now passes 60 ASAN checksum checks, including
+automatic and public O3 paths. Guard, vector matrix, shape and SCCP regressions
+pass. Coil vendoring, installed delivery and performance comparisons follow.

@@ -1,0 +1,140 @@
+(module stogir.tests.loop-analysis)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.adjacency" :as adjacency)
+(import "stogir.loop-shape" :as shape)
+(import "stogir.loop-affine" :as affine)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn scalar-type [(width i32)] (-> i32)
+  (match width (1 2) (2 3) (4 4) (_ 5)))
+
+; variant: ordinary, volatile, reduction, mixed width, nonunit, nonlinear.
+(defn check [(width i32) (variant i32) (initial i64)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        source (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        destination (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        bound (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        entry (require (b/emit! (mut graph) 114 0 [start]))
+        header (require (b/loop-begin! (mut graph) entry))
+        zero (require (b/scalar-constant! (mut graph) 5 (cast u64 initial) 8))
+        one (require (b/scalar-constant! (mut graph) 5 1 8))
+        iv (require (b/loop-phi! (mut graph) header zero))
+        accumulator
+          (if (= variant 2) (require (b/loop-phi! (mut graph) header zero)) 0)
+        condition (require (b/emit! (mut graph) 20 1 [iv bound]))
+        branch (require (b/emit! (mut graph) 116 0 [header condition]))
+        body (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        exit (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        factor
+          (require (b/scalar-constant! (mut graph)
+                                       5
+                                       (cast u64
+                                             (if (= variant 4)
+                                                 (* width 2)
+                                                 width))
+                                       8))
+        scale
+          (require (b/emit! (mut graph) 28 5 [iv (if (= variant 5) iv factor)]))
+        address (require (b/emit! (mut graph) 26 6 [source scale]))
+        output (require (b/emit! (mut graph) 26 6 [destination scale]))
+        loaded
+          (require (b/emit! (mut graph)
+                            (if (= variant 1) 92 91)
+                            (scalar-type width)
+                            [body address]))
+        value
+          (if (= variant 3)
+              (require (b/conversion! (mut graph)
+                                      (if (= width 1) 34 35)
+                                      (scalar-type (if (= width 1)
+                                                       2
+                                                       (/ width 2)))
+                                      8
+                                      loaded))
+              loaded)
+        stored (require (b/emit! (mut graph) 93 0 [loaded output value]))
+        next (require (b/emit! (mut graph) 26 5 [iv one]))
+        back (require (b/emit! (mut graph) 115 0 [stored]))
+        (mut failures) 0]
+    (b/patch! (mut graph) header 2 back)
+    (b/patch! (mut graph) iv 3 next)
+    (when (= variant 2)
+      (b/patch! (mut graph)
+                accumulator
+                3
+                (require (b/emit! (mut graph) 26 5 [accumulator iv]))))
+    (let [ret
+            (require (b/emit! (mut graph)
+                              120
+                              5
+                              [exit (if (= variant 2) accumulator iv) (: 0 i32)]))
+          before (len (.instructions graph))]
+      (match (pipeline/prepare graph start [ret] a)
+        (Err [message] (panic "{}" message))
+        (Ok [value]
+            (let [(mut prepared) value
+                  (mut pred) (adjacency/build (.blocks prepared) true a)
+                  (mut succ) (adjacency/build (.blocks prepared) false a)
+                  (mut ownership) (shape/owners prepared a)
+                  expected (not (or (= variant 1) (= variant 2) (= variant 3)))]
+              (match (shape/recognize graph
+                                      prepared
+                                      pred
+                                      succ
+                                      ownership
+                                      [ret]
+                                      header
+                                      a)
+                (None [] (when expected (set! failures (+ failures 1))))
+                (Some [value]
+                      (let [(mut loop) value
+                            (mut facts)
+                              (affine/build graph prepared ownership loop a)]
+                        (unless expected (set! failures (+ failures 1)))
+                        (match (affine/accesses graph loop facts a)
+                          (None []
+                                (when (= variant 0)
+                                  (set! failures (+ failures 1))))
+                          (Some [items]
+                                (let [(mut accesses) items]
+                                  (unless (= variant 0)
+                                    (set! failures (+ failures 1)))
+                                  (when (or (!= (len accesses) 2)
+                                            (!= (.base (get accesses 0)) source)
+                                            (!= (.base (get accesses 1))
+                                                destination)
+                                            (!= (.offset (get accesses 0)) 0))
+                                    (set! failures (+ failures 1)))
+                                  (free! (mut accesses)))))
+                        (free! (mut facts))
+                        (shape/release! (mut loop)))))
+              (free! (mut ownership))
+              (adjacency/release! (mut pred))
+              (adjacency/release! (mut succ))
+              (pipeline/release! (mut prepared)))))
+      (when (!= before (len (.instructions graph)))
+        (set! failures (+ failures 1))))
+    (g/release! (mut graph))
+    (when (!= failures 0)
+      (println "loop analysis width={} variant={} initial={}"
+               width
+               variant
+               initial))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for width [(: 1 i32) 2 4 8]
+      (for variant [(: 0 i32) 1 2 3 4 5]
+        (for initial [0 1]
+          (set! failures (+ failures (check width variant initial))))))
+    (println "counted-loop shape and affine checks: {} failures" failures)
+    (if (= failures 0) 0 1)))
