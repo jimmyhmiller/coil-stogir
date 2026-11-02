@@ -1,0 +1,187 @@
+(module stogir.tests.jit-sccp-control)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.calls" :as calls)
+(import "stogir.sccp-analysis" :as analysis)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn signature! [(graph (mut g/Graph))] (-> void)
+  (let [a (malloc-allocator)]
+    (match (calls/create 0 11 [(: 11 u8)] a)
+      (Err [message] (panic "{}" message))
+      (Ok [prototype]
+          (let [(mut owned) prototype]
+            (require (calls/function! (mut graph) owned a))
+            (calls/release! (mut owned)))))))
+
+(defn execute [(graph g/Graph) (roots (slice i32)) (cases i32) (answer i64)]
+  (-> i64)
+  (let [(mut failures) 0]
+    (match (compile/text graph 1 roots (malloc-allocator))
+      (Err [message] (panic "control compile: {}" message))
+      (Ok [text]
+          (let [(mut text) text]
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "control map: {}" message))
+              (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        f (p/cast (fnptr (cc/C) [i64] i64) (.base loaded))]
+                    (if (< cases 0)
+                        (when (!= (f 0) answer) (set! failures (+ failures 1)))
+                        (for [input -2 (+ (cast i64 cases) 3)]
+                          (let [expected
+                                  (if (and (>= input 0)
+                                           (< input (cast i64 cases)))
+                                      (+ input 10)
+                                      777)]
+                            (when (!= (f input) expected)
+                              (set! failures (+ failures 1))))))
+                    (jit/release! (mut loaded)))))
+            (free! (mut text)))))
+    failures))
+
+;;; Delete a leading infeasible predecessor while keeping every dynamic switch
+;;; successor. Wide region/Phi extents shrink independently across cell boundaries.
+(defn wide [(cases i32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        c (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        condition (require (b/emit! (mut graph) 68 11 [one (: 0 i32)]))
+        branch (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        dead (require (b/emit! (mut graph) 114 0 [no]))
+        split (require (b/switch! (mut graph) yes c))
+        (mut predecessors) (ArrayList::new [i32] a)
+        (mut values) (ArrayList::new [i32] a)
+        (mut roots) (ArrayList::new [i32] a)
+        (mut failures) 0]
+    (push! (mut predecessors) dead)
+    (push! (mut values) (require (b/scalar-constant! (mut graph) 11 666 8)))
+    (push! (mut roots) branch)
+    (push! (mut roots) split)
+    (push! (mut roots) dead)
+    (for [i 0 (cast i64 cases)]
+      (let [key (require (b/scalar-constant! (mut graph) 11 (cast u64 i) 8))
+            arm (require (b/case-value! (mut graph) split key))
+            end (require (b/emit! (mut graph) 114 0 [arm]))]
+        (push! (mut predecessors) end)
+        (push! (mut roots) end)
+        (push! (mut values)
+               (require (b/scalar-constant! (mut graph)
+                                            11
+                                            (cast u64 (+ i 10))
+                                            8)))))
+    (let [fallback (require (b/case-default! (mut graph) split))
+          end (require (b/emit! (mut graph) 114 0 [fallback]))]
+      (push! (mut predecessors) end)
+      (push! (mut roots) end)
+      (push! (mut values) (require (b/scalar-constant! (mut graph) 11 777 8))))
+    (let [region (require (b/emit! (mut graph) 112 0 (slice predecessors)))
+          (mut inputs) (ArrayList::new [i32] a)]
+      (push! (mut inputs) region)
+      (for value values (push! (mut inputs) value))
+      (let [phi (require (b/emit! (mut graph) 67 11 (slice inputs)))
+            done (require (b/emit! (mut graph) 120 11 [region phi (: 0 i32)]))]
+        (push! (mut roots) phi)
+        (push! (mut roots) done)
+        (signature! (mut graph))
+        (set! failures (+ failures (execute graph (slice roots) cases 0)))
+        (match (analysis/analyze-rooted graph 8 (slice roots) a)
+          (Err [message] (panic "wide analysis: {}" message))
+          (Ok [facts]
+              (let [(mut facts) facts]
+                (match (rewrite/rewrite graph facts (slice roots) a)
+                  (Err [message] (panic "wide rewrite {}: {}" cases message))
+                  (Ok [result]
+                      (let [(mut result) result]
+                        (when (or (!= (get (.arities (.graph result))
+                                           (cast i64 region))
+                                      (+ cases 1))
+                                  (!= (get (.arities (.graph result))
+                                           (cast i64 phi))
+                                      (+ cases 2))
+                                  (!= (get (.arities graph) (cast i64 region))
+                                      (+ cases 2)))
+                          (set! failures (+ failures 1)))
+                        (set! failures
+                              (+ failures
+                                 (execute (.graph result)
+                                          (slice (.roots result))
+                                          cases
+                                          0)))
+                        (rewrite/release! (mut result)))))
+                (analysis/release! (mut facts))))))
+      (free! (mut inputs)))
+    (free! (mut predecessors))
+    (free! (mut values))
+    (free! (mut roots))
+    (g/release! (mut graph))
+    failures))
+
+(defn terminals [(truth bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        literal
+          (require (b/scalar-constant! (mut graph) 1 (if truth (: 1 u64) 0) 8))
+        condition (require (b/emit! (mut graph) 68 1 [literal (: 0 i32)]))
+        branch (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        first (require (b/scalar-constant! (mut graph) 11 42 8))
+        second (require (b/scalar-constant! (mut graph) 11 43 8))
+        ret-yes (require (b/emit! (mut graph) 120 11 [yes first (: 0 i32)]))
+        ret-no (require (b/emit! (mut graph) 120 11 [no second ret-yes]))
+        roots [branch ret-yes ret-no]
+        (mut failures) 0]
+    (require (b/patch! (mut graph) start 1 ret-no))
+    (signature! (mut graph))
+    (set! failures (+ failures (execute graph roots -1 (if truth 42 43))))
+    (match (analysis/analyze-rooted graph 8 roots a)
+      (Err [message] (panic "terminal analysis: {}" message))
+      (Ok [facts]
+          (let [(mut facts) facts]
+            (match (rewrite/rewrite graph facts roots a)
+              (Err [message] (panic "terminal rewrite: {}" message))
+              (Ok [result]
+                  (let [(mut result) result
+                        live (if truth ret-yes ret-no)]
+                    (when (or (!= (.op1 (get (.instructions (.graph result)) 1))
+                                  live)
+                              (!= (.op3 (get (.instructions (.graph result))
+                                             (cast i64 live)))
+                                  0)
+                              (!= (.op1 (get (.instructions graph) 1)) ret-no))
+                      (set! failures (+ failures 1)))
+                    (set! failures
+                          (+ failures
+                             (execute (.graph result)
+                                      (slice (.roots result))
+                                      -1
+                                      (if truth 42 43))))
+                    (rewrite/release! (mut result)))))
+            (analysis/release! (mut facts)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for cases [(: 1 i32) 2 3 6 15 63]
+      (set! failures (+ failures (wide cases))))
+    (for truth [false true] (set! failures (+ failures (terminals truth))))
+    (println "native SCCP control rewrite checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

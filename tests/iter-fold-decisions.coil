@@ -1,0 +1,87 @@
+(module stogir.tests.iter-fold-decisions)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.sccp-fold" :as fold)
+(import "stogir.sccp-values" :as v)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.args" :as args)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (args/init! argc argv)
+  (let [a (malloc-allocator)
+        oracle (args/has? "--oracle")
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        y (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        minimum
+          (require (b/scalar-constant! (mut graph) 11 0x8000000000000000 8))
+        minus-one
+          (require (b/scalar-constant! (mut graph) 11 0xFFFFFFFFFFFFFFFF 8))
+        add (require (b/emit! (mut graph) 26 11 [x y]))
+        division (require (b/emit! (mut graph) 29 11 [x seven start]))
+        zero-division (require (b/emit! (mut graph) 29 11 [seven zero start]))
+        overflow-division
+          (require (b/emit! (mut graph) 29 11 [minimum minus-one start]))
+        checked (require (b/emit! (mut graph) 41 11 [x y]))
+        literal-checked (require (b/emit! (mut graph) 41 11 [seven seven]))
+        overflow (require (b/emit! (mut graph) 44 1 [checked]))
+        soft (require (b/emit! (mut graph) 68 11 [x (: 0 i32)]))
+        hard (require (b/emit! (mut graph) 68 11 [x (: 1 i32)]))
+        hard-literal (require (b/emit! (mut graph) 68 11 [seven (: 1 i32)]))
+        select (require (b/emit! (mut graph) 60 11 [x seven zero]))
+        equal (require (b/emit! (mut graph) 14 1 [x y]))
+        frame (require (b/emit! (mut graph) 66 6 []))
+        minimum-same (require (b/emit! (mut graph) 58 11 [x x]))
+        negate (require (b/emit! (mut graph) 31 11 [x]))
+        cast (require (b/emit! (mut graph) 36 12 [x]))
+        references
+          [add division zero-division overflow-division checked literal-checked
+           overflow soft hard hard-literal select equal frame minimum-same
+           negate cast]
+        kinds [(: 3 i32) 3 0 0 0 1 3 2 0 0 3 3 3 2 3 3]
+        (mut domain) (v/create (len (.instructions graph)) a)
+        (mut failures) 0]
+    (for [i 1 (len (.instructions graph))]
+      (v/kind! (mut domain) (cast i32 i) 131))
+    (when oracle
+      (println "GRAPH {} {}"
+               (len (.instructions graph))
+               (len (.constants graph)))
+      (for [i 1 (len (.instructions graph))]
+        (let [node (get (.instructions graph) i)]
+          (println "NODE {} {} {} {} {}"
+                   i
+                   (.header node)
+                   (.op1 node)
+                   (.op2 node)
+                   (.op3 node))))
+      (for [i 0 (len (.constants graph))]
+        (let [node (get (.constants graph) i)]
+          (println "NODE {} {} {} {} {}"
+                   (- -1 i)
+                   (.header node)
+                   (.op1 node)
+                   (.op2 node)
+                   (.op3 node))))
+      (println "READY"))
+    (for [i 0 (len references)]
+      (let [r (get references i)]
+        (match (fold/evaluate graph domain r 8)
+          (Err [message] (panic "{}" message))
+          (Ok [decision]
+              (when oracle (println "FOLD {} {}" r (.kind decision)))
+              (when (!= (.kind decision) (get kinds i))
+                (println "unexpected decision for {}: {}" r (.kind decision))
+                (set! failures (+ failures 1)))))))
+    (v/release! (mut domain))
+    (g/release! (mut graph))
+    (println "iterative fold decisions: {} failures" failures)
+    (if (= failures 0) 0 1)))

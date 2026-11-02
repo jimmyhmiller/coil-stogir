@@ -141,8 +141,9 @@ coil run tests/sccp-values.coil -- --oracle
 The [value-domain comparison](docs/validation/sccp-values-oracle.json) records
 state/queue agreement with the pinned reference, including dependent copy
 partition splits and exact constant payloads. This is a prerequisite for SCCP;
-it does not enable SCCP in the compiler. Analysis, rewriting and follow-up
-iterative optimization remain pending.
+it does not enable SCCP in the compiler. Development analysis and graph rewriting
+now have pinned-reference and native execution checks. Remaining folding,
+follow-up iterative optimization, mode policy and compiler delivery are pending.
 
 Whole-node graph rewrites keep existing references fixed, clear construction
 CSE, and expose released continuation cells as NOPs. They reject requests that
@@ -158,3 +159,19 @@ coil run tests/jit-pressure.coil --debug-checks
 coil run tests/jit-switch-pressure.coil --debug-checks
 coil run tests/aot-switch-pressure-link.coil --debug-checks --link-flag /tmp/coil-stogir-switch-pressure-gp.o --link-flag /tmp/coil-stogir-switch-pressure-fp.o --link-flag /tmp/coil-stogir-phi-pressure.o
 ```
+
+The development SCCP rewrite uses an owned copy of the same graph, preserves
+explicit data roots, compresses region/Phi inputs together and unlinks unreachable
+terminal-list members. Callers must rebuild graph analyses before code generation.
+The execution checks compare original/transformed functions and verify COPY
+payloads after graph storage is released:
+
+```sh
+coil run tests/jit-sccp-rewrite.coil --debug-checks
+coil run tests/jit-sccp-control.coil --debug-checks
+coil run tests/sccp-rewrite-errors.coil --debug-checks --sanitize=address
+coil run tests/aot-sccp-rewrite-link.coil --debug-checks --link-flag /tmp/coil-stogir-sccp-dynamic.o --link-flag /tmp/coil-stogir-sccp-false.o --link-flag /tmp/coil-stogir-sccp-true.o --link-flag /tmp/coil-stogir-sccp-payload.o
+```
+
+The first command generates all four objects for the linked consumer. These are
+component checks; the optimizer remains disabled in the delivered Coil backend.
