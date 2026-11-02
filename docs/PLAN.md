@@ -1731,6 +1731,37 @@ Evidence and source hashes: `docs/validation/sccp-analysis-oracle.json`.
 These checks establish this development component's covered behavior, not an
 enabled optimizing backend or a change in accepted benchmark results.
 
+## Scalar SCCP folding bridge — development
+
+The runner now applies lattice-aware scalar folding through the same evaluators
+used during construction, rather than rejecting every arithmetic expression.
+It preserves upstream's backward discovery and direct-replacement benefit gate,
+then meets constant or copy results into the combined domain. Conversion
+iteration candidates and checked overflow behavior follow the pinned pipeline.
+Algebraic restarts, remaining structural/vector families and PROTO are not yet
+ported; eligible unimplemented families still return explicit errors.
+
+Target pointer width is an explicit analysis input, validated before graph
+constant checks. The same graph produces address wrap at 32 bits and a 2^32
+result at 64 bits. Invalid widths and out-of-width literals are rejected.
+Analysis remains read-only over the graph.
+
+818 reference graphs produce 4,973 compared observations: 4,941 exact matches,
+32 verified existing Coil rule-coverage extensions and no unexplained
+differences. The extensions are literal bit counts and same-type signed extrema;
+known-answer assertions remain in the tests. The oracle preserves reserved C
+constant slots by remapping references and normalizes signed narrow payloads.
+It invokes unmodified pinned analysis/folding functions. Evidence and exact
+scope: `docs/validation/sccp-fold-oracle.json`.
+
+The fold suite passes AddressSanitizer and debug checks. Existing worklist/Phi,
+combined-domain and conditional construction/native regressions pass. A captured
+frozen stencil graph also analyzes successfully, finding zero new constant or
+copy facts (`docs/validation/sccp-stencil-analysis.json`). This provides no
+runtime improvement; the stencil's SIMD gap still requires a general extension
+after the missing original optimizer stages. Graph/control rewriting, external
+roots, iteration, mode policy and backend delivery remain unfinished.
+
 ## SCCP analysis development branch
 
 The ignored .worktrees/sccp-analysis checkout begins feasible-input Phi analysis

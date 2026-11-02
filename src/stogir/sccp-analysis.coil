@@ -1,5 +1,5 @@
 ;;; Worklist orchestration adapted from pinned ir_sccp.c:ir_sccp_analyze.
-;;; Development: general folding and mem2ssa policy are not yet implemented.
+;;; Development: remaining fold families and mem2ssa policy are not yet implemented.
 (module stogir.sccp-analysis)
 (import "stogir.graph" :as g)
 (import "stogir.node" :as n)
@@ -9,12 +9,13 @@
 (import "stogir.sccp-values" :as v)
 (import "stogir.sccp-phi" :as phi)
 (import "stogir.sccp-control" :as control)
+(import "stogir.sccp-fold" :as folding)
 (import "stogir.bitqueue" :as q)
 (import "stogir.uses" :as uses)
 (import "coil.alloc" :use [Allocator])
 (import "coil.result" :use [Result Ok Err])
 
-(defstruct Analysis [(domain v/Domain) (iteration q/Queue)])
+(defstruct Analysis [(domain v/Domain) (iteration q/Queue) (pointer-bytes i32)])
 
 (defn release! [(analysis (mut Analysis))] (-> void)
   (v/release! (mut (.domain analysis)))
@@ -24,33 +25,6 @@
   (let [shape (op/shape opcode)
         kind (get shape 0)]
     (or (= kind #\d) (= kind #\p) (= kind #\r))))
-
-;;; COPY is a foldable instruction whose transfer needs no graph mutation.
-;;; Other folds must be ported, not silently replaced by an overdefined fact.
-(defn copy! [(graph g/Graph)
-             (domain (mut v/Domain))
-             (edges uses/Uses)
-             (reference i32)] (-> bool)
-  (let [source (.op1 (get (.instructions graph) (cast i64 reference)))
-        identity (v/identity domain source)]
-    (if (v/top? domain source)
-        (do (v/add-input! (mut domain) source) false)
-        (if (< identity 0)
-            (let [constant (phi/constant graph identity)]
-              (if (= (n/opcode constant) 78)
-                  (v/meet-long! (mut domain) edges reference identity constant)
-                  (v/meet-constant! (mut domain) edges reference constant)))
-            (let [value (v/at domain identity)
-                  kind (v/state-kind value)]
-              (if (= kind (op/count))
-                  (v/meet-copy! (mut domain) edges reference identity)
-                  (if (= kind 78)
-                      (v/meet-long! (mut domain)
-                                    edges
-                                    reference
-                                    (.op2 value)
-                                    (phi/constant graph (.op2 value)))
-                      (v/meet-constant! (mut domain) edges reference value))))))))
 
 ;;; Preconditions: fresh analysis, verified graph and Phi shapes; entry START
 ;;; is reference one. MEM2SSA immediate-Phi policy is not yet supported.
@@ -77,12 +51,15 @@
                                            (mut (.domain analysis))
                                            edges
                                            r))
-                    (= opcode 68)
-                      (set! changed
-                            (copy! graph (mut (.domain analysis)) edges r))
-                    (and (>= opcode 14) (<= opcode 66))
-                      (set! error
-                            "SCCP general fold transfer is not implemented")
+                    (and (>= opcode 14) (<= opcode 68))
+                      (match (folding/transfer! graph
+                                                (mut (.domain analysis))
+                                                edges
+                                                (mut (.iteration analysis))
+                                                r
+                                                (.pointer-bytes analysis))
+                        (Err [message] (set! error message))
+                        (Ok [result] (set! changed result)))
                     :else
                       (do
                         (v/make-bottom! (mut (.domain analysis)) edges r)
@@ -104,30 +81,42 @@
         (set! reference (q/pop! (mut (.pending (.domain analysis)))))))
     (if (= error "") (Ok 0) (Err error))))
 
-(defn create [(size i64) (a (dyn Allocator))] (-> Analysis)
-  (Analysis :domain (v/create size a) :iteration (q/create size a)))
+(defn create [(size i64) (pointer-bytes i32) (a (dyn Allocator))] (-> Analysis)
+  (Analysis
+    :domain (v/create size a)
+    :iteration (q/create size a)
+    :pointer-bytes pointer-bytes))
 
-(defn analyze [(graph g/Graph) (a (dyn Allocator))]
+(defn analyze [(graph g/Graph) (pointer-bytes i32) (a (dyn Allocator))]
   (-> (Result Analysis (slice u8)))
-  (match (verify/structure graph)
-    (Err [message] (Err message))
-    (Ok [_]
-        (match (verify/phis graph)
-          (Err [message] (Err message))
-          (Ok [_]
-              (match (switch/verify graph a)
-                (Err [message] (Err message))
-                (Ok [_]
-                    (if (or (<= (len (.instructions graph)) 1)
-                            (!= (n/opcode (get (.instructions graph) 1)) 104))
-                        (Err "SCCP requires START at reference one")
-                        (let [(mut edges) (uses/build graph a)
-                              (mut result)
-                                (create (len (.instructions graph)) a)
-                              status (run! graph edges (mut result))]
-                          (uses/release! (mut edges))
-                          (match status
-                            (Err [message]
-                                 (release! (mut result))
-                                 (Err message))
-                            (Ok [_] (Ok result))))))))))))
+  (if (not (or (= pointer-bytes 4) (= pointer-bytes 8)))
+      (Err "invalid SCCP target pointer width")
+      (match (verify/constants graph pointer-bytes)
+        (Err [message] (Err message))
+        (Ok [_]
+            (match (verify/structure graph)
+              (Err [message] (Err message))
+              (Ok [_]
+                  (match (verify/phis graph)
+                    (Err [message] (Err message))
+                    (Ok [_]
+                        (match (switch/verify graph a)
+                          (Err [message] (Err message))
+                          (Ok [_]
+                              (if (or (<= (len (.instructions graph)) 1)
+                                      (!= (n/opcode (get (.instructions graph)
+                                                         1))
+                                          104))
+                                  (Err "SCCP requires START at reference one")
+                                  (let [(mut edges) (uses/build graph a)
+                                        (mut result)
+                                          (create (len (.instructions graph))
+                                                  pointer-bytes
+                                                  a)
+                                        status (run! graph edges (mut result))]
+                                    (uses/release! (mut edges))
+                                    (match status
+                                      (Err [message]
+                                           (release! (mut result))
+                                           (Err message))
+                                      (Ok [_] (Ok result)))))))))))))))

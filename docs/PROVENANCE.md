@@ -200,3 +200,26 @@ unknown because the shared image resolver permits address zero; this deliberatel
 retains the library's existing contract instead of upstream's nonzero-symbol
 assumption. Signed narrow switch ranges use the graph's width-aware order keys;
 the differential switch cases use full-width signed/unsigned selectors.
+
+### Scalar lattice folding — development branch
+
+`stogir.sccp-fold` bridges the combined domain to the existing construction
+evaluators. Its discovery/benefit gate, constant/copy meets and conversion
+iteration candidates follow pinned `ir_sccp.c:ir_sccp_analyze` and
+`ir_sccp_fold`. Scalar arithmetic, comparisons, conversions, checked arithmetic,
+overflow projection and conditional selection reuse Coil's established scalar
+rules. Overflowing checked operations remain instructions. Analysis explicitly
+owns the target pointer width; constants are validated against that width.
+
+The current scalar comparison covers 818 graphs and 4,973 observations: 4,941
+match exactly. The remaining 32 are recorded rule-coverage extensions, not
+discarded cases: the existing Coil evaluator folds literal bit counts and
+same-type signed extrema absent from the pinned matching rules. Those results
+also have independent known-answer assertions. Reference normalization preserves
+upstream's three reserved constant references and its sign-extended narrow
+constant representation. See `validation/sccp-fold-oracle.json`.
+
+This is not full upstream folding parity. Algebraic restart/structural rules,
+PROTO and remaining vector families are unfinished. Eligible unported families
+return explicit errors in this development runner. No graph transformation or
+production optimizer integration is enabled.
