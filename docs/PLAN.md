@@ -1641,3 +1641,14 @@ simultaneous register use`). It is recorded in the project pad under
 allocator-rewrite-pressure and is being investigated against pinned ir_ra.c.
 The test will not be weakened to avoid pressure. These APIs are not yet
 vendored, installed, or connected to SCCP.
+
+The allocator failure was traced with a temporary, uninstalled diagnostic
+compiler: parent 461, part 2379, register 0, start=position=1506, end=1554,
+next register-required use=-1. A minimal two-interval, one-register case also
+reproduces it at starts 0/7 with later required uses 1/10/70. Upstream explicitly
+permits spilling the whole owner when there is no earlier assignment to retain
+(`child = other` in ir_allocate_blocked_reg). The port now handles that case
+without creating an empty prefix; immediate register-required uses stay guarded.
+Allocator driver, split/shape checks, native mixed-payload checks and AArch64
+allocation integration pass with the fix. The original pressured rewrite
+program still needs validation using a rebuilt stogir compiler.

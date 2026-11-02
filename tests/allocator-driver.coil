@@ -54,13 +54,56 @@
       (free! (mut parts))
       failures)))
 
+(defn same-start [(position i64) (next-use i64)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut parts) (ArrayList::new [a/Part] allocator)
+        (mut first) (a/create 1 allocator)
+        (mut second) (a/create 2 allocator)
+        (mut layout) (f/create allocator)
+        (mut failures) 0]
+    ; A live-in Phi can start at the same point as a short-lived use while its
+    ; first register-required use is later. Its whole prefix can reside in a slot.
+    (r/add! (mut (.ranges first)) position (+ next-use 8))
+    (c/add! (mut (.uses first)) next-use 1 -1)
+    (r/add! (mut (.ranges second)) position (+ position 1))
+    (c/add! (mut (.uses second)) position 1 -1)
+    (push! (mut parts) first)
+    (push! (mut parts) second)
+    (match (a/run! (mut parts) (mut layout) 1 1 8 8 allocator)
+      (Err [message]
+           (do
+             (println "same-start allocation: {}" message)
+             (set! failures (+ failures 1))))
+      (Ok [_] 0))
+    (match (verify/verify parts 1 1)
+      (Err [message]
+           (do
+             (println "same-start consistency: {}" message)
+             (set! failures (+ failures 1))))
+      (Ok [_] 0))
+    (for item [[(: 1 i64) position 1] [1 next-use 0] [2 position 0]]
+      (match (locations/lookup parts (cast i32 (get item 0)) (get item 1))
+        (Err [_] (set! failures (+ failures 1)))
+        (Ok [location]
+            (when (!= (.kind location) (cast i32 (get item 2)))
+              (set! failures (+ failures 1))))))
+    (for [i 0 (len parts)] (a/release! (elem (mut parts) i)))
+    (free! (mut parts))
+    (f/release! (mut layout))
+    failures))
+
 (defn main [] (-> i64)
   (let [allocator (malloc-allocator)
         (mut parts) (ArrayList::new [a/Part] allocator)
         (mut first) (a/create 1 allocator)
         (mut second) (a/create 2 allocator)
         (mut frame) (f/create allocator)
-        (mut failures) (+ (fixed-check) (reservation-transfers))]
+        (mut failures)
+          (+ (fixed-check)
+             (reservation-transfers)
+             (same-start 0 1)
+             (same-start 0 10)
+             (same-start 7 70))]
     (r/add! (mut (.ranges first)) 0 20)
     (c/add! (mut (.uses first)) 0 1 -1)
     (c/add! (mut (.uses first)) 19 1 -1)
