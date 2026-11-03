@@ -397,3 +397,11 @@ emission finishes. The full-scan public interfaces remain compatibility wrappers
 and a differential oracle, including negative-parent lookup behavior. This is
 independent Coil plumbing for the existing location policy guided by ir_ra.c and
 ir_aarch64.dasc; no new allocation or emission decisions are introduced.
+
+### Indexed opcode arity facts
+
+Fixed input counts and physical operand-slot counts are stored in signed-byte
+lookup tables, matching upstream's ir_op_infos organization. Existing meanings,
+variadic sentinels and invalid-opcode results are unchanged. The opcode test
+independently derives both counts from the frozen pinned shape strings,
+including extra metadata operands, and checks invalid integer boundaries.
