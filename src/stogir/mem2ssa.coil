@@ -29,8 +29,9 @@
       (when (> steps (len mapping)) (panic "cyclic promotion replacement")))
     r))
 
-;;; An exact typed partition is required. Overlap, type punning and partial
-;;; accesses conservatively retain memory rather than inventing byte semantics.
+;;; Exact field boundaries are required. Same-width scalar views preserve bits
+;;; through BITCAST as upstream does; partial overlap and mixed BOOL views retain
+;;; memory. Pointer/integer casts retain provenance only at the full 64-bit width.
 (defn cell! [(cells (mut (ArrayList Cell)))
              (start i64)
              (owner i32)
@@ -46,7 +47,11 @@
                    (< (.offset cell) (+ offset (cast i64 size))))
           (if (and (= offset (.offset cell))
                    (= size (.size cell))
-                   (= ty (.ty cell)))
+                   (or (= ty (.ty cell))
+                       (and (!= ty 1)
+                            (!= (.ty cell) 1)
+                            (types/valid-scalar? (cast i32 ty))
+                            (types/valid-scalar? (cast i32 (.ty cell))))))
               (set! found (cast i32 (+ i 1)))
               (set! conflict true)))))
     (if conflict
@@ -108,9 +113,11 @@
                             (if (< id 0)
                                 (set! valid false)
                                 (set! (mut accesses) (cast i64 r) id)))))
-                  (and (= opcode 68)
+                  (and (or (= opcode 68) (= opcode 36))
                        (= (.operand edge) 1)
-                       (= (n/type-id node) 6)
+                       (or (= (n/type-id node) 6)
+                           (= (n/type-id node) 5)
+                           (= (n/type-id node) 11))
                        (= (.op2 node) 0))
                     (do
                       (set! (mut owners) (cast i64 r) owner)
@@ -118,7 +125,9 @@
                       (push! (mut work) r))
                   (and (= opcode 26)
                        (= (.operand edge) 1)
-                       (= (n/type-id node) 6)
+                       (or (= (n/type-id node) 6)
+                           (= (n/type-id node) 5)
+                           (= (n/type-id node) 11))
                        (< (.op2 node) 0))
                     (match (g/lookup graph (.op2 node))
                       (None [] (set! valid false))
@@ -173,6 +182,7 @@
               (mut complete) (zeros size a)
               (mut next) (zeros size a)
               (mut data) (zeros size a)
+              (mut casts) (zeros size a)
               (mut control) (zeros size a)
               (mut cells) (ArrayList::new [Cell] a)
               (mut blocks) (ArrayList::new [i32] a)
@@ -228,9 +238,18 @@
                               (if (and (= (.block cell) block)
                                        (!= (.value cell) 0))
                                   (do
-                                    (set! (mut data)
-                                          (cast i64 current)
-                                          (.value cell))
+                                    (let [stored
+                                            (match (g/lookup graph
+                                                             (.value cell))
+                                              (Some [v] (n/type-id v))
+                                              (None [] (: 0 u8)))]
+                                      (if (= stored (n/type-id node))
+                                          (set! (mut data)
+                                                (cast i64 current)
+                                                (.value cell))
+                                          (set! (mut casts)
+                                                (cast i64 current)
+                                                (.value cell))))
                                     (set! (mut control)
                                           (cast i64 current)
                                           (.op1 node)))
@@ -260,7 +279,15 @@
                     count (get (.arities graph) r)
                     owner (get owners r)
                     value (get data r)]
-                (cond (!= value 0)
+                (cond (!= (get casts r) 0)
+                        (do
+                          (g/rewrite-inputs! (mut graph)
+                                             (cast i32 r)
+                                             36
+                                             (n/type-id node)
+                                             [(resolve data (get casts r))])
+                          (set! changes (+ changes 1)))
+                      (!= value 0)
                         (do
                           (g/rewrite-inputs! (mut graph)
                                              (cast i32 r)
@@ -299,6 +326,7 @@
             (for [i 0 (len roots)]
               (let [root (get roots i)]
                 (when (and (= (get data (cast i64 root)) 0)
+                           (= (get casts (cast i64 root)) 0)
                            (!= (get control (cast i64 root)) 0))
                   (set! (mut roots) i (resolve control root))))))
           (uses/release! (mut edges))
@@ -309,6 +337,7 @@
           (free! (mut complete))
           (free! (mut next))
           (free! (mut data))
+          (free! (mut casts))
           (free! (mut control))
           (free! (mut cells))
           (free! (mut blocks))))
