@@ -432,7 +432,7 @@ subsequent SCCP without adding artificial operands or changing graph semantics.
 `call-inline` is an independent interprocedural extension, not a claimed port of
 an upstream module inliner. It retains the compact graph and existing typed
 prototype encoding. The transactional component expands only direct named,
-exact-prototype, acyclic single-exit scalar definitions within an explicit node budget.
+ABI-compatible, acyclic single-exit scalar definitions within an explicit node budget.
 Never takes precedence. A bounded topological check rejects cycles; every control
 node must be live from the single return. IF/BEGIN/END/MERGE and typed PHI nodes
 are cloned without flattening or changing their predecessor order. Nested calls,
@@ -450,3 +450,10 @@ Affected nodes seed the ordinary iterative worklist; all structural analyses
 are rebuilt before matching/liveness. Linked before/after JIT images check
 arithmetic, memory effects, FP/signed zero, immutable inputs and byte-identical
 name/prototype/policy/budget fallbacks. No source annotations are changed.
+
+The call expander also accepts same-width signed/unsigned integer parameter
+pairs (u8/i8, u16/i16, u32/i32 and u64/i64), inserting explicit typed BITCASTs.
+Flags, result type, parameter count and group trailer must still match exactly.
+Bool/char, pointer, floating and integer width changes are excluded. Cast cells
+count toward the transaction's growth budget. Linked execution checks high-bit
+u32/i32 arguments, negative values and byte-identical width-mismatch fallback.

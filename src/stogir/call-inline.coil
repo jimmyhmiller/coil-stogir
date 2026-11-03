@@ -44,6 +44,25 @@
        (!= opcode 65)
        (!= opcode 66)))
 
+(defn signed-pair? [(left u8) (right u8)] (-> bool)
+  (or (and (>= left 2) (<= left 5) (= (cast i32 right) (+ (cast i32 left) 6)))
+      (and (>= right 2) (<= right 5) (= (cast i32 left) (+ (cast i32 right) 6)))))
+
+;;; Exact flags, result, arity and ABI group trailer. Ordinary integer parameter
+;;; signedness may differ at the same width; mapping inserts an explicit BITCAST.
+;;; Bool/char, pointer, floating and width changes are deliberately excluded.
+(defn compatible? [(call (slice u8)) (definition (slice u8))] (-> bool)
+  (let [(mut good) (and (>= (len call) 3) (= (len call) (len definition)))]
+    (when good
+      (let [end (+ 3 (cast i64 (get definition 2)))]
+        (for [i 0 (len call)]
+          (let [left (get call i)
+                right (get definition i)]
+            (when (and (!= left right)
+                       (not (and (>= i 3) (< i end) (signed-pair? left right))))
+              (set! good false))))))
+    good))
+
 (defn closed-acyclic? [(graph g/Graph) (roots (slice i32)) (a (dyn Allocator))]
   (-> bool)
   (let [(mut ready) (zeros (len (.instructions graph)) a)
@@ -133,8 +152,8 @@
                                                                  (.function-prototype callee))
                                             (None [] (set! good false))
                                             (Some [definition]
-                                                  (if (or (!= signature
-                                                              definition)
+                                                  (if (or (not (compatible? signature
+                                                                            definition))
                                                           (< (len definition) 3))
                                                       (set! good false)
                                                       (let [parameters
@@ -143,6 +162,8 @@
                                                                          2))
                                                             result
                                                               (get definition 1)
+                                                            (mut conversions)
+                                                              (: 0 i64)
                                                             (mut effects) 0
                                                             (mut r) 1]
                                                         (when (or (!= (& (get definition
@@ -211,6 +232,20 @@
                                                                 count
                                                                   (get (.arities callee)
                                                                        r)]
+                                                            (when (and (= opcode
+                                                                          71)
+                                                                       (>= (.op3 node)
+                                                                           0)
+                                                                       (< (.op3 node)
+                                                                          parameters))
+                                                              (when (!= (get signature
+                                                                             (+ 3
+                                                                                (cast i64
+                                                                                      (.op3 node))))
+                                                                        (n/type-id node))
+                                                                (set! conversions
+                                                                      (+ conversions
+                                                                         1))))
                                                             (cond (= opcode 0) 0
                                                                   (= opcode 104)
                                                                     (when (!= r
@@ -308,6 +343,11 @@
                                                                                  count)
                                                                            4)
                                                                         4)))))
+                                                        (when (> (+ (- size 1)
+                                                                    conversions)
+                                                                 (cast i64
+                                                                       budget))
+                                                          (set! good false))
                                                         (when (not (closed-acyclic? callee
                                                                                     (.roots target)
                                                                                     a))
@@ -374,7 +414,22 @@
             count (get (.arities callee) r)]
         (cond (= opcode 71)
                 (match (g/operand graph reference (+ (.op3 node) 3))
-                  (Some [input] (set! (mut mapping) r input))
+                  (Some [input]
+                        (match (g/lookup graph input)
+                          (None [] (set! error "inline argument disappeared"))
+                          (Some [actual]
+                                (if (= (n/type-id actual) (n/type-id node))
+                                    (set! (mut mapping) r input)
+                                    (match (g/append-inputs! (mut graph)
+                                                             36
+                                                             (n/type-id node)
+                                                             [input])
+                                      (None []
+                                            (set! error
+                                                  "inline argument cast space exhausted"))
+                                      (Some [casted]
+                                            (set! (mut mapping) r casted)
+                                            (push! (mut seeds) casted)))))))
                   (None [] (set! error "inline parameter missing")))
               (or (= opcode 0) (= opcode 104) (= opcode 120)) 0
               :else
@@ -529,19 +584,20 @@
                   reference (.reference site)]
               (when (and (= error "")
                          (eligible? graph reference target remaining a))
-                (match (apply! (mut graph)
-                               (mut observed)
-                               reference
-                               target
-                               (mut seeds)
-                               a)
-                  (Err [message] (set! error message))
-                  (Ok [count]
-                      (set! changes (+ changes count))
-                      (set! remaining
-                            (- remaining
-                               (cast i32
-                                     (- (len (.instructions (.graph target))) 1)))))))))
+                (let [before (len (.instructions graph))]
+                  (match (apply! (mut graph)
+                                 (mut observed)
+                                 reference
+                                 target
+                                 (mut seeds)
+                                 a)
+                    (Err [message] (set! error message))
+                    (Ok [count]
+                        (set! changes (+ changes count))
+                        (set! remaining
+                              (- remaining
+                                 (cast i32
+                                       (- (len (.instructions graph)) before))))))))))
           (when (= error "")
             (match (rewrite/validate graph pointer-bytes a)
               (Err [message] (set! error message))
