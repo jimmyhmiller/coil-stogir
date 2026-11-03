@@ -1,0 +1,130 @@
+(module stogir.tests.jit-mem2ssa)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.mem2ssa" :as mem)
+(import "stogir.node" :as n)
+(import "stogir.options" :as options)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [x] x) (Err [e] (panic "{}" e))))
+
+(defn execute [(code image/Image)] (-> void)
+  (match (jit/map-image code (malloc-allocator))
+    (Err [e] (panic "{}" e))
+    (Ok [loaded]
+        (let [(mut loaded) loaded
+              f (p/cast (fnptr (cc/C) [i64 i64] i64) (.base (.memory loaded)))]
+          (for x [-100 -1 0 11 333]
+            (for y [-77 -2 0 4 555]
+              (assert (= (f x y) (+ (+ x 3) (* y 7))))))
+          (jit/release-image! (mut loaded))))))
+
+(defn fixture [(escape bool) (overlap bool) (volatile bool) (boundary bool)]
+  (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        y (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        sixteen (require (b/scalar-constant! (mut graph) 5 16 8))
+        eight (require (b/scalar-constant! (mut graph) 5 8 8))
+        three (require (b/scalar-constant! (mut graph) 11 3 8))
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))
+        slot (require (b/stack-allocate! (mut graph) start sixteen 16))
+        hi (require (b/emit! (mut graph) 26 6 [slot eight]))
+        xx (require (b/emit! (mut graph) 26 11 [x three]))
+        yy (require (b/emit! (mut graph) 28 11 [y seven]))
+        s0 (require (b/emit! (mut graph) 93 0 [slot slot xx]))
+        s1 (require (b/emit! (mut graph) 93 0 [s0 hi yy]))
+        extra (if overlap (require (b/emit! (mut graph) 91 4 [s1 slot])) s1)
+        incoming
+          (if boundary
+              (let [end (require (b/emit! (mut graph) 114 0 [extra]))]
+                (require (b/emit! (mut graph) 106 0 [end (: 0 i32)])))
+              extra)
+        l0
+          (require (b/emit! (mut graph) (if volatile 92 91) 11 [incoming slot]))
+        l1 (require (b/emit! (mut graph) 91 11 [l0 hi]))
+        value (require (b/emit! (mut graph) 26 11 [l0 l1]))
+        result
+          (if escape
+              (let [same (require (b/emit! (mut graph) 14 1 [slot hi]))]
+                (require (b/emit! (mut graph) 60 11 [same x value])))
+              value)
+        ret (require (b/emit! (mut graph) 120 11 [l1 result (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)
+        (mut working) (g/duplicate graph a)]
+    (push! (mut roots) ret)
+    (match (compile/image graph start [ret] "_before" a)
+      (Err [e] (panic "{}" e))
+      (Ok [code]
+          (let [(mut code) code] (execute code) (image/release! (mut code)))))
+    (let [changes (require (mem/promote! (mut working) (mut roots) a))]
+      (if (or escape overlap volatile boundary)
+          (assert (= changes 0))
+          (do
+            (assert (> changes 0))
+            (assert (= (n/opcode (get (.instructions working) (cast i64 slot)))
+                       0)))))
+    (match (sccp/optimize working 8 (slice roots) a)
+      (Err [e] (panic "{}" e))
+      (Ok [optimized]
+          (let [(mut optimized) optimized]
+            (match (compile/image (.graph optimized)
+                                  start
+                                  (slice (.roots optimized))
+                                  "_mem2ssa"
+                                  a)
+              (Err [e] (panic "{}" e))
+              (Ok [code]
+                  (let [(mut code) code]
+                    (execute code)
+                    (unless (or escape overlap volatile boundary)
+                      (match (macho/image-object code a)
+                        (Err [e] (panic "{}" e))
+                        (Ok [bytes]
+                            (let [(mut bytes) bytes]
+                              (match (fs/write-file a
+                                                    "/tmp/coil-stogir-mem2ssa.o"
+                                                    (slice bytes))
+                                (Err [_] (panic "object write failed"))
+                                (Ok [_] 0))
+                              (free! (mut bytes))))))
+                    (image/release! (mut code)))))
+            (rewrite/release! (mut optimized)))))
+    (for level [(: 2 i32) 3]
+      (match (compile/image-with-options graph
+                                         start
+                                         [ret]
+                                         "_public"
+                                         (options/Options :level level)
+                                         a)
+        (Err [e] (panic "public mode: {}" e))
+        (Ok [code]
+            (let [(mut code) code] (execute code) (image/release! (mut code))))))
+    ; Caller-owned graph remains unchanged by the explicitly owned pass fixture.
+    (assert (= (n/opcode (get (.instructions graph) (cast i64 slot))) 81))
+    (g/release! (mut working))
+    (g/release! (mut graph))
+    (free! (mut roots))))
+
+(defn main [] (-> i64)
+  (fixture false false false false)
+  (fixture true false false false)
+  (fixture false true false false)
+  (fixture false false true false)
+  (fixture false false false true)
+  (println "mem2ssa: scalar partitions, escape, overlap and volatile JIT checks pass")
+  0)
