@@ -18,7 +18,7 @@
 (import "stogir.aot.macho" :as macho)
 (import "stogir.bytes" :as bytes)
 (import "stogir.jit.darwin" :as jit)
-(import "coil.alloc" :use [malloc-allocator])
+(import "coil.alloc" :use [malloc-allocator Allocator])
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.fs" :as fs)
 (import "coil.cc" :as cc)
@@ -304,6 +304,29 @@
       (g/release! (mut graph))
       output)))
 
+(defn inline-nested-call! [(graph (mut g/Graph))
+                           (control i32)
+                           (mode i32)
+                           (a (dyn Allocator))] (-> i32)
+  (let [named (require (symbols/function! (mut graph) "_inline_target" 0))
+        target
+          (if (= mode 22)
+              (require (b/emit! (mut graph) 68 6 [named (: 0 i32)]))
+              named)]
+    (match (calls/create (if (= mode 21) (: 16 u8) 0) 11 [] a)
+      (Err [message] (panic "{}" message))
+      (Ok [prototype]
+          (let [(mut prototype) prototype
+                call
+                  (require (calls/emit! (mut graph)
+                                        prototype
+                                        control
+                                        target
+                                        []
+                                        a))]
+            (calls/release! (mut prototype))
+            call)))))
+
 (defn inline-case [(kind i32)
                    (never bool)
                    (budget i32)
@@ -417,7 +440,11 @@
             join (require (b/emit! (mut callee) 112 0 [yes-end no-end]))]
         (set! control join)
         (set! returned (require (b/emit! (mut callee) 67 11 [join plus minus])))))
-    (when (= kind 18)
+    (when (or (= kind 19) (= kind 21) (= kind 22))
+      (let [called (inline-nested-call! (mut callee) start kind a)]
+        (set! control called)
+        (set! returned (require (b/emit! (mut callee) 26 11 [x called])))))
+    (when (or (= kind 18) (= kind 20))
       (let [mask (require (b/scalar-constant! (mut callee) 11 31 8))
             limit (require (b/emit! (mut callee) 47 11 [x mask]))
             zero (require (b/scalar-constant! (mut callee) 11 0 8))
@@ -431,8 +458,18 @@
             body (require (b/emit! (mut callee) 107 0 [split (: 0 i32)]))
             done (require (b/emit! (mut callee) 108 0 [split (: 0 i32)]))
             next-index (require (b/emit! (mut callee) 26 11 [index one]))
-            next-sum (require (b/emit! (mut callee) 26 11 [sum index]))
-            back (require (b/emit! (mut callee) 115 0 [body]))]
+            called
+              (if (= kind 20) (inline-nested-call! (mut callee) body kind a) 0)
+            item
+              (if (= kind 20)
+                  (require (b/emit! (mut callee) 26 11 [index called]))
+                  index)
+            next-sum (require (b/emit! (mut callee) 26 11 [sum item]))
+            back
+              (require (b/emit! (mut callee)
+                                115
+                                0
+                                [(if (= kind 20) called body)]))]
         (b/patch! (mut callee) loop 2 back)
         (b/patch! (mut callee) index 3 next-index)
         (b/patch! (mut callee) sum 3 next-sum)
@@ -619,7 +656,9 @@
                   (Ok [output]
                       (let [(mut output) output
                             expected
-                              (if (or (= kind 13)
+                              (if (or (= kind 21)
+                                      (= kind 22)
+                                      (= kind 13)
                                       (= kind 16)
                                       never
                                       (<= budget 1)
@@ -862,6 +901,25 @@
                                                                            61))))
                                                             (assert (= (function value)
                                                                        (case kind
+                                                                         21
+                                                                           (+ value
+                                                                              61)
+                                                                         22
+                                                                           (+ value
+                                                                              61)
+                                                                         19
+                                                                           (+ value
+                                                                              61)
+                                                                         20
+                                                                           (let [n
+                                                                                   (& value
+                                                                                      31)]
+                                                                             (+ (* n
+                                                                                   61)
+                                                                                (/ (* n
+                                                                                      (- n
+                                                                                         1))
+                                                                                   2)))
                                                                          18
                                                                            (let [n
                                                                                    (& value
@@ -1297,6 +1355,14 @@
   (indirect-inline-case false 64)
   (indirect-inline-case true 64)
   (indirect-inline-case false 0)
+  (inline-case 21 false 128 true true)
+  (inline-case 22 false 128 true true)
+  (inline-case 19 false 128 true true)
+  (inline-case 19 true 128 true true)
+  (inline-case 19 false 0 true true)
+  (inline-case 20 false 128 true true)
+  (inline-case 20 true 128 true true)
+  (inline-case 20 false 0 true true)
   (inline-case 18 false 128 true true)
   (inline-case 18 true 128 true true)
   (inline-case 18 false 0 true true)
