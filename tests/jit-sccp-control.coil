@@ -321,7 +321,67 @@
     (free! (mut boundary-roots))
     (g/release! (mut graph))))
 
+;;; CIR's single-predecessor blocks arrive as MERGE, including rooted ones.
+(defn region-choice-execute [(graph g/Graph) (start i32) (roots (slice i32))]
+  (-> void)
+  (let [a (malloc-allocator)]
+    (match (compile/text graph start roots a)
+      (Err [message] (panic "region choice: {}" message))
+      (Ok [text]
+          (let [(mut text) text]
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "region choice map: {}" message))
+              (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        f (p/cast (fnptr (cc/C) [i64] i64) (.base loaded))]
+                    (for value [-9223372036854775807 -1 0 1 9223372036854775807]
+                      (assert (= (f value) (if (= value 0) 2 8))))
+                    (jit/release! (mut loaded)))))
+            (free! (mut text)))))))
+
+(defn single-region-diamond [(depth i64)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        two (require (b/scalar-constant! (mut graph) 11 2 8))
+        eight (require (b/scalar-constant! (mut graph) 11 8 8))
+        condition (require (b/emit! (mut graph) 14 1 [x zero]))
+        branch (require (b/emit! (mut graph) 116 0 [start condition]))
+        (mut yes) (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        (mut no) (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)]
+    (for [i 0 depth]
+      (let [y (require (b/emit! (mut graph) 114 0 [yes]))
+            n (require (b/emit! (mut graph) 114 0 [no]))]
+        (set! yes (require (b/emit! (mut graph) 112 0 [y])))
+        (set! no (require (b/emit! (mut graph) 112 0 [n])))
+        (for root [y n yes no] (push! (mut roots) root))))
+    (let [y (require (b/emit! (mut graph) 114 0 [yes]))
+          n (require (b/emit! (mut graph) 114 0 [no]))
+          merge (require (b/emit! (mut graph) 112 0 [y n]))
+          phi (require (b/emit! (mut graph) 67 11 [merge two eight]))
+          ret (require (b/emit! (mut graph) 120 11 [merge phi (: 0 i32)]))]
+      (push! (mut roots) ret)
+      (region-choice-execute graph start (slice roots))
+      (match (sccp/optimize graph 8 (slice roots) a)
+        (Err [message] (panic "single regions: {}" message))
+        (Ok [result]
+            (let [(mut result) result]
+              (assert (= (n/opcode (get (.instructions (.graph result))
+                                        (cast i64 phi)))
+                         60))
+              (region-choice-execute (.graph result)
+                                     start
+                                     (slice (.roots result)))
+              (rewrite/release! (mut result))))))
+    (free! (mut roots))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (single-region-diamond 1)
+  (single-region-diamond 3)
   (for reversed [false true]
     (for inverted [false true]
       (for effect [false true]
