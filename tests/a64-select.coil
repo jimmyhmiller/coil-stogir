@@ -41,6 +41,41 @@
     (g/release! (mut graph))
     result))
 
+(defn logical-case [(ty i32)
+                    (op i32)
+                    (bits u64)
+                    (constant-first bool)
+                    (immediate? bool)] (-> i64)
+  (let [a (malloc-allocator)
+        wide (or (= ty 5) (= ty 11))
+        width (case ty 1 1 2 8 8 8 3 16 9 16 4 32 10 32 64)
+        word-mask
+          (if wide
+              (: 0xFFFFFFFFFFFFFFFF u64)
+              (- (<< (: 1 u64) (cast u64 width)) 1))
+        mask (& bits word-mask)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        arg (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        literal (require (b/scalar-constant! (mut graph) ty mask 8))
+        value
+          (require (b/emit! (mut graph)
+                            op
+                            ty
+                            (if constant-first [literal arg] [arg literal])))
+        ret (require (b/emit! (mut graph) 120 ty [start value (: 0 i32)]))
+        (mut failures) 0]
+    (match (s/arithmetic graph value)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [tile]
+          (when (or (!= (.rule tile) (+ (if immediate? 41 6) (- op 46)))
+                    (!= (.wide tile) wide)
+                    (and immediate?
+                         (or (!= (.left tile) arg) (!= (.right tile) 0))))
+            (set! failures (+ failures 1)))))
+    (g/release! (mut graph))
+    failures))
+
 ;;; Fusion changes machine def/uses, while graph nodes and explicit roots remain intact.
 (defn match-case [(protect bool) (shared bool)] (-> i64)
   (let [(mut graph) (g/create (malloc-allocator))
@@ -154,6 +189,29 @@
             (+ failures
                (shift-case ty 28 8 false 38 3)
                (shift-case ty 28 8 true 38 3))))
+    (for ty [(: 4 i32) 10 5 11]
+      (for op [(: 46 i32) 47 48]
+        (for first [false true]
+          (for mask [(: 31 u64)
+                     0xFFFF0000FFFF0000
+                     0x8000000180000001
+                     0x5555555555555555]
+            (set! failures (+ failures (logical-case ty op mask first true))))
+          (for mask [(: 0 u64) 0xFFFFFFFFFFFFFFFF 0x0123456789ABCDEF]
+            (set! failures (+ failures (logical-case ty op mask first false)))))))
+    (for ty [(: 2 i32) 8 3 9]
+      (for op [(: 46 i32) 47 48]
+        (for first [false true]
+          (for mask [(: 1 u64) 3 15 31 128 240 255 65535]
+            (set! failures (+ failures (logical-case ty op mask first true))))
+          (for mask [(: 0 u64) 42 85 129]
+            (set! failures (+ failures (logical-case ty op mask first false)))))))
+    (for op [(: 46 i32) 47 48]
+      (for first [false true]
+        (set! failures
+              (+ failures
+                 (logical-case 1 op 1 first true)
+                 (logical-case 1 op 0 first false)))))
     (set! failures
           (+ failures
              (match-case false false)
