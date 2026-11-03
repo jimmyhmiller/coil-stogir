@@ -45,6 +45,93 @@
     (uses/release! (mut expected))
     failures))
 
+(defn boolean-compare-execute [(graph g/Graph)
+                               (roots (slice i32))
+                               (opcode i32)
+                               (constant u64)] (-> void)
+  (match (compile/text graph 1 roots (malloc-allocator))
+    (Err [message] (panic "{}" message))
+    (Ok [text]
+        (let [(mut text) text]
+          (match (jit/map-text (slice text))
+            (Err [message] (panic "{}" message))
+            (Ok [loaded]
+                (let [(mut loaded) loaded
+                      f (p/cast (fnptr (cc/C) [i64] i64) (.base loaded))]
+                  (for input [0 1 2 128 255 256 -1]
+                    (let [truth (if (!= (& input 255) 0) (: 1 u64) 0)
+                          expected
+                            (if (= opcode 14)
+                                (= truth constant)
+                                (!= truth constant))]
+                      (assert (= (f input) (if expected 1 0)))))
+                  (jit/release! (mut loaded)))))
+          (free! (mut text))))))
+
+(defn boolean-compare-case [(opcode i32)
+                            (constant u64)
+                            (mode i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        input (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        boolean (require (b/conversion! (mut graph) 35 1 8 input))
+        extended
+          (if (= mode 0)
+              boolean
+              (require (b/emit! (mut graph)
+                                (if (= mode 1) 33 34)
+                                11
+                                [boolean])))
+        literal
+          (require (b/scalar-constant! (mut graph)
+                                       (if (= mode 0) 1 11)
+                                       constant
+                                       8))
+        comparison (require (b/emit! (mut graph) opcode 1 [extended literal]))
+        result (require (b/emit! (mut graph) 34 11 [comparison]))
+        ret (require (b/emit! (mut graph) 120 11 [start result (: 0 i32)]))
+        shared
+          (if (= mode 3)
+              (require (b/emit! (mut graph) 68 11 [extended (: 0 i32)]))
+              0)
+        (mut roots) (ArrayList::new [i32] a)
+        (mut lists) (uses/build graph a)
+        (mut queue) (q/create (len (.instructions graph)) a)
+        (mut protected) (bits/create (len (.instructions graph)) a)]
+    (push! (mut roots) ret)
+    (when (= mode 3) (push! (mut roots) shared))
+    (when (= mode 4) (push! (mut roots) extended))
+    (when (= mode 5) (push! (mut roots) comparison))
+    (for root roots (bits/add! (mut protected) (cast i64 root)))
+    (boolean-compare-execute graph (slice roots) opcode constant)
+    (q/add! (mut queue) (cast i64 comparison))
+    (require (iter/run! (mut graph) (mut lists) (mut queue) protected 8 a))
+    (assert (= (check-uses graph lists) 0))
+    (require (rewrite/validate graph 8 a))
+    (if (and (<= constant 1) (!= mode 3) (!= mode 4))
+        (assert (!= (n/opcode (get (.instructions graph)
+                                   (cast i64 comparison)))
+                    (cast u8 opcode)))
+        (assert (= (n/opcode (get (.instructions graph)
+                                  (cast i64 comparison)))
+                   (cast u8 opcode))))
+    (boolean-compare-execute graph (slice roots) opcode constant)
+    (q/add! (mut queue) (cast i64 comparison))
+    (assert (= (require (iter/run! (mut graph)
+                                   (mut lists)
+                                   (mut queue)
+                                   protected
+                                   8
+                                   a))
+               0))
+    (assert (= (check-uses graph lists) 0))
+    (bits/release! (mut protected))
+    (q/release! (mut queue))
+    (uses/release! (mut lists))
+    (free! (mut roots))
+    (g/release! (mut graph))))
+
 ;;; Signed extraction of an upper field, with shared/rooted counterexamples.
 (defn high-view [(type i32) (mode i32) (shift-extra i64)] (-> void)
   (let [a (malloc-allocator)
@@ -328,6 +415,11 @@
     (g/release! (mut graph))))
 
 (defn main [] (-> i64)
+  (for opcode [(: 14 i32) 15]
+    (for mode [(: 0 i32) 1 2 3 4 5]
+      (for constant [(: 0 u64) 1 2]
+        (unless (and (= mode 0) (= constant 2))
+          (boolean-compare-case opcode constant mode)))))
   (for pointer [(: 4 i32) 8]
     (for rooted [false true]
       (for spec [[(: 8 i32) 33 11 35 8]
