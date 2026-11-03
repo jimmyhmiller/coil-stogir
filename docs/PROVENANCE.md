@@ -753,3 +753,10 @@ that value in the 32-bit instruction. Word-level zero/all-ones and unencodable
 patterns keep their register fallback. Extended host-independent selection and
 native graph tests cover all scalar widths, both literal sides, narrow signed
 returns and boolean inputs. ASAN and stogir O3 tests pass.
+## Conditional PHI branch splitting
+
+The IF(PHI) and IF(CMP(PHI, literal)) transformations follow the control-shape approach in pinned upstream `ir_sccp.c`, `ir_try_split_if` (line 3168) and `ir_try_split_if_cmp` (line 3348), at commit 92171d0a4a36b0acf707f2dea7998de615dd4acd. This independent Coil implementation reuses compact graph references, updates def-use lists during each mutation, and queues only newly exposed predecessor merges. Optimization remains before matching and liveness, shared by JIT and AOT.
+
+The supported subset has exactly two predecessors, one singly used unobserved scalar PHI, an optional singly used unobserved comparison against a typed literal, and complete true/false projections. Opposite constant outcomes collapse both tests; a single constant outcome moves the variable test onto its predecessor. Equal constant outcomes, shared values and protected value observations retain the original graph. Explicit control observations are remapped to preserve precisely the earlier effects without evaluating an incoming value prematurely. Root-observation handling is a library contract extension, not claimed upstream code parity.
+
+Tests execute before/after graphs over integer and floating comparisons (including signed zero, infinities and NaNs), reversed predecessors, effectful paths, duplicate/control/value observations and nested merges. Incremental use lists are compared with an independent rebuild, and repeated application must be idempotent.
