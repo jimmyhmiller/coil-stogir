@@ -6,6 +6,7 @@
 (import "stogir.sccp-analysis" :as analysis)
 (import "stogir.sccp" :as sccp)
 (import "stogir.boolean-diamond" :as diamond)
+(import "stogir.control-merge" :as control)
 (import "stogir.uses" :as uses)
 (import "stogir.bitqueue" :as queue)
 (import "stogir.sccp-rewrite" :as rewrite)
@@ -184,7 +185,11 @@
 
 ;;; Reversed merge order, inverted boolean results and nonempty arms. Compare
 ;;; the maintained use lists against a fresh build before native execution.
-(defn boolean-diamond [(reversed bool) (inverted bool) (effect bool) (ty u8)]
+(defn boolean-diamond [(reversed bool)
+                       (inverted bool)
+                       (effect bool)
+                       (ty u8)
+                       (boundaries i32)]
   (-> void)
   (let [a (malloc-allocator)
         (mut graph) (g/create a)
@@ -198,10 +203,27 @@
         branch (require (b/emit! (mut graph) 116 0 [start condition]))
         yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
         no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        (mut yes-control) yes
+        (mut no-control) no
+        (mut boundary-roots) (ArrayList::new [i32] a)
+        unused
+          (do
+            (for [i 0 (cast i64 boundaries)]
+              (let [yes-end (require (b/emit! (mut graph) 114 0 [yes-control]))
+                    no-end (require (b/emit! (mut graph) 114 0 [no-control]))]
+                (set! yes-control
+                      (require (b/emit! (mut graph) 106 0 [yes-end (: 0 i32)])))
+                (set! no-control
+                      (require (b/emit! (mut graph) 106 0 [no-end (: 0 i32)])))
+                (for ref [yes-end no-end yes-control no-control]
+                  (push! (mut boundary-roots) ref))))
+            0)
         store
-          (if effect (require (b/emit! (mut graph) 93 0 [yes pointer x])) yes)
+          (if effect
+              (require (b/emit! (mut graph) 93 0 [yes-control pointer x]))
+              yes-control)
         yes-end (require (b/emit! (mut graph) 114 0 [store]))
-        no-end (require (b/emit! (mut graph) 114 0 [no]))
+        no-end (require (b/emit! (mut graph) 114 0 [no-control]))
         merge
           (require (b/emit! (mut graph)
                             112
@@ -225,6 +247,7 @@
         (mut edges) (uses/build graph a)
         (mut work) (queue/create (len (.instructions graph)) a)]
     (for r [ret branch yes no yes-end no-end phi] (push! (mut roots) r))
+    (for ref boundary-roots (push! (mut roots) ref))
     (match (sccp/optimize graph 8 (slice roots) a)
       (Err [message] (panic "boolean pipeline: {}" message))
       (Ok [result]
@@ -234,6 +257,8 @@
                                          (cast i64 phi)))
                           67)))
             (rewrite/release! (mut result)))))
+    (assert (= (control/merge! (mut graph) (mut roots) (mut edges) (mut work) a)
+               (* boundaries 2)))
     (let [changes
             (require (diamond/rewrite! (mut graph)
                                        (mut roots)
@@ -289,6 +314,7 @@
     (uses/release! (mut edges))
     (queue/release! (mut work))
     (free! (mut roots))
+    (free! (mut boundary-roots))
     (g/release! (mut graph))))
 
 (defn main [] (-> i64)
@@ -296,7 +322,8 @@
     (for inverted [false true]
       (for effect [false true]
         (for ty [(: 1 u8) 2 3 4 5 7 8 9 10 11]
-          (boolean-diamond reversed inverted effect ty)))))
+          (for boundaries [(: 0 i32) 3]
+            (boolean-diamond reversed inverted effect ty boundaries))))))
   (let [(mut failures) 0]
     (for cases [(: 1 i32) 2 3 6 15 63]
       (set! failures (+ failures (wide cases))))
