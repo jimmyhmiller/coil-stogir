@@ -25,6 +25,68 @@
 (import "coil.primitive" :as primitive)
 (import "coil.result" :use [Result Ok Err Some None])
 
+;;; No-change transactions borrow the caller. They must still validate every
+;;; site, and releasing a changed result must never release the original graph.
+(defn conditional-inline-check [(caller g/Graph)
+                                (roots (slice i32))
+                                (called i32)
+                                (target inlining/Callee)
+                                (pointer-bytes i32)
+                                (budget i32)
+                                (expected i32)] (-> void)
+  (let [site (inlining/Site :reference called :target target)
+        before (get (.instructions caller) (cast i64 called))
+        before-header (.header before)
+        before-one (.op1 before)
+        before-two (.op2 before)
+        before-three (.op3 before)
+        before-count (len (.instructions caller))
+        before-constants (len (.constants caller))]
+    (match (inlining/optimize-sites-if-changed caller
+                                               roots
+                                               [site]
+                                               pointer-bytes
+                                               budget
+                                               (malloc-allocator))
+      (Err [message] (panic "conditional inline: {}" message))
+      (Ok [outcome]
+          (match outcome
+            (None [] (assert (= expected 0)))
+            (Some [result]
+                  (let [(mut result) result]
+                    (assert (= (.changes result) expected))
+                    (assert (> expected 0))
+                    (rewrite/release! (mut result)))))))
+    (match (inlining/optimize-sites-if-changed caller
+                                               roots
+                                               []
+                                               pointer-bytes
+                                               budget
+                                               (malloc-allocator))
+      (Err [message] (panic "empty inline: {}" message))
+      (Ok [outcome]
+          (match outcome
+            (None [] 0)
+            (Some [result]
+                  (let [(mut result) result]
+                    (rewrite/release! (mut result))
+                    (panic "empty sites expanded"))))))
+    (match (inlining/optimize-sites-if-changed caller
+                                               roots
+                                               [site site]
+                                               pointer-bytes
+                                               0
+                                               (malloc-allocator))
+      (Err [_] 0)
+      (Ok [_] (panic "zero-budget duplicate sites accepted")))
+    (let [after (get (.instructions caller) (cast i64 called))]
+      (assert (= before-header (.header after)))
+      (assert (= before-one (.op1 after)))
+      (assert (= before-two (.op2 after)))
+      (assert (= before-three (.op3 after)))
+      (assert (= before-count (len (.instructions caller))))
+      (assert (= before-constants (len (.constants caller)))))))
+
 (defn require [(result (Result i32 (slice u8)))] (-> i32)
   (match result (Ok [r] r) (Err [message] (println "{}" message) 0)))
 
@@ -722,6 +784,23 @@
                                   (: 0 i32)
                                   1)]
                         (assert (= (.changes output) expected))
+                        (conditional-inline-check caller
+                                                  (slice roots)
+                                                  called
+                                                  (inlining/Callee
+                                                    :name
+                                                      (if matching
+                                                          "_inline_leaf"
+                                                          "_other_leaf")
+                                                    :graph callee
+                                                    :entry start
+                                                    :roots [exit]
+                                                    :observed
+                                                      (slice callee-observed)
+                                                    :never never)
+                                                  8
+                                                  budget
+                                                  expected)
                         (when (and (= kind 24) (= expected 1))
                           (assert (= (len (.instructions (.graph output)))
                                      (+ before-count 1)))
@@ -1383,6 +1462,19 @@
                                                         [exit]
                                                         "_register_leaf"
                                                         a))]
+                    (conditional-inline-check caller
+                                              (slice roots)
+                                              called
+                                              (inlining/Callee
+                                                :name "_register_leaf"
+                                                :graph callee
+                                                :entry start
+                                                :roots [exit]
+                                                :observed [exit]
+                                                :never never)
+                                              pointer-bytes
+                                              budget
+                                              expected)
                     (when (= expected 0)
                       (assert (= (slice (.text before)) (slice (.text after))))
                       (assert (= (slice (.data before)) (slice (.data after)))))
