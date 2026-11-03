@@ -686,3 +686,23 @@ immutable inputs. Indirect and variadic cases execute correctly without graph
 expansion; Never/zero-budget cases remain calls. Restoring the loop-only inliner
 fails the new expansion-count assertion. Compiler adoption requires separate
 worklist dependency, termination and recursive-template policy validation.
+
+
+### Complete observed controls in call expansion
+
+`Callee` now supplies `observed` controls separately from its unique RETURN root.
+The independent bounded inliner validates these roots, uses all of them for
+control closure, clones them through the normal two-phase mapping, and appends
+their mapped references to caller observations. This preserves side exits and
+infinite control regions rather than inferring observability from RETURN alone.
+UNREACHABLE terminals are accepted with zero reserved operand and no linked
+previous-terminal metadata. Frame/stack operations remain excluded, and the
+private register-result proof remains restricted to its existing linear region.
+
+The extended module-execution suite passes ASAN. Hot inputs compare linked
+native before/after answers; cold inputs execute a helper CALL then UNREACHABLE
+in child processes and must trap. A child watchdog bounds failures. Never and
+zero-budget fallbacks preserve execution, and omitting the non-returning root
+retains the original call. Restoring RETURN-only closure fails the new assertion.
+This is an explicit independent inliner extension; normal graph verification,
+CFG, placement, matching and liveness remain the post-optimization pipeline.

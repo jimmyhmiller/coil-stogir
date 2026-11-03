@@ -327,6 +327,39 @@
             (calls/release! (mut prototype))
             call)))))
 
+(extern fork :cc (cc/C) [] (-> i32))
+
+(extern waitpid :cc (cc/C) [i32 (ptr i32) i32] (-> i32))
+
+(extern exit-child :as "_exit" :cc (cc/C) [i32] (-> void))
+
+(extern signal :cc (cc/C) [i32 u64] (-> u64))
+
+(extern alarm :cc (cc/C) [u32] (-> u32))
+
+(defn inline-trap-handler :cc (cc/C) [(number i32)] (-> void)
+  (exit-child 77))
+
+(defn inline-trapped? [(function (fnptr (cc/C) [i64] i64)) (value i64)]
+  (-> bool)
+  (let [child (fork)]
+    (if (< child 0)
+        false
+        (if (= child 0)
+            (do
+              (signal 5
+                      (primitive/cast u64
+                                      (primitive/cast (ptr u8)
+                                                      (fnptr-of inline-trap-handler))))
+              (alarm 2)
+              (function value)
+              (exit-child 99)
+              false)
+            (let [(mut status) (: 0 i32)]
+              (and (= (waitpid child (mut status) 0) child)
+                   (= (& status 127) 0)
+                   (= (& (>> status 8) 255) 77)))))))
+
 (defn inline-case [(kind i32)
                    (never bool)
                    (budget i32)
@@ -351,7 +384,8 @@
         (mut arguments) (ArrayList::new [i32] a)
         (mut control) start
         (mut returned) x
-        (mut roots) (ArrayList::new [i32] a)]
+        (mut roots) (ArrayList::new [i32] a)
+        (mut callee-observed) (ArrayList::new [i32] a)]
     (push! (mut parameters) (cast u8 input-type))
     (push! (mut arguments) input)
     (cond (= kind 0)
@@ -475,12 +509,25 @@
         (b/patch! (mut callee) sum 3 next-sum)
         (set! control done)
         (set! returned sum)))
+    (when (= kind 23)
+      (let [zero (require (b/scalar-constant! (mut callee) 11 0 8))
+            three (require (b/scalar-constant! (mut callee) 11 3 8))
+            condition (require (b/emit! (mut callee) 16 1 [zero x]))
+            split (require (b/emit! (mut callee) 116 0 [start condition]))
+            cold (require (b/emit! (mut callee) 107 0 [split (: 0 i32)]))
+            hot (require (b/emit! (mut callee) 108 0 [split (: 0 i32)]))
+            call (inline-nested-call! (mut callee) cold 19 a)
+            trap (require (b/unreachable! (mut callee) call 0))]
+        (push! (mut callee-observed) trap)
+        (set! control hot)
+        (set! returned (require (b/emit! (mut callee) 26 11 [x three])))))
     (let [exit
             (require (b/emit! (mut callee)
                               120
                               result
                               [control returned (: 0 i32)]))
           target (require (symbols/function! (mut caller) "_inline_leaf" 0))]
+      (push! (mut callee-observed) exit)
       (match (calls/create-grouped 0
                                    (cast u8 result)
                                    (slice parameters)
@@ -557,6 +604,7 @@
                             :graph callee
                             :entry start
                             :roots [exit]
+                            :observed (slice callee-observed)
                             :never false)
                         sites
                           [(inlining/Site :reference called :target definition)
@@ -648,6 +696,7 @@
                                             :graph callee
                                             :entry start
                                             :roots [exit]
+                                            :observed (slice callee-observed)
                                             :never never)
                                           8
                                           budget
@@ -667,6 +716,27 @@
                                   (: 0 i32)
                                   1)]
                         (assert (= (.changes output) expected))
+                        (when (and (= kind 23) (= expected 1))
+                          ; A provider that omits the non-returning region must
+                          ; retain the call, not erase that observable control.
+                          (match (inlining/optimize caller
+                                                    (slice roots)
+                                                    called
+                                                    (inlining/Callee
+                                                      :name "_inline_leaf"
+                                                      :graph callee
+                                                      :entry start
+                                                      :roots [exit]
+                                                      :observed [exit]
+                                                      :never false)
+                                                    8
+                                                    128
+                                                    a)
+                            (Err [message] (panic "{}" message))
+                            (Ok [kept]
+                                (let [(mut kept) kept]
+                                  (assert (= (.changes kept) 0))
+                                  (rewrite/release! (mut kept))))))
                         (when (and (= kind 18) (= expected 1))
                           ; A separate infinite control region cannot be lost
                           ; merely because the provider supplied one RETURN.
@@ -684,6 +754,8 @@
                                                         :graph open
                                                         :entry start
                                                         :roots [exit]
+                                                        :observed
+                                                          (slice callee-observed)
                                                         :never false)
                                                       8
                                                       128
@@ -739,6 +811,8 @@
                                                       :graph callee
                                                       :entry start
                                                       :roots [exit]
+                                                      :observed
+                                                        (slice callee-observed)
                                                       :never false)
                                                     8
                                                     64
@@ -779,7 +853,7 @@
                               (mut leaf)
                                 (owned-image (compile/image callee
                                                             start
-                                                            [exit]
+                                                            (slice callee-observed)
                                                             "_inline_leaf"
                                                             a))]
                           (bytes/append32! (mut (.data global)) 73)
@@ -878,83 +952,93 @@
                                                                   -100 -1 0 5
                                                                   222 2147483648
                                                                   4294967295]
-                                                        (if (= kind 17)
-                                                            (let [answer
-                                                                    (function value)
-                                                                  target-index
-                                                                    (find (.image module)
-                                                                          "_inline_target")]
-                                                              (assert (>= target-index
-                                                                          0))
-                                                              (assert (= (cast u64
-                                                                               answer)
-                                                                         (get (.addresses loaded)
-                                                                              (cast i64
-                                                                                    target-index))))
-                                                              (let [target
-                                                                      (primitive/cast (fnptr (cc/C)
-                                                                                             []
-                                                                                             i64)
-                                                                                      (primitive/cast (ptr u8)
-                                                                                                      answer))]
-                                                                (assert (= (target)
-                                                                           61))))
-                                                            (assert (= (function value)
-                                                                       (case kind
-                                                                         21
-                                                                           (+ value
-                                                                              61)
-                                                                         22
-                                                                           (+ value
-                                                                              61)
-                                                                         19
-                                                                           (+ value
-                                                                              61)
-                                                                         20
-                                                                           (let [n
-                                                                                   (& value
-                                                                                      31)]
-                                                                             (+ (* n
-                                                                                   61)
-                                                                                (/ (* n
-                                                                                      (- n
-                                                                                         1))
-                                                                                   2)))
-                                                                         18
-                                                                           (let [n
-                                                                                   (& value
-                                                                                      31)]
-                                                                             (/ (* n
-                                                                                   (- n
-                                                                                      1))
-                                                                                2))
-                                                                         0 73
-                                                                         14 73
-                                                                         15 73
-                                                                         16
-                                                                           4050765991979987505
-                                                                         13
-                                                                           (cast i64
-                                                                                 (cast i32
-                                                                                       value))
-                                                                         12
-                                                                           (cast i64
-                                                                                 (cast i32
-                                                                                       value))
-                                                                         10
-                                                                           (if (> value
-                                                                                  0)
+                                                        (if (and (= kind 23)
+                                                                 (> value 0))
+                                                            (assert (inline-trapped? function
+                                                                                     value))
+                                                            (if (= kind 17)
+                                                                (let [answer
+                                                                        (function value)
+                                                                      target-index
+                                                                        (find (.image module)
+                                                                              "_inline_target")]
+                                                                  (assert (>= target-index
+                                                                              0))
+                                                                  (assert (= (cast u64
+                                                                                   answer)
+                                                                             (get (.addresses loaded)
+                                                                                  (cast i64
+                                                                                        target-index))))
+                                                                  (let [target
+                                                                          (primitive/cast (fnptr (cc/C)
+                                                                                                 []
+                                                                                                 i64)
+                                                                                          (primitive/cast (ptr u8)
+                                                                                                          answer))]
+                                                                    (assert (= (target)
+                                                                               61))))
+                                                                (assert (= (function value)
+                                                                           (case kind
+                                                                             23
                                                                                (+ value
                                                                                   3)
-                                                                               (- value
-                                                                                  3))
-                                                                         8
-                                                                           (+ value
-                                                                              3)
-                                                                         2
-                                                                           (+ value
-                                                                              3)
-                                                                         value))))))))
+                                                                             21
+                                                                               (+ value
+                                                                                  61)
+                                                                             22
+                                                                               (+ value
+                                                                                  61)
+                                                                             19
+                                                                               (+ value
+                                                                                  61)
+                                                                             20
+                                                                               (let [n
+                                                                                       (& value
+                                                                                          31)]
+                                                                                 (+ (* n
+                                                                                       61)
+                                                                                    (/ (* n
+                                                                                          (- n
+                                                                                             1))
+                                                                                       2)))
+                                                                             18
+                                                                               (let [n
+                                                                                       (& value
+                                                                                          31)]
+                                                                                 (/ (* n
+                                                                                       (- n
+                                                                                          1))
+                                                                                    2))
+                                                                             0
+                                                                               73
+                                                                             14
+                                                                               73
+                                                                             15
+                                                                               73
+                                                                             16
+                                                                               4050765991979987505
+                                                                             13
+                                                                               (cast i64
+                                                                                     (cast i32
+                                                                                           value))
+                                                                             12
+                                                                               (cast i64
+                                                                                     (cast i32
+                                                                                           value))
+                                                                             10
+                                                                               (if (> value
+                                                                                      0)
+                                                                                   (+ value
+                                                                                      3)
+                                                                                   (- value
+                                                                                      3))
+                                                                             8
+                                                                               (+ value
+                                                                                  3)
+                                                                             2
+                                                                               (+ value
+                                                                                  3)
+                                                                             value)))))))))
                                             (jit/release-image! (mut loaded)))))
                                     (link/release! (mut module))))))
                           (image/release! (mut original))
@@ -964,6 +1048,7 @@
                           (image/release! (mut target-code)))
                         (rewrite/release! (mut output)))))
                 (calls/release! (mut signature)))))))
+    (free! (mut callee-observed))
     (free! (mut roots))
     (free! (mut arguments))
     (free! (mut parameters))
@@ -1031,6 +1116,7 @@
                                           :graph callee
                                           :entry start
                                           :roots [exit]
+                                          :observed [exit]
                                           :never never)
                                         8
                                         budget
@@ -1243,6 +1329,7 @@
                                         :graph callee
                                         :entry start
                                         :roots [exit]
+                                        :observed [exit]
                                         :never never)
                                       pointer-bytes
                                       budget
@@ -1355,6 +1442,9 @@
   (indirect-inline-case false 64)
   (indirect-inline-case true 64)
   (indirect-inline-case false 0)
+  (inline-case 23 false 128 true true)
+  (inline-case 23 true 128 true true)
+  (inline-case 23 false 0 true true)
   (inline-case 21 false 128 true true)
   (inline-case 22 false 128 true true)
   (inline-case 19 false 128 true true)
