@@ -4,6 +4,10 @@
 (import "stogir.node" :as n)
 (import "stogir.calls" :as calls)
 (import "stogir.sccp-analysis" :as analysis)
+(import "stogir.sccp" :as sccp)
+(import "stogir.boolean-diamond" :as diamond)
+(import "stogir.uses" :as uses)
+(import "stogir.bitqueue" :as queue)
 (import "stogir.sccp-rewrite" :as rewrite)
 (import "stogir.a64.compile" :as compile)
 (import "stogir.jit.darwin" :as jit)
@@ -178,7 +182,121 @@
     (g/release! (mut graph))
     failures))
 
+;;; Reversed merge order, inverted boolean results and nonempty arms. Compare
+;;; the maintained use lists against a fresh build before native execution.
+(defn boolean-diamond [(reversed bool) (inverted bool) (effect bool) (ty u8)]
+  (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        pointer (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        zero (require (b/scalar-constant! (mut graph) (cast i32 ty) 0 8))
+        one (require (b/scalar-constant! (mut graph) (cast i32 ty) 1 8))
+        input-zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        condition (require (b/emit! (mut graph) 14 1 [x input-zero]))
+        branch (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        store
+          (if effect (require (b/emit! (mut graph) 93 0 [yes pointer x])) yes)
+        yes-end (require (b/emit! (mut graph) 114 0 [store]))
+        no-end (require (b/emit! (mut graph) 114 0 [no]))
+        merge
+          (require (b/emit! (mut graph)
+                            112
+                            0
+                            (if reversed [no-end yes-end] [yes-end no-end])))
+        true-value (if inverted zero one)
+        false-value (if inverted one zero)
+        phi
+          (require (b/emit! (mut graph)
+                            67
+                            (cast i32 ty)
+                            [merge
+                             (if reversed false-value true-value)
+                             (if reversed true-value false-value)]))
+        result
+          (if (= ty 11)
+              phi
+              (require (b/emit! (mut graph) (if (= ty 5) 36 34) 11 [phi])))
+        ret (require (b/emit! (mut graph) 120 11 [merge result (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)
+        (mut edges) (uses/build graph a)
+        (mut work) (queue/create (len (.instructions graph)) a)]
+    (for r [ret branch yes no yes-end no-end phi] (push! (mut roots) r))
+    (match (sccp/optimize graph 8 (slice roots) a)
+      (Err [message] (panic "boolean pipeline: {}" message))
+      (Ok [result]
+          (let [(mut result) result]
+            (unless effect
+              (assert (!= (n/opcode (get (.instructions (.graph result))
+                                         (cast i64 phi)))
+                          67)))
+            (rewrite/release! (mut result)))))
+    (let [changes
+            (require (diamond/rewrite! (mut graph)
+                                       (mut roots)
+                                       (mut edges)
+                                       (mut work)
+                                       a))]
+      (assert (= changes (if effect 0 1)))
+      (unless effect
+        (assert (= (n/opcode (get (.instructions graph) (cast i64 phi)))
+                   (if (= ty 1)
+                       (if inverted 45 68)
+                       (if inverted
+                           60
+                           (if (or (= ty 2) (= ty 7) (= ty 8)) 36 34)))))))
+    (require (rewrite/validate graph 8 a))
+    (let [(mut rebuilt) (uses/build graph a)]
+      (for [i 0 (len (.ranges rebuilt))]
+        (let [expected (get (.ranges rebuilt) i)
+              actual (get (.ranges edges) i)]
+          (assert (= (.count expected) (.count actual)))
+          (for [j (.offset expected) (+ (.offset expected) (.count expected))]
+            (let [edge (get (.edges rebuilt) j)
+                  (mut found) false]
+              (for [k (.offset actual) (+ (.offset actual) (.count actual))]
+                (let [other (get (.edges edges) k)]
+                  (when (and (= (.user edge) (.user other))
+                             (= (.operand edge) (.operand other)))
+                    (set! found true))))
+              (assert found)))))
+      (uses/release! (mut rebuilt)))
+    (for root roots
+      (assert (!= (n/opcode (get (.instructions graph) (cast i64 root))) 0)))
+    (match (compile/text graph start (slice roots) a)
+      (Err [e] (panic "boolean control: {}" e))
+      (Ok [text]
+          (let [(mut text) text]
+            (match (jit/map-text (slice text))
+              (Err [e] (panic "{}" e))
+              (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        f
+                          (p/cast (fnptr (cc/C) [i64 (ptr i64)] i64)
+                                  (.base loaded))]
+                    (for input [-50 -1 0 1 99]
+                      (let [(mut memory) 123]
+                        (assert (= (f input (p/cast (ptr i64) (mut memory)))
+                                   (if (if inverted (!= input 0) (= input 0))
+                                       1
+                                       0)))
+                        (assert (= memory (if (and effect (= input 0)) 0 123)))))
+                    (jit/release! (mut loaded)))))
+            (free! (mut text)))))
+    (uses/release! (mut edges))
+    (queue/release! (mut work))
+    (free! (mut roots))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (for reversed [false true]
+    (for inverted [false true]
+      (for effect [false true]
+        (for ty [(: 1 u8) 2 3 4 5 7 8 9 10 11]
+          (boolean-diamond reversed inverted effect ty)))))
   (let [(mut failures) 0]
     (for cases [(: 1 i32) 2 3 6 15 63]
       (set! failures (+ failures (wide cases))))
