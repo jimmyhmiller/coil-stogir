@@ -717,3 +717,27 @@ COPY observation, cached for duplicate roots; its original PARAM cell bounds the
 additional growth. ASAN compares native before/after answers and checks duplicate
 root identity, one-cell growth, Never/zero budget and a three-cell budget. The
 strict-control version fails this regression before execution.
+
+
+### AArch64 logical immediates
+
+The pinned upstream `ir_aarch64.dasc` uses `aarch64_may_encode_logical_imm`
+and logical-immediate binary rules. Our persistent selector now covers ordinary
+32/64-bit OR, AND and XOR literals on either side. Zero, all-ones and masks that
+cannot be encoded retain the register rule; narrow scalar and vector paths are
+unchanged. Selection stores canonical N:immr:imms fields before liveness and
+physical emission consumes those fields without redoing mask search.
+
+The independent encoder discovers the smallest repeated element by halving,
+then uses popcount/ctz to locate and verify its circular run of ones. It does not
+copy DynASM's immediate encoder. Field/width/register validation rejects reserved
+encodings, and the emitter checks the full tile payload before narrowing it.
+Matching uses allocated scalar registers; ABI-specific SP/ZR forms remain the
+responsibility of their existing encoders. Graph references, pass order, CFG,
+placement, uses and the shared JIT/AOT emitter stay unchanged.
+
+Host-independent encoder and selection checks cover known words, normalized
+32-bit inputs, reserved fields and both literal sides. The existing native
+`jit-bitwise` suite enumerates all 6,636 mathematical masks independently by
+bit position and executes AND/ORR/EOR words against five inputs (99,540 hardware
+answers), plus signed/unsigned graph compilation and non-encodable fallback.

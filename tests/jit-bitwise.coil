@@ -11,10 +11,161 @@
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.primitive" :as primitive)
 (import "coil.cc" :as cc)
-(import "coil.result" :use [Result Ok Err])
+(import "coil.result" :use [Result Ok Err Some None])
 
 (defn require [(result (Result i32 (slice u8)))] (-> i32)
   (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defstruct LogicalCase [(mask u64) (wide bool) (offset i64)])
+
+;;; Enumerate masks by their mathematical circular bit positions, independently
+;;; of the encoder's period/run analysis. Hardware execution is the word oracle.
+(defn logical-native-check [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut code) (ArrayList::new [u8] a)
+        (mut cases) (ArrayList::new [LogicalCase] a)
+        (mut failures) (logical-native-check)]
+    (for wide [false true]
+      (let [width (if wide 64 32)
+            (mut element) 2]
+        (while (<= element width)
+          (for [ones 1 element]
+            (for [rotation 0 element]
+              (let [(mut mask) (: 0 u64)]
+                (for [bit 0 width]
+                  (when (< (% (+ bit rotation) element) ones)
+                    (set! mask (| mask (<< (: 1 u64) (cast u64 bit))))))
+                (match (e/logical-mask wide mask)
+                  (None [] (set! failures (+ failures 1)))
+                  (Some [fields]
+                        (push! (mut cases)
+                               (LogicalCase
+                                 :mask mask
+                                 :wide wide
+                                 :offset (len code)))
+                        (for [operation 0 3]
+                          (match (e/logical-immediate wide
+                                                      (cast i32 operation)
+                                                      0
+                                                      0
+                                                      fields)
+                            (Err [_]
+                                 (set! failures (+ failures 1))
+                                 (bytes/append32! (mut code) 0xD503201F))
+                            (Ok [word] (bytes/append32! (mut code) word)))
+                          (bytes/append32! (mut code) 0xD65F03C0)))))))
+          (set! element (* element 2)))))
+    (when (!= (len cases) 6636) (set! failures (+ failures 1)))
+    (match (jit/map-text (slice code))
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [mapped]
+          (let [(mut mapped) mapped]
+            (for spec cases
+              (for [operation 0 3]
+                (let [address
+                        (primitive/index (.base mapped)
+                                         (+ (.offset spec) (* operation 8)))]
+                  (for value [(: 0 u64)
+                              1
+                              0xFFFFFFFFFFFFFFFF
+                              0x8000000080000000
+                              0x0123456789ABCDEF]
+                    (let [expected
+                            (case operation
+                              0 (& value (.mask spec))
+                              1 (| value (.mask spec))
+                              (^ value (.mask spec)))
+                          answer
+                            (if (.wide spec)
+                                (let [f
+                                        (primitive/cast (fnptr (cc/C) [u64] u64)
+                                                        address)]
+                                  (f value))
+                                (let [f
+                                        (primitive/cast (fnptr (cc/C) [u32] u32)
+                                                        address)]
+                                  (cast u64 (f (cast u32 value)))))]
+                      (when (!= answer
+                                (if (.wide spec)
+                                    expected
+                                    (& expected 0xFFFFFFFF)))
+                        (set! failures (+ failures 1))))))))
+            (jit/release! (mut mapped)))))
+    (for wide [false true]
+      (for value [(: 0 u64) 0xFFFFFFFFFFFFFFFF 0x0123456789ABCDEF]
+        (match (e/logical-mask wide value)
+          (None [] 0)
+          (Some [_] (set! failures (+ failures 1))))))
+    (free! (mut cases))
+    (free! (mut code))
+    failures))
+
+(defn logical-compiled-case [(ty i32)
+                             (op i32)
+                             (bits u64)
+                             (constant-first bool)
+                             (immediate? bool)] (-> i64)
+  (let [a (malloc-allocator)
+        wide (or (= ty 5) (= ty 11))
+        mask (if wide bits (& bits 0xFFFFFFFF))
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        arg (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        literal (require (b/scalar-constant! (mut graph) ty mask 8))
+        value
+          (require (b/emit! (mut graph)
+                            op
+                            ty
+                            (if constant-first [literal arg] [arg literal])))
+        ret (require (b/emit! (mut graph) 120 ty [start value (: 0 i32)]))
+        (mut failures) 0]
+    (match (select/arithmetic graph value)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [tile]
+          (when (or (!= (.rule tile) (+ (if immediate? 41 6) (- op 46)))
+                    (!= (.wide tile) wide)
+                    (and immediate?
+                         (or (!= (.left tile) arg) (!= (.right tile) 0))))
+            (set! failures (+ failures 1)))))
+    (match (compile/text graph start [ret] a)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [text]
+          (let [(mut text) text]
+            (match (jit/map-text (slice text))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [mapped]
+                  (let [(mut mapped) mapped]
+                    (for input [(: 0 u64)
+                                1
+                                0xFFFFFFFFFFFFFFFF
+                                0x8000000080000000
+                                0x0123456789ABCDEF]
+                      (let [expected
+                              (case op
+                                46 (| input mask)
+                                47 (& input mask)
+                                (^ input mask))
+                            answer
+                              (if wide
+                                  (let [f
+                                          (primitive/cast (fnptr (cc/C)
+                                                                 [u64]
+                                                                 u64)
+                                                          (.base mapped))]
+                                    (f input))
+                                  (let [f
+                                          (primitive/cast (fnptr (cc/C)
+                                                                 [u32]
+                                                                 u32)
+                                                          (.base mapped))]
+                                    (cast u64 (f (cast u32 input)))))]
+                        (when (!= answer
+                                  (if wide expected (& expected 0xFFFFFFFF)))
+                          (set! failures (+ failures 1)))))
+                    (jit/release! (mut mapped)))))
+            (free! (mut text)))))
+    (g/release! (mut graph))
+    failures))
 
 (defn main [] (-> i64)
   (let [(mut text) (ArrayList::new [u8] (malloc-allocator))
@@ -55,6 +206,18 @@
               (set! failures (+ failures 1)))
             (when (not (jit/release! (mut owned)))
               (set! failures (+ failures 1))))))
+    (for ty [(: 4 i32) 10 5 11]
+      (for op [(: 46 i32) 47 48]
+        (for first [false true]
+          (for mask [(: 31 u64)
+                     0xFFFF0000FFFF0000
+                     0x8000000180000001
+                     0x5555555555555555]
+            (set! failures
+                  (+ failures (logical-compiled-case ty op mask first true))))
+          (for mask [(: 0 u64) 0xFFFFFFFFFFFFFFFF 0x0123456789ABCDEF]
+            (set! failures
+                  (+ failures (logical-compiled-case ty op mask first false)))))))
     (free! (mut text))
     (println "compiled bitwise checks: {} failures" failures)
     (if (= failures 0) 0 1)))

@@ -14,7 +14,7 @@ and [LICENSE](../LICENSE).
 | Optional mem2ssa, then reset CFG | Typed nonescaping ALLOCA partitions and demand-driven SSA across joins/loops before SCCP. Uninitialized paths retain storage. Analyses are rebuilt afterward. |
 | SCCP at optimization levels above one | Rooted analysis, owned rewriting and incremental scalar fold/CSE/DCE run through explicit image/object options at levels 2/3. Fold/restart coverage, promotion and CFG/control/load cleanup remain incomplete. See `OPTIMIZATION_MODES.md`. |
 | CFG, dominators, loops, GCM, scheduling | `pipeline.prepare` orchestrates CFG, dominance, loop depth, placement and scheduling. Full upstream algorithm parity remains unverified. |
-| Target matching | `a64.compile.generate` builds a persistent `a64.match.Plan` before register analysis. Fusion and reuse coverage remain incomplete. |
+| Target matching | `a64.compile.generate` builds a persistent `a64.match.Plan` before register analysis. 32/64-bit logical immediates are persistent tiles; broader fusion and reuse coverage remain incomplete. |
 | Virtual registers, live ranges, coalescing, allocation | Matched operands feed register liveness, ranges and constraints, then split-interval allocation. Explicit upstream coalescing and full allocation-policy parity remain open. |
 | Block scheduling and emission | Post-allocation block ordering and native emission. The scheduling core has a pinned-upstream differential; this does not establish whole-pipeline equivalence. |
 
