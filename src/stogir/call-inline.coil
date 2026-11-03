@@ -3,7 +3,7 @@
 ;;; the semantic representation. See NOTICE and docs/PROVENANCE.md.
 (module stogir.call-inline)
 
-(export Callee optimize)
+(export Callee Site optimize optimize-sites)
 
 (import "stogir.graph" :as g)
 (import "stogir.node" :as n)
@@ -451,52 +451,73 @@
     (free! (mut mapping))
     (if (= error "") (Ok 1) (Err error))))
 
-;;; Transactional scalar/single-block component. Unsupported definitions and
-;;; Never leave a byte-equivalent owned graph. All analyses must be rebuilt.
-(defn optimize [(source g/Graph)
-                (roots (slice i32))
-                (reference i32)
-                (target Callee)
-                (pointer-bytes i32)
-                (budget i32)
-                (a (dyn Allocator))] (-> (Result rewrite/Rewritten (slice u8)))
-  (let [(mut error) ""]
+(defstruct Site [(reference i32) (target Callee)])
+
+;;; One transaction and graph copy for an ordered set of distinct original CALLs.
+;;; The budget bounds total cloned cells, not each individual call. Definitions
+;;; are borrowed and immutable throughout; all structural analyses are rebuilt.
+(defn optimize-sites [(source g/Graph)
+                      (roots (slice i32))
+                      (sites (slice Site))
+                      (pointer-bytes i32)
+                      (budget i32)
+                      (a (dyn Allocator))]
+  (-> (Result rewrite/Rewritten (slice u8)))
+  (let [(mut error) ""
+        (mut seen) (zeros (len (.instructions source)) a)]
     (when (or (< budget 0) (> budget 16384))
       (set! error "invalid inline budget"))
     (match (rewrite/validate source pointer-bytes a)
       (Err [message] (set! error message))
       (Ok [_] 0))
-    (when (= error "")
-      (match (rewrite/validate (.graph target) pointer-bytes a)
-        (Err [message] (set! error message))
-        (Ok [_] 0)))
     (for root roots
       (when (or (<= root 0) (not (g/contains? source root)))
         (set! error "invalid inline caller root")))
-    (for root (.roots target)
-      (when (or (<= root 0) (not (g/contains? (.graph target) root)))
-        (set! error "invalid inline callee root")))
-    (match (g/lookup source reference)
-      (Some [call]
-            (when (or (<= reference 0) (!= (n/opcode call) 79))
-              (set! error "inline target must be CALL")))
-      (None [] (set! error "inline CALL missing")))
+    (for site sites
+      (let [target (.target site)
+            reference (.reference site)]
+        (when (= error "")
+          (match (rewrite/validate (.graph target) pointer-bytes a)
+            (Err [message] (set! error message))
+            (Ok [_] 0)))
+        (for root (.roots target)
+          (when (or (<= root 0) (not (g/contains? (.graph target) root)))
+            (set! error "invalid inline callee root")))
+        (match (g/lookup source reference)
+          (Some [call]
+                (if (or (<= reference 0) (!= (n/opcode call) 79))
+                    (set! error "inline target must be CALL")
+                    (if (!= (get seen (cast i64 reference)) 0)
+                        (set! error "duplicate inline CALL")
+                        (set! (mut seen) (cast i64 reference) 1))))
+          (None [] (set! error "inline CALL missing")))))
+    (free! (mut seen))
     (if (!= error "")
         (Err error)
         (let [(mut graph) (g/duplicate source a)
               (mut observed) (ArrayList::new [i32] a)
               (mut seeds) (ArrayList::new [i32] a)
-              (mut changes) (: 0 i32)]
+              (mut changes) (: 0 i32)
+              (mut remaining) budget]
           (for root roots (push! (mut observed) root))
-          (when (eligible? source reference target budget)
-            (match (apply! (mut graph)
-                           (mut observed)
-                           reference
-                           target
-                           (mut seeds)
-                           a)
-              (Err [message] (set! error message))
-              (Ok [count] (set! changes count))))
+          (for site sites
+            (let [target (.target site)
+                  reference (.reference site)]
+              (when (and (= error "")
+                         (eligible? graph reference target remaining))
+                (match (apply! (mut graph)
+                               (mut observed)
+                               reference
+                               target
+                               (mut seeds)
+                               a)
+                  (Err [message] (set! error message))
+                  (Ok [count]
+                      (set! changes (+ changes count))
+                      (set! remaining
+                            (- remaining
+                               (cast i32
+                                     (- (len (.instructions (.graph target))) 1)))))))))
           (when (= error "")
             (match (rewrite/validate graph pointer-bytes a)
               (Err [message] (set! error message))
@@ -515,3 +536,18 @@
                       :roots observed
                       :changes changes
                       :iteration queue))))))))
+
+;;; Transactional single-site convenience API.
+(defn optimize [(source g/Graph)
+                (roots (slice i32))
+                (reference i32)
+                (target Callee)
+                (pointer-bytes i32)
+                (budget i32)
+                (a (dyn Allocator))] (-> (Result rewrite/Rewritten (slice u8)))
+  (optimize-sites source
+                  roots
+                  [(Site :reference reference :target target)]
+                  pointer-bytes
+                  budget
+                  a))

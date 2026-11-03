@@ -415,6 +415,101 @@
                                                   caller-signature
                                                   a))
                         (calls/release! (mut caller-signature)))))
+                (when (= kind 2)
+                  (let [(mut chain) (g/duplicate caller a)
+                        second
+                          (require (calls/emit! (mut chain)
+                                                signature
+                                                called
+                                                target
+                                                [called]
+                                                a))
+                        definition
+                          (inlining/Callee
+                            :name "_inline_leaf"
+                            :graph callee
+                            :entry start
+                            :roots [exit]
+                            :never false)
+                        sites
+                          [(inlining/Site :reference called :target definition)
+                           (inlining/Site :reference second :target definition)]]
+                    (g/write-input-word! (mut chain) done 1 second)
+                    (g/write-input-word! (mut chain) done 2 second)
+                    (for limit [(: 0 i32)
+                                (cast i32 (- callee-count 1))
+                                (cast i32 (* 2 (- callee-count 1)))]
+                      (match (inlining/optimize-sites chain
+                                                      [done]
+                                                      sites
+                                                      8
+                                                      limit
+                                                      a)
+                        (Err [message] (panic "{}" message))
+                        (Ok [batch]
+                            (let [(mut batch) batch]
+                              (assert (= (.changes batch)
+                                         (if (= limit 0)
+                                             0
+                                             (if (= limit
+                                                    (cast i32
+                                                          (- callee-count 1)))
+                                                 1
+                                                 2))))
+                              (let [(mut code)
+                                      (owned-image (compile/image (.graph batch)
+                                                                  entry
+                                                                  (slice (.roots batch))
+                                                                  "_inline_batch"
+                                                                  a))
+                                    (mut leaf)
+                                      (owned-image (compile/image callee
+                                                                  start
+                                                                  [exit]
+                                                                  "_inline_leaf"
+                                                                  a))]
+                                (match (link/compose [code leaf] a)
+                                  (Err [message] (panic "{}" message))
+                                  (Ok [module]
+                                      (let [(mut module) module]
+                                        (match (jit/map-image (.image module) a)
+                                          (Err [message] (panic "{}" message))
+                                          (Ok [loaded]
+                                              (let [(mut loaded) loaded
+                                                    index
+                                                      (find (.image module)
+                                                            "_inline_batch")]
+                                                (assert (>= index 0))
+                                                (let [address
+                                                        (get (.addresses loaded)
+                                                             (cast i64 index))
+                                                      function
+                                                        (primitive/cast (fnptr (cc/C)
+                                                                               [i64]
+                                                                               i64)
+                                                                        (primitive/cast (ptr u8)
+                                                                                        address))]
+                                                  (for value [-100 -1 0 5 222]
+                                                    (assert (= (function value)
+                                                               (+ value 6)))))
+                                                (jit/release-image! (mut loaded)))))
+                                        (link/release! (mut module)))))
+                                (image/release! (mut code))
+                                (image/release! (mut leaf)))
+                              (rewrite/release! (mut batch))))))
+                    (match (inlining/optimize-sites chain
+                                                    [done]
+                                                    [(get sites 0)
+                                                     (get sites 0)]
+                                                    8
+                                                    64
+                                                    a)
+                      (Err [_] 0)
+                      (Ok [bad]
+                          (let [(mut bad) bad]
+                            (rewrite/release! (mut bad))
+                            (panic "duplicate sites accepted"))))
+                    (g/release! (mut chain))))
                 (match (inlining/optimize caller
                                           (slice roots)
                                           called
