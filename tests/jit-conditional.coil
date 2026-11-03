@@ -39,9 +39,13 @@
         a (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 1]))
         b (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 2]))
         a-literal
-          (if (= ty 1) (: 1 u64) (& (: 0xFEDCBA9876543280 u64) (mask ty)))
+          (if (>= mode 9)
+              (if (= mode 9) (: 1 u64) 0)
+              (if (= ty 1) (: 1 u64) (& (: 0xFEDCBA9876543280 u64) (mask ty))))
         b-literal
-          (if (= ty 1) (: 0 u64) (& (: 0x123456789ABC7F01 u64) (mask ty)))
+          (if (>= mode 9)
+              (if (= mode 9) (: 0 u64) 1)
+              (if (= ty 1) (: 0 u64) (& (: 0x123456789ABC7F01 u64) (mask ty))))
         c-literal
           (if (= mode 4)
               (: 0 u64)
@@ -54,7 +58,7 @@
                                            8))
               (if (= mode 6) a (if (= mode 7) b c)))
         yes
-          (if (or (= mode 1) (= mode 3) (= mode 5))
+          (if (or (= mode 1) (= mode 3) (= mode 5) (>= mode 9))
               (require (b/scalar-constant! (mut graph)
                                            (cast i32 ty)
                                            a-literal
@@ -63,7 +67,7 @@
         no
           (if (= mode 8)
               a
-              (if (or (= mode 2) (= mode 3) (= mode 5))
+              (if (or (= mode 2) (= mode 3) (= mode 5) (>= mode 9))
                   (require (b/scalar-constant! (mut graph)
                                                (cast i32 ty)
                                                b-literal
@@ -136,7 +140,10 @@
                                         c-literal
                                         (if (= mode 6) a (if (= mode 7) b c)))
                                   effective-a
-                                    (if (or (= mode 1) (= mode 3) (= mode 5))
+                                    (if (or (= mode 1)
+                                            (= mode 3)
+                                            (= mode 5)
+                                            (>= mode 9))
                                         a-literal
                                         a)
                                   effective-b
@@ -144,7 +151,8 @@
                                         a
                                         (if (or (= mode 2)
                                                 (= mode 3)
-                                                (= mode 5))
+                                                (= mode 5)
+                                                (>= mode 9))
                                             b-literal
                                             b))
                                   wanted
@@ -172,13 +180,73 @@
     (g/release! (mut graph))
     failures))
 
+;;; FCMP truth must keep NaNs true and both signed zeros false for CSET.
+(defn floating-choice [(cty u8) (inverted bool)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        condition
+          (require (b/emit! (mut graph) 71 (cast i32 cty) [start (: 0 i32) 0]))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        one (require (b/scalar-constant! (mut graph) 5 1 8))
+        selected
+          (require (b/emit! (mut graph)
+                            60
+                            5
+                            [condition
+                             (if inverted zero one)
+                             (if inverted one zero)]))
+        ret (require (b/emit! (mut graph) 120 5 [start selected (: 0 i32)]))]
+    (match (calls/create 0 5 [cty] a)
+      (Err [message] (panic "{}" message))
+      (Ok [prototype]
+          (let [(mut prototype) prototype]
+            (require (calls/function! (mut graph) prototype a))
+            (calls/release! (mut prototype)))))
+    (match (compile/text graph start [ret] a)
+      (Err [message] (panic "{}" message))
+      (Ok [text]
+          (let [(mut text) text]
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "{}" message))
+              (Ok [loaded]
+                  (let [(mut loaded) loaded]
+                    (for bits [(: 0 u64)
+                               0x8000000000000000
+                               0x3FF0000000000000
+                               0xBFF0000000000000
+                               0x7FF0000000000000
+                               0xFFF0000000000000
+                               0x7FF8000000000042]
+                      (let [(mut raw) bits
+                            value (load (primitive/cast (ptr f64) (mut raw)))
+                            truth (and (!= bits 0) (!= bits 0x8000000000000000))
+                            expected
+                              (if (if inverted (not truth) truth) (: 1 u64) 0)
+                            f64-call
+                              (primitive/cast (fnptr (cc/C) [f64] u64)
+                                              (.base loaded))
+                            f32-call
+                              (primitive/cast (fnptr (cc/C) [f32] u64)
+                                              (.base loaded))
+                            actual
+                              (if (= cty 12)
+                                  (f64-call value)
+                                  (f32-call (primitive/cast f32 value)))]
+                        (assert (= actual expected))))
+                    (jit/release! (mut loaded)))))
+            (free! (mut text)))))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (for cty [(: 12 u8) 13]
+    (for inverted [false true] (floating-choice cty inverted)))
   (let [(mut failures) 0]
     (for cty [(: 1 u8) 2 3 4 5 6 7 8 9 10 11]
       (for ty [(: 1 u8) 2 3 4 5 6 7 8 9 10 11]
         (let [(mut mode) (: 0 i32)]
-          (while (< mode 9)
-            (when (or (< mode 6) (= mode 8) (= cty ty))
+          (while (< mode 11)
+            (when (or (< mode 6) (>= mode 8) (= cty ty))
               (set! failures (+ failures (check cty ty mode))))
             (set! mode (+ mode 1))))))
     (println "native conditional selection checks: {} failures" failures)
