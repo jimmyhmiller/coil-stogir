@@ -743,3 +743,13 @@ bit position and executes AND/ORR/EOR words against five inputs (99,540 hardware
 answers), plus signed/unsigned graph compilation and non-encodable fallback.
 
 The final tests retain host-independent encoder/selector checks and put hardware execution in the existing Darwin `jit-bitwise` suite. All four suites pass ASAN and when built by stogir O3. Logical matching avoids the pre-existing shift/multiply literal lookup, so the selected mask is analyzed only once.
+
+
+Narrow scalar logical operations use the same 32-bit immediate tiles while
+retaining `narrow!`'s existing input and result normalization. This includes
+byte/halfword signedness and booleans; vector paths remain unchanged. The raw
+constant already has the verified scalar type's width, so it is interpreted as
+that value in the 32-bit instruction. Word-level zero/all-ones and unencodable
+patterns keep their register fallback. Extended host-independent selection and
+native graph tests cover all scalar widths, both literal sides, narrow signed
+returns and boolean inputs. ASAN and stogir O3 tests pass.
