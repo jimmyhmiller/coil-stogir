@@ -741,3 +741,5 @@ Host-independent encoder and selection checks cover known words, normalized
 `jit-bitwise` suite enumerates all 6,636 mathematical masks independently by
 bit position and executes AND/ORR/EOR words against five inputs (99,540 hardware
 answers), plus signed/unsigned graph compilation and non-encodable fallback.
+
+The final tests retain host-independent encoder/selector checks and put hardware execution in the existing Darwin `jit-bitwise` suite. All four suites pass ASAN and when built by stogir O3. Logical matching avoids the pre-existing shift/multiply literal lookup, so the selected mask is analyzed only once.
