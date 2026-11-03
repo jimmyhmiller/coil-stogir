@@ -499,3 +499,15 @@ iterative-fold suite exercises two pointer widths, rooted/shared observations,
 use-list reconstruction, explicit rewrite/guard counts, raw FP/NaN payloads and
 signed/high-bit inputs against the scalar conversion oracle. Native execution is
 checked on the implemented 64-bit target; 32-bit cases verify graph/type policy.
+
+### Indirect result graph expansion
+
+Our independent bounded graph inliner now accepts explicit indirect-result
+prototypes. Their first graph parameter already denotes the caller's destination
+(the incoming x8 storage), so ordinary parameter substitution and control/effect
+cloning preserve the existing storage identity. Register-piece results remain
+excluded: their private callee buffer requires a separate escape/alias proof.
+The module execution suite compares linked before/after O3 images with aliased
+and separate source/destination objects, store-followed-by-load observations,
+multiple seeds, and byte-identical Never/zero-budget fallbacks. Both ASAN and
+stogir-built execution pass. This extension is not claimed as an upstream port.

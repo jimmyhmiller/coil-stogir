@@ -6,6 +6,8 @@
 (import "stogir.strings" :as strings)
 (import "stogir.calls" :as calls)
 (import "stogir.call-groups" :as groups)
+(import "stogir.call-results" :as results)
+(import "stogir.options" :as options)
 (import "stogir.call-inline" :as inlining)
 (import "stogir.sccp-rewrite" :as rewrite)
 (import "stogir.liveness" :as live)
@@ -855,7 +857,182 @@
     (g/release! (mut caller))
     (g/release! (mut callee))))
 
+(defn indirect-inline-case [(never bool) (budget i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut callee) (g/create a)
+        (mut caller) (g/create a)
+        start (require (b/emit! (mut callee) 104 0 [(: 0 i32)]))
+        result (require (b/emit! (mut callee) 71 6 [start (: 0 i32) 0]))
+        input (require (b/emit! (mut callee) 71 6 [start (: 0 i32) 1]))
+        seed (require (b/emit! (mut callee) 71 5 [start (: 0 i32) 2]))
+        one (require (b/scalar-constant! (mut callee) 5 1 8))
+        eight (require (b/scalar-constant! (mut callee) 5 8 8))
+        initial (require (b/emit! (mut callee) 91 5 [start input]))
+        first (require (b/emit! (mut callee) 26 5 [initial seed]))
+        written (require (b/emit! (mut callee) 93 0 [initial result first]))
+        observed (require (b/emit! (mut callee) 91 5 [written input]))
+        second (require (b/emit! (mut callee) 26 5 [observed one]))
+        offset (require (b/emit! (mut callee) 26 6 [result eight]))
+        final (require (b/emit! (mut callee) 93 0 [observed offset second]))
+        exit (require (b/emit! (mut callee) 120 0 [final (: 0 i32) 0]))
+        entry (require (b/emit! (mut caller) 104 0 [(: 0 i32)]))
+        destination (require (b/emit! (mut caller) 71 6 [entry (: 0 i32) 0]))
+        source (require (b/emit! (mut caller) 71 6 [entry (: 0 i32) 1]))
+        value (require (b/emit! (mut caller) 71 5 [entry (: 0 i32) 2]))
+        function (require (symbols/function! (mut caller) "_indirect_leaf" 0))]
+    (match (calls/create-result 0 [(: 6 u8) 6 5] [] (results/indirect) a)
+      (Err [message] (panic "{}" message))
+      (Ok [prototype]
+          (let [(mut prototype) prototype
+                _ (require (calls/function! (mut callee) prototype a))
+                called
+                  (require (calls/emit! (mut caller)
+                                        prototype
+                                        entry
+                                        function
+                                        [destination source value]
+                                        a))
+                first (require (b/emit! (mut caller) 91 5 [called destination]))
+                eight (require (b/scalar-constant! (mut caller) 5 8 8))
+                offset (require (b/emit! (mut caller) 26 6 [destination eight]))
+                second (require (b/emit! (mut caller) 91 5 [first offset]))
+                answer (require (b/emit! (mut caller) 26 5 [first second]))
+                done
+                  (require (b/emit! (mut caller)
+                                    120
+                                    5
+                                    [second answer (: 0 i32)]))]
+            (match (calls/create 0 5 [(: 6 u8) 6 5] a)
+              (Err [message] (panic "{}" message))
+              (Ok [signature]
+                  (let [(mut signature) signature]
+                    (require (calls/function! (mut caller) signature a))
+                    (calls/release! (mut signature)))))
+            (let [before-count (len (.instructions caller))]
+              (match (inlining/optimize caller
+                                        [done called]
+                                        called
+                                        (inlining/Callee
+                                          :name "_indirect_leaf"
+                                          :graph callee
+                                          :entry start
+                                          :roots [exit]
+                                          :never never)
+                                        8
+                                        budget
+                                        a)
+                (Err [message] (panic "{}" message))
+                (Ok [expanded]
+                    (let [(mut expanded) expanded
+                          expected (if (or never (= budget 0)) (: 0 i32) 1)]
+                      (assert (= (.changes expanded) expected))
+                      (assert (= before-count (len (.instructions caller))))
+                      (assert (= (n/opcode (get (.instructions caller)
+                                                (cast i64 called)))
+                                 79))
+                      (let [(mut original)
+                              (owned-image (compile/image-with-options caller
+                                                                       entry
+                                                                       [done
+                                                                        called]
+                                                                       "_indirect_caller"
+                                                                       (options/Options
+                                                                         :level
+                                                                           3)
+                                                                       a))
+                            (mut output)
+                              (owned-image (compile/image-with-options (.graph expanded)
+                                                                       entry
+                                                                       (slice (.roots expanded))
+                                                                       "_indirect_caller"
+                                                                       (options/Options
+                                                                         :level
+                                                                           3)
+                                                                       a))
+                            (mut leaf)
+                              (owned-image (compile/image callee
+                                                          start
+                                                          [exit]
+                                                          "_indirect_leaf"
+                                                          a))]
+                        (when (= expected 0)
+                          (assert (= (slice (.text original))
+                                     (slice (.text output))))
+                          (assert (= (slice (.data original))
+                                     (slice (.data output)))))
+                        (for after [false true]
+                          (match (link/compose [(if after output original) leaf]
+                                               a)
+                            (Err [message] (panic "{}" message))
+                            (Ok [module]
+                                (let [(mut module) module]
+                                  (match (jit/map-image (.image module) a)
+                                    (Err [message] (panic "{}" message))
+                                    (Ok [mapped]
+                                        (let [(mut mapped) mapped
+                                              index
+                                                (find (.image module)
+                                                      "_indirect_caller")]
+                                          (assert (>= index 0))
+                                          (let [function
+                                                  (primitive/cast (fnptr (cc/C)
+                                                                         [(ptr u64)
+                                                                          (ptr u64)
+                                                                          u64]
+                                                                         u64)
+                                                                  (primitive/cast (ptr u8)
+                                                                                  (get (.addresses mapped)
+                                                                                       (cast i64
+                                                                                             index))))
+                                                (mut storage)
+                                                  (ArrayList::new [u64] a)
+                                                (mut separate) (: 73 u64)]
+                                            (push! (mut storage) 11)
+                                            (push! (mut storage) 22)
+                                            (for alias [false true]
+                                              (for seed [(: 0 u64) 3 17]
+                                                (set! (mut storage) 0 11)
+                                                (set! (mut storage) 1 22)
+                                                (set! separate 73)
+                                                (let [destination
+                                                        (.data storage)
+                                                      source
+                                                        (if alias
+                                                            destination
+                                                            (primitive/cast (ptr u64)
+                                                                            (mut separate)))
+                                                      first
+                                                        (+ (if alias
+                                                               (: 11 u64)
+                                                               73)
+                                                           seed)
+                                                      second
+                                                        (if alias
+                                                            (+ first 1)
+                                                            (: 74 u64))]
+                                                  (assert (= (function destination
+                                                                       source
+                                                                       seed)
+                                                             (+ first second)))
+                                                  (assert (= (get storage 0)
+                                                             first))
+                                                  (assert (= (get storage 1)
+                                                             second)))))
+                                            (free! (mut storage)))
+                                          (jit/release-image! (mut mapped)))))
+                                  (link/release! (mut module))))))
+                        (image/release! (mut original))
+                        (image/release! (mut output))
+                        (image/release! (mut leaf)))
+                      (rewrite/release! (mut expanded))))))
+            (calls/release! (mut prototype)))))
+    (g/release! (mut caller))
+    (g/release! (mut callee))))
+
 (defn main [] (-> i64)
+  (indirect-inline-case false 64)
+  (indirect-inline-case true 64)
+  (indirect-inline-case false 0)
   (inline-case 17 false 64 true true)
   (inline-case 14 false 64 true true)
   (inline-case 15 false 64 true true)
