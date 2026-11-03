@@ -517,3 +517,13 @@ conversion. Existing closed-control, use-count and movable-condition exclusions
 remain. Boolean COPY/NOT/ZEXT shortcuts are restricted to actual 0/1 choices;
 other values remain typed COND nodes. Stable observable END/BEGIN references and
 maintained def-use lists are preserved. No effectful arm is speculated.
+
+### Shared integer diamond values
+
+The PHI-to-COND rewrite no longer requires exactly one use of the PHI value.
+Pinned ir_sccp.c:ir_optimize_phi does not impose that restriction: the replacement
+keeps the same typed reference, so every consumer observes the same selected
+value. Control-region use restrictions remain unchanged. The control suite
+compares 2048 cases, including two observations of each PHI, against the branch
+oracle, exact rebuilt use lists, ASAN and stogir-built execution. The old guard
+fails the shared-value regression before the change.
