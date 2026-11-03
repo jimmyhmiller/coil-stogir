@@ -669,3 +669,20 @@ and negative inputs, and Never/zero-budget fallback. A separate infinite control
 region is explicitly rejected. ASAN passes; restoring the old inliner fails the
 new expansion-count assertion. No source inline annotation or backend-specific
 emission shortcut is introduced.
+
+
+### Nested ordinary direct calls in bounded graph expansion
+
+The next independent component accepts ordinary CALL nodes whose callee is a
+named FUNC constant carrying its typed prototype. The existing constant mapper
+re-interns both function names and prototype bytes in the destination graph;
+CALL control/data edges and ABI grouping remain unchanged. Indirect PROTO nodes,
+variadic calls and aggregate-result call adapters remain excluded. Never policy
+and the transaction's actual graph-growth budget are unchanged.
+
+The extended module-execution suite passes ASAN for a direct nested call and a
+call inside a two-PHI loop, comparing linked execution before/after and checking
+immutable inputs. Indirect and variadic cases execute correctly without graph
+expansion; Never/zero-budget cases remain calls. Restoring the loop-only inliner
+fails the new expansion-count assertion. Compiler adoption requires separate
+worklist dependency, termination and recursive-template policy validation.
