@@ -2,6 +2,7 @@
 (import "stogir.graph" :as g)
 (import "stogir.builder" :as b)
 (import "stogir.mem2ssa" :as mem)
+(import "stogir.liveness" :as live)
 (import "stogir.load-forward" :as forward)
 (import "stogir.node" :as n)
 (import "stogir.types" :as types)
@@ -437,7 +438,54 @@
     (free! (mut roots))
     (g/release! (mut graph))))
 
+;;; Splitting a rooted LOAD's value/control must retain preceding external
+;;; effects even when the caller observes the loaded value without a RETURN.
+(defn rooted-effects [(forwarded bool) (view bool)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        external (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        bytes (require (b/scalar-constant! (mut graph) 5 8 8))
+        value (require (b/scalar-constant! (mut graph) 5 73 8))
+        slot (require (b/stack-allocate! (mut graph) start bytes 16))
+        effect (require (b/emit! (mut graph) 93 0 [slot external value]))
+        write (require (b/emit! (mut graph) 93 0 [effect slot value]))
+        read (require (b/emit! (mut graph) 91 (if view 12 5) [write slot]))
+        (mut roots) (ArrayList::new [i32] a)
+        (mut before) (live/mark graph [read] a)]
+    (assert (get before (cast i64 effect)))
+    (free! (mut before))
+    (push! (mut roots) read)
+    (if forwarded
+        (require (forward/run! (mut graph) (mut roots) 8 true a))
+        (require (mem/promote! (mut graph) (mut roots) a)))
+    (let [(mut after) (live/mark graph (slice roots) a)]
+      (assert (get after (cast i64 effect)))
+      (free! (mut after)))
+    (assert (= (get roots 0) read))
+    ; The production ordering forwards before promotion, then runs SCCP.
+    (require (mem/promote! (mut graph) (mut roots) a))
+    (require (rewrite/validate graph 8 a))
+    (match (sccp/optimize graph 8 (slice roots) a)
+      (Err [e] (panic "{}" e))
+      (Ok [result]
+          (let [(mut result) result
+                (mut marked)
+                  (live/mark (.graph result) (slice (.roots result)) a)]
+            (assert (get marked (cast i64 effect)))
+            (assert (= (n/opcode (get (.instructions (.graph result))
+                                      (cast i64 effect)))
+                       93))
+            (free! (mut marked))
+            (rewrite/release! (mut result)))))
+    (free! (mut roots))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (rooted-effects false false)
+  (rooted-effects false true)
+  (rooted-effects true false)
+  (rooted-effects true true)
   (for type [(: 2 u8) 8 3 9 4 10 5]
     (let [width (cast i64 (types/size (cast i32 type) 8))]
       (for [offset 0 (+ (- 8 width) 1)]
