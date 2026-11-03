@@ -327,8 +327,12 @@
                                                                                            input)
                                                                             (Some [value]
                                                                                   (when (or (not (scalar? (n/type-id value)))
-                                                                                            (!= (n/opcode value)
-                                                                                                (n/type-id value)))
+                                                                                            (not (or (= (n/opcode value)
+                                                                                                        (n/type-id value))
+                                                                                                     (= (n/opcode value)
+                                                                                                        74)
+                                                                                                     (= (n/opcode value)
+                                                                                                        75))))
                                                                                     (set! good
                                                                                           false)))
                                                                             (None []
@@ -359,6 +363,38 @@
     (for [i 0 count] (push! (mut result) 0))
     result))
 
+(defn constant! [(caller (mut g/Graph)) (callee g/Graph) (value n/Node)]
+  (-> (Result i32 (slice u8)))
+  (let [opcode (n/opcode value)]
+    (if (or (= opcode 74) (= opcode 75))
+        (match (strings/lookup (.strings callee)
+                               (cast i32 (n/constant-bits value)))
+          (None [] (Err "inline symbol name missing"))
+          (Some [name]
+                (let [(mut proto) (: 0 i32)
+                      (mut error) ""]
+                  (when (> (n/auxiliary value) 0)
+                    (match (strings/lookup (.strings callee)
+                                           (cast i32 (n/auxiliary value)))
+                      (None [] (set! error "inline symbol prototype missing"))
+                      (Some [bytes]
+                            (match (strings/intern! (mut (.strings caller))
+                                                    bytes)
+                              (None []
+                                    (set! error
+                                          "inline symbol prototype space exhausted"))
+                              (Some [id] (set! proto id))))))
+                  (if (!= error "")
+                      (Err error)
+                      (symbols/named! (mut caller) opcode name proto)))))
+        (match (g/intern-constant! (mut caller)
+                                   opcode
+                                   (n/type-id value)
+                                   (n/auxiliary value)
+                                   (n/constant-bits value))
+          (None [] (Err "inline constant reference space exhausted"))
+          (Some [reference] (Ok reference))))))
+
 (defn mapped! [(caller (mut g/Graph))
                (callee g/Graph)
                (mapping (ArrayList i32))
@@ -378,14 +414,9 @@
             (match (g/lookup callee reference)
               (None [] (Err "inline constant missing"))
               (Some [value]
-                    (match (g/intern-constant! (mut caller)
-                                               (n/opcode value)
-                                               (n/type-id value)
-                                               (n/auxiliary value)
-                                               (n/constant-bits value))
-                      (None []
-                            (Err "inline constant reference space exhausted"))
-                      (Some [new] (set! (mut constants) index new) (Ok new)))))))))
+                    (match (constant! (mut caller) callee value)
+                      (Err [message] (Err message))
+                      (Ok [new] (set! (mut constants) index new) (Ok new)))))))))
 
 ;;; The graph is owned and eligible; all old references remain stable. Reserve
 ;;; every clone before patching edges so legal forward references remain legal.

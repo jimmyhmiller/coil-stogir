@@ -457,3 +457,11 @@ Flags, result type, parameter count and group trailer must still match exactly.
 Bool/char, pointer, floating and integer width changes are excluded. Cast cells
 count toward the transaction's growth budget. Linked execution checks high-bit
 u32/i32 arguments, negative values and byte-identical width-mismatch fallback.
+
+Named FUNC/SYM address constants retain symbol identity across expansion. Their
+names and any attached prototype bytes are re-interned into the caller; graph
+string IDs are never copied as if they were module-wide IDs. The embedding
+module supplies explicit relocation bindings for new imports. Private STR
+constants remain unsupported, preserving their identity and ownership. Linked
+execution checks global loads, returned function-pointer identity and execution,
+prototype-byte remapping, and unchanged private-string fallback.
