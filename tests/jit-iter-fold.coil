@@ -6,6 +6,8 @@
 (import "stogir.conversion" :as conversion)
 (import "stogir.fold" :as scalar)
 (import "stogir.sccp" :as sccp)
+(import "stogir.sccp-analysis" :as analysis)
+(import "stogir.sccp-values" :as values)
 (import "coil.arraylist" :use [ArrayList])
 (import "stogir.iter-fold" :as iter)
 (import "stogir.sccp-rewrite" :as rewrite)
@@ -130,6 +132,134 @@
     (q/release! (mut queue))
     (uses/release! (mut lists))
     (free! (mut roots))
+    (g/release! (mut graph))))
+
+(defn masked-execute [(before g/Graph)
+                      (after g/Graph)
+                      (before-roots (slice i32))
+                      (after-roots (slice i32))] (-> void)
+  (let [(mut first-text)
+          (match (compile/text before 1 before-roots (malloc-allocator))
+            (Err [message] (panic "{}" message))
+            (Ok [text] text))
+        (mut second-text)
+          (match (compile/text after 1 after-roots (malloc-allocator))
+            (Err [message] (panic "{}" message))
+            (Ok [text] text))]
+    (match (jit/map-text (slice first-text))
+      (Err [message] (panic "{}" message))
+      (Ok [first]
+          (let [(mut first) first]
+            (match (jit/map-text (slice second-text))
+              (Err [message] (panic "{}" message))
+              (Ok [second]
+                  (let [(mut second) second
+                        f (p/cast (fnptr (cc/C) [u64] i64) (.base first))
+                        g (p/cast (fnptr (cc/C) [u64] i64) (.base second))]
+                    (for [input 0 256]
+                      (assert (= (f (cast u64 input)) (g (cast u64 input)))))
+                    (for input [(: 0x10000 u64)
+                                0x7FFFFFFF
+                                0x80000000
+                                0xFFFFFFFF
+                                0x100000000
+                                0x7FFFFFFFFFFFFFFF
+                                0x8000000000000000
+                                0xFFFFFFFFFFFFFFFF
+                                0x5555555555555555
+                                0xAAAAAAAAAAAAAAAA]
+                      (assert (= (f input) (g input))))
+                    (jit/release! (mut second)))))
+            (jit/release! (mut first)))))
+    (free! (mut first-text))
+    (free! (mut second-text))))
+
+;;; Compare raw native AND/conversion/CMP instructions against the optimized
+;;; graph. Byte inputs are exhaustive, with wider sign/truncation boundaries.
+(defn masked-bits [(ty i32) (bits u64)] (-> u64)
+  (& bits
+     (cast u64
+           (- (<< (: 1 u128)
+                  (cast u128 (* 8 (types/scalar-size ty 8))))
+              1))))
+
+(defn masked-case [(ty i32)
+                   (opcode i32)
+                   (mask u64)
+                   (limit u64)
+                   (mode i32)
+                   (commuted bool)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        input (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        width (types/scalar-size ty 8)
+        narrowed
+          (if (< width 8)
+              (require (b/emit! (mut graph) 35 ty [input]))
+              (if (= ty 5)
+                  input
+                  (require (b/emit! (mut graph) 36 ty [input]))))
+        and-type (if (or (= mode 2) (= mode 3)) (: 5 i32) ty)
+        operand (if (or (= mode 2) (= mode 3)) input narrowed)
+        literal
+          (require (b/scalar-constant! (mut graph)
+                                       and-type
+                                       (masked-bits and-type mask)
+                                       8))
+        masked
+          (if (>= mode 4)
+              narrowed
+              (require (b/emit! (mut graph)
+                                47
+                                and-type
+                                (if commuted
+                                    [literal operand]
+                                    [operand literal]))))
+        truncated
+          (if (or (= mode 2) (= mode 3))
+              (require (b/emit! (mut graph) 35 ty [masked]))
+              masked)
+        value
+          (if (or (= mode 1) (= mode 3) (>= mode 4))
+              (require (b/emit! (mut graph)
+                                (if (or (= mode 3) (= mode 5)) 33 34)
+                                11
+                                [truncated]))
+              truncated)
+        compared-type (if (or (= mode 1) (= mode 3) (>= mode 4)) (: 11 i32) ty)
+        threshold
+          (require (b/scalar-constant! (mut graph)
+                                       compared-type
+                                       (masked-bits compared-type limit)
+                                       8))
+        comparison (require (b/emit! (mut graph) opcode 1 [value threshold]))
+        result (require (b/emit! (mut graph) 34 11 [comparison]))
+        ret (require (b/emit! (mut graph) 120 11 [start result (: 0 i32)]))]
+    (when (and (= mode 3) (= mask 127) (= limit 131) (= opcode 16))
+      (for pointer-bytes [(: 4 i32) 8]
+        (match (analysis/analyze graph pointer-bytes a)
+          (Err [message] (panic "mask analysis: {}" message))
+          (Ok [facts]
+              (let [(mut facts) facts
+                    result (values/at (.domain facts) comparison)]
+                (unless (and (= (values/state-kind result) 1)
+                             (= (n/constant-bits result) 1))
+                  (panic "mask proof absent: type {}, commuted {}, kind {}, bits {}"
+                         ty
+                         commuted
+                         (values/state-kind result)
+                         (n/constant-bits result)))
+                (analysis/release! (mut facts)))))))
+    (match (sccp/optimize graph 8 [ret] a)
+      (Err [message] (panic "mask comparison: {}" message))
+      (Ok [optimized]
+          (let [(mut optimized) optimized]
+            (masked-execute graph
+                            (.graph optimized)
+                            [ret]
+                            (slice (.roots optimized)))
+            (rewrite/release! (mut optimized)))))
     (g/release! (mut graph))))
 
 ;;; Signed extraction of an upper field, with shared/rooted counterexamples.
@@ -415,6 +545,21 @@
     (g/release! (mut graph))))
 
 (defn main [] (-> i64)
+  (masked-case 2 16 127 131 3 false)
+  (for ty [(: 2 i32) 8 3 9 4 10 5 11]
+    (for opcode [(: 14 i32) 15 16 17 18 19 20 21 22 23]
+      (for mask [(: 0 u64) 5 127 128 0xFFFFFFFFFFFFFFFF]
+        (for limit [(: 0 u64) 1 2 131 0xFFFFFFFFFFFFFFFF]
+          (for commuted [false true]
+            (masked-case ty opcode mask limit 0 commuted)
+            (when (or (= ty 2) (= ty 8) (= ty 4) (= ty 10))
+              (for mode [(: 1 i32) 2 3]
+                (masked-case ty opcode mask limit mode commuted))))))))
+  (for ty [(: 2 i32) 8 4 10]
+    (for opcode [(: 14 i32) 15 16 17 18 19 20 21 22 23]
+      (for limit [(: 0 u64) 1 2 131 0xFFFFFFFFFFFFFFFF]
+        (for mode [(: 4 i32) 5]
+          (masked-case ty opcode 0 limit mode false)))))
   (for opcode [(: 14 i32) 15]
     (for mode [(: 0 i32) 1 2 3 4 5]
       (for constant [(: 0 u64) 1 2]
