@@ -706,3 +706,14 @@ zero-budget fallbacks preserve execution, and omitting the non-returning root
 retains the original call. Restoring RETURN-only closure fails the new assertion.
 This is an explicit independent inliner extension; normal graph verification,
 CFG, placement, matching and liveness remain the post-optimization pipeline.
+
+
+Observed roots can also be values after SCCP or CALL expansion. The initial
+control-only observation validation failed while compiling the module-execution
+suite with stogir (`generate-matched`: invalid inline observed control), so that
+candidate was not delivered. The corrected contract accepts every valid positive
+observation. A rooted PARAM mapped to a literal actual argument gets one positive
+COPY observation, cached for duplicate roots; its original PARAM cell bounds the
+additional growth. ASAN compares native before/after answers and checks duplicate
+root identity, one-cell growth, Never/zero budget and a three-cell budget. The
+strict-control version fails this regression before execution.
