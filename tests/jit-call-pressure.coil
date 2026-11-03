@@ -1,4 +1,9 @@
 (module stogir.tests.jit-call-pressure)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.a64.constants" :as constants)
+(import "stogir.a64.frame-memory" :as memory)
+(import "stogir.a64.frame-address" :as address)
+(import "stogir.bytes" :as bytes)
 (import "stogir.graph" :as g)
 (import "stogir.builder" :as b)
 (import "stogir.calls" :as calls)
@@ -38,6 +43,87 @@
 
 (defn require [(result (Result i32 (slice u8)))] (-> i32)
   (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+;;; A native ABI caller seeds every preserved GPR, calls the generated
+;;; function under pressure, records the registers and restores its own caller.
+(defn word! [(code (mut (ArrayList u8))) (value (Result u32 (slice u8)))]
+  (-> void)
+  (match value
+    (Err [message] (panic "probe encoding: {}" message))
+    (Ok [word] (bytes/append32! (mut code) word))))
+
+(defn preserved-probe [(function u64) (target u64) (cells (ptr i64))] (-> i64)
+  (let [a (malloc-allocator)
+        (mut code) (ArrayList::new [u8] a)
+        (mut observed) (ArrayList::new [u64] a)
+        (mut failures) (: 0 i64)]
+    (require (address/adjust! (mut code) true 96 16))
+    (for [reg 19 29]
+      (require (memory/access! (mut code)
+                               false
+                               8
+                               (cast i32 reg)
+                               31
+                               (* (- reg 19) 8)
+                               false
+                               17))
+      (push! (mut observed) 0))
+    (require (memory/access! (mut code) false 8 30 31 80 false 17))
+    (require (memory/access! (mut code) false 8 4 31 88 false 17))
+    (for [reg 19 29]
+      (require (constants/emit! (mut code)
+                                true
+                                (cast i32 reg)
+                                (+ (: 0x718293A4B5C60000 u64) (cast u64 reg)))))
+    ; ORR Xd, XZR, Xn preserves flags and all registers except its result.
+    (word! (mut code) (encode/logical-register true 1 16 31 0))
+    (word! (mut code) (encode/logical-register true 1 0 31 1))
+    (word! (mut code) (encode/logical-register true 1 1 31 2))
+    (word! (mut code) (encode/logical-register true 1 2 31 3))
+    (word! (mut code) (encode/call-register 16))
+    (require (memory/access! (mut code) true 8 16 31 88 false 17))
+    (for [reg 19 29]
+      (require (memory/access! (mut code)
+                               false
+                               8
+                               (cast i32 reg)
+                               16
+                               (* (- reg 19) 8)
+                               false
+                               17)))
+    (for [reg 19 29]
+      (require (memory/access! (mut code)
+                               true
+                               8
+                               (cast i32 reg)
+                               31
+                               (* (- reg 19) 8)
+                               false
+                               17)))
+    (require (memory/access! (mut code) true 8 30 31 80 false 17))
+    (require (address/adjust! (mut code) false 96 16))
+    (word! (mut code) (encode/ret 30))
+    (match (jit/map-text (slice code))
+      (Err [message] (panic "probe map: {}" message))
+      (Ok [image]
+          (let [(mut image) image
+                probe
+                  (primitive/cast (fnptr (cc/C)
+                                         [u64 u64 i64 (ptr i64) (ptr u64)]
+                                         i64)
+                                  (.base image))]
+            (when (!= (probe function target 7 cells (elem (mut observed) 0))
+                      468)
+              (set! failures (+ failures 1)))
+            (for [i 0 10]
+              (when (!= (get observed i)
+                        (+ (: 0x718293A4B5C60000 u64) (cast u64 (+ i 19))))
+                (println "callee-saved x{} was corrupted" (+ i 19))
+                (set! failures (+ failures 1))))
+            (unless (jit/release! (mut image)) (set! failures (+ failures 1))))))
+    (free! (mut observed))
+    (free! (mut code))
+    failures))
 
 (defn wrap [(value i64) (ty u8)] (-> i64)
   (if (= ty 11)
@@ -216,6 +302,12 @@
                                                  (get cells i)))
                                       (set! failures (+ failures 1))))
                                   (set! i (+ i 1))))
+                              (set! failures
+                                    (+ failures
+                                       (preserved-probe (primitive/cast u64
+                                                                        (.base owned-image))
+                                                        target
+                                                        (elem (mut cells) 0))))
                               (free! (mut cells))
                               (when (not (jit/release! (mut owned-image)))
                                 (set! failures (+ failures 1))))))
