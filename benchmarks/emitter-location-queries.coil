@@ -1,0 +1,51 @@
+(module stogir.benchmarks.emitter-location-queries)
+(import "stogir.allocation" :as a)
+(import "stogir.interval" :as range)
+(import "stogir.locations" :as locations)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.args" :as args)
+(import "coil.result" :use [Result Ok Err])
+
+(defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (args/init! argc argv)
+  (let [allocator (malloc-allocator)
+        count
+          (if (args/has? "--small") 256 (if (args/has? "--large") 4096 1024))
+        indexed (not (args/has? "--linear"))
+        (mut parts) (ArrayList::new [a/Part] allocator)
+        (mut expected) 0
+        (mut checksum) 0]
+    ; Interleaved split children, holes and mixed register/spill locations.
+    (for half [(: 0 i64) 1]
+      (for [i 0 count]
+        (let [(mut part) (a/create (cast i32 i) allocator)
+              value (+ (* i 8) half)]
+          (range/add! (mut (.ranges part)) (* half 10) (+ (* half 10) 8))
+          (if (= half 0)
+              (set! (.register part) (cast i32 (% i 8)))
+              (set! (.spill-slot part) value))
+          (push! (mut parts) part)
+          (set! expected (+ expected (if (= half 0) (% i 8) (+ value 1)))))))
+    (match (locations/build-index parts count allocator)
+      (Err [message] (panic "{}" message))
+      (Ok [index]
+          (let [(mut index) index
+                view
+                  (if indexed
+                      (locations/indexed-view parts index)
+                      (locations/linear-view parts))]
+            (for half [(: 0 i64) 1]
+              (for [i 0 count]
+                (match (locations/resolve view (cast i32 i) (+ (* half 10) 3))
+                  (Err [message] (panic "{}" message))
+                  (Ok [location]
+                      (set! checksum
+                            (+ checksum
+                               (.value location)
+                               (cast i64 (.kind location))))))))
+            (assert (= checksum expected))
+            (locations/release-index! (mut index)))))
+    (for [i 0 (len parts)] (a/release! (elem (mut parts) i)))
+    (free! (mut parts))
+    0))
