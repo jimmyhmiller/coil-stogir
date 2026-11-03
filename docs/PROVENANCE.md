@@ -651,3 +651,21 @@ Native before/after results, exact uses, rooted storage, balanced AFREE,
 observed FRAME_ADDR and unknown-size allocation retention are checked. ASAN and
 stogir-built checks pass, with the existing 2640 stack/free variants, frame,
 mem2ssa, iterative folds, module execution and 112 atomic graphs passing ASAN.
+
+
+### Closed returning loops in bounded call expansion
+
+The independent graph inliner now accepts LOOP_BEGIN/LOOP_END and loop-carried
+PHIs in a closed single-return region. This extends the earlier acyclic-only
+component; it is not attributed to an upstream module inliner. The existing
+two-phase clone reserves all definitions before patching forward and cyclic
+edges. The closure check requires every control node to be reachable backwards
+from the return. Separate non-returning regions remain ineligible. Nested calls,
+frame operations, terminal side exits and variadic calls remain excluded.
+
+`tests/module-execution.coil` compares linked native execution before and after
+expansion of a loop with two PHIs, including zero and multiple trips, positive
+and negative inputs, and Never/zero-budget fallback. A separate infinite control
+region is explicitly rejected. ASAN passes; restoring the old inliner fails the
+new expansion-count assertion. No source inline annotation or backend-specific
+emission shortcut is introduced.
