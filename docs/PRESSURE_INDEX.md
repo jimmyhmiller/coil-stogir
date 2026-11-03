@@ -30,6 +30,32 @@ configurations remain. Split allocation, scalar/call/floating/checked/switch pre
 dynamic stack scopes and captured stencil checks pass. This component is still
 isolated; no full compiler performance or installed delivery claim is made here.
 
+## Assigned values and immutable physical reservations
+
+Canonical initially assigned negative-parent reservations have one range and one
+fixed use at its start, matching their register. Successful spill paths cannot
+mutate a negative-parent part. Other shapes stay in the general live collection.
+A register/start index with a maximum-end segment tree finds overlaps without
+scanning every future call or scanning behind a long incoming reservation.
+
+Free-until and next-use are separate queries: a reservation can overlap the
+current point while its only use is already past; later reservations can still
+supply next-use. Exact self exclusion remains part-based. Assigned values expire
+only at their final range end or after losing their register. Future holes and
+preassigned values remain represented; split/evicted ranges are read afresh.
+New assignments are deduplicated in that collection. Queries must advance
+monotonically, with equal-position post-eviction queries supported. Fixed events
+remain independent and are never expired using their owner's live ranges.
+
+64 additional seeded monotonic query configurations cover1/4/16/64 registers,
+long and nested reservations, holes, preassigned owners, noncanonical negative
+parts and fixed uses outside ranges. All three vectors match the full scan,
+including queries on reservations themselves and repeated same-position queries.
+A mutation trace checks eviction, same-position re-query, reassignment, expiration
+and surviving out-of-range fixed uses. Existing event/split and pressure oracles
+remain. ASAN native pressure, realignment and stencil checks pass. Compiler
+integration and full-source performance validation follow separately.
+
 ## Historical fixed-part index and validation
 
 Diagnostic sampling of repeated public O3 compilation identified allocation

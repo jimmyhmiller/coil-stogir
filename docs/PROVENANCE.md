@@ -347,3 +347,14 @@ The semantic graph, interval constraints, allocation decisions, verification and
 subposition transfers are unchanged. Every split path updates ownership; fixed
 uses outside live ranges remain represented. The full-scan query is retained as
 an independent oracle. Assigned-interval scanning still needs separate work.
+
+### Assigned-value and physical-reservation pressure discovery
+
+`reserved-ranges` uses an independent Coil maximum-end segment tree for immutable
+canonical physical reservations. `allocation.AssignedIndex` keeps the remaining
+assigned values, expires only their final ranges, retains holes, and re-reads
+split/evicted ranges. These structures implement the existing pressure policy
+under the monotonic linear-scan frontier guided by pinned `ir_ra.c`; they are not
+a translation of upstream's active/inactive linked lists. Noncanonical inputs
+retain general intersection/next-use handling. All three pressure vectors and
+verification remain unchanged.
