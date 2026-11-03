@@ -5,6 +5,7 @@
 (import "stogir.types" :as types)
 (import "stogir.calls" :as calls)
 (import "stogir.sccp-analysis" :as analysis)
+(import "stogir.sccp-values" :as values)
 (import "stogir.sccp-rewrite" :as rewrite)
 (import "stogir.a64.compile" :as compile)
 (import "stogir.aot.macho" :as macho)
@@ -12,7 +13,7 @@
 (import "stogir.jit.darwin" :as jit)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [malloc-allocator])
-(import "coil.result" :use [Result Ok Err])
+(import "coil.result" :use [Result Ok Err Some None])
 (import "coil.primitive" :as p)
 (import "coil.cc" :as cc)
 (import "coil.fs" :as fs)
@@ -455,7 +456,98 @@
             (analysis/release! (mut facts)))))
     failures))
 
+(defn late-phi-input [(delayed bool)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        selector (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        one (require (b/scalar-constant! (mut graph) 5 1 8))
+        address (require (b/scalar-constant! (mut graph) 6 73 8))
+        split (require (b/switch! (mut graph) start selector))
+        first (require (b/case-value! (mut graph) split zero))
+        second (require (b/case-value! (mut graph) split one))
+        other (require (b/case-default! (mut graph) split))
+        end-first (require (b/emit! (mut graph) 114 0 [first]))
+        end-second (require (b/emit! (mut graph) 114 0 [second]))
+        (mut end-other)
+          (if delayed 0 (require (b/emit! (mut graph) 114 0 [other])))
+        region
+          (match (g/append-inputs! (mut graph)
+                                   112
+                                   0
+                                   [end-first end-second end-other])
+            (Some [r] r)
+            (None [] (panic "region allocation")))
+        phi
+          (match (g/append-inputs! (mut graph) 67 5 [region zero one (: 0 i32)])
+            (Some [r] r)
+            (None [] (panic "phi allocation")))]
+    (when delayed
+      (set! end-other (require (b/emit! (mut graph) 114 0 [other])))
+      (g/write-input-word! (mut graph) region 3 end-other))
+    (let [late
+            (match (g/append-inputs! (mut graph) 36 5 [address])
+              (Some [r] r)
+              (None [] (panic "late value allocation")))
+          ret (require (b/emit! (mut graph) 120 5 [region phi (: 0 i32)]))]
+      (g/write-input-word! (mut graph) phi 4 late)
+      (match (calls/create 0 5 [(: 5 u8)] a)
+        (Err [message] (panic "{}" message))
+        (Ok [prototype]
+            (let [(mut prototype) prototype]
+              (require (calls/function! (mut graph) prototype a))
+              (calls/release! (mut prototype)))))
+      (require (rewrite/validate graph 8 a))
+      (match (analysis/analyze-rooted graph 8 [ret] a)
+        (Err [message] (panic "{}" message))
+        (Ok [facts]
+            (let [(mut facts) facts]
+              (assert (!= (values/state-kind (values/at (.domain facts) late))
+                          0))
+              (match (rewrite/rewrite graph facts [ret] a)
+                (Err [message] (panic "{}" message))
+                (Ok [rewritten]
+                    (let [(mut rewritten) rewritten]
+                      (for after [false true]
+                        (match (compile/image (if after
+                                                  (.graph rewritten)
+                                                  graph)
+                                              start
+                                              (if after
+                                                  (slice (.roots rewritten))
+                                                  [ret])
+                                              "_late_phi"
+                                              a)
+                          (Err [message] (panic "{}" message))
+                          (Ok [code]
+                              (let [(mut code) code]
+                                (match (jit/map-image code a)
+                                  (Err [message] (panic "{}" message))
+                                  (Ok [mapped]
+                                      (let [(mut mapped) mapped
+                                            function
+                                              (p/cast (fnptr (cc/C) [u64] u64)
+                                                      (p/cast (ptr u8)
+                                                              (get (.addresses mapped)
+                                                                   0)))]
+                                        (for input [(: 0 u64)
+                                                    1
+                                                    2
+                                                    0xffffffffffffffff]
+                                          (assert (= (function input)
+                                                     (if (= input 0)
+                                                         0
+                                                         (if (= input 1) 1 73)))))
+                                        (jit/release-image! (mut mapped)))))
+                                (image/release! (mut code))))))
+                      (rewrite/release! (mut rewritten)))))
+              (analysis/release! (mut facts)))))
+      (g/release! (mut graph)))))
+
 (defn main [] (-> i64)
+  (late-phi-input false)
+  (late-phi-input true)
   (let [(mut failures) 0]
     (set! failures
           (+ failures
