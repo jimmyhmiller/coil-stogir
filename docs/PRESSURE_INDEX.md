@@ -1,4 +1,36 @@
-# Indexed fixed constraints during pressure queries
+# Allocation pressure query indexes
+
+## Current fixed-event index development
+
+The solver now builds a sorted per-register table of immutable fixed-use events
+once after its initial reservations. Binary searches inspect only event
+positions inside the current interval's ranges. A persistent split forest maps
+each event to its exact current child; every free-allocation split, spill-prefix
+split and eviction split updates that forest. Event-owner queries cache their
+last leaf, and follow descendants when it splits again. No constraint is inferred
+from range coverage: the generic API permits fixed uses outside live ranges.
+
+This changes pressure discovery only. Free-until, next-use, fixed-at, class masks,
+spill geometry, decisions and all allocator checks remain in force. Assigned-range
+intersections still use the previous scan, so this is not a complete active/inactive
+allocator port and does not claim linear whole-solver complexity. Construction,
+sorting, ownership updates and queries stay inside IR-to-machine-code generation.
+
+The old full scan and previous fixed-part index remain available as compatibility
+entry points and differential oracles. The solver requires all initial fixed uses
+to be present at construction; subsequent mutations only partition those uses.
+Adding new constraints during allocation would require updating this event index.
+
+Focused ASAN validation covers 64 seeded event/split configurations across1/4/16/64
+registers, holes, negative-parent physical reservations, repeated prefix/child
+splits and constraints outside their owners' ranges. All three pressure vectors
+are compared with the full scan. A targeted sequence invokes each actual tracked
+solver mutation, including eviction's nested spill split. Existing256 previous-index
+configurations remain. Split allocation, scalar/call/floating/checked/switch pressure,
+dynamic stack scopes and captured stencil checks pass. This component is still
+isolated; no full compiler performance or installed delivery claim is made here.
+
+## Historical fixed-part index and validation
 
 Diagnostic sampling of repeated public O3 compilation identified allocation
 pressure scans and constraint-use iteration as prominent leaf costs. The solver
