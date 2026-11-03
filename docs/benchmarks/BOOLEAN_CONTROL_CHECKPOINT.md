@@ -8,4 +8,4 @@ On the unchanged 200-million-call branch fixture, five warm alternating samples 
 
 The importer emits END/single-predecessor MERGE boundaries between conditional projections and arm bodies. SCCP changes these MERGEs to BEGIN. Pinned upstream subsequently normalizes eligible END/BEGIN pairs using `ir_merge_blocks`; that additional control normalization remains under development in the isolated standalone worktree and is not part of this checkpoint.
 
-FAST passed 49/49 in 213.6s, warning on cli/objects at 1.60GB versus 1.5GB. Installation and off-checkout verification are recorded separately when complete.
+FAST passed 49/49 in 213.6s, warning on cli/objects at 1.60GB versus 1.5GB. Official global install of f904ad20 passed. Off-checkout verification confirmed exact source correspondence for all 137 SDK modules, code-section equality with the candidate, correct timing backend tags, native LLVM/TPDE/stogir execution and the installed 80-case control/pipeline suite.
