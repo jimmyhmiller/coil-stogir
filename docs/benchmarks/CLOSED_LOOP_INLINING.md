@@ -20,3 +20,5 @@ Same LLVM-built opaque runner object, 20 million calls, exact checksum 859763163
 The isolated loop component reduces runtime by **13.64%**, leaving a **2.66x** gap to LLVM. The accessor now absorbs the trie helper, while the outer kernel still calls the accessor because it retains a bounds-check CALL. New object size is 13,648 bytes versus 13,512 before. The single new kernel generation diagnostic is 0.008730 s; this is not full compiler acceptance. Raw samples and runner identity are in `closed-loop-inlining/avec-results.json`.
 
 FAST passes **49/49 in 217.2 s**. The existing cli/objects memory warning is 1.67 GB. No frontend semantics were changed; this checkpoint does not rerun the full compiler acceptance workload.
+
+The complete extended module-execution suite also passes when compiled by stogir O3. Official global installation completed for source 256d0dd7. Off-checkout module execution passes using installed imports; all 144 installed SDK modules match the tested standalone component.
