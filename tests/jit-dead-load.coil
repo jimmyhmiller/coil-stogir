@@ -1,0 +1,132 @@
+(module stogir.tests.jit-dead-load)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.dead-code" :as dead)
+(import "stogir.uses" :as uses)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [value] value) (Err [message] (panic "{}" message))))
+
+(defn exact-uses [(graph g/Graph) (actual uses/Uses)] (-> void)
+  (let [(mut expected) (uses/build graph (malloc-allocator))]
+    (for [r 0 (len (.ranges expected))]
+      (let [want (get (.ranges expected) r)
+            got (get (.ranges actual) r)]
+        (assert (= (.count want) (.count got)))
+        (for [i (.offset want) (+ (.offset want) (.count want))]
+          (let [edge (get (.edges expected) i)
+                (mut found) false]
+            (for [j (.offset got) (+ (.offset got) (.count got))]
+              (let [other (get (.edges actual) j)]
+                (when (and (= (.user edge) (.user other))
+                           (= (.operand edge) (.operand other)))
+                  (set! found true))))
+            (assert found)))))
+    (uses/release! (mut expected))))
+
+(defn execute [(graph g/Graph) (roots (slice i32))] (-> void)
+  (let [a (malloc-allocator)]
+    (match (compile/text graph 1 roots a)
+      (Err [message] (panic "{}" message))
+      (Ok [text]
+          (let [(mut text) text]
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "{}" message))
+              (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        f (p/cast (fnptr (cc/C) [u64] u64) (.base loaded))]
+                    (for value [(: 0 u64)
+                                1
+                                73
+                                0x8000000000000000
+                                0xFFFFFFFFFFFFFFFF]
+                      (assert (= (f value) value)))
+                    (jit/release! (mut loaded)))))
+            (free! (mut text)))))))
+
+;0 unused private reads;1 rooted value;2 rooted storage;3 used load;
+;4 volatile;5 atomic;6 a dead address expression exposes another dead load.
+(defn check [(mode i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        input (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        size (require (b/scalar-constant! (mut graph) 5 16 8))
+        eight (require (b/scalar-constant! (mut graph) 5 8 8))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        place (require (b/stack-allocate! (mut graph) start size 16))
+        offset (require (b/emit! (mut graph) 26 6 [place eight]))
+        initialized
+          (if (or (= mode 1) (>= mode 3))
+              (require (b/emit! (mut graph)
+                                93
+                                0
+                                [place place (if (= mode 6) offset input)]))
+              place)
+        opcode (if (= mode 4) (: 92 i32) (if (= mode 5) 126 91))
+        first
+          (require (b/emit! (mut graph)
+                            opcode
+                            (if (= mode 6) 6 5)
+                            [initialized place]))
+        address
+          (if (= mode 6)
+              (require (b/emit! (mut graph) 26 6 [first zero]))
+              offset)
+        second (require (b/emit! (mut graph) 91 5 [first address]))
+        returned (if (= mode 3) first input)
+        ret (require (b/emit! (mut graph) 120 5 [second returned (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)]
+    (push! (mut roots) ret)
+    (when (= mode 1) (push! (mut roots) first))
+    (when (= mode 2) (push! (mut roots) place))
+    (execute graph (slice roots))
+    (let [(mut working) (g/duplicate graph a)
+          (mut edges) (uses/build working a)]
+      (assert (> (dead/prune! (mut working) (mut edges) (slice roots) a) 0))
+      (assert (= (n/opcode (get (.instructions working) (cast i64 second))) 0))
+      (assert (= (n/opcode (get (.instructions working) (cast i64 first)))
+                 (if (or (= mode 0) (= mode 2) (= mode 6))
+                     (: 0 u8)
+                     (cast u8 opcode))))
+      (exact-uses working edges)
+      (require (rewrite/validate working 8 a))
+      (execute working (slice roots))
+      (assert (= (dead/prune! (mut working) (mut edges) (slice roots) a) 0))
+      (uses/release! (mut edges))
+      (g/release! (mut working)))
+    (match (sccp/optimize-memory graph 8 (slice roots) true a)
+      (Err [message] (panic "{}" message))
+      (Ok [result]
+          (let [(mut result) result]
+            (when (= mode 0)
+              (assert (= (n/opcode (get (.instructions (.graph result))
+                                        (cast i64 place)))
+                         0)))
+            (when (= mode 2)
+              (assert (= (n/opcode (get (.instructions (.graph result))
+                                        (cast i64 place)))
+                         81)))
+            (when (or (= mode 4) (= mode 5))
+              (assert (= (n/opcode (get (.instructions (.graph result))
+                                        (cast i64 first)))
+                         (cast u8 opcode))))
+            (execute (.graph result) (slice (.roots result)))
+            (rewrite/release! (mut result)))))
+    (free! (mut roots))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (for mode [(: 0 i32) 1 2 3 4 5 6] (check mode))
+  (println "dead load/control/use and promotion checks: 0 failures")
+  0)
