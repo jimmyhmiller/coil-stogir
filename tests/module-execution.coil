@@ -4,6 +4,7 @@
 (import "stogir.builder" :as b)
 (import "stogir.symbols" :as symbols)
 (import "stogir.calls" :as calls)
+(import "stogir.call-groups" :as groups)
 (import "stogir.call-inline" :as inlining)
 (import "stogir.sccp-rewrite" :as rewrite)
 (import "stogir.liveness" :as live)
@@ -290,7 +291,7 @@
                    (compatible bool)] (-> void)
   (let [a (malloc-allocator)
         pointer (or (= kind 3) (= kind 4) (= kind 7))
-        floating (or (= kind 5) (= kind 6))
+        floating (or (= kind 5) (= kind 6) (= kind 9))
         scalar (if floating (: 12 i32) 11)
         result (if (= kind 4) (: 0 i32) scalar)
         (mut callee) (g/create a)
@@ -300,6 +301,7 @@
         parameter (if pointer (: 6 i32) scalar)
         x (require (b/emit! (mut callee) 71 parameter [start (: 0 i32) 0]))
         input (require (b/emit! (mut caller) 71 parameter [entry (: 0 i32) 0]))
+        (mut descriptors) (ArrayList::new [groups/Group] a)
         (mut parameters) (ArrayList::new [u8] a)
         (mut arguments) (ArrayList::new [i32] a)
         (mut control) start
@@ -340,13 +342,32 @@
                                                0x8000000000000000
                                                8)))
           :else 0)
+    (when (>= kind 8)
+      (let [y (require (b/emit! (mut callee) 71 scalar [start (: 0 i32) 1]))
+            three
+              (require (b/scalar-constant! (mut caller)
+                                           scalar
+                                           (if floating 0x4008000000000000 3)
+                                           8))]
+        (push! (mut parameters) (cast u8 scalar))
+        (push! (mut arguments) three)
+        (push! (mut descriptors)
+               (groups/Group
+                 :first 0
+                 :count 2
+                 :alignment 8))
+        (set! returned (require (b/emit! (mut callee) 26 scalar [x y])))))
     (let [exit
             (require (b/emit! (mut callee)
                               120
                               result
                               [control returned (: 0 i32)]))
           target (require (symbols/function! (mut caller) "_inline_leaf" 0))]
-      (match (calls/create 0 (cast u8 result) (slice parameters) a)
+      (match (calls/create-grouped 0
+                                   (cast u8 result)
+                                   (slice parameters)
+                                   (slice descriptors)
+                                   a)
         (Err [message] (panic "{}" message))
         (Ok [signature]
             (let [(mut signature) signature]
@@ -381,7 +402,12 @@
                     callee-count (len (.instructions callee))]
                 (push! (mut roots) done)
                 (push! (mut roots) called)
-                (match (calls/create 0 (cast u8 scalar) (slice parameters) a)
+                (match (calls/create 0
+                                     (cast u8 scalar)
+                                     (if (>= kind 8)
+                                         [(cast u8 parameter)]
+                                         (slice parameters))
+                                     a)
                   (Err [message] (panic "{}" message))
                   (Ok [caller-signature]
                       (let [(mut caller-signature) caller-signature]
@@ -564,6 +590,9 @@
                                                         (assert (= (function value)
                                                                    (case kind
                                                                      0 73
+                                                                     8
+                                                                       (+ value
+                                                                          3)
                                                                      2
                                                                        (+ value
                                                                           3)
@@ -578,6 +607,7 @@
     (free! (mut roots))
     (free! (mut arguments))
     (free! (mut parameters))
+    (free! (mut descriptors))
     (g/release! (mut caller))
     (g/release! (mut callee))))
 
@@ -585,7 +615,7 @@
   (inline-case 0 false 1 true true)
   (inline-case 0 false 64 false true)
   (inline-case 0 false 64 true false)
-  (for [kind 0 8]
+  (for [kind 0 10]
     (inline-case (cast i32 kind) false 64 true true)
     (inline-case (cast i32 kind) true 64 true true)
     (inline-case (cast i32 kind) false 0 true true))

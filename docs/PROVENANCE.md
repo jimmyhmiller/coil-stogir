@@ -434,7 +434,11 @@ an upstream module inliner. It retains the compact graph and existing typed
 prototype encoding. The transactional component expands only direct named,
 exact-prototype, single-block scalar definitions within an explicit node budget.
 Never takes precedence. Nested calls, CFG/frame-dependent operations, variadic
-and grouped/aggregate ABI cases remain calls in this initial component.
+and aggregate-result ABI cases remain calls in this initial component. Ordinary
+scalar results also accept validated grouped scalar arguments with identical
+prototype bytes: grouping changes register/stack placement, while graph-level
+arguments remain explicit scalar SSA values. Integer pairs and floating groups
+are exercised by linked before/after execution.
 
 Formal parameters map to actual SSA arguments; clones are reserved before edge
 patching, scalar constants retain their bits, and effects remain on the explicit
