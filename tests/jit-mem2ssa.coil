@@ -87,7 +87,7 @@
       (Ok [code]
           (let [(mut code) code] (execute code) (image/release! (mut code)))))
     (let [changes (require (mem/promote! (mut working) (mut roots) a))]
-      (if (or escape overlap volatile boundary)
+      (if (or escape overlap volatile)
           (assert (= changes 0))
           (do
             (assert (> changes 0))
@@ -106,7 +106,7 @@
               (Ok [code]
                   (let [(mut code) code]
                     (execute code)
-                    (unless (or escape overlap volatile boundary)
+                    (unless (or escape overlap volatile)
                       (match (macho/image-object code a)
                         (Err [e] (panic "{}" e))
                         (Ok [bytes]
@@ -201,7 +201,121 @@
               (image/release! (mut code))))))
     (g/release! (mut graph))))
 
+(defn loop-fixture [(updates bool)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        limit (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        eight (require (b/scalar-constant! (mut graph) 5 8 8))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        slot (require (b/stack-allocate! (mut graph) start eight 16))
+        initialized (require (b/emit! (mut graph) 93 0 [slot slot zero]))
+        entry (require (b/emit! (mut graph) 114 0 [initialized]))
+        head (require (b/loop-begin! (mut graph) entry))
+        index (require (b/loop-phi! (mut graph) head zero))
+        condition (require (b/emit! (mut graph) 16 1 [index limit]))
+        branch (require (b/emit! (mut graph) 116 0 [head condition]))
+        body (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        exit (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        previous (require (b/emit! (mut graph) 91 11 [body slot]))
+        sum (require (b/emit! (mut graph) 26 11 [previous index]))
+        store
+          (if updates
+              (require (b/emit! (mut graph) 93 0 [previous slot sum]))
+              previous)
+        next (require (b/emit! (mut graph) 26 11 [index one]))
+        back (require (b/emit! (mut graph) 115 0 [store]))
+        result (require (b/emit! (mut graph) 91 11 [exit slot]))
+        ret (require (b/emit! (mut graph) 120 11 [result result (: 0 i32)]))]
+    (require (b/patch! (mut graph) head 2 back))
+    (require (b/patch! (mut graph) index 3 next))
+    (for level [(: 1 i32) 2 3]
+      (match (compile/image-with-options graph
+                                         start
+                                         [ret]
+                                         "_flow_loop"
+                                         (options/Options :level level)
+                                         a)
+        (Err [e] (panic "loop mode {}: {}" level e))
+        (Ok [code]
+            (let [(mut code) code]
+              (match (jit/map-image code a)
+                (Err [e] (panic "{}" e))
+                (Ok [loaded]
+                    (let [(mut loaded) loaded
+                          f
+                            (p/cast (fnptr (cc/C) [i64] i64)
+                                    (.base (.memory loaded)))]
+                      (for n [-10 -1 0 1 2 7 31 100]
+                        (assert (= (f n)
+                                   (if (and updates (> n 0))
+                                       (/ (* n (- n 1)) 2)
+                                       0))))
+                      (jit/release-image! (mut loaded)))))
+              (image/release! (mut code))))))
+    (g/release! (mut graph))))
+
+;;; One incoming edge lacks a definition. The owner and load must stay in
+;;; memory; this graph is inspected but its uninitialized path is never run.
+(defn uninitialized-fixture [(initialized bool)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        eight (require (b/scalar-constant! (mut graph) 5 8 8))
+        slot (require (b/stack-allocate! (mut graph) start eight 16))
+        branch (require (b/emit! (mut graph) 116 0 [slot x]))
+        yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        store (require (b/emit! (mut graph) 93 0 [yes slot x]))
+        end1 (require (b/emit! (mut graph) 114 0 [store]))
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))
+        other
+          (if initialized
+              (require (b/emit! (mut graph) 93 0 [no slot seven]))
+              no)
+        end2 (require (b/emit! (mut graph) 114 0 [other]))
+        merge (require (b/emit! (mut graph) 112 0 [end2 end1]))
+        read (require (b/emit! (mut graph) 91 11 [merge slot]))
+        ret (require (b/emit! (mut graph) 120 11 [read read (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)]
+    (push! (mut roots) ret)
+    (require (mem/promote! (mut graph) (mut roots) a))
+    (assert (= (n/opcode (get (.instructions graph) (cast i64 slot)))
+               (if initialized (: 0 u8) (: 81 u8))))
+    (assert (= (n/opcode (get (.instructions graph) (cast i64 read)))
+               (if initialized (: 68 u8) (: 91 u8))))
+    (when initialized
+      (match (compile/image-with-options graph
+                                         start
+                                         (slice roots)
+                                         "_diamond"
+                                         (options/Options :level 2)
+                                         a)
+        (Err [e] (panic "{}" e))
+        (Ok [code]
+            (let [(mut code) code]
+              (match (jit/map-image code a)
+                (Err [e] (panic "{}" e))
+                (Ok [loaded]
+                    (let [(mut loaded) loaded
+                          f
+                            (p/cast (fnptr (cc/C) [i64] i64)
+                                    (.base (.memory loaded)))]
+                      (for x [-100 -1 0 1 50]
+                        (assert (= (f x) (if (= x 0) 7 x))))
+                      (jit/release-image! (mut loaded)))))
+              (image/release! (mut code))))))
+    (require (rewrite/validate graph 8 a))
+    (free! (mut roots))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (loop-fixture false)
+  (loop-fixture true)
+  (uninitialized-fixture false)
+  (uninitialized-fixture true)
   (fixture false false false false false)
   (fixture false false false false true)
   (fixture true false false false true)
