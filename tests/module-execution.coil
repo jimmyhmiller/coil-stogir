@@ -1029,7 +1029,215 @@
     (g/release! (mut caller))
     (g/release! (mut callee))))
 
+(defn require-image [(result (Result image/Image (slice u8)))] (-> image/Image)
+  (match result (Ok [value] value) (Err [message] (panic "{}" message))))
+
+;;; A register-return result place is private until the ABI capture. Modes
+;;; exercise alias/escape/coverage fallbacks without executing undefined bytes.
+(defn register-inline-case [(mode i32)
+                            (never bool)
+                            (budget i32)
+                            (piece u8)
+                            (pieces i32)
+                            (pointer-bytes i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut callee) (g/create a)
+        (mut caller) (g/create a)
+        start (require (b/emit! (mut callee) 104 0 [(: 0 i32)]))
+        destination (require (b/emit! (mut callee) 71 6 [start (: 0 i32) 0]))
+        input (require (b/emit! (mut callee) 71 6 [start (: 0 i32) 1]))
+        seed (require (b/emit! (mut callee) 71 5 [start (: 0 i32) 2]))
+        one (require (b/scalar-constant! (mut callee) 5 1 8))
+        eight (require (b/scalar-constant! (mut callee) 5 8 8))
+        initial (require (b/emit! (mut callee) 91 5 [start input]))
+        first (require (b/emit! (mut callee) 26 5 [initial seed]))
+        written0
+          (require (b/emit! (mut callee) 93 0 [initial destination first]))
+        written
+          (if (= mode 6)
+              (require (b/emit! (mut callee) 93 0 [written0 input destination]))
+              written0)
+        observed
+          (require (b/emit! (mut callee)
+                            91
+                            5
+                            [written (if (= mode 7) destination input)]))
+        second (require (b/emit! (mut callee) 26 5 [observed one]))
+        offset (require (b/emit! (mut callee) 26 6 [destination eight]))
+        final
+          (if (= mode 5)
+              observed
+              (require (b/emit! (mut callee) 93 0 [observed offset second])))
+        exit (require (b/emit! (mut callee) 120 0 [final (: 0 i32) 0]))
+        entry (require (b/emit! (mut caller) 104 0 [(: 0 i32)]))
+        source (require (b/emit! (mut caller) 71 6 [entry (: 0 i32) 0]))
+        value (require (b/emit! (mut caller) 71 5 [entry (: 0 i32) 1]))
+        size
+          (require (b/scalar-constant! (mut caller) 5 (if (= mode 2) 24 16) 8))
+        place
+          (if (= mode 1)
+              source
+              (require (b/stack-allocate! (mut caller) entry size 16)))
+        control
+          (if (= mode 8)
+              (require (b/emit! (mut caller) 91 5 [place source]))
+              (if (= mode 1) entry place))
+        function (require (symbols/function! (mut caller) "_register_leaf" 0))
+        (mut roots) (ArrayList::new [i32] a)]
+    (match (calls/create-result 0
+                                [(: 6 u8) 6 5]
+                                []
+                                (results/pieces piece pieces)
+                                a)
+      (Err [message] (panic "{}" message))
+      (Ok [prototype]
+          (let [(mut prototype) prototype
+                _ (require (calls/function! (mut callee) prototype a))
+                called
+                  (require (calls/emit! (mut caller)
+                                        prototype
+                                        control
+                                        function
+                                        [place
+                                         (if (= mode 3) place source)
+                                         value]
+                                        a))
+                first (require (b/emit! (mut caller) 91 5 [called place]))
+                eight (require (b/scalar-constant! (mut caller) 5 8 8))
+                offset (require (b/emit! (mut caller) 26 6 [place eight]))
+                second (require (b/emit! (mut caller) 91 5 [first offset]))
+                answer (require (b/emit! (mut caller) 26 5 [first second]))
+                done
+                  (require (b/emit! (mut caller)
+                                    120
+                                    5
+                                    [second answer (: 0 i32)]))]
+            (push! (mut roots) done)
+            (push! (mut roots) called)
+            (when (= mode 4) (push! (mut roots) place))
+            (match (calls/create 0 5 [(: 6 u8) 5] a)
+              (Err [message] (panic "{}" message))
+              (Ok [signature]
+                  (let [(mut signature) signature]
+                    (require (calls/function! (mut caller) signature a))
+                    (calls/release! (mut signature)))))
+            (match (inlining/optimize caller
+                                      (slice roots)
+                                      called
+                                      (inlining/Callee
+                                        :name "_register_leaf"
+                                        :graph callee
+                                        :entry start
+                                        :roots [exit]
+                                        :never never)
+                                      pointer-bytes
+                                      budget
+                                      a)
+              (Err [message] (panic "{}" message))
+              (Ok [expanded]
+                  (let [(mut expanded) expanded
+                        expected
+                          (if (and (= mode 0)
+                                   (= pointer-bytes 8)
+                                   (not never)
+                                   (> budget 0))
+                              (: 1 i32)
+                              0)
+                        _ (assert (= (.changes expanded) expected))
+                        (mut before)
+                          (require-image (compile/image-with-options caller
+                                                                     entry
+                                                                     (slice roots)
+                                                                     "_register_caller"
+                                                                     (options/Options
+                                                                       :level 3)
+                                                                     a))
+                        (mut after)
+                          (require-image (compile/image-with-options (.graph expanded)
+                                                                     entry
+                                                                     (slice (.roots expanded))
+                                                                     "_register_caller"
+                                                                     (options/Options
+                                                                       :level 3)
+                                                                     a))
+                        (mut leaf)
+                          (require-image (compile/image callee
+                                                        start
+                                                        [exit]
+                                                        "_register_leaf"
+                                                        a))]
+                    (when (= expected 0)
+                      (assert (= (slice (.text before)) (slice (.text after))))
+                      (assert (= (slice (.data before)) (slice (.data after)))))
+                    (unless (or (= mode 3) (= mode 5) (= mode 6))
+                      (for changed [false true]
+                        (match (link/compose [(if changed after before) leaf] a)
+                          (Err [message] (panic "{}" message))
+                          (Ok [module]
+                              (let [(mut module) module]
+                                (match (jit/map-image (.image module) a)
+                                  (Err [message] (panic "{}" message))
+                                  (Ok [mapped]
+                                      (let [(mut mapped) mapped
+                                            index
+                                              (find (.image module)
+                                                    "_register_caller")
+                                            f
+                                              (primitive/cast (fnptr (cc/C)
+                                                                     [(ptr u64)
+                                                                      u64]
+                                                                     u64)
+                                                              (primitive/cast (ptr u8)
+                                                                              (get (.addresses mapped)
+                                                                                   (cast i64
+                                                                                         index))))
+                                            (mut storage)
+                                              (ArrayList::new [u64] a)]
+                                        (push! (mut storage) 73)
+                                        (push! (mut storage) 22)
+                                        (for seed [(: 0 u64)
+                                                   3
+                                                   17
+                                                   0x7FF8000000000042
+                                                   0xFFFFFFFFFFFFFF00]
+                                          (set! (mut storage) 0 73)
+                                          (set! (mut storage) 1 22)
+                                          (let [wanted
+                                                  (if (= mode 7)
+                                                      (+ (* (+ (: 73 u64) seed)
+                                                            2)
+                                                         1)
+                                                      (+ (: 147 u64) seed))]
+                                            (assert (= (f (.data storage) seed)
+                                                       wanted))))
+                                        (free! (mut storage))
+                                        (jit/release-image! (mut mapped)))))
+                                (link/release! (mut module)))))))
+                    (image/release! (mut before))
+                    (image/release! (mut after))
+                    (image/release! (mut leaf))
+                    (rewrite/release! (mut expanded)))))
+            (calls/release! (mut prototype)))))
+    (free! (mut roots))
+    (g/release! (mut caller))
+    (g/release! (mut callee))))
+
 (defn main [] (-> i64)
+  (for spec [[(: 5 u8) 2]
+             [(: 11 u8) 2]
+             [(: 12 u8) 2]
+             [(: 13 u8) 4]
+             [(: 37 u8) 1]]
+    (for mode [(: 0 i32) 1 2 3 4 5 6 7 8]
+      (register-inline-case mode
+                            false
+                            128
+                            (get spec 0)
+                            (cast i32 (get spec 1))
+                            8))
+    (register-inline-case 0 true 128 (get spec 0) (cast i32 (get spec 1)) 8)
+    (register-inline-case 0 false 0 (get spec 0) (cast i32 (get spec 1)) 8))
+  (register-inline-case 0 false 128 5 2 4)
   (indirect-inline-case false 64)
   (indirect-inline-case true 64)
   (indirect-inline-case false 0)

@@ -511,3 +511,30 @@ The module execution suite compares linked before/after O3 images with aliased
 and separate source/destination objects, store-followed-by-load observations,
 multiple seeds, and byte-identical Never/zero-budget fallbacks. Both ASAN and
 stogir-built execution pass. This extension is not claimed as an upstream port.
+
+### Private register-result expansion
+
+The independent graph inliner also accepts register-piece result prototypes when
+both storage identities are proven private. The caller's result argument must
+be a fresh exact-size ALLOCA immediately preceding this CALL. Its address may
+only flow through full-width copies/bitcasts and bounded constant offsets to
+normal capture loads after the call; escapes, other arguments, stores and rooted
+pointer observations reject expansion. Caller uses are built lazily once per
+batch, against the immutable source graph, only for eligible register results.
+
+The callee must have one virtual result parameter. Existing mem2ssa field
+classification proves that address does not escape; a complete straight control
+chain must write every result byte, with no reads of the private result object.
+This preserves the ABI's delayed capture when the caller's other pointers alias.
+No private callee buffer is blindly replaced with externally visible storage.
+Only the implemented 64-bit pointer target takes this path; 32-bit falls back.
+This is a local extension, not claimed as an upstream inliner port.
+
+The linked O3 before/after matrix covers GPR/signed pairs, f64 pairs, four f32
+pieces and a vector return, including raw NaN payloads/high bits. Fresh captures
+expand; external/oversized/aliased/observed/escaped/partially written/read-back
+or non-immediate captures, Never, zero budget and the 32-bit target fall back
+with byte-identical images. Undefined uninitialized capture cases are checked
+structurally and are not executed. ASAN and stogir-built execution pass. The
+previous implementation fails the expansion-count regression. Compiler module
+integration and template promotion are separate subsequent work.
