@@ -2,6 +2,9 @@
 (import "stogir.graph" :as g)
 (import "stogir.builder" :as b)
 (import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.sccp" :as sccp)
+(import "coil.arraylist" :use [ArrayList])
 (import "stogir.iter-fold" :as iter)
 (import "stogir.sccp-rewrite" :as rewrite)
 (import "stogir.uses" :as uses)
@@ -40,7 +43,100 @@
     (uses/release! (mut expected))
     failures))
 
+;;; Signed extraction of an upper field, with shared/rooted counterexamples.
+(defn high-view [(type i32) (mode i32) (shift-extra i64)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        distance (+ (- 64 (* (cast i64 (types/size type 8)) 8)) shift-extra)
+        amount
+          (require (b/scalar-constant! (mut graph) 5 (cast u64 distance) 8))
+        shift (require (b/emit! (mut graph) 50 5 [x amount]))
+        field (require (b/emit! (mut graph) 35 type [shift]))
+        extended (require (b/emit! (mut graph) 33 11 [field]))
+        result
+          (if (= mode 2)
+              (let [unsigned (require (b/emit! (mut graph) 34 11 [field]))]
+                (require (b/emit! (mut graph) 26 11 [extended unsigned])))
+              extended)
+        ret (require (b/emit! (mut graph) 120 11 [start result (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)]
+    (push! (mut roots) ret)
+    (when (= mode 1) (push! (mut roots) field))
+    (let [(mut working) (g/duplicate graph a)
+          (mut lists) (uses/build working a)
+          (mut queue) (q/create (len (.instructions working)) a)
+          (mut protected) (bits/create (len (.instructions working)) a)]
+      (for root roots (bits/add! (mut protected) (cast i64 root)))
+      (q/add! (mut queue) (cast i64 extended))
+      (require (iter/run! (mut working) (mut lists) (mut queue) protected 8 a))
+      (assert (= (check-uses working lists) 0))
+      (require (rewrite/validate working 8 a))
+      (uses/release! (mut lists))
+      (q/release! (mut queue))
+      (bits/release! (mut protected))
+      (g/release! (mut working)))
+    (match (sccp/optimize graph 8 (slice roots) a)
+      (Err [e] (panic "{}" e))
+      (Ok [result]
+          (let [(mut result) result]
+            (assert (= (n/opcode (get (.instructions (.graph result))
+                                      (cast i64 field)))
+                       (if (and (= mode 0) (= shift-extra 0)) 51 35)))
+            (require (rewrite/validate (.graph result) 8 a))
+            (match (compile/image graph start [ret] "_high_before" a)
+              (Err [e] (panic "{}" e))
+              (Ok [before]
+                  (let [(mut before) before]
+                    (match (compile/image (.graph result)
+                                          start
+                                          (slice (.roots result))
+                                          "_high_after"
+                                          a)
+                      (Err [e] (panic "{}" e))
+                      (Ok [after]
+                          (let [(mut after) after]
+                            (match (jit/map-image before a)
+                              (Err [e] (panic "{}" e))
+                              (Ok [first]
+                                  (let [(mut first) first]
+                                    (match (jit/map-image after a)
+                                      (Err [e] (panic "{}" e))
+                                      (Ok [second]
+                                          (let [(mut second) second
+                                                f
+                                                  (p/cast (fnptr (cc/C)
+                                                                 [u64]
+                                                                 i64)
+                                                          (.base (.memory first)))
+                                                g
+                                                  (p/cast (fnptr (cc/C)
+                                                                 [u64]
+                                                                 i64)
+                                                          (.base (.memory second)))]
+                                            (for bits [(: 0 u64)
+                                                       1
+                                                       9223372036854775808
+                                                       18446744073709551615
+                                                       18364758544493064720
+                                                       81985529216486895]
+                                              (assert (= (f bits) (g bits))))
+                                            (jit/release-image! (mut second)))))
+                                    (jit/release-image! (mut first)))))
+                            (image/release! (mut after)))))
+                    (image/release! (mut before)))))
+            (rewrite/release! (mut result)))))
+    (free! (mut roots))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (for type [(: 8 i32) 9 10]
+    (high-view type 0 0)
+    (high-view type 1 0)
+    (high-view type 2 0)
+    (high-view type 0 -1)
+    (high-view type 0 1))
   (let [a (malloc-allocator)
         (mut graph) (g/create a)
         start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
