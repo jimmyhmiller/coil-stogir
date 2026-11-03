@@ -2,6 +2,7 @@
 (import "stogir.graph" :as g)
 (import "stogir.builder" :as b)
 (import "stogir.mem2ssa" :as mem)
+(import "stogir.load-forward" :as forward)
 (import "stogir.node" :as n)
 (import "stogir.types" :as types)
 (import "stogir.options" :as options)
@@ -168,37 +169,46 @@
           (if (= bytes 8)
               (: 0xFFFFFFFFFFFFFFFF u64)
               (- (<< (: 1 u64) (cast u64 (* bytes 8))) 1))]
-    (for level [(: 1 i32) 2 3]
-      (match (compile/image-with-options graph
-                                         start
-                                         [ret]
-                                         "_view"
-                                         (options/Options :level level)
-                                         a)
-        (Err [e] (panic "{}" e))
-        (Ok [code]
-            (let [(mut code) code]
-              (match (jit/map-image code a)
-                (Err [e] (panic "{}" e))
-                (Ok [loaded-code]
-                    (let [(mut loaded-code) loaded-code
-                          f
-                            (p/cast (fnptr (cc/C) [u64] u64)
-                                    (.base (.memory loaded-code)))]
-                      (for value [(: 0 u64)
-                                  1
-                                  127
-                                  128
-                                  255
-                                  65535
-                                  0x80000000
-                                  0x7FC00001
-                                  0x8000000000000000
-                                  0x7FF8000000001234
-                                  0xFFFFFFFFFFFFFFFF]
-                        (assert (= (f value) (& value mask))))
-                      (jit/release-image! (mut loaded-code)))))
-              (image/release! (mut code))))))
+    (let [(mut forwarded) (g/duplicate graph a)
+          (mut observed) (ArrayList::new [i32] a)]
+      (push! (mut observed) ret)
+      (assert (= (require (forward/run! (mut forwarded) (mut observed) 8 true a))
+                 1))
+      (require (rewrite/validate forwarded 8 a))
+      (for level [(: 1 i32) 2 3 4]
+        (match (compile/image-with-options (if (= level 4) forwarded graph)
+                                           start
+                                           [ret]
+                                           "_view"
+                                           (options/Options
+                                             :level (if (= level 4) 1 level))
+                                           a)
+          (Err [e] (panic "{}" e))
+          (Ok [code]
+              (let [(mut code) code]
+                (match (jit/map-image code a)
+                  (Err [e] (panic "{}" e))
+                  (Ok [loaded-code]
+                      (let [(mut loaded-code) loaded-code
+                            f
+                              (p/cast (fnptr (cc/C) [u64] u64)
+                                      (.base (.memory loaded-code)))]
+                        (for value [(: 0 u64)
+                                    1
+                                    127
+                                    128
+                                    255
+                                    65535
+                                    0x80000000
+                                    0x7FC00001
+                                    0x8000000000000000
+                                    0x7FF8000000001234
+                                    0xFFFFFFFFFFFFFFFF]
+                          (assert (= (f value) (& value mask))))
+                        (jit/release-image! (mut loaded-code)))))
+                (image/release! (mut code))))))
+      (g/release! (mut forwarded))
+      (free! (mut observed)))
     (g/release! (mut graph))))
 
 (defn loop-fixture [(updates bool)] (-> void)
@@ -334,7 +344,105 @@
     (free! (mut roots))
     (g/release! (mut graph))))
 
+;;; Mixed-width extraction must agree with actual machine memory semantics,
+;;; including signed high bytes and disjoint later stores. Opaque parameters
+;;; prevent constant folding from hiding an incorrect extraction.
+(defn forward-fixture [(type u8) (offset i64) (blocked i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        bytes (require (b/scalar-constant! (mut graph) 5 16 8))
+        displacement
+          (require (b/scalar-constant! (mut graph) 5 (cast u64 offset) 8))
+        eight (require (b/scalar-constant! (mut graph) 11 8 8))
+        slot (require (b/stack-allocate! (mut graph) start bytes 16))
+        high (require (b/emit! (mut graph) 26 6 [slot eight]))
+        bits (require (b/conversion! (mut graph) 36 5 8 slot))
+        shifted (require (b/emit! (mut graph) 26 5 [bits displacement]))
+        pointer (require (b/conversion! (mut graph) 36 6 8 shifted))
+        store (require (b/emit! (mut graph) 93 0 [slot slot x]))
+        later (require (b/emit! (mut graph) 93 0 [store high x]))
+        incoming
+          (case blocked
+            1 (require (b/emit! (mut graph) 92 5 [later slot]))
+            2
+              (let [byte (require (b/scalar-constant! (mut graph) 2 255 8))]
+                (require (b/emit! (mut graph) 93 0 [later pointer byte])))
+            3
+              (let [unknown
+                      (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))]
+                (require (b/emit! (mut graph) 93 0 [later unknown x])))
+            4
+              (let [end (require (b/emit! (mut graph) 114 0 [later]))]
+                (require (b/emit! (mut graph) 106 0 [end (: 0 i32)])))
+            later)
+        read
+          (require (b/emit! (mut graph) 91 (cast i32 type) [incoming pointer]))
+        extended
+          (if (= type 5)
+              read
+              (require (b/emit! (mut graph)
+                                (if (types/signed? (cast i32 type)) 33 34)
+                                5
+                                [read])))
+        ret (require (b/emit! (mut graph) 120 5 [read extended (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)
+        (mut working) (g/duplicate graph a)]
+    (push! (mut roots) ret)
+    (push! (mut roots) read)
+    (assert (= (require (forward/run! (mut working) (mut roots) 8 false a)) 0))
+    (assert (= (require (forward/run! (mut working) (mut roots) 8 true a))
+               (if (= blocked 0) 1 0)))
+    (require (rewrite/validate working 8 a))
+    (when (!= blocked 3)
+      (match (compile/image graph start [ret] "_memory_before" a)
+        (Err [e] (panic "{}" e))
+        (Ok [before]
+            (let [(mut before) before]
+              (match (compile/image working
+                                    start
+                                    (slice roots)
+                                    "_memory_after"
+                                    a)
+                (Err [e] (panic "{}" e))
+                (Ok [after]
+                    (let [(mut after) after]
+                      (match (jit/map-image before a)
+                        (Err [e] (panic "{}" e))
+                        (Ok [first]
+                            (let [(mut first) first]
+                              (match (jit/map-image after a)
+                                (Err [e] (panic "{}" e))
+                                (Ok [second]
+                                    (let [(mut second) second
+                                          f
+                                            (p/cast (fnptr (cc/C) [u64] u64)
+                                                    (.base (.memory first)))
+                                          g
+                                            (p/cast (fnptr (cc/C) [u64] u64)
+                                                    (.base (.memory second)))]
+                                      (for bits [(: 0 u64)
+                                                 1
+                                                 9223372036854775808
+                                                 18446744073709551615
+                                                 18364758544493064720
+                                                 81985529216486895]
+                                        (assert (= (f bits) (g bits))))
+                                      (jit/release-image! (mut second)))))
+                              (jit/release-image! (mut first)))))
+                      (image/release! (mut after)))))
+              (image/release! (mut before))))))
+    (g/release! (mut working))
+    (free! (mut roots))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (for type [(: 2 u8) 8 3 9 4 10 5]
+    (let [width (cast i64 (types/size (cast i32 type) 8))]
+      (for [offset 0 (+ (- 8 width) 1)]
+        (forward-fixture type offset 0))))
+  (for barrier [(: 1 i32) 2 3 4] (forward-fixture 10 4 barrier))
   (deep-chain)
   (loop-fixture false)
   (loop-fixture true)
