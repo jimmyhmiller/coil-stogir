@@ -426,3 +426,20 @@ typed COPY/BITCAST, its value reference remains and its resolved prior control
 closure is added as a root. Removed private storage/control-only roots retain
 their existing remapping. This preserves unrelated external effects through
 subsequent SCCP without adding artificial operands or changing graph semantics.
+
+### Bounded direct scalar graph-call expansion
+
+`call-inline` is an independent interprocedural extension, not a claimed port of
+an upstream module inliner. It retains the compact graph and existing typed
+prototype encoding. The transactional component expands only direct named,
+exact-prototype, single-block scalar definitions within an explicit node budget.
+Never takes precedence. Nested calls, CFG/frame-dependent operations, variadic
+and grouped/aggregate ABI cases remain calls in this initial component.
+
+Formal parameters map to actual SSA arguments; clones are reserved before edge
+patching, scalar constants retain their bits, and effects remain on the explicit
+control chain. CALL value roots retain their identity plus a control root.
+Affected nodes seed the ordinary iterative worklist; all structural analyses
+are rebuilt before matching/liveness. Linked before/after JIT images check
+arithmetic, memory effects, FP/signed zero, immutable inputs and byte-identical
+name/prototype/policy/budget fallbacks. No source annotations are changed.

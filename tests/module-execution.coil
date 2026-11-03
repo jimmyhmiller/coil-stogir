@@ -1,8 +1,12 @@
 (module stogir.tests.module-execution)
 (import "stogir.graph" :as g)
+(import "stogir.node" :as n)
 (import "stogir.builder" :as b)
 (import "stogir.symbols" :as symbols)
 (import "stogir.calls" :as calls)
+(import "stogir.call-inline" :as inlining)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.liveness" :as live)
 (import "stogir.link" :as link)
 (import "stogir.image" :as image)
 (import "stogir.text-data" :as text-data)
@@ -277,7 +281,314 @@
                   (jit/release-image! (mut owned)))))
           failures))))
 
+;;; Compare independently linked caller/callee images with graph expansion. The
+;;; original graphs remain immutable, including their constant-reference spaces.
+(defn inline-case [(kind i32)
+                   (never bool)
+                   (budget i32)
+                   (matching bool)
+                   (compatible bool)] (-> void)
+  (let [a (malloc-allocator)
+        pointer (or (= kind 3) (= kind 4) (= kind 7))
+        floating (or (= kind 5) (= kind 6))
+        scalar (if floating (: 12 i32) 11)
+        result (if (= kind 4) (: 0 i32) scalar)
+        (mut callee) (g/create a)
+        (mut caller) (g/create a)
+        start (require (b/emit! (mut callee) 104 0 [(: 0 i32)]))
+        entry (require (b/emit! (mut caller) 104 0 [(: 0 i32)]))
+        parameter (if pointer (: 6 i32) scalar)
+        x (require (b/emit! (mut callee) 71 parameter [start (: 0 i32) 0]))
+        input (require (b/emit! (mut caller) 71 parameter [entry (: 0 i32) 0]))
+        (mut parameters) (ArrayList::new [u8] a)
+        (mut arguments) (ArrayList::new [i32] a)
+        (mut control) start
+        (mut returned) x
+        (mut roots) (ArrayList::new [i32] a)]
+    (push! (mut parameters) (cast u8 parameter))
+    (push! (mut arguments) input)
+    (cond (= kind 0)
+            (set! returned (require (b/scalar-constant! (mut callee) 11 73 8)))
+          (= kind 2)
+            (let [three (require (b/scalar-constant! (mut callee) 11 3 8))]
+              (set! returned (require (b/emit! (mut callee) 26 11 [x three]))))
+          (= kind 3)
+            (do
+              (set! returned (require (b/emit! (mut callee) 91 11 [start x])))
+              (set! control returned))
+          (or (= kind 4) (= kind 7))
+            (let [value
+                    (require (b/emit! (mut callee) 71 11 [start (: 0 i32) 1]))
+                  argument
+                    (require (b/emit! (mut caller) 71 11 [entry (: 0 i32) 1]))]
+              (push! (mut parameters) 11)
+              (push! (mut arguments) argument)
+              (set! control
+                    (require (b/emit! (mut callee) 93 0 [start x value])))
+              (set! returned (if (= kind 4) 0 value)))
+          (= kind 5)
+            (let [three
+                    (require (b/scalar-constant! (mut callee)
+                                                 12
+                                                 0x4008000000000000
+                                                 8))]
+              (set! returned (require (b/emit! (mut callee) 26 12 [x three]))))
+          (= kind 6)
+            (set! returned
+                  (require (b/scalar-constant! (mut callee)
+                                               12
+                                               0x8000000000000000
+                                               8)))
+          :else 0)
+    (let [exit
+            (require (b/emit! (mut callee)
+                              120
+                              result
+                              [control returned (: 0 i32)]))
+          target (require (symbols/function! (mut caller) "_inline_leaf" 0))]
+      (match (calls/create 0 (cast u8 result) (slice parameters) a)
+        (Err [message] (panic "{}" message))
+        (Ok [signature]
+            (let [(mut signature) signature]
+              (if compatible
+                  (require (calls/function! (mut callee) signature a))
+                  (match (calls/create 32 (cast u8 result) (slice parameters) a)
+                    (Err [message] (panic "{}" message))
+                    (Ok [definition]
+                        (let [(mut definition) definition]
+                          (require (calls/function! (mut callee) definition a))
+                          (calls/release! (mut definition))))))
+              (let [called
+                      (require (calls/emit! (mut caller)
+                                            signature
+                                            entry
+                                            target
+                                            (slice arguments)
+                                            a))
+                    value
+                      (if (= kind 4)
+                          (require (b/emit! (mut caller) 91 11 [called input]))
+                          called)
+                    done
+                      (require (b/emit! (mut caller)
+                                        120
+                                        scalar
+                                        [(if (= kind 4) value called)
+                                         value
+                                         (: 0 i32)]))
+                    before-count (len (.instructions caller))
+                    before-constants (len (.constants caller))
+                    callee-count (len (.instructions callee))]
+                (push! (mut roots) done)
+                (push! (mut roots) called)
+                (match (calls/create 0 (cast u8 scalar) (slice parameters) a)
+                  (Err [message] (panic "{}" message))
+                  (Ok [caller-signature]
+                      (let [(mut caller-signature) caller-signature]
+                        (require (calls/function! (mut caller)
+                                                  caller-signature
+                                                  a))
+                        (calls/release! (mut caller-signature)))))
+                (match (inlining/optimize caller
+                                          (slice roots)
+                                          called
+                                          (inlining/Callee
+                                            :name
+                                              (if matching
+                                                  "_inline_leaf"
+                                                  "_other_leaf")
+                                            :graph callee
+                                            :entry start
+                                            :roots [exit]
+                                            :never never)
+                                          8
+                                          budget
+                                          a)
+                  (Err [message] (panic "{}" message))
+                  (Ok [output]
+                      (let [(mut output) output
+                            expected
+                              (if (or never
+                                      (<= budget 1)
+                                      (not matching)
+                                      (not compatible))
+                                  (: 0 i32)
+                                  1)]
+                        (assert (= (.changes output) expected))
+                        (assert (= (n/opcode (get (.instructions caller)
+                                                  (cast i64 called)))
+                                   79))
+                        (assert (= before-count (len (.instructions caller))))
+                        (assert (= before-constants (len (.constants caller))))
+                        (assert (= callee-count (len (.instructions callee))))
+                        (assert (= (n/opcode (get (.instructions (.graph output))
+                                                  (cast i64 called)))
+                                   (if (= expected 0) 79 (if (= result 0) 0 68))))
+                        (when (and (= expected 1) (or (= kind 4) (= kind 7)))
+                          ; An explicit CALL value/control root must retain the
+                          ; cloned STORE without relying on a separate RETURN root.
+                          (match (inlining/optimize caller
+                                                    [called]
+                                                    called
+                                                    (inlining/Callee
+                                                      :name "_inline_leaf"
+                                                      :graph callee
+                                                      :entry start
+                                                      :roots [exit]
+                                                      :never false)
+                                                    8
+                                                    64
+                                                    a)
+                            (Err [message] (panic "{}" message))
+                            (Ok [rooted]
+                                (let [(mut rooted) rooted
+                                      (mut marked)
+                                        (live/mark (.graph rooted)
+                                                   (slice (.roots rooted))
+                                                   a)
+                                      (mut stores) 0]
+                                  (for [r
+                                        before-count
+                                        (len (.instructions (.graph rooted)))]
+                                    (when (= (n/opcode (get (.instructions (.graph rooted))
+                                                            r))
+                                             93)
+                                      (assert (get marked r))
+                                      (set! stores (+ stores 1))))
+                                  (assert (= stores 1))
+                                  (free! (mut marked))
+                                  (rewrite/release! (mut rooted))))))
+                        (let [(mut original)
+                                (owned-image (compile/image caller
+                                                            entry
+                                                            (slice roots)
+                                                            "_inline_caller"
+                                                            a))
+                              (mut expanded)
+                                (owned-image (compile/image (.graph output)
+                                                            entry
+                                                            (slice (.roots output))
+                                                            "_inline_caller"
+                                                            a))
+                              (mut leaf)
+                                (owned-image (compile/image callee
+                                                            start
+                                                            [exit]
+                                                            "_inline_leaf"
+                                                            a))]
+                          (when (= expected 0)
+                            (assert (= (slice (.text original))
+                                       (slice (.text expanded))))
+                            (assert (= (slice (.data original))
+                                       (slice (.data expanded)))))
+                          (for after [false true]
+                            (match (link/compose [(if after expanded original)
+                                                  leaf]
+                                                 a)
+                              (Err [message] (panic "{}" message))
+                              (Ok [module]
+                                  (let [(mut module) module]
+                                    (match (jit/map-image (.image module) a)
+                                      (Err [message] (panic "{}" message))
+                                      (Ok [loaded]
+                                          (let [(mut loaded) loaded
+                                                index
+                                                  (find (.image module)
+                                                        "_inline_caller")
+                                                address
+                                                  (if (< index 0)
+                                                      (panic "inline caller symbol missing")
+                                                      (get (.addresses loaded)
+                                                           (cast i64 index)))]
+                                            (assert (>= index 0))
+                                            (if floating
+                                                (let [function
+                                                        (primitive/cast (fnptr (cc/C)
+                                                                               [f64]
+                                                                               f64)
+                                                                        (primitive/cast (ptr u8)
+                                                                                        address))]
+                                                  (for value [(: -100.0 f64)
+                                                              -1.0
+                                                              0.0
+                                                              5.0
+                                                              222.0]
+                                                    (let [(mut answer)
+                                                            (function value)]
+                                                      (if (= kind 6)
+                                                          (assert (= (load (primitive/cast (ptr u64)
+                                                                                           (mut answer)))
+                                                                     0x8000000000000000))
+                                                          (assert (= answer
+                                                                     (+ value
+                                                                        3.0)))))))
+                                                (if pointer
+                                                    (let [(mut slot) (: 0 i64)]
+                                                      (for value [-100 -1 0 5
+                                                                  222]
+                                                        (if (= kind 3)
+                                                            (do
+                                                              (set! slot value)
+                                                              (let [function
+                                                                      (primitive/cast (fnptr (cc/C)
+                                                                                             [(ptr i64)]
+                                                                                             i64)
+                                                                                      (primitive/cast (ptr u8)
+                                                                                                      address))]
+                                                                (assert (= (function (primitive/cast (ptr i64)
+                                                                                                     (mut slot)))
+                                                                           value))))
+                                                            (do
+                                                              (set! slot 0)
+                                                              (let [function
+                                                                      (primitive/cast (fnptr (cc/C)
+                                                                                             [(ptr i64)
+                                                                                              i64]
+                                                                                             i64)
+                                                                                      (primitive/cast (ptr u8)
+                                                                                                      address))]
+                                                                (assert (= (function (primitive/cast (ptr i64)
+                                                                                                     (mut slot))
+                                                                                     value)
+                                                                           value))
+                                                                (assert (= slot
+                                                                           value)))))))
+                                                    (let [function
+                                                            (primitive/cast (fnptr (cc/C)
+                                                                                   [i64]
+                                                                                   i64)
+                                                                            (primitive/cast (ptr u8)
+                                                                                            address))]
+                                                      (for value [-100 -1 0 5
+                                                                  222]
+                                                        (assert (= (function value)
+                                                                   (case kind
+                                                                     0 73
+                                                                     2
+                                                                       (+ value
+                                                                          3)
+                                                                     value)))))))
+                                            (jit/release-image! (mut loaded)))))
+                                    (link/release! (mut module))))))
+                          (image/release! (mut original))
+                          (image/release! (mut expanded))
+                          (image/release! (mut leaf)))
+                        (rewrite/release! (mut output)))))
+                (calls/release! (mut signature)))))))
+    (free! (mut roots))
+    (free! (mut arguments))
+    (free! (mut parameters))
+    (g/release! (mut caller))
+    (g/release! (mut callee))))
+
 (defn main [] (-> i64)
+  (inline-case 0 false 1 true true)
+  (inline-case 0 false 64 false true)
+  (inline-case 0 false 64 true false)
+  (for [kind 0 8]
+    (inline-case (cast i32 kind) false 64 true true)
+    (inline-case (cast i32 kind) true 64 true true)
+    (inline-case (cast i32 kind) false 0 true true))
   (let [allocator (malloc-allocator)
         (mut data) (data-image)
         (mut a) (pair-image true)
