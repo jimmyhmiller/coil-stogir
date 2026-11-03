@@ -7,7 +7,7 @@
 (import "stogir.frame" :as f)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [malloc-allocator])
-(import "coil.result" :use [Ok Err])
+(import "coil.result" :use [Result Ok Err])
 
 (defn fixed-check [] (-> i64)
   (let [allocator (malloc-allocator)
@@ -173,6 +173,127 @@
              failures)
     failures))
 
+;;; Frozen pairwise acceptance oracle for the indexed verifier.
+(defn pairwise-verify [(parts (ArrayList a/Part))
+                       (register-count i32)
+                       (allowed u64)]
+  (-> (Result i32 (slice u8)))
+  (let [(mut error) ""
+        (mut checked) (: 0 i32)
+        (mut i) 0
+        target-mask
+          (if (and (> register-count 0) (< register-count 64))
+              (- (<< (: 1 u64) (cast u64 register-count)) 1)
+              (: 0xFFFFFFFFFFFFFFFF u64))]
+    (when (or (<= register-count 0) (> register-count 64))
+      (set! error "invalid physical register count"))
+    (while (and (= error "") (< i (len parts)))
+      (let [part (at parts i)
+            reg (.register part)
+            (mut last-end) -1]
+        (when (> (len (.ranges part)) 0)
+          (when (= (& (& allowed target-mask) (.allowed part)) 0)
+            (set! error "interval has no admissible target register"))
+          (if (>= reg 0)
+              (when (or (>= reg register-count)
+                        (>= reg 64)
+                        (= (& (& allowed (.allowed part))
+                              (<< (: 1 u64) (cast u64 reg)))
+                           0))
+                (set! error "assignment uses forbidden register"))
+              (when (< (.spill-slot part) 0)
+                (set! error "interval has no physical location")))
+          (for range (.ranges part)
+            (when (or (< (.start range) 0)
+                      (<= (.end range) (.start range))
+                      (<= (.start range) last-end))
+              (set! error "invalid or unmerged live ranges"))
+            (set! last-end (.end range)))
+          (for use (.uses part)
+            (when (not (r/covers? (.ranges part) (.position use)))
+              (set! error "constraint outside interval"))
+            (when (and (>= (.kind use) 1) (< reg 0))
+              (set! error "register-required use spilled"))
+            (when (and (= (.kind use) 2) (!= reg (.register use)))
+              (set! error "fixed register constraint violated")))
+          (let [(mut j) 0]
+            (while (and (= error "") (< j i))
+              (let [other (at parts j)]
+                (when (and (>= (.parent part) 0)
+                           (= (.parent part) (.parent other))
+                           (!= (.allowed part) (.allowed other)))
+                  (set! error "split intervals disagree on register class"))
+                (when (and (>= reg 0)
+                           (= (.register other) reg)
+                           (>= (r/intersection (.ranges part)
+                                               (.ranges other)
+                                               0)
+                               0))
+                  (set! error "overlapping intervals share register")))
+              (set! j (+ j 1))))
+          (set! checked (+ checked 1))))
+      (set! i (+ i 1)))
+    (if (= error "") (Ok checked) (Err error))))
+
+(defn verifier-differential [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut failures) 0
+        (mut accepted) 0]
+    (for [scenario 0 1200]
+      (let [(mut parts) (ArrayList::new [a/Part] allocator)
+            variant (% scenario 12)
+            count (+ 1 (% (/ scenario 12) 23))
+            mask (if (= variant 10) (: 0x8000000000000000 u64) (: 3 u64))
+            registers (if (= variant 10) (: 64 i32) (: 2 i32))]
+        (for [j 0 count]
+          (let [i (- (- count j) 1)
+                (mut part)
+                  (a/create (if (= variant 9)
+                                (: 2147483647 i32)
+                                (cast i32 (if (= variant 8) -1 (% i 5))))
+                            allocator)
+                start (* i 16)]
+            (set! (.allowed part) mask)
+            (set! (.register part)
+                  (if (= variant 10) (: 63 i32) (cast i32 (% i 2))))
+            (for [k 0 3]
+              (r/add! (mut (.ranges part))
+                      (+ start (* k 4))
+                      (+ start (* k 4) 2)))
+            (when (= i 0)
+              (case variant
+                1 (r/add! (mut (.ranges part)) 0 500)
+                2 (set! (.register part) 3)
+                3 (set! (.register part) -1)
+                4 (c/add! (mut (.uses part)) 3 1 -1)
+                5 (c/add! (mut (.uses part)) 0 2 1)
+                6 (push! (mut (.ranges part)) (r/Range :start -1 :end 2))
+                7 (set! (.allowed part) 1)
+                9 (set! (.allowed part) 1)
+                11 (clear! (mut (.ranges part)))
+                0))
+            (when (and (= variant 11) (= i 1)) (set! (.allowed part) 1))
+            (push! (mut parts) part)))
+        (let [expected (pairwise-verify parts registers mask)
+              actual (verify/verify parts registers mask)]
+          (match expected
+            (Err [_]
+                 (match actual
+                   (Err [_] 0)
+                   (Ok [_] (set! failures (+ failures 1)))))
+            (Ok [count]
+                (set! accepted (+ accepted 1))
+                (match actual
+                  (Err [_] (set! failures (+ failures 1)))
+                  (Ok [other]
+                      (unless (= count other) (set! failures (+ failures 1))))))))
+        (for [i 0 (len parts)] (a/release! (elem (mut parts) i)))
+        (free! (mut parts))))
+    (println "verifier differential: 1200 cases, {} accepted, {} differences"
+             accepted
+             failures)
+    failures))
+
 (defn main [] (-> i64)
   (let [allocator (malloc-allocator)
         (mut parts) (ArrayList::new [a/Part] allocator)
@@ -227,5 +348,6 @@
         (set! i (+ i 1))))
     (free! (mut parts))
     (f/release! (mut frame))
+    (set! failures (+ failures (verifier-differential)))
     (println "allocator driver checks: {} failures" failures)
     (if (= failures 0) 0 1)))

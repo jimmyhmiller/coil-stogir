@@ -2042,3 +2042,20 @@ median thresholds; the confirming observed ranges also meet both. A saturated
 external-Node run is retained with explicit rejection. Full native/AOT, FAST and
 installed SDK checks pass. See LOCATION_INDEX.md and the Coil benchmark report.
 This checkpoint does not claim whole-CLI speed or full upstream pass parity.
+
+## Small compiler-gap iteration
+
+The full compiler comparison exposed much larger costs than the earlier stencil.
+Development now isolates those costs in benchmarks/compiler-gaps rather than
+waiting for each full self-rebuild. The aggregate fixture lost all stack traffic
+through nonescaping field promotion, including full-width integer address
+containers and same-width scalar bitcasts. Cross-block Phi promotion is still
+open. Standalone JIT, linked AOT, public O2/O3 paths and ASAN pass focused tests.
+The ordinary-wrapper fixture retains a call and isolates the inlining gap.
+
+The independent allocation verifier now uses a sparse parent-class index and a
+sorted live-range sweep, preserving all validation rather than bypassing it.
+The frozen pairwise oracle agrees on 1,200 scenarios; pressure/call/FP/switch
+integration and ASAN pass. See ALLOCATION_VERIFICATION.md and its raw scaling
+data. Full compiler measurements and installed delivery are separate gates;
+small-case wins do not establish the full compiler performance target.
