@@ -3,6 +3,7 @@
 (import "stogir.builder" :as b)
 (import "stogir.mem2ssa" :as mem)
 (import "stogir.node" :as n)
+(import "stogir.types" :as types)
 (import "stogir.options" :as options)
 (import "stogir.sccp" :as sccp)
 (import "stogir.sccp-rewrite" :as rewrite)
@@ -134,6 +135,72 @@
     (g/release! (mut graph))
     (free! (mut roots))))
 
+;;; Memory and BITCAST views must agree on narrow sign bits and FP payloads.
+(defn scalar-view [(stored i32) (loaded i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        bytes (types/scalar-size stored 8)
+        unsigned (case bytes 1 (: 2 i32) 2 (: 3 i32) 4 (: 4 i32) 5)
+        raw
+          (if (= bytes 8)
+              x
+              (require (b/conversion! (mut graph) 35 unsigned 8 x)))
+        input
+          (if (= stored unsigned)
+              raw
+              (require (b/conversion! (mut graph) 36 stored 8 raw)))
+        extent (require (b/scalar-constant! (mut graph) 5 (cast u64 bytes) 8))
+        slot (require (b/stack-allocate! (mut graph) start extent 16))
+        write (require (b/emit! (mut graph) 93 0 [slot slot input]))
+        read (require (b/emit! (mut graph) 91 loaded [write slot]))
+        bits
+          (if (= loaded unsigned)
+              read
+              (require (b/conversion! (mut graph) 36 unsigned 8 read)))
+        result
+          (if (= bytes 8)
+              bits
+              (require (b/conversion! (mut graph) 34 5 8 bits)))
+        ret (require (b/emit! (mut graph) 120 5 [read result (: 0 i32)]))
+        mask
+          (if (= bytes 8)
+              (: 0xFFFFFFFFFFFFFFFF u64)
+              (- (<< (: 1 u64) (cast u64 (* bytes 8))) 1))]
+    (for level [(: 1 i32) 2 3]
+      (match (compile/image-with-options graph
+                                         start
+                                         [ret]
+                                         "_view"
+                                         (options/Options :level level)
+                                         a)
+        (Err [e] (panic "{}" e))
+        (Ok [code]
+            (let [(mut code) code]
+              (match (jit/map-image code a)
+                (Err [e] (panic "{}" e))
+                (Ok [loaded-code]
+                    (let [(mut loaded-code) loaded-code
+                          f
+                            (p/cast (fnptr (cc/C) [u64] u64)
+                                    (.base (.memory loaded-code)))]
+                      (for value [(: 0 u64)
+                                  1
+                                  127
+                                  128
+                                  255
+                                  65535
+                                  0x80000000
+                                  0x7FC00001
+                                  0x8000000000000000
+                                  0x7FF8000000001234
+                                  0xFFFFFFFFFFFFFFFF]
+                        (assert (= (f value) (& value mask))))
+                      (jit/release-image! (mut loaded-code)))))
+              (image/release! (mut code))))))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
   (fixture false false false false false)
   (fixture false false false false true)
@@ -141,5 +208,13 @@
   (fixture false true false false true)
   (fixture false false true false true)
   (fixture false false false true true)
-  (println "mem2ssa: scalar partitions, escape, overlap and volatile JIT checks pass")
+  (for stored [(: 2 i32) 7 8]
+    (for loaded [(: 2 i32) 7 8] (scalar-view stored loaded)))
+  (for stored [(: 3 i32) 9]
+    (for loaded [(: 3 i32) 9] (scalar-view stored loaded)))
+  (for stored [(: 4 i32) 10 13]
+    (for loaded [(: 4 i32) 10 13] (scalar-view stored loaded)))
+  (for stored [(: 5 i32) 6 11 12]
+    (for loaded [(: 5 i32) 6 11 12] (scalar-view stored loaded)))
+  (println "mem2ssa: partitions, 1254 scalar-view answers, escape/overlap/volatile checks pass")
   0)
