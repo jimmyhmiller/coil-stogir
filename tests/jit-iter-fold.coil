@@ -8,6 +8,7 @@
 (import "stogir.sccp" :as sccp)
 (import "stogir.sccp-analysis" :as analysis)
 (import "stogir.sccp-values" :as values)
+(import "stogir.sccp-fold" :as fold-bridge)
 (import "coil.arraylist" :use [ArrayList])
 (import "stogir.iter-fold" :as iter)
 (import "stogir.sccp-rewrite" :as rewrite)
@@ -263,6 +264,43 @@
     (g/release! (mut original))
     (g/release! (mut graph))))
 
+(defn check-current-view [(graph g/Graph)] (-> void)
+  (let [a (malloc-allocator)
+        (mut domain) (values/create (len (.instructions graph)) a)]
+    (for [i 1 (len (.instructions graph))]
+      (values/kind! (mut domain) (cast i32 i) 131))
+    (for [i 1 (len (.instructions graph))]
+      (let [opcode (n/opcode (get (.instructions graph) i))]
+        (when (iter/foldable? (cast i32 opcode))
+          (for pointer-bytes [(: 4 i32) 8]
+            (match (fold-bridge/evaluate graph
+                                         domain
+                                         (cast i32 i)
+                                         pointer-bytes)
+              (Err [message]
+                   (match (fold-bridge/evaluate-current graph
+                                                        (cast i32 i)
+                                                        pointer-bytes)
+                     (Err [current] (assert (= current message)))
+                     (Ok [_] (panic "current view accepted lattice error"))))
+              (Ok [decision]
+                  (match (fold-bridge/evaluate-current graph
+                                                       (cast i32 i)
+                                                       pointer-bytes)
+                    (Err [message] (panic "current view: {}" message))
+                    (Ok [current]
+                        (assert (= (.kind current) (.kind decision)))
+                        (assert (= (.source current) (.source decision)))
+                        (assert (= (.header (.constant current))
+                                   (.header (.constant decision))))
+                        (assert (= (.op1 (.constant current))
+                                   (.op1 (.constant decision))))
+                        (assert (= (.op2 (.constant current))
+                                   (.op2 (.constant decision))))
+                        (assert (= (.op3 (.constant current))
+                                   (.op3 (.constant decision))))))))))))
+    (values/release! (mut domain))))
+
 ;;; Compare raw native AND/conversion/CMP instructions against the optimized
 ;;; graph. Byte inputs are exhaustive, with wider sign/truncation boundaries.
 (defn masked-bits [(ty i32) (bits u64)] (-> u64)
@@ -340,6 +378,7 @@
                          (values/state-kind result)
                          (n/constant-bits result)))
                 (analysis/release! (mut facts)))))))
+    (check-current-view graph)
     (match (sccp/optimize graph 8 [ret] a)
       (Err [message] (panic "mask comparison: {}" message))
       (Ok [optimized]
