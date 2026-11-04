@@ -1625,7 +1625,186 @@
     (g/release! (mut caller))
     (g/release! (mut leaf))))
 
+(defn preflight-message [(value (Result (Option rewrite/Rewritten) (slice u8)))]
+  (-> (slice u8))
+  (match value
+    (Err [message] message)
+    (Ok [outcome]
+        (match outcome
+          (None [] "")
+          (Some [owned]
+                (let [(mut owned) owned]
+                  (rewrite/release! (mut owned))
+                  (panic "Never preflight unexpectedly changed caller")))))))
+
+;;; Compare a repeated-target batch against a fresh single-site transaction.
+;;; Aliases deliberately share instructions but differ in other validation input.
+;;; Do not release shallow aliases: only the original and duplicate own storage.
+(defn repeated-validation [(mode i32) (budget i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut callee) (g/create a)
+        (mut caller) (g/create a)
+        start (require (b/emit! (mut callee) 104 0 [(: 0 i32)]))
+        literal (require (b/scalar-constant! (mut callee) 11 42 8))
+        inner (require (symbols/function! (mut callee) "_cache_inner" 0))
+        entry (require (b/emit! (mut caller) 104 0 [(: 0 i32)]))
+        target (require (symbols/function! (mut caller) "_cache_callee" 0))]
+    (match (calls/create 0 11 [] a)
+      (Err [message] (panic "{}" message))
+      (Ok [signature]
+          (let [(mut signature) signature]
+            (require (calls/function! (mut callee) signature a))
+            (let [effect
+                    (require (calls/emit! (mut callee)
+                                          signature
+                                          start
+                                          inner
+                                          []
+                                          a))
+                  exit
+                    (require (b/emit! (mut callee)
+                                      120
+                                      11
+                                      [effect literal (: 0 i32)]))
+                  first
+                    (require (calls/emit! (mut caller)
+                                          signature
+                                          entry
+                                          target
+                                          []
+                                          a))
+                  second
+                    (require (calls/emit! (mut caller)
+                                          signature
+                                          first
+                                          target
+                                          []
+                                          a))
+                  third (require (calls/emit! (mut caller) signature second target [] a))
+                  done
+                    (require (b/emit! (mut caller)
+                                      120
+                                      11
+                                      [third third (: 0 i32)]))
+                  (mut other) (g/duplicate callee a)
+                  (mut alias) callee]
+              (case mode
+                1
+                  (do
+                    (set! (mut (.constants other)) 0 (n/constant 0 0 0 42))
+                    (set! (.constants alias) (.constants other)))
+                2
+                  (do
+                    (set! (mut (.arities other)) 1 -1)
+                    (set! (.arities alias) (.arities other)))
+                3
+                  (do
+                    (set! (mut (.constant-spans other)) 0 0)
+                    (set! (.constant-spans alias) (.constant-spans other)))
+                4
+                  (do
+                    (set! (mut (.bytes (.strings other))) 0 0)
+                    (set! (.bytes (.strings alias)) (.bytes (.strings other))))
+                5
+                  (let [(mut entry) (get (.entries (.strings other)) 0)]
+                    (set! (.length entry) 0)
+                    (set! (mut (.entries (.strings other))) 0 entry)
+                    (set! (.entries (.strings alias))
+                          (.entries (.strings other))))
+                6 (set! (.len (.arities alias)) 0)
+                7 (set! (.len (.constant-spans alias)) 0)
+                8 (set! (.len (.entries (.strings alias))) 0)
+                9 (set! (.len (.constants alias)) 0)
+                10 (set! (.function-prototype alias) 0)
+                14 (set! (.len (.instructions alias)) 1)
+                15 (do
+                     (set! (mut (.constants other)) 0 (n/constant 11 11 0 43))
+                     (set! (.constants alias) (.constants other)))
+                0)
+              (let [original
+                      (inlining/Callee
+                        :name "_cache_callee"
+                        :graph callee
+                        :entry start
+                        :roots [exit]
+                        :observed [exit]
+                        :never true)
+                    altered
+                      (inlining/Callee
+                        :name "_cache_callee"
+                        :graph alias
+                        :entry start
+                        :roots (if (= mode 11) [(: 999999 i32)] [exit])
+                        :observed (if (= mode 12) [(: 999999 i32)] [exit])
+                        :never true)
+                    first-site (inlining/Site :reference first :target original)
+                    second-site
+                      (inlining/Site :reference second :target altered)
+                    expected
+                      (preflight-message (inlining/optimize-sites-if-changed caller
+                                                                             [done]
+                                                                             [second-site]
+                                                                             8
+                                                                             budget
+                                                                             a))
+                    actual
+                      (preflight-message (inlining/optimize-sites-if-changed caller
+                                                                             [done]
+                                                                             [first-site
+                                                                              second-site]
+                                                                             8
+                                                                             budget
+                                                                             a))]
+                (assert (= actual expected))
+                (when (or (and (>= mode 1) (<= mode 9))
+                          (= mode 11)
+                          (= mode 12)
+                          (= mode 14))
+                  (assert (!= actual "")))
+                (when (= mode 0) (assert (= actual "")))
+                (when (= mode 15)
+                  (assert (= (preflight-message (inlining/optimize-sites-if-changed caller [done]
+                     [first-site second-site (inlining/Site :reference third :target original)]
+                     8 budget a)) "")))
+                (when (= mode 13)
+                  (assert (!= (preflight-message (inlining/optimize-sites-if-changed caller
+                                                                                     [done]
+                                                                                     [first-site
+                                                                                      first-site]
+                                                                                     8
+                                                                                     budget
+                                                                                     a))
+                              "")))
+                ; A new transaction must not inherit a successful prior proof.
+                (when (= mode 0)
+                  (set! (mut (.constants callee)) 0 (n/constant 0 0 0 42))
+                  (let [changed
+                          (inlining/Callee
+                            :name "_cache_callee"
+                            :graph callee
+                            :entry start
+                            :roots [exit]
+                            :observed [exit]
+                            :never true)]
+                    (assert (!= (preflight-message (inlining/optimize-sites-if-changed caller
+                                                                                       [done]
+                                                                                       [(inlining/Site
+                                                                                          :reference
+                                                                                            second
+                                                                                          :target
+                                                                                            changed)]
+                                                                                       8
+                                                                                       budget
+                                                                                       a))
+                                "")))))
+              (g/release! (mut other)))
+            (calls/release! (mut signature)))))
+    (g/release! (mut caller))
+    (g/release! (mut callee))))
+
 (defn main [] (-> i64)
+  (for mode (range 0 16)
+    (for budget [(: 0 i32) 512] (repeated-validation (cast i32 mode) budget)))
   (for ty [(: 2 u8) 3 4 5 6 8 9 10 11]
     (for opcode [(: 29 i32) 30] (unguarded-division-inline opcode ty)))
   (for spec [[(: 5 u8) 2]

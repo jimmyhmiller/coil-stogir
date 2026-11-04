@@ -20,6 +20,8 @@
 (import "stogir.bitqueue" :as q)
 (import "stogir.liveness" :as live)
 (import "coil.arraylist" :use [ArrayList])
+(import "coil.hashmap" :use [HashMap])
+(import "coil.primitive" :as p)
 (import "coil.alloc" :use [Allocator])
 (import "coil.result" :use [Result Ok Err Option Some None])
 
@@ -920,9 +922,39 @@
 
 (defstruct Site [(reference i32) (target Callee)])
 
+;;; All storage consulted by rewrite.validate: instructions/arities, constants/
+;;; spans, binary string bytes/entries, and function prototype metadata. Interner
+;;; hash tables and allocation capacities are not read by any of these validators.
+;;; Identity is valid only inside this call's immutable-callee transaction.
+(defn validation-view [(graph g/Graph)] (-> (array u64 13))
+  [(p/cast u64 (.data (.instructions graph)))
+   (cast u64 (len (.instructions graph)))
+   (p/cast u64 (.data (.arities graph)))
+   (cast u64 (len (.arities graph)))
+   (p/cast u64 (.data (.constants graph)))
+   (cast u64 (len (.constants graph)))
+   (p/cast u64 (.data (.constant-spans graph)))
+   (cast u64 (len (.constant-spans graph)))
+   (p/cast u64 (.data (.bytes (.strings graph))))
+   (cast u64 (len (.bytes (.strings graph))))
+   (p/cast u64 (.data (.entries (.strings graph))))
+   (cast u64 (len (.entries (.strings graph))))
+   (cast u64 (.function-prototype graph))])
+
+(defstruct Validated [(view (array u64 13)) (next i64)])
+
+(defn same-view? [(left (array u64 13)) (right (array u64 13))] (-> bool)
+  (let [(mut same) true
+        (mut i) (: 0 i64)]
+    (while (and same (< i 13))
+      (set! same (= (get left i) (get right i)))
+      (set! i (+ i 1)))
+    same))
+
 ;;; Borrow the source until the first proven expansion, then open one owning
 ;;; transaction. None means no mutation and no graph copy; Some owns its result.
-;;; All input validation still runs, including on no-change and Never sites.
+;;; All inputs remain validated, including on no-change and Never sites.
+;;; Duplicate immutable callee views share a successful proof only in this call.
 ;;; The budget bounds total reserved instruction cells, not each individual
 ;;; call or the source graph's stable-reference storage length. Mapped PARAMs,
 ;;; START/RETURN and NOP cells do not consume caller instruction space. Casts,
@@ -936,7 +968,9 @@
                                  (a (dyn Allocator))]
   (-> (Result (Option rewrite/Rewritten) (slice u8)))
   (let [(mut error) ""
-        (mut seen) (zeros (len (.instructions source)) a)]
+        (mut seen) (zeros (len (.instructions source)) a)
+        (mut validated) (ArrayList::new [Validated] a)
+        (mut validation-heads) (HashMap::new-scalar [u64 i64] a)]
     (when (or (< budget 0) (> budget 16384))
       (set! error "invalid inline budget"))
     (match (rewrite/validate source pointer-bytes a)
@@ -949,9 +983,24 @@
       (let [target (.target site)
             reference (.reference site)]
         (when (= error "")
-          (match (rewrite/validate (.graph target) pointer-bytes a)
-            (Err [message] (set! error message))
-            (Ok [_] 0)))
+          (let [view (validation-view (.graph target))
+                key (get view 0)
+                head
+                  (match (get validation-heads key)
+                    (Some [x] x)
+                    (None [] (: 0 i64)))
+                (mut cursor) head
+                (mut found) false]
+            (while (and (> cursor 0) (not found))
+              (let [prior (get validated (- cursor 1))]
+                (set! found (same-view? view (.view prior)))
+                (set! cursor (.next prior))))
+            (unless found
+              (match (rewrite/validate (.graph target) pointer-bytes a)
+                (Err [message] (set! error message))
+                (Ok [_]
+                    (push! (mut validated) (Validated :view view :next head))
+                    (set! (mut validation-heads) key (len validated)))))))
         (for root (.roots target)
           (when (or (<= root 0) (not (g/contains? (.graph target) root)))
             (set! error "invalid inline callee root")))
@@ -972,6 +1021,8 @@
                         (set! (mut seen) (cast i64 reference) 1))))
           (None [] (set! error "inline CALL missing")))))
     (free! (mut seen))
+    (free! (mut validated))
+    (free! (mut validation-heads))
     (if (!= error "")
         (Err error)
         (let [(mut graph) source
@@ -1020,9 +1071,12 @@
                         (Err [message] (set! error message))
                         (Ok [count]
                             (set! changes (+ changes count))
-                            (let [added (cast i32 (- (len (.instructions graph)) before))]
+                            (let [added
+                                    (cast i32
+                                          (- (len (.instructions graph)) before))]
                               (if (> added remaining)
-                                  (set! error "inline cloning exceeded preflight budget")
+                                  (set! error
+                                        "inline cloning exceeded preflight budget")
                                   (set! remaining (- remaining added))))))))))))
           (match capture-edges
             (None [] 0)
