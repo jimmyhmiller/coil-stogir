@@ -922,7 +922,57 @@
     (assert (= (n/opcode (get (.instructions graph) (cast i64 read))) 91))
     (g/release! (mut graph))))
 
+; Only original entry-prefix objects may cross opaque stack scopes. Exercise
+; inner objects, copied/observed saved pointers, and explicit frees as fallbacks.
+(defn scoped-entry [(mode i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        y (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        size (require (b/scalar-constant! (mut graph) 5 8 8))
+        three (require (b/scalar-constant! (mut graph) 11 3 8))
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))
+        early (if (= mode 1) (require (b/emit! (mut graph) 83 6 [start])) start)
+        slot (require (b/stack-allocate! (mut graph) early size 16))
+        xx (require (b/emit! (mut graph) 26 11 [x three]))
+        yy (require (b/emit! (mut graph) 28 11 [y seven]))
+        sum (require (b/emit! (mut graph) 26 11 [xx yy]))
+        stored (require (b/emit! (mut graph) 93 0 [slot slot sum]))
+        saved (if (= mode 1) early (require (b/emit! (mut graph) 83 6 [stored])))
+        inner (require (b/stack-allocate! (mut graph) (if (= mode 1) stored saved) size 16))
+        prior (if (= mode 4) (require (b/stack-free! (mut graph) inner size)) inner)
+        restore (if (= mode 2) (require (b/emit! (mut graph) 68 6 [saved (: 0 i32)])) saved)
+        ; Read inner storage before restoration, and outer storage after it.
+        loaded (require (b/emit! (mut graph) 91 11 [prior slot]))
+        ended (require (b/emit! (mut graph) 84 0 [loaded restore]))
+        value (if (= mode 1) loaded (require (b/emit! (mut graph) 91 11 [ended slot])))
+        ret (require (b/emit! (mut graph) 120 11 [(if (= mode 1) ended value) value (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)
+        (mut working) (g/duplicate graph a)]
+    (push! (mut roots) ret)
+    (when (= mode 3) (push! (mut roots) saved))
+    (for before [true false]
+      (unless before
+        (require (mem/promote! (mut working) (mut roots) a))
+        (assert (= (n/opcode (get (.instructions working) (cast i64 slot)))
+                   (if (= mode 0) (: 0 u8) 81))))
+      (match (compile/image (if before graph working) start (slice roots) "_scoped" a)
+        (Err [e] (panic "{}" e))
+        (Ok [code]
+            (let [(mut code) code] (execute code) (image/release! (mut code))))))
+    (for level [(: 2 i32) 3]
+      (match (compile/image-with-options graph start [ret] "_scoped_public"
+                                         (options/Options :level level) a)
+        (Err [e] (panic "{}" e))
+        (Ok [code]
+            (let [(mut code) code] (execute code) (image/release! (mut code))))))
+    (free! (mut roots))
+    (g/release! (mut working))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (for mode [(: 0 i32) 1 2 3 4] (scoped-entry mode))
   (for kind [(: 73 i32) 74 75 77]
     (for commuted [false true]
       (for write [false true] (symbolic-offset kind commuted write))))
