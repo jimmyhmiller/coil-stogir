@@ -889,7 +889,88 @@
     (free! (mut roots))
     (g/release! (mut graph))))
 
+;;; Independent widened arithmetic oracle for the original shift expression.
+(defn rotate-piece [(value u64) (count u64) (width i32) (left bool)] (-> u64)
+  (let [mask (- (<< (: 1 u128) (cast u128 width)) 1)
+        x (& (cast u128 value) mask)
+        shift (cast u128 (& count (cast u64 (- width 1))))]
+    (cast u64 (& (if left (<< x shift) (>> x shift)) mask))))
+
+(defn rotate-restart [(ty u8) (mode i32) (add bool) (swap bool)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 0]))
+        y (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 1]))
+        width (* 8 (types/scalar-size (cast i32 ty) 8))
+        mask (cast u64 (- (<< (: 1 u128) (cast u128 width)) 1))
+        amount (case mode 0 (: 0 u64) 1 1 2 (cast u64 (- width 1)) 3 (cast u64 width) 7 1 8 (cast u64 (+ width 1)) 5)
+        literal (require (b/scalar-constant! (mut graph) (cast i32 ty) amount 8))
+        full (require (b/scalar-constant! (mut graph) (cast i32 ty) (cast u64 width) 8))
+        lc (if (= mode 4) y literal)
+        rc (if (= mode 4)
+               (require (b/emit! (mut graph) 27 (cast i32 ty) [full y]))
+               (require (b/scalar-constant! (mut graph) (cast i32 ty)
+                          (& (if (= mode 6) (cast u64 (- width 4)) (- (cast u64 width) amount)) mask) 8)))
+        first (if (= mode 7)
+                  (require (b/emit! (mut graph) 28 (cast i32 ty)
+                            [x (require (b/scalar-constant! (mut graph) (cast i32 ty) 2 8))]))
+                  (require (b/emit! (mut graph) 49 (cast i32 ty) [x lc])))
+        second (require (b/emit! (mut graph) 50 (cast i32 ty) [(if (= mode 5) y x) rc]))
+        result (require (b/emit! (mut graph) (if add 26 46) (cast i32 ty)
+                         (if swap [second first] [first second])))
+        ret (require (b/emit! (mut graph) 120 (cast i32 ty) [start result (: 0 i32)]))
+        expected-fold (and (!= mode 5) (!= mode 6) (!= mode 8)
+                           (or (not add) (and (!= mode 0) (!= mode 3) (!= mode 4))))]
+    ; The incremental restart must preserve exact-position use multisets,
+    ; including the explicitly shared/rooted original producer.
+    (let [(mut copy) (g/duplicate graph a)
+          (mut lists) (uses/build copy a)
+          (mut queue) (q/create (len (.instructions copy)) a)
+          (mut protected) (bits/create (len (.instructions copy)) a)]
+      (for root [ret result first] (bits/add! (mut protected) (cast i64 root)))
+      (q/add! (mut queue) (cast i64 result))
+      (require (iter/run! (mut copy) (mut lists) (mut queue) protected 8 a))
+      (assert (= (check-uses copy lists) 0))
+      (bits/release! (mut protected))
+      (q/release! (mut queue))
+      (uses/release! (mut lists))
+      (g/release! (mut copy)))
+    (match (sccp/optimize graph 8 [ret result first] a)
+      (Err [message] (panic "rotate ty={} mode={}: {}" ty mode message))
+      (Ok [optimized]
+          (let [(mut optimized) optimized
+                op (n/opcode (get (.instructions (.graph optimized)) (cast i64 result)))]
+            (assert (= (or (= op 52) (= op 53)) expected-fold))
+            (for original [true false]
+              (match (compile/image (if original graph (.graph optimized))
+                                    start (if original [ret result first] (slice (.roots optimized))) "_rotate_restart" a)
+                (Err [message] (panic "{}" message))
+                (Ok [code]
+                    (let [(mut code) code]
+                      (match (jit/map-image code a)
+                        (Err [message] (panic "{}" message))
+                        (Ok [loaded]
+                            (let [(mut loaded) loaded
+                                  f (p/cast (fnptr (cc/C) [u64 u64] u64) (.base (.memory loaded)))]
+                              (for value [(: 0 u64) 1 3 0x80 0x8000 0x80000000 0x8000000000000000 0xFFFFFFFFFFFFFFFF 0xFEDCBA9876543210]
+                                (for count [(: 0 u64) 1 5 7 8 15 16 31 32 63 64 65 127 255 0xFFFFFFFFFFFFFFFF]
+                                  (let [c (if (= mode 4) (& count mask) amount)
+                                        d (if (= mode 4) (& (- (+ (cast u128 width) (+ 1 (cast u128 mask))) (cast u128 c)) (cast u128 mask)) (cast u128 (if (= mode 6) (cast u64 (- width 4)) (- (cast u64 width) amount))))
+                                        l (rotate-piece value c width true)
+                                        r (rotate-piece (if (= mode 5) count value) (cast u64 d) width false)
+                                        wanted (& (if add (+ l r) (| l r)) mask)]
+                                    (assert (= (& (f value count) mask) wanted)))))
+                              (jit/release-image! (mut loaded)))))
+                      (image/release! (mut code))))))
+            (rewrite/release! (mut optimized)))))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (for ty [(: 2 u8) 3 4 5 8 9 10 11]
+    (for mode [(: 0 i32) 1 2 3 4 5 6 7 8]
+      (for add [false true]
+        (for swap [false true] (rotate-restart ty mode add swap)))))
   (constant-cse-invalidation)
   (for observed [(: 0 i32) 1 2 3]
     (for seed [(: 0 i32) 1 2] (constant-cse-case observed seed)))
