@@ -1270,3 +1270,9 @@ rebuilt use edges and typed validation agree. Child traps verify the default
 store before exiting, and serialized linked AOT answers pass. ASAN/debug verifier,
 module execution and SCCP control suites also pass.
 See [packed switch values](SWITCH_VALUE_LOOKUP.md) for commands and limitations.
+
+The domain suite further checks CHAR/address/bool selector normalization,
+address-result fallback, both floating-result fallback types, and a32-bit
+pointer selector near UINT32_MAX. There are111 native differential fixtures,
+two FP no-change graphs and one32-bit pointer graph validation; all pass under
+ASAN/debug. The linked AOT driver also passes after this expansion.

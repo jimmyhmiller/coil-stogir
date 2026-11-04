@@ -30,3 +30,8 @@ validation and actual SCCP dispatch removal. Trap children check the default
 store before exiting. Verifier, module execution and native SCCP-control
 ASAN/debug suites pass too. No compiler integration or speedup is established
 by these correctness checks; broader fallback checks and measurements follow.
+
+The expanded domain checks pass111 native fixtures, two floating-result
+no-change checks and a32-bit pointer-selector graph validation. Boolean selector
+inputs use their actual canonical conversion semantics; CHAR/address selectors
+are checked at width boundaries. Address/FP results retain the original graph.

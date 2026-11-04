@@ -324,7 +324,7 @@
             (free! (mut extra))
             (uses/release! (mut edges))
             (set! edges (uses/build working a))))
-        (let [expected (if (and (or (= mode 0) (= mode 1) (= mode 2) (= mode 11)) (<= length 64)) (: 1 i32) 0)]
+        (let [expected (if (and (or (= mode 0) (= mode 1) (= mode 2) (= mode 11)) (<= length 64) (!= result-type 6)) (: 1 i32) 0)]
           (assert (= (lookup/rewrite! (mut working) roots (mut edges) (mut queue) 8 a) expected))
           (when (= expected 0)
             (assert (= (len (.instructions working))
@@ -347,7 +347,7 @@
           (Err [message] (panic "packed pipeline: {}" message))
           (Ok [owned]
               (let [(mut optimized) owned]
-                (when (and (or (= mode 0) (= mode 1) (= mode 2) (= mode 11)) (<= length 64))
+                (when (and (or (= mode 0) (= mode 1) (= mode 2) (= mode 11)) (<= length 64) (!= result-type 6))
                   (assert (!= (n/opcode (get (.instructions (.graph optimized)) (cast i64 split))) 117)))
                 (for version [(: 0 i32) 1 2]
                   (let [selected (case version 0 graph 1 working (.graph optimized))]
@@ -377,10 +377,17 @@
                                                                   (.base (.memory mapped)))]
                                     (for offset [(: -1 i64) 0 1 2 3 4 5 6 7 8 9 10 11 18 19 20 (- length 1) length (+ length 1)]
                                       (let [key (cast u64 (+ (cast i128 first) (cast i128 offset)))
-                                            index (if (or (= mode 3) (= mode 4)) (/ offset 2) offset)
-                                            inside (and (>= offset 0)
-                                                        (< index length)
-                                                        (or (!= mode 3) (= (% offset 2) 0)))
+                                            selector-mask (lookup/mask selector-type 8)
+                                            raw-bits (& (^ key bias) selector-mask)
+                                            canonical (if (= selector-type 1)
+                                                          (if (= raw-bits 0) (: 0 u64) 1) raw-bits)
+                                            ordered (^ canonical bias)
+                                            modulus (<< (: 1 u128) (cast u128 (* 8 (types/scalar-size selector-type 8))))
+                                            distance (cast u64 (& (- (+ (cast u128 ordered) modulus) (cast u128 first))
+                                                                  (cast u128 selector-mask)))
+                                            index (cast i64 (if (or (= mode 3) (= mode 4)) (/ distance 2) distance))
+                                            inside (and (< distance (cast u64 (* length (if (or (= mode 3) (= mode 4)) 2 1))))
+                                                        (or (!= mode 3) (= (% distance 2) 0)))
                                             answer (if inside (packed-value result-type index mode)
                                                        (if (= result-type 1) 0 (& (: 777 u64) result-mask)))
                                             (mut counter) (: 0 u64)]
@@ -401,7 +408,78 @@
       (free! (mut inputs)))
     (free! (mut observed)) (free! (mut ends)) (free! (mut values)) (g/release! (mut graph))))
 
+(defn packed-floating-rejection [(ty i32)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        key (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        split (require (b/switch! (mut graph) start key))
+        (mut ends) (ArrayList::new [i32] a) (mut values) (ArrayList::new [i32] a)
+        (mut inputs) (ArrayList::new [i32] a) (mut roots) (ArrayList::new [i32] a)]
+    (for i [(: 0 u64) 1]
+      (let [constant (require (b/scalar-constant! (mut graph) 5 i 8))
+            arm (require (b/case-value! (mut graph) split constant))]
+        (push! (mut ends) (require (b/emit! (mut graph) 114 0 [arm])))
+        (push! (mut values) (require (b/scalar-constant! (mut graph) ty (+ i 1) 8)))))
+    (let [arm (require (b/case-default! (mut graph) split))]
+      (push! (mut ends) (require (b/emit! (mut graph) 114 0 [arm])))
+      (push! (mut values) (require (b/scalar-constant! (mut graph) ty 3 8))))
+    (let [merge (require (b/emit! (mut graph) 112 0 (slice ends)))]
+      (push! (mut inputs) merge)
+      (for value values (push! (mut inputs) value))
+      (let [phi (require (b/emit! (mut graph) 67 ty (slice inputs)))
+            ret (require (b/emit! (mut graph) 120 ty [merge phi (: 0 i32)]))
+            before (len (.instructions graph))
+            (mut edges) (uses/build graph a) (mut queue) (q/create before a)]
+        (push! (mut roots) ret)
+        (require (rewrite/validate graph 8 a))
+        (assert (= (lookup/rewrite! (mut graph) roots (mut edges) (mut queue) 8 a) 0))
+        (assert (= (len (.instructions graph)) before))
+        (assert (= (q/pop! (mut queue)) -1))
+        (require (rewrite/validate graph 8 a))
+        (q/release! (mut queue)) (uses/release! (mut edges))))
+    (free! (mut roots)) (free! (mut inputs)) (free! (mut values)) (free! (mut ends))
+    (g/release! (mut graph))))
+
+(defn packed-pointer32 [] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        raw (require (b/emit! (mut graph) 71 4 [start (: 0 i32) 0]))
+        selector (require (b/conversion! (mut graph) 36 6 4 raw))
+        split (require (b/switch! (mut graph) start selector))
+        (mut ends) (ArrayList::new [i32] a) (mut values) (ArrayList::new [i32] a)
+        (mut inputs) (ArrayList::new [i32] a) (mut roots) (ArrayList::new [i32] a)]
+    (for i [(: 0 u64) 1]
+      (let [key (require (b/scalar-constant! (mut graph) 6 (+ (: 0xFFFFFFFE u64) i) 4))
+            arm (require (b/case-value! (mut graph) split key))]
+        (push! (mut ends) (require (b/emit! (mut graph) 114 0 [arm])))
+        (push! (mut values) (require (b/scalar-constant! (mut graph) 5 (+ 100 i) 4)))))
+    (let [fallback (require (b/case-default! (mut graph) split))]
+      (push! (mut ends) (require (b/emit! (mut graph) 114 0 [fallback])))
+      (push! (mut values) (require (b/scalar-constant! (mut graph) 5 777 4))))
+    (let [merge (require (b/emit! (mut graph) 112 0 (slice ends)))]
+      (push! (mut inputs) merge)
+      (for value values (push! (mut inputs) value))
+      (let [phi (require (b/emit! (mut graph) 67 5 (slice inputs)))
+            ret (require (b/emit! (mut graph) 120 5 [merge phi (: 0 i32)]))
+            (mut edges) (uses/build graph a) (mut queue) (q/create (len (.instructions graph)) a)]
+        (push! (mut roots) ret) (push! (mut roots) phi)
+        (require (rewrite/validate graph 4 a))
+        (assert (= (lookup/rewrite! (mut graph) roots (mut edges) (mut queue) 4 a) 1))
+        (require (rewrite/validate graph 4 a))
+        (q/release! (mut queue)) (uses/release! (mut edges))))
+    (free! (mut roots)) (free! (mut inputs)) (free! (mut values)) (free! (mut ends))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (packed-pointer32)
+  (for selector [(: 6 i32) 7]
+    (packed-check selector 5 0 0 10 false)
+    (packed-check selector 11 (- (lookup/mask selector 8) 9) 0 10 false))
+  (packed-check 1 5 0 0 2 false)
+  (packed-check 1 1 0 0 2 false)
+  (packed-check 5 6 0 0 10 false)
+  (for ty [(: 12 i32) 13] (packed-floating-rejection ty))
+
   (for selector [(: 2 i32) 3 4 5 8 9 10 11]
     (for result [(: 1 i32) 2 5 8 11]
       (packed-check selector result 0 0 10 false)
