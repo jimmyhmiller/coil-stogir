@@ -977,3 +977,12 @@ answers across eight integer widths/signedness variants and ADDR, including zero
 divisors, signed min/-1, extreme bit patterns and positive/negative divisors.
 Additional tests cover a floating divide, exact one-cell budgets, Never/zero
 budget, and a guarded division that remains a call. Existing module cases pass.
+
+## Read-only site proof diagnostics
+
+`inspect-verified-site` reports common eligibility, caller-capture privacy and
+complete virtual-result proof separately for inputs satisfying the existing
+verified-site contract. It does not mutate either graph or replace any guard.
+The compiler invokes it only under its statistics trace. The module suite checks
+that these diagnostics agree with actual expansion across existing ABI, alias,
+Never, budget, guard, observation and result cases under ASAN.
