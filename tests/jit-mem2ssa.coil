@@ -515,6 +515,64 @@
     (free! (mut values))
     (free! (mut found))))
 
+;;; Named constant payloads are string IDs, never private-field offsets.
+;;; Both real byte positions are initialized; resolution to eight stays inside
+;;; the allocation and differs from the named constant's metadata payload.
+(defn symbolic-private-offset [(kind i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        unused (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        size (require (b/scalar-constant! (mut graph) 5 16 8))
+        owner (require (b/stack-allocate! (mut graph) start size 16))
+        named
+          (require (case kind
+                     73 (symbols/function-address! (mut graph) 8 0)
+                     74 (symbols/function! (mut graph) "_offset" 0)
+                     75 (symbols/symbol! (mut graph) "_offset")
+                     (symbols/string! (mut graph) "_offset")))
+        payload
+          (n/constant-bits (match (g/lookup graph named)
+                             (Some [node] node)
+                             (None [] (panic "missing offset"))))
+        number (require (b/scalar-constant! (mut graph) 6 payload 8))
+        first (require (b/emit! (mut graph) 26 6 [owner number]))
+        second (require (b/emit! (mut graph) 26 6 [owner named]))
+        a-value (require (b/scalar-constant! (mut graph) 2 41 8))
+        b-value (require (b/scalar-constant! (mut graph) 2 97 8))
+        store-a (require (b/emit! (mut graph) 93 0 [owner first a-value]))
+        store-b (require (b/emit! (mut graph) 93 0 [store-a second b-value]))
+        read (require (b/emit! (mut graph) 91 2 [store-b first]))
+        answer (require (b/emit! (mut graph) 34 5 [read]))
+        ret (require (b/emit! (mut graph) 120 5 [read answer (: 0 i32)]))
+        want (if (= kind 73) (: 97 u64) 41)
+        (mut working) (g/duplicate graph a)
+        (mut roots) (ArrayList::new [i32] a)]
+    (push! (mut roots) ret)
+    (when (!= kind 77)
+      (match (compile/image graph start [ret] "_private_offset_before" a)
+        (Err [message] (panic "{}" message))
+        (Ok [code]
+            (let [(mut code) code]
+              (symbolic-offset-execute code want)
+              (image/release! (mut code))))))
+    (let [changes (require (mem/promote! (mut working) (mut roots) a))]
+      (when (!= kind 77)
+        (match (compile/image working
+                              start
+                              (slice roots)
+                              "_private_offset_after"
+                              a)
+          (Err [message] (panic "{}" message))
+          (Ok [code]
+              (let [(mut code) code]
+                (symbolic-offset-execute code want)
+                (image/release! (mut code))))))
+      (assert (if (= kind 73) (> changes 0) (= changes 0))))
+    (g/release! (mut working))
+    (free! (mut roots))
+    (g/release! (mut graph))))
+
 (defn symbolic-offset [(kind i32) (commuted bool) (write bool)] (-> void)
   (let [a (malloc-allocator)
         (mut graph) (g/create a)
@@ -1036,6 +1094,7 @@
     (g/release! (mut graph))))
 
 (defn main [] (-> i64)
+  (for kind [(: 73 i32) 74 75 77] (symbolic-private-offset kind))
   (for mode [(: 0 i32) 1 2 3 4] (scoped-entry mode))
   (for kind [(: 73 i32) 74 75 77]
     (for commuted [false true]
