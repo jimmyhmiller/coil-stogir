@@ -12,6 +12,7 @@
 (import "stogir.a64.compile" :as compile)
 (import "stogir.jit.darwin" :as jit)
 (import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
 (import "coil.primitive" :as p)
 (import "coil.cc" :as cc)
 (import "coil.result" :use [Result Ok Err])
@@ -52,7 +53,7 @@
                     (jit/release-image! (mut loaded)))))
             (link/release! (mut module)))))))
 
-(defn check [(read-result bool) (padding i32)] (-> i64)
+(defn check [(read-result bool) (padding i32) (scope-mode i32)] (-> i64)
   (let [a (malloc-allocator)
         (mut leaf) (g/create a)
         entry (require (b/emit! (mut leaf) 104 0 [(: 0 i32)]))
@@ -63,10 +64,12 @@
         zero (require (b/scalar-constant! (mut leaf) 11 0 8))
         eleven (require (b/scalar-constant! (mut leaf) 5 11 8))
         twenty-two (require (b/scalar-constant! (mut leaf) 5 22 8))
-        local (require (b/stack-allocate! (mut leaf) entry sixteen 16))
+        saved (if (= scope-mode 0) entry (require (b/emit! (mut leaf) 83 6 [entry])))
+        local (require (b/stack-allocate! (mut leaf) saved sixteen 16))
+        inner (if (= scope-mode 4) (require (b/emit! (mut leaf) 83 6 [local])) local)
         high (require (b/emit! (mut leaf) 26 6 [local eight]))
         condition (require (b/emit! (mut leaf) 16 1 [seed zero]))
-        branch (require (b/emit! (mut leaf) 116 0 [local condition]))
+        branch (require (b/emit! (mut leaf) 116 0 [inner condition]))
         yes (require (b/emit! (mut leaf) 107 0 [branch (: 0 i32)]))
         no (require (b/emit! (mut leaf) 108 0 [branch (: 0 i32)]))
         yes-control
@@ -85,7 +88,14 @@
         written (require (b/emit! (mut leaf) 93 0 [second destination first]))
         out-high (require (b/emit! (mut leaf) 26 6 [destination eight]))
         written (require (b/emit! (mut leaf) 93 0 [written out-high second]))
-        returned (require (b/emit! (mut leaf) 120 0 [written (: 0 i32) 0]))
+        freed (if (= scope-mode 5) (require (b/stack-free! (mut leaf) written sixteen)) written)
+        restored-inner (if (= scope-mode 4) (require (b/emit! (mut leaf) 84 0 [freed inner])) freed)
+        source (if (= scope-mode 2) (require (b/emit! (mut leaf) 68 6 [saved (: 0 i32)])) saved)
+        restored (if (= scope-mode 0) restored-inner
+                     (require (b/emit! (mut leaf) 84 0 [restored-inner source])))
+        returned (require (b/emit! (mut leaf) 120 0 [restored (: 0 i32) 0]))
+        (mut observed) (ArrayList::new [i32] a)
+        rejected? (or read-result (= scope-mode 2) (= scope-mode 3) (= scope-mode 5))
         (mut caller) (g/create a)
         start (require (b/emit! (mut caller) 104 0 [(: 0 i32)]))
         limit (require (b/emit! (mut caller) 71 5 [start (: 0 i32) 0]))
@@ -106,6 +116,8 @@
         signed (require (b/emit! (mut caller) 36 11 [index]))
         input (require (b/emit! (mut caller) 27 11 [signed bias]))
         target (require (symbols/function! (mut caller) "_stack_inline_leaf" 0))]
+    (push! (mut observed) returned)
+    (when (= scope-mode 3) (push! (mut observed) saved))
     (match (calls/create-result 0 [(: 6 u8) 11] [] (results/pieces 5 2) a)
       (Err [message] (panic "{}" message))
       (Ok [prototype]
@@ -136,12 +148,12 @@
               (require (b/emit! (mut leaf) 0 0 [])))
             (match (inline/optimize caller [done] called
                                     (inline/Callee :name "_stack_inline_leaf" :graph leaf
-                                      :entry entry :roots [returned] :observed [returned] :never false)
+                                      :entry entry :roots [returned] :observed (slice observed) :never false)
                                     8 16384 a)
               (Err [message] (panic "{}" message))
               (Ok [probe]
                   (let [(mut probe) probe]
-                    (assert (= (.changes probe) (if read-result 0 1)))
+                    (assert (= (.changes probe) (if rejected? 0 1)))
                     (set! growth (cast i32 (- (len (.instructions (.graph probe)))
                                               (len (.instructions caller)))))
                     (rewrite/release! (mut probe)))))
@@ -153,10 +165,10 @@
                                       :graph leaf
                                       :entry entry
                                       :roots [returned]
-                                      :observed [returned]
+                                      :observed (slice observed)
                                       :never false)
                                     8
-                                    (if read-result 0 (- growth 1))
+                                    (if rejected? 0 (- growth 1))
                                     a)
               (Err [message] (panic "{}" message))
               (Ok [rejected]
@@ -171,15 +183,15 @@
                                       :graph leaf
                                       :entry entry
                                       :roots [returned]
-                                      :observed [returned]
+                                      :observed (slice observed)
                                       :never false)
                                     8
-                                    (if read-result 16384 growth)
+                                    (if rejected? 16384 growth)
                                     a)
               (Err [message] (panic "{}" message))
               (Ok [expanded]
                   (let [(mut expanded) expanded]
-                    (assert (= (.changes expanded) (if read-result 0 1)))
+                    (assert (= (.changes expanded) (if rejected? 0 1)))
                     (match (compile/image leaf
                                           entry
                                           [returned]
@@ -211,10 +223,13 @@
                             (image/release! (mut leaf-image)))))
                     (rewrite/release! (mut expanded)))))
             (calls/release! (mut prototype)))))
+    (free! (mut observed))
     (g/release! (mut caller))
     (g/release! (mut leaf))
     (println "scoped inline result loop (result-read={}): pass" read-result)
     0))
 
 (defn main [] (-> i64)
-  (+ (check false 0) (check true 0) (check false 1024)))
+  (+ (check false 0 0) (check true 0 0) (check false 1024 0)
+     (check false 0 1) (check false 0 2) (check false 0 3)
+     (check false 0 4) (check false 0 5) (check true 0 1)))

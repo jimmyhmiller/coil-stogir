@@ -943,3 +943,22 @@ source immutability. The scoped native loop checks exact measured reservation
 boundaries and one-cell-under rejection, including a source padded with1024 NOPs;
 its virtual-result read guard remains independently exercised with a large budget.
 No growth budget was raised and no benchmark-specific exception was introduced.
+
+## Transitive cloning of existing opaque stack scopes
+
+Bounded call expansion can now clone existing BLOCK_BEGIN/BLOCK_END operations
+rather than rejecting a template solely because earlier expansion inserted them.
+The shared stogir.stack opacity proof requires direct snapshot/restore links,
+no saved-pointer arithmetic/copies/escapes or observable snapshots, and no AFREE.
+The original scope edges are remapped with the other graph edges; any new outer
+allocation scope is still preserved and charged. Return-tail result coverage can
+cross these proven opaque control operations; full byte coverage, no virtual
+result read, alias/privacy and ordinary typed-call restrictions remain.
+
+The proof was moved from mem2ssa unchanged and is now shared; entry-object
+promotion behavior remains conservative. Native/ASAN million-iteration tests
+exercise preexisting and nested scopes, exact clone budgets, padding, and copied
+or observed saved pointers, explicit frees and result reads as fallback cases.
+Existing module/recursive/ABI tests and the complete memory/forwarding suite pass
+under ASAN. This preserves upstream stack operations in the existing graph; it
+introduces no alternative scoped representation or ABI shortcut.
