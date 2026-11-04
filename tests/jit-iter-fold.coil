@@ -1230,7 +1230,104 @@
     (free! (mut roots))
     (g/release! (mut graph))))
 
+;;; Exercise the upstream power fold through exact edge maintenance and
+;;; native before/after execution, including shared/observed input and guard.
+(defn power-division-case [(ty i32) (mode i32) (bits u64)
+                           (opcode i32) (pointer-bytes i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        width (* 8 (types/scalar-size ty pointer-bytes))
+        mask (if (= width 64) (: 0xFFFFFFFFFFFFFFFF u64)
+                 (- (<< (: 1 u64) (cast u64 width)) 1))
+        source-type (if (= mode 0) ty (if (= mode 1) 2 8))
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        input (require (b/emit! (mut graph) 71 source-type
+                                [start (: 0 i32) 0]))
+        value (if (= mode 0) input
+                  (require (b/emit! (mut graph) (if (= mode 1) 34 33)
+                                    ty [input])))
+        divisor (require (b/scalar-constant! (mut graph) ty bits pointer-bytes))
+        result (require (b/emit! (mut graph) opcode ty
+                                 [value divisor start]))
+        ret (require (b/emit! (mut graph) 120 ty
+                              [start result (: 0 i32)]))
+        (mut working) (g/duplicate graph a)
+        (mut edges) (uses/build working a)
+        (mut queue) (q/create (len (.instructions working)) a)
+        normalized (& bits mask)
+        expected (and (> normalized 0)
+                      (= (& normalized (- normalized 1)) 0)
+                      (or (and (>= ty 2) (<= ty 5))
+                          (and (= mode 1)
+                               (= (& normalized (<< (: 1 u64)
+                                                    (cast u64 (- width 1)))) 0))))]
+    (assert (= (iter/power-division! (mut working) (mut edges) (mut queue)
+                                     result pointer-bytes)
+               expected))
+    (assert (= (check-uses working edges) 0))
+    (require (rewrite/validate working pointer-bytes a))
+    (let [rewritten (get (.instructions working) (cast i64 result))]
+      (assert (= (n/opcode rewritten)
+                 (if expected (if (= opcode 29) 50 47) (cast u8 opcode))))
+      (when expected
+        (assert (= (.op3 rewritten) 0))
+        (assert (= (.op1 rewritten) value))))
+    ; Zero and signed-overflow inputs remain structural rejection tests.
+    (when (and (= pointer-bytes 8) (> normalized 0))
+      (for after [false true]
+        (match (compile/text (if after working graph) start
+                              [ret value input start] a)
+          (Err [message] (panic "power fold native: {}" message))
+          (Ok [owned]
+              (let [(mut text) owned]
+                (match (jit/map-text (slice text))
+                  (Err [message] (panic "power fold map: {}" message))
+                  (Ok [owned]
+                      (let [(mut mapped) owned
+                            function (p/cast (fnptr (cc/C) [u64] u64)
+                                              (.base mapped))]
+                        (for x [(: 0 u64) 1 3 4 5 127 128 255 256
+                                32767 32768 0x7FFFFFFF 0x80000000
+                                0x8000000000000000 0xFFFFFFFFFFFFFFFF]
+                          (let [source-mask
+                                  (if (= mode 0) mask (: 255 u64))
+                                raw (& x source-mask)
+                                argument
+                                  (if (and (= mode 2) (!= (& raw 128) 0))
+                                      (| raw (^ mask (: 255 u64))) raw)]
+                            (match (scalar/integer-binary opcode ty 8 argument normalized)
+                              (None [] 0)
+                              (Some [answer]
+                                    (assert (= (& (function x) mask) answer))))))
+                        (jit/release! (mut mapped)))))
+                (free! (mut text)))))))
+    (when (and (= ty 11) (= mode 1) (= bits 4) (= pointer-bytes 8))
+      (match (iter/optimize graph 8 [ret result value input start] [result] a)
+        (Err [message] (panic "power fold pipeline: {}" message))
+        (Ok [owned]
+            (let [(mut optimized) owned
+                  changed (get (.instructions (.graph optimized))
+                                (cast i64 result))]
+              (assert (= (n/opcode changed) (if (= opcode 29) 50 47)))
+              (require (rewrite/validate (.graph optimized) 8 a))
+              (rewrite/release! (mut optimized))))))
+    (q/release! (mut queue))
+    (uses/release! (mut edges))
+    (g/release! (mut working))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (for pointer-bytes [(: 4 i32) 8]
+    (for ty [(: 2 i32) 3 4 5 8 9 10 11]
+      (let [width (* 8 (types/scalar-size ty pointer-bytes))]
+        (for mode [(: 0 i32) 1 2]
+          (when (or (= mode 0) (> width 8))
+            (for opcode [(: 29 i32) 30]
+              (for divisor [(: 0 u64) 1 2 3 4
+                            (<< (: 1 u64) (cast u64 (- width 2)))
+                            (<< (: 1 u64) (cast u64 (- width 1)))]
+                (power-division-case ty mode divisor opcode pointer-bytes))))))))
+
   (for source [(: 2 i32) 3 4 8 9 10]
     (for target [(: 4 i32) 10 5 11]
       (when (< (types/scalar-size source 8) (types/scalar-size target 8))
