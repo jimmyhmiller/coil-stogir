@@ -1,0 +1,64 @@
+(module gaps.iterator-return)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as p)
+(import "coil.result" :use [Option Some None])
+
+(defstruct Cursor [(data (ptr u8)) (length i64) (index i64)])
+
+; Same operation with default and Never inlining policies, to distinguish
+; conditional aggregate-call lowering from optimization across the call.
+(defn next-default [(cursor (ptr Cursor))] (-> (Option u8))
+  (let [index (.index (load cursor))]
+    (if (< index (.length (load cursor)))
+        (do
+          (store! (field cursor index) (+ index 1))
+          (Some (load (p/index (.data (load cursor)) index))))
+        (None))))
+
+(defn next-never :inline (Never) [(cursor (ptr Cursor))] (-> (Option u8))
+  (let [index (.index (load cursor))]
+    (if (< index (.length (load cursor)))
+        (do
+          (store! (field cursor index) (+ index 1))
+          (Some (load (p/index (.data (load cursor)) index))))
+        (None))))
+
+; Non-associative ordered mixing prevents a sum-reduction/vectorization gap
+; from masquerading as a call/return lowering measurement.
+(defn consume-default [(data (ptr u8)) (length i64)] (-> u64)
+  (let [(mut cursor)
+          (Cursor
+            :data data
+            :length length
+            :index 0)
+        (mut hash) (: 0x9E3779B97F4A7C15 u64)
+        (mut more) true]
+    (while more
+      (match (next-default (mut cursor))
+        (None [] (set! more false))
+        (Some [byte]
+              (set! hash (^ (| (<< hash 5) (>> hash 59)) (cast u64 byte))))))
+    hash))
+
+(defn consume-never [(data (ptr u8)) (length i64)] (-> u64)
+  (let [(mut cursor)
+          (Cursor
+            :data data
+            :length length
+            :index 0)
+        (mut hash) (: 0x9E3779B97F4A7C15 u64)
+        (mut more) true]
+    (while more
+      (match (next-never (mut cursor))
+        (None [] (set! more false))
+        (Some [byte]
+              (set! hash (^ (| (<< hash 5) (>> hash 59)) (cast u64 byte))))))
+    hash))
+
+(defn kernel :cc (cc/C) :inline (Never) [(data (ptr u8))
+                                         (length i64)
+                                         (never bool)]
+  (-> u64)
+  (if never (consume-never data length) (consume-default data length)))
+
+(export-c [kernel :as "gap_iterator_return"])
