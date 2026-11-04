@@ -1,10 +1,15 @@
 (module stogir.tests.jit-call)
 (import "stogir.graph" :as g)
+(import "stogir.node" :as n)
 (import "stogir.builder" :as b)
 (import "stogir.calls" :as calls)
+(import "stogir.call-results" :as results)
 (import "stogir.symbols" :as symbols)
+(import "stogir.strings" :as strings)
 (import "stogir.options" :as options)
 (import "stogir.image" :as image)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.a64.tail-plan" :as tails)
 (import "stogir.a64.compile" :as compile)
 (import "stogir.jit.darwin" :as jit)
 (import "coil.fs" :as fs)
@@ -12,7 +17,7 @@
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.primitive" :as primitive)
 (import "coil.cc" :as cc)
-(import "coil.result" :use [Result Ok Err])
+(import "coil.result" :use [Result Ok Err Some None])
 
 (defn combine :cc (cc/C) [(a i64) (b i64) (c i64) (d i64)] (-> i64)
   (+ (+ (* a 3) (* b 5)) (+ (* c 7) (* d 11))))
@@ -126,7 +131,8 @@
 
 ;;; A CALL/RET fallback exhausts the stack long before the millionth step.
 ;;; Test both self relocation and an opaque target with a register-copy cycle.
-(defn recursive-tail [(direct bool) (prefix bool) (level i32)] (-> void)
+(defn recursive-tail [(direct bool) (prefix bool) (level i32) (explicit bool)]
+  (-> void)
   (let [a (malloc-allocator)
         (mut graph) (g/create a)
         start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
@@ -152,7 +158,8 @@
         next (require (b/emit! (mut graph) 27 11 [count one]))
         (mut types) (ArrayList::new [u8] a)
         (mut arguments) (ArrayList::new [i32] a)
-        (mut control) no]
+        (mut control) no
+        (mut tail-reference) (: 0 i32)]
     (when (not direct)
       (push! (mut types) 6)
       (push! (mut arguments) target))
@@ -184,13 +191,23 @@
           (let [(mut prototype) owned]
             (require (calls/function! (mut graph) prototype a))
             (let [tail
-                    (require (calls/emit-tail! (mut graph)
-                                               prototype
-                                               control
-                                               target
-                                               (slice arguments)
-                                               done
-                                               a))]
+                    (if explicit
+                        (require (calls/emit-tail! (mut graph)
+                                                   prototype
+                                                   control
+                                                   target
+                                                   (slice arguments)
+                                                   done
+                                                   a))
+                        (let [call
+                                (require (calls/emit! (mut graph)
+                                                      prototype
+                                                      control
+                                                      target
+                                                      (slice arguments)
+                                                      a))]
+                          (require (b/emit! (mut graph) 120 11 [call call done]))))]
+              (set! tail-reference tail)
               (match (compile/image-with-options graph
                                                  start
                                                  [done tail]
@@ -231,14 +248,426 @@
                               (jit/release-image! (mut mapped)))))
                       (image/release! (mut output))))))
             (calls/release! (mut prototype)))))
+    (when (and direct (not prefix) (= level 3) (not explicit))
+      (match (compile/object-with-options graph
+                                          start
+                                          [done tail-reference]
+                                          "_tail_recursive"
+                                          (options/Options :level level)
+                                          a)
+        (Err [message] (panic "tail AOT object: {}" message))
+        (Ok [owned]
+            (let [(mut object) owned]
+              (match (fs/write-file a
+                                    "/tmp/coil-stogir-tail-recursive.o"
+                                    (slice object))
+                (Err [_] (panic "tail AOT write failed"))
+                (Ok [_] 0))
+              (free! (mut object))))))
+    ; Late matching preserves the templates' original graph and root IDs.
+    (let [terminal (get (.instructions graph) (cast i64 tail-reference))
+          call (get (.instructions graph) (cast i64 (.op1 terminal)))]
+      (assert (= (n/opcode terminal) (if explicit (: 121 u8) 120)))
+      (assert (= (n/opcode call) (if explicit (: 80 u8) 79))))
     (free! (mut arguments))
     (free! (mut types))
     (g/release! (mut graph))))
 
+(defn bump :cc (cc/C) [(counter (ptr i64))] (-> i64)
+  (store! counter (+ (load counter) 1))
+  97)
+
+;;; A void caller can ignore a scalar return. An observed CALL identity must
+;;; still retain its result definition and ordinary RETURN, even in this shape.
+(defn ignored-tail [(observed bool)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        counter (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        (mut roots) (ArrayList::new [i32] a)]
+    (match (calls/create 0 0 [(: 6 u8) 6] a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+          (let [(mut own) owned]
+            (require (calls/function! (mut graph) own a))
+            (calls/release! (mut own)))))
+    (match (calls/create 0 11 [(: 6 u8)] a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+          (let [(mut prototype) owned
+                call
+                  (require (calls/emit! (mut graph)
+                                        prototype
+                                        start
+                                        target
+                                        [counter]
+                                        a))
+                done (require (b/emit! (mut graph) 120 0 [call (: 0 i32) 0]))]
+            (push! (mut roots) done)
+            (when observed (push! (mut roots) call))
+            (match (pipeline/prepare graph start (slice roots) a)
+              (Err [message] (panic "ignored tail schedule: {}" message))
+              (Ok [owned]
+                  (let [(mut prepared) owned]
+                    (match (tails/select graph
+                                         (.schedule prepared)
+                                         (slice roots)
+                                         true
+                                         a)
+                      (Err [message] (panic "ignored tail proof: {}" message))
+                      (Ok [owned]
+                          (let [(mut plan) owned]
+                            (assert (= (len (.returns plan)) (if observed 0 1)))
+                            (tails/release! (mut plan)))))
+                    (pipeline/release! (mut prepared)))))
+            (match (compile/text graph start (slice roots) a)
+              (Err [message] (panic "ignored tail compile: {}" message))
+              (Ok [owned]
+                  (let [(mut text) owned]
+                    (match (jit/map-text (slice text))
+                      (Err [message] (panic "ignored tail mapping: {}" message))
+                      (Ok [owned]
+                          (let [(mut mapped) owned
+                                function
+                                  (primitive/cast (fnptr (cc/C)
+                                                         [u64 (ptr i64)]
+                                                         void)
+                                                  (.base mapped))
+                                target
+                                  (primitive/cast u64
+                                                  (primitive/cast (ptr u8)
+                                                                  (fnptr-of bump)))
+                                (mut count) (: 1 i64)]
+                            (for [i 0 100]
+                              (function target
+                                        (primitive/cast (ptr i64) (mut count))))
+                            (assert (= count 101))
+                            (jit/release! (mut mapped)))))
+                    (free! (mut text)))))
+            (calls/release! (mut prototype)))))
+    (free! (mut roots))
+    (g/release! (mut graph))))
+
+(defn mixed-tail-target :cc (cc/C) [(left i64) (x f64) (right i64) (y f32)]
+  (-> f64)
+  (+ (+ (* (cast f64 left) 3.0) (* x 5.0))
+     (+ (* (cast f64 right) 7.0) (* (cast f64 y) 11.0))))
+
+(defn stack-tail-target :cc (cc/C) [(a i64)
+                                    (b i64)
+                                    (c i64)
+                                    (d i64)
+                                    (e i64)
+                                    (f i64)
+                                    (g i64)
+                                    (h i64)
+                                    (i i64)] (-> i64)
+  (+ (+ (+ a (* b 2)) (+ (* c 3) (* d 4)))
+     (+ (+ (* e 5) (* f 6)) (+ (* g 7) (+ (* h 8) (* i 9))))))
+
+;;; Stack arguments deliberately retain CALL/RET. Mixed register banks can jump.
+(defn abi-tail [(stack bool) (explicit bool) (level i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        left (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        right (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        x (if stack 0 (require (b/emit! (mut graph) 71 12 [start (: 0 i32) 3])))
+        y (if stack 0 (require (b/emit! (mut graph) 71 13 [start (: 0 i32) 4])))
+        result-type (if stack (: 11 u8) 12)
+        (mut arguments) (ArrayList::new [i32] a)
+        (mut types) (ArrayList::new [u8] a)]
+    (match (calls/create 0
+                         result-type
+                         (if stack [(: 6 u8) 11 11] [(: 6 u8) 11 11 12 13])
+                         a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+          (let [(mut signature) owned]
+            (require (calls/function! (mut graph) signature a))
+            (calls/release! (mut signature)))))
+    (if stack
+        (do
+          (for value [right left right left right left right left right]
+            (push! (mut arguments) value)
+            (push! (mut types) 11)))
+        (do
+          (for value [right x left y] (push! (mut arguments) value))
+          (for ty [(: 11 u8) 12 11 13] (push! (mut types) ty))))
+    (match (calls/create 0 result-type (slice types) a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+          (let [(mut prototype) owned
+                done
+                  (if explicit
+                      (require (calls/emit-tail! (mut graph)
+                                                 prototype
+                                                 start
+                                                 target
+                                                 (slice arguments)
+                                                 0
+                                                 a))
+                      (let [call
+                              (require (calls/emit! (mut graph)
+                                                    prototype
+                                                    start
+                                                    target
+                                                    (slice arguments)
+                                                    a))]
+                        (require (b/emit! (mut graph)
+                                          120
+                                          (cast i32 result-type)
+                                          [call call (: 0 i32)]))))]
+            (match (pipeline/prepare graph start [done] a)
+              (Err [message] (panic "tail ABI prepare: {}" message))
+              (Ok [owned]
+                  (let [(mut prepared) owned]
+                    (match (tails/select graph
+                                         (.schedule prepared)
+                                         [done]
+                                         true
+                                         a)
+                      (Err [message] (panic "tail ABI proof: {}" message))
+                      (Ok [owned]
+                          (let [(mut plan) owned]
+                            (assert (= (len (.returns plan))
+                                       (if (or explicit stack) 0 1)))
+                            (when explicit
+                              (let [call
+                                      (.op1 (get (.instructions graph)
+                                                 (cast i64 done)))]
+                                (assert (= (get (.modes plan) (cast i64 call))
+                                           (if stack 2 1)))))
+                            (tails/release! (mut plan)))))
+                    (pipeline/release! (mut prepared)))))
+            (match (compile/image-with-options graph
+                                               start
+                                               [done]
+                                               "_tail_abi"
+                                               (options/Options :level level)
+                                               a)
+              (Err [message] (panic "tail ABI compile: {}" message))
+              (Ok [owned]
+                  (let [(mut output) owned]
+                    (match (jit/map-image output a)
+                      (Err [message] (panic "tail ABI map: {}" message))
+                      (Ok [owned]
+                          (let [(mut mapped) owned
+                                address
+                                  (primitive/cast (ptr u8)
+                                                  (get (.addresses mapped) 0))]
+                            (if stack
+                                (let [function
+                                        (primitive/cast (fnptr (cc/C)
+                                                               [u64 i64 i64]
+                                                               i64)
+                                                        address)
+                                      target
+                                        (primitive/cast u64
+                                                        (primitive/cast (ptr u8)
+                                                                        (fnptr-of stack-tail-target)))]
+                                  (for left [(: -17 i64) 0 93]
+                                    (for right [(: -31 i64) 0 127]
+                                      (assert (= (function target left right)
+                                                 (stack-tail-target right
+                                                                    left
+                                                                    right
+                                                                    left
+                                                                    right
+                                                                    left
+                                                                    right
+                                                                    left
+                                                                    right))))))
+                                (let [function
+                                        (primitive/cast (fnptr (cc/C)
+                                                               [u64 i64 i64 f64
+                                                                f32]
+                                                               f64)
+                                                        address)
+                                      target
+                                        (primitive/cast u64
+                                                        (primitive/cast (ptr u8)
+                                                                        (fnptr-of mixed-tail-target)))]
+                                  (for left [(: -17 i64) 0 93]
+                                    (for right [(: -31 i64) 0 127]
+                                      (assert (= (function target
+                                                           left
+                                                           right
+                                                           1.25
+                                                           (: -2.5 f32))
+                                                 (mixed-tail-target right
+                                                                    1.25
+                                                                    left
+                                                                    (: -2.5 f32))))))))
+                            (jit/release-image! (mut mapped)))))
+                    (image/release! (mut output)))))
+            (calls/release! (mut prototype)))))
+    (free! (mut arguments))
+    (free! (mut types))
+    (g/release! (mut graph))))
+
+(defstruct TailPair [(a i64) (b i64)])
+
+(defstruct TailHfa [(a f64) (b f64) (c f64) (d f64)])
+
+(defstruct TailLarge [(a i64) (b i64) (c i64)])
+
+(defn pair-target :cc (cc/C) [(x i64)] (-> TailPair)
+  (TailPair :a x :b (+ x 17)))
+
+(defn hfa-target :cc (cc/C) [(x i64)] (-> TailHfa)
+  (TailHfa
+    :a (cast f64 x)
+    :b 1.25
+    :c -2.5
+    :d 97.0))
+
+(defn large-target :cc (cc/C) [(x i64)] (-> TailLarge)
+  (TailLarge
+    :a x
+    :b (+ x 17)
+    :c (- x 31)))
+
+;;; PARAM0 is a synthetic capture place for GP/HFA, and the real x8 for SRET.
+(defn aggregate-tail [(kind i32) (explicit bool) (level i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        name
+          (match (strings/intern! (mut (.strings graph)) "tail-result")
+            (Some [id] id)
+            (None [] (panic "tail result name failed")))
+        named (require (b/emit! (mut graph) 71 6 [start name (: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        value (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        spec
+          (if (= kind 0)
+              (results/pieces 11 2)
+              (if (= kind 1) (results/pieces 12 4) (results/indirect)))]
+    (match (calls/create-result 0 [(: 6 u8) 6 11] [] spec a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+          (let [(mut signature) owned]
+            (require (calls/function! (mut graph) signature a))
+            (calls/release! (mut signature)))))
+    (match (calls/create-result 0 [(: 6 u8) 11] [] spec a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+          (let [(mut signature) owned
+                done
+                  (if explicit
+                      (require (calls/emit-tail! (mut graph)
+                                                 signature
+                                                 start
+                                                 target
+                                                 [named value]
+                                                 0
+                                                 a))
+                      (let [call
+                              (require (calls/emit! (mut graph)
+                                                    signature
+                                                    start
+                                                    target
+                                                    [named value]
+                                                    a))]
+                        (require (b/emit! (mut graph) 120 0 [call (: 0 i32) 0]))))]
+            (match (pipeline/prepare graph start [done] a)
+              (Err [message] (panic "aggregate tail prepare: {}" message))
+              (Ok [owned]
+                  (let [(mut prepared) owned]
+                    (match (tails/select graph
+                                         (.schedule prepared)
+                                         [done]
+                                         true
+                                         a)
+                      (Err [message] (panic "aggregate tail proof: {}" message))
+                      (Ok [owned]
+                          (let [(mut plan) owned]
+                            (assert (= (len (.returns plan)) (if explicit 0 1)))
+                            (let [call
+                                    (.op1 (get (.instructions graph)
+                                               (cast i64 done)))]
+                              (assert (= (get (.modes plan) (cast i64 call)) 1)))
+                            (tails/release! (mut plan)))))
+                    (pipeline/release! (mut prepared)))))
+            (match (compile/image-with-options graph
+                                               start
+                                               [done]
+                                               "_aggregate_tail"
+                                               (options/Options :level level)
+                                               a)
+              (Err [message] (panic "aggregate tail compile: {}" message))
+              (Ok [owned]
+                  (let [(mut output) owned]
+                    (match (jit/map-image output a)
+                      (Err [message] (panic "aggregate tail map: {}" message))
+                      (Ok [owned]
+                          (let [(mut mapped) owned
+                                address
+                                  (primitive/cast (ptr u8)
+                                                  (get (.addresses mapped) 0))]
+                            (for value [(: -100 i64) 0 17 1000000]
+                              (match kind
+                                (0 (let [function
+                                           (primitive/cast (fnptr (cc/C)
+                                                                  [u64 i64]
+                                                                  TailPair)
+                                                           address)
+                                         target
+                                           (primitive/cast u64
+                                                           (primitive/cast (ptr u8)
+                                                                           (fnptr-of pair-target)))
+                                         actual (function target value)]
+                                     (assert (= (.a actual) value))
+                                     (assert (= (.b actual) (+ value 17)))))
+                                (1 (let [function
+                                           (primitive/cast (fnptr (cc/C)
+                                                                  [u64 i64]
+                                                                  TailHfa)
+                                                           address)
+                                         target
+                                           (primitive/cast u64
+                                                           (primitive/cast (ptr u8)
+                                                                           (fnptr-of hfa-target)))
+                                         actual (function target value)]
+                                     (assert (= (.a actual) (cast f64 value)))
+                                     (assert (= (.b actual) 1.25))
+                                     (assert (= (.c actual) -2.5))
+                                     (assert (= (.d actual) 97.0))))
+                                (_ (let [function
+                                           (primitive/cast (fnptr (cc/C)
+                                                                  [u64 i64]
+                                                                  TailLarge)
+                                                           address)
+                                         target
+                                           (primitive/cast u64
+                                                           (primitive/cast (ptr u8)
+                                                                           (fnptr-of large-target)))
+                                         actual (function target value)]
+                                     (assert (= (.a actual) value))
+                                     (assert (= (.b actual) (+ value 17)))
+                                     (assert (= (.c actual) (- value 31)))))))
+                            (jit/release-image! (mut mapped)))))
+                    (image/release! (mut output)))))
+            (calls/release! (mut signature)))))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (for kind [(: 0 i32) 1 2]
+    (for explicit [false true]
+      (for level [(: 1 i32) 2 3] (aggregate-tail kind explicit level))))
+  (for stack [false true]
+    (for explicit [false true]
+      (for level [(: 1 i32) 2 3] (abi-tail stack explicit level))))
+  (ignored-tail false)
+  (ignored-tail true)
   (for direct [false true]
     (for prefix [false true]
-      (for level [(: 1 i32) 2 3] (recursive-tail direct prefix level))))
+      (for level [(: 1 i32) 2 3]
+        (for explicit [false true]
+          (recursive-tail direct prefix level explicit)))))
   (check-tail false)
   (check-tail true)
   (let [allocator (malloc-allocator)

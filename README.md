@@ -175,3 +175,12 @@ coil run tests/aot-sccp-rewrite-link.coil --debug-checks --link-flag /tmp/coil-s
 
 The first command generates all four objects for the linked consumer. These are
 component checks; the optimizer remains disabled in the delivered Coil backend.
+
+Tail-call checks (native macOS AArch64):
+
+```sh
+coil run tests/jit-call.coil --debug-runtime --sanitize=address
+coil run tests/aot-call-link.coil --debug-runtime --sanitize=address --link-flag /tmp/coil-stogir-call.o --link-flag /tmp/coil-stogir-tail-recursive.o
+```
+
+The first command creates both AOT fixtures used by the second.

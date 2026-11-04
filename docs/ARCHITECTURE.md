@@ -164,9 +164,20 @@ ASAN/debug scalar tests pass direct/indirect million-deep recursion, swapped
 arguments, prefix calls and O1/O2/O3; frame tests check native/fallback proofs,
 integer pointer views, and 16/64-byte alignment. Existing stack, call-pressure,
 floating-call, aggregate-result and narrow-varargs suites pass unchanged.
-Tail-specific FP/aggregate/stack-copy coverage and Coil integration are still
-pending; this development branch is not delivered to the compiler.
+Tail-specific mixed GP/FP, stack-argument fallback, GP-pair/HFA/x8 result
+forwarding and linked AOT self-recursion also pass. Copied aggregate arguments
+remain conservatively in the call/return fallback. Coil integration is pending;
+this development branch is not delivered to the compiler.
 
 Late CALL/RETURN recognition must follow upstream `ir_emit.c:ir_try_tailcall`
 after module inlining. Eager conversion while preparing templates would make
 otherwise useful templates fail the current inliner's legality checks.
+
+Ordinary CALL/RETURN pairs are recognized by a persistent late machine plan,
+following `ir_emit.c:ir_try_tailcall`. Only a sole matching RETURN may consume
+the CALL, and an explicitly observed CALL root blocks absorption. Void callers
+may ignore a scalar result. Matching suppresses the virtual result definition
+and RETURN before liveness and constraints; the semantic graph stays unchanged.
+Caller-clobber reservations use the resulting live ranges, so a selected CALL
+with no virtual result does not leave x0/v0 unreserved. Native eligibility uses
+the same declared ABI and frame lifetime proof as explicit tail calls.
