@@ -1,5 +1,11 @@
 (module stogir.tests.jit-switch-tables)
 (import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.switch-values" :as lookup)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.uses" :as uses)
+(import "stogir.bitqueue" :as q)
 (import "stogir.builder" :as b)
 (import "stogir.switch" :as switch)
 (import "stogir.types" :as types)
@@ -11,6 +17,7 @@
 (import "stogir.bytes" :as bytes)
 (import "stogir.jit.darwin" :as jit)
 (import "coil.arraylist" :use [ArrayList])
+(import "coil.slice" :use [subslice])
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.primitive" :as primitive)
 (import "coil.cc" :as cc)
@@ -213,7 +220,201 @@
     (free! (mut records))
     failures))
 
+(extern packed-fork :as "fork" :cc (cc/C) [] (-> i32))
+(extern packed-wait :as "waitpid" :cc (cc/C) [i32 (ptr i32) i32] (-> i32))
+(extern packed-exit :as "_exit" :cc (cc/C) [i32] (-> void))
+(extern packed-signal :as "signal" :cc (cc/C) [i32 (ptr i8)] (-> (ptr i8)))
+(extern packed-alarm :as "alarm" :cc (cc/C) [u32] (-> u32))
+
+(defn packed-counter-slot [] (-> (ptr (ptr u64))) (primitive/alloc-static (ptr u64)))
+(defn packed-trap-handler :cc (cc/C) [(signal i32)] (-> void)
+  (packed-exit (if (= (load (load (packed-counter-slot))) 901) 77 78)))
+(defn packed-trapped? [(function (fnptr (cc/C) [u64 (ptr u64)] u64)) (key u64)] (-> bool)
+  (let [child (packed-fork)]
+    (if (< child 0) false
+        (if (= child 0)
+            (let [(mut counter) (: 0 u64)]
+              (set! (packed-counter-slot) (primitive/cast (ptr u64) (mut counter)))
+              (packed-signal 5 (primitive/cast (ptr i8) (fnptr-of packed-trap-handler)))
+              (packed-alarm 2) (function key (mut counter)) (packed-exit 99) false)
+            (let [(mut status) (: 0 i32)]
+              (and (= (packed-wait child (mut status) 0) child)
+                   (= (& status 127) 0) (= (& (>> status 8) 255) 77)))))))
+
+;;; Original, unpacked case values are also the native oracle.
+(defn packed-value [(ty i32) (index i64) (mode i32)] (-> u64)
+  (let [mask (lookup/mask ty 8)]
+    (if (= ty 1) (if (= mode 2) 1 (cast u64 (% index 2)))
+        (if (= mode 2) 42
+            (if (= mode 11) (cast u64 (% index 2))
+                (let [base (if (= mode 1)
+                               (if (types/signed? ty)
+                                   (<< (: 1 u64) (cast u64 (- (* 8 (types/scalar-size ty 8)) 1)))
+                                   (- mask 20))
+                               (if (types/signed? ty) (- (: 0xFFFFFFFFFFFFFFFF u64) 19) (: 50 u64)))
+                      delta (if (= mode 10) (<< (: 1 u64) (cast u64 index))
+                                (cast u64 (% (* index 7) 13)))]
+                  (cast u64 (& (+ (cast u128 base) (cast u128 delta)) (cast u128 mask)))))))))
+
+;;; Nonmonotonic constants and reversed case insertion make the oracle
+;;; independent of the Phi/input order used by the transformation.
+(defn packed-check [(selector-type i32) (result-type i32) (first u64)
+                    (mode i32) (length i64) (trap-default bool)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        raw (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        pointer (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        selector (if (= selector-type 5) raw
+                     (require (b/conversion! (mut graph)
+                               (if (= (types/scalar-size selector-type 8) 8) 36 35)
+                               selector-type 8 raw)))
+        split (require (b/switch! (mut graph) start selector))
+        bias (switch/sign-mask selector-type)
+        result-mask (lookup/mask result-type 8)
+        (mut ends) (ArrayList::new [i32] a)
+        (mut values) (ArrayList::new [i32] a)
+        (mut observed) (ArrayList::new [i32] a)]
+    (when (= mode 8) (push! (mut observed) split))
+    (for [i 0 length]
+      (let [delta (- (- length 1) i)
+            ordered (+ first (cast u64 (if (or (= mode 3) (= mode 4)) (* delta 2) delta)))
+            key (require (b/scalar-constant! (mut graph) selector-type
+                                             (^ ordered bias) 8))
+            arm (if (= mode 4)
+                    (require (b/case-range! (mut graph) split key
+                               (require (b/scalar-constant! (mut graph) selector-type (^ (+ ordered 1) bias) 8))))
+                    (require (b/case-value! (mut graph) split key)))
+            control (if (= mode 5)
+                        (require (b/emit! (mut graph) 93 0
+                                   [arm pointer (require (b/scalar-constant! (mut graph) 5 902 8))])) arm)
+            end (require (b/emit! (mut graph) 114 0 [control]))
+            bits (packed-value result-type delta mode)
+            value (require (b/scalar-constant! (mut graph) result-type bits 8))]
+        (when (and (= mode 6) (= delta 0)) (push! (mut observed) arm))
+        (when (and (= mode 7) (= delta 0)) (push! (mut observed) end))
+        (push! (mut ends) end) (push! (mut values) value)))
+    (let [fallback (require (b/case-default! (mut graph) split))
+          code (require (b/scalar-constant! (mut graph) 5 901 8))
+          stored (require (b/emit! (mut graph) 93 0 [fallback pointer code]))
+          value (require (b/scalar-constant! (mut graph) result-type
+                            (if (= result-type 1) 0 (& (: 777 u64) result-mask)) 8))]
+      (if trap-default
+          (push! (mut observed) (require (b/emit! (mut graph) 121 0 [stored (: 0 i32) 0])))
+          (do (push! (mut ends) (require (b/emit! (mut graph) 114 0 [stored])))
+              (push! (mut values) value))))
+    (let [merge (require (b/emit! (mut graph) 112 0 (slice ends)))
+          (mut inputs) (ArrayList::new [i32] a)]
+      (push! (mut inputs) merge)
+      (for value values (push! (mut inputs) value))
+      (let [phi (require (b/emit! (mut graph) 67 result-type (slice inputs)))
+            ret (require (b/emit! (mut graph) 120 result-type [merge phi (: 0 i32)]))
+            (mut roots) (ArrayList::new [i32] a)
+            (mut working) (g/duplicate graph a)
+            (mut edges) (uses/build working a)
+            (mut queue) (q/create (len (.instructions working)) a)]
+        (push! (mut roots) ret) (push! (mut roots) phi)
+        (for root observed (push! (mut roots) root))
+        (when (= mode 9)
+          (let [(mut extra) (ArrayList::new [i32] a)]
+            (push! (mut extra) merge)
+            (for [i 0 (len ends)]
+              (push! (mut extra) (require (b/scalar-constant! (mut working) 5 (cast u64 i) 8))))
+            (let [other (require (b/emit! (mut working) 67 5 (slice extra)))]
+              (push! (mut roots) other))
+            (free! (mut extra))
+            (uses/release! (mut edges))
+            (set! edges (uses/build working a))))
+        (let [expected (if (and (or (= mode 0) (= mode 1) (= mode 2) (= mode 11)) (<= length 64)) (: 1 i32) 0)]
+          (assert (= (lookup/rewrite! (mut working) roots (mut edges) (mut queue) 8 a) expected))
+          (when (= expected 0)
+            (assert (= (len (.instructions working))
+                       (+ (len (.instructions graph)) (if (= mode 9) (/ (+ (len ends) 5) 4) 0))))))
+        (require (rewrite/validate working 8 a))
+        (let [(mut rebuilt) (uses/build working a)]
+          (for [r 1 (len (.instructions working))]
+            (let [actual (get (.ranges edges) r) expected (get (.ranges rebuilt) r)]
+              (assert (= (.count actual) (.count expected)))
+              (for [i (.offset expected) (+ (.offset expected) (.count expected))]
+                (let [want (get (.edges rebuilt) i) (mut matches) 0]
+                  (for [j (.offset actual) (+ (.offset actual) (.count actual))]
+                    (let [got (get (.edges edges) j)]
+                      (when (and (= (.user got) (.user want)) (= (.operand got) (.operand want)))
+                        (set! matches (+ matches 1)))))
+                  (assert (= matches 1))))))
+          (uses/release! (mut rebuilt)))
+        (match (sccp/optimize graph 8
+                              (if (= mode 9) (subslice (slice roots) 0 (- (len roots) 1)) (slice roots)) a)
+          (Err [message] (panic "packed pipeline: {}" message))
+          (Ok [owned]
+              (let [(mut optimized) owned]
+                (when (and (or (= mode 0) (= mode 1) (= mode 2) (= mode 11)) (<= length 64))
+                  (assert (!= (n/opcode (get (.instructions (.graph optimized)) (cast i64 split))) 117)))
+                (for version [(: 0 i32) 1 2]
+                  (let [selected (case version 0 graph 1 working (.graph optimized))]
+                    (match (compile/image selected start
+                                           (if (= version 2) (slice (.roots optimized))
+                                               (if (and (= version 0) (= mode 9))
+                                                   (subslice (slice roots) 0 (- (len roots) 1)) (slice roots)))
+                                           "_packed_switch" a)
+                      (Err [message] (panic "packed compile: {}" message))
+                      (Ok [owned]
+                          (let [(mut output) owned]
+                            (when (and (= version 2) (= selector-type 5) (= result-type 5)
+                                       (= first 0) (= mode 0) (= length 10) (not trap-default))
+                              (assert (= (len (.text-data output)) 0))
+                              (match (macho/image-object output a)
+                                (Err [message] (panic "packed object: {}" message))
+                                (Ok [owned]
+                                    (let [(mut object) owned]
+                                      (match (fs/write-file a "/tmp/coil-stogir-packed-switch.o" (slice object))
+                                        (Err [_] (panic "packed object write")) (Ok [_] 0))
+                                      (free! (mut object))))))
+                            (match (jit/map-image output a)
+                              (Err [message] (panic "packed map: {}" message))
+                              (Ok [owned]
+                                  (let [(mut mapped) owned
+                                        function (primitive/cast (fnptr (cc/C) [u64 (ptr u64)] u64)
+                                                                  (.base (.memory mapped)))]
+                                    (for offset [(: -1 i64) 0 1 2 3 4 5 6 7 8 9 10 11 18 19 20 (- length 1) length (+ length 1)]
+                                      (let [key (cast u64 (+ (cast i128 first) (cast i128 offset)))
+                                            index (if (or (= mode 3) (= mode 4)) (/ offset 2) offset)
+                                            inside (and (>= offset 0)
+                                                        (< index length)
+                                                        (or (!= mode 3) (= (% offset 2) 0)))
+                                            answer (if inside (packed-value result-type index mode)
+                                                       (if (= result-type 1) 0 (& (: 777 u64) result-mask)))
+                                            (mut counter) (: 0 u64)]
+                                        (if (and trap-default (not inside))
+                                            (assert (packed-trapped? function (^ key bias)))
+                                            (do
+                                              (let [actual (& (function (^ key bias) (mut counter)) result-mask)]
+                                                (when (!= actual answer)
+                                                  (println "packed types {}/{} mode {} version {} offset {} actual {} expected {} counter {}"
+                                                            selector-type result-type mode version offset actual answer counter))
+                                                (assert (= actual answer)))
+                                              (assert (= counter (if inside (if (= mode 5) (: 902 u64) 0) 901)))))))
+                                    (jit/release-image! (mut mapped)))))
+                            (image/release! (mut output)))))))
+                (rewrite/release! (mut optimized)))))
+        (q/release! (mut queue)) (uses/release! (mut edges))
+        (g/release! (mut working)) (free! (mut roots)))
+      (free! (mut inputs)))
+    (free! (mut observed)) (free! (mut ends)) (free! (mut values)) (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (for selector [(: 2 i32) 3 4 5 8 9 10 11]
+    (for result [(: 1 i32) 2 5 8 11]
+      (packed-check selector result 0 0 10 false)
+      (packed-check selector result (- (lookup/mask selector 8) 9) 0 10 false)))
+  (for result [(: 1 i32) 2 5 8 11]
+    (for mode [(: 1 i32) 2] (packed-check 5 result 0 mode 10 false)))
+  (for mode [(: 3 i32) 4 5 6 7 8 9 10] (packed-check 5 5 0 mode 10 false))
+  (for length [(: 64 i64) 65] (packed-check 5 5 0 11 length false))
+  (packed-check 8 1 192 11 64 false)
+  (packed-check 5 5 0 0 10 true)
+  (packed-check 8 11 246 0 10 true)
+  (packed-check 5 5 0 5 10 true)
+
   (let [(mut failures) (backward-check)]
     (for ty [(: 2 i32) 3 4 5 6 7 8 9 10 11]
       (let [top
