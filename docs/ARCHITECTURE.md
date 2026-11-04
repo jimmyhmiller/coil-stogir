@@ -137,3 +137,36 @@ payloads never become masks. The existing ASAN/debug native fold suite adds
 960 graph cases / 26,880 original and rewritten answers covering signed/unsigned
 source and destination types, exact and adjacent masks, four observation modes,
 both operand orders, and both supported pointer widths.
+
+
+### Native tail calls (isolated development checkpoint)
+
+TAILCALL follows pinned `ir.c:_ir_TAILCALL_N`: a typed CALL-like opcode80
+followed by UNREACHABLE, with no usable result definition. Construction and
+verification require a declared matching return ABI and a unique terminal
+successor. Aggregate calls must forward the caller's result PARAM0 (the third
+compact PARAM operand is its index; the second is a name string ID).
+
+Persistent AArch64 matching proves whether to jump or use the upstream-style
+call/return fallback. Argument installation reuses ordinary parallel transfers.
+An indirect target moves from x30 to x15 after arguments are installed; x15 is
+neither an argument nor a preserved register, and survives the x16/x17 epilogue
+scratch work. Frame restoration is shared with ordinary returns. Direct B and
+BL retain their own link bit under the same BRANCH26 relocation.
+
+Stack/copy arguments retain call/return. Explicit private-frame addresses are
+tracked through pointer and integer views; unknown escapes retain call/return.
+Register-result capture buffers are caller-side writes, not callee arguments.
+The synthetic function register-result PARAM0 is itself a private-frame origin.
+No trusted escape flag is provided.
+
+ASAN/debug scalar tests pass direct/indirect million-deep recursion, swapped
+arguments, prefix calls and O1/O2/O3; frame tests check native/fallback proofs,
+integer pointer views, and 16/64-byte alignment. Existing stack, call-pressure,
+floating-call, aggregate-result and narrow-varargs suites pass unchanged.
+Tail-specific FP/aggregate/stack-copy coverage and Coil integration are still
+pending; this development branch is not delivered to the compiler.
+
+Late CALL/RETURN recognition must follow upstream `ir_emit.c:ir_try_tailcall`
+after module inlining. Eager conversion while preparing templates would make
+otherwise useful templates fail the current inliner's legality checks.

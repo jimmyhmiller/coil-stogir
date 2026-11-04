@@ -2,6 +2,11 @@
 (import "stogir.graph" :as g)
 (import "stogir.builder" :as b)
 (import "stogir.calls" :as calls)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.a64.tail-plan" :as tails)
+(import "stogir.node" :as node)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
 (import "stogir.a64.compile" :as compile)
 (import "stogir.a64.encode" :as e)
 (import "stogir.bytes" :as bytes)
@@ -21,7 +26,108 @@
     (Ok [word] (bytes/append32! (mut code) word))
     (Err [msg] (println "{}" msg))))
 
+(defn read-number :cc (cc/C) [(p (ptr i64))] (-> i64)
+  (load p))
+
+(defn add-five :cc (cc/C) [(n i64)] (-> i64)
+  (+ n 5))
+
+;;; A private local can die before the jump only if no pointer to it escapes.
+;;; Check the persistent proof as well as execution, including integer views
+;;; and over-aligned frames whose entry SP must be restored exactly.
+(defn tail-frame [(escape bool) (view bool) (alignment i32) (level i32)]
+  (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        size (require (b/scalar-constant! (mut graph) 5 8 8))
+        literal (require (b/scalar-constant! (mut graph) 11 37 8))
+        slot (require (b/stack-allocate! (mut graph) start size alignment))
+        pointer
+          (if view
+              (let [bits (require (b/emit! (mut graph) 36 5 [slot]))]
+                (require (b/emit! (mut graph) 36 6 [bits])))
+              slot)
+        stored (require (b/emit! (mut graph) 93 0 [slot pointer literal]))
+        loaded
+          (if escape 0 (require (b/emit! (mut graph) 91 11 [stored pointer])))
+        argument (if escape pointer loaded)]
+    (match (calls/create 0 11 [(: 6 u8)] a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+          (let [(mut own) owned]
+            (require (calls/function! (mut graph) own a))
+            (calls/release! (mut own)))))
+    (match (calls/create 0 11 [(if escape (: 6 u8) 11)] a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+          (let [(mut prototype) owned
+                done
+                  (require (calls/emit-tail! (mut graph)
+                                             prototype
+                                             (if escape stored loaded)
+                                             target
+                                             [argument]
+                                             0
+                                             a))
+                call (.op1 (get (.instructions graph) (cast i64 done)))]
+            (require (compile/validate graph))
+            (match (pipeline/prepare graph start [done] a)
+              (Err [message] (panic "tail frame schedule: {}" message))
+              (Ok [owned]
+                  (let [(mut prepared) owned]
+                    (match (tails/build graph (.schedule prepared) a)
+                      (Err [message] (panic "tail frame proof: {}" message))
+                      (Ok [owned]
+                          (let [(mut modes) owned]
+                            (assert (= (get modes (cast i64 call))
+                                       (if escape 2 1)))
+                            (free! (mut modes)))))
+                    (pipeline/release! (mut prepared)))))
+            (match (compile/image-with-options graph
+                                               start
+                                               [done]
+                                               "_tail_frame"
+                                               (options/Options :level level)
+                                               a)
+              (Err [message]
+                   (panic "tail frame escape={} view={} align={} level={}: {}"
+                          escape
+                          view
+                          alignment
+                          level
+                          message))
+              (Ok [owned]
+                  (let [(mut output) owned]
+                    (match (jit/map-image output a)
+                      (Err [message] (panic "tail frame mapping: {}" message))
+                      (Ok [owned]
+                          (let [(mut mapped) owned
+                                function
+                                  (primitive/cast (fnptr (cc/C) [u64] i64)
+                                                  (primitive/cast (ptr u8)
+                                                                  (get (.addresses mapped)
+                                                                       0)))
+                                address
+                                  (if escape
+                                      (primitive/cast u64
+                                                      (primitive/cast (ptr u8)
+                                                                      (fnptr-of read-number)))
+                                      (primitive/cast u64
+                                                      (primitive/cast (ptr u8)
+                                                                      (fnptr-of add-five))))]
+                            (assert (= (function address) (if escape 37 42)))
+                            (jit/release-image! (mut mapped)))))
+                    (image/release! (mut output)))))
+            (calls/release! (mut prototype)))))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (for escape [false true]
+    (for view [false true]
+      (for alignment [(: 16 i32) 64]
+        (for level [(: 1 i32) 2 3] (tail-frame escape view alignment level)))))
   (let [allocator (malloc-allocator)
         (mut probe) (ArrayList::new [u8] allocator)
         (mut graph) (g/create allocator)

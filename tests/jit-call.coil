@@ -2,9 +2,13 @@
 (import "stogir.graph" :as g)
 (import "stogir.builder" :as b)
 (import "stogir.calls" :as calls)
+(import "stogir.symbols" :as symbols)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
 (import "stogir.a64.compile" :as compile)
 (import "stogir.jit.darwin" :as jit)
 (import "coil.fs" :as fs)
+(import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.primitive" :as primitive)
 (import "coil.cc" :as cc)
@@ -59,7 +63,184 @@
             (free! (mut code)))))
     failures))
 
+(defn check-tail [(prefix bool)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        p (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        q (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))]
+    (match (calls/create 0 11 [(: 6 u8) 11 11] a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+          (let [(mut own) owned]
+            (require (calls/function! (mut graph) own a))
+            (calls/release! (mut own)))))
+    (match (calls/create 0 11 [(: 11 u8) 11 11 11] a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+          (let [(mut prototype) owned
+                before
+                  (if prefix
+                      (require (calls/emit! (mut graph)
+                                            prototype
+                                            start
+                                            target
+                                            [p q p seven]
+                                            a))
+                      start)
+                done
+                  (require (calls/emit-tail! (mut graph)
+                                             prototype
+                                             before
+                                             target
+                                             [q p q seven]
+                                             0
+                                             a))]
+            (match (compile/text graph start [done] a)
+              (Err [message] (panic "native tail: {}" message))
+              (Ok [owned]
+                  (let [(mut text) owned]
+                    (match (jit/map-text (slice text))
+                      (Err [message] (panic "tail mapping: {}" message))
+                      (Ok [owned]
+                          (let [(mut mapped) owned
+                                function
+                                  (primitive/cast (fnptr (cc/C)
+                                                         [u64 i64 i64]
+                                                         i64)
+                                                  (.base mapped))
+                                address
+                                  (primitive/cast u64
+                                                  (primitive/cast (ptr u8)
+                                                                  (fnptr-of combine)))]
+                            (for p [(: -100 i64) -1 0 1 127 1000]
+                              (for q [(: -77 i64) -1 0 1 255]
+                                (assert (= (function address p q)
+                                           (combine q p q 7)))))
+                            (jit/release! (mut mapped)))))
+                    (free! (mut text)))))
+            (calls/release! (mut prototype)))))
+    (g/release! (mut graph))))
+
+;;; A CALL/RET fallback exhausts the stack long before the millionth step.
+;;; Test both self relocation and an opaque target with a register-copy cycle.
+(defn recursive-tail [(direct bool) (prefix bool) (level i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target
+          (if direct
+              (require (symbols/function! (mut graph) "_tail_recursive" 0))
+              (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0])))
+        first (if direct (: 0 i32) 1)
+        count (require (b/emit! (mut graph) 71 11 [start (: 0 i32) first]))
+        left (require (b/emit! (mut graph) 71 11 [start (: 0 i32) (+ first 1)]))
+        right
+          (require (b/emit! (mut graph) 71 11 [start (: 0 i32) (+ first 2)]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        ten (require (b/scalar-constant! (mut graph) 11 10 8))
+        condition (require (b/emit! (mut graph) 14 1 [count zero]))
+        branch (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        scaled (require (b/emit! (mut graph) 28 11 [left ten]))
+        answer (require (b/emit! (mut graph) 26 11 [scaled right]))
+        done (require (b/emit! (mut graph) 120 11 [yes answer (: 0 i32)]))
+        next (require (b/emit! (mut graph) 27 11 [count one]))
+        (mut types) (ArrayList::new [u8] a)
+        (mut arguments) (ArrayList::new [i32] a)
+        (mut control) no]
+    (when (not direct)
+      (push! (mut types) 6)
+      (push! (mut arguments) target))
+    (for ty [(: 11 u8) 11 11] (push! (mut types) ty))
+    (for value [next right left] (push! (mut arguments) value))
+    (when prefix
+      (match (calls/create 0 11 [(: 11 u8) 11 11 11] a)
+        (Err [message] (panic "{}" message))
+        (Ok [owned]
+            (let [(mut prototype) owned
+                  function
+                    (require (b/scalar-constant! (mut graph)
+                                                 6
+                                                 (primitive/cast u64
+                                                                 (primitive/cast (ptr u8)
+                                                                                 (fnptr-of combine)))
+                                                 8))]
+              (set! control
+                    (require (calls/emit! (mut graph)
+                                          prototype
+                                          control
+                                          function
+                                          [count left right one]
+                                          a)))
+              (calls/release! (mut prototype))))))
+    (match (calls/create 0 11 (slice types) a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+          (let [(mut prototype) owned]
+            (require (calls/function! (mut graph) prototype a))
+            (let [tail
+                    (require (calls/emit-tail! (mut graph)
+                                               prototype
+                                               control
+                                               target
+                                               (slice arguments)
+                                               done
+                                               a))]
+              (match (compile/image-with-options graph
+                                                 start
+                                                 [done tail]
+                                                 "_tail_recursive"
+                                                 (options/Options :level level)
+                                                 a)
+                (Err [message]
+                     (panic "recursive tail direct={} prefix={} level={}: {}"
+                            direct
+                            prefix
+                            level
+                            message))
+                (Ok [owned]
+                    (let [(mut output) owned]
+                      (match (jit/map-image output a)
+                        (Err [message]
+                             (panic "recursive tail mapping: {}" message))
+                        (Ok [owned]
+                            (let [(mut mapped) owned
+                                  address (get (.addresses mapped) 0)
+                                  direct-function
+                                    (primitive/cast (fnptr (cc/C)
+                                                           [i64 i64 i64]
+                                                           i64)
+                                                    (primitive/cast (ptr u8)
+                                                                    address))
+                                  indirect-function
+                                    (primitive/cast (fnptr (cc/C)
+                                                           [u64 i64 i64 i64]
+                                                           i64)
+                                                    (primitive/cast (ptr u8)
+                                                                    address))]
+                              (for n [(: 0 i64) 1 2 31 1000001]
+                                (assert (= (if direct
+                                               (direct-function n 3 4)
+                                               (indirect-function address n 3 4))
+                                           (if (= (& n 1) 0) 34 43))))
+                              (jit/release-image! (mut mapped)))))
+                      (image/release! (mut output))))))
+            (calls/release! (mut prototype)))))
+    (free! (mut arguments))
+    (free! (mut types))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (for direct [false true]
+    (for prefix [false true]
+      (for level [(: 1 i32) 2 3] (recursive-tail direct prefix level))))
+  (check-tail false)
+  (check-tail true)
   (let [allocator (malloc-allocator)
         (mut graph) (g/create allocator)
         start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))

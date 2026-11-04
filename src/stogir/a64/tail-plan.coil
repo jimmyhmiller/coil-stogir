@@ -1,0 +1,135 @@
+;;; Tail-jump eligibility over immutable graph facts. Native emission follows
+;;; pinned ir_aarch64.dasc:ir_emit_tailcall; stack/copy arguments retain call/ret.
+(module stogir.a64.tail-plan)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.uses" :as uses)
+(import "stogir.bitset" :as bits)
+(import "stogir.bitqueue" :as q)
+(import "stogir.calls" :as calls)
+(import "stogir.call-results" :as results)
+(import "stogir.strings" :as strings)
+(import "stogir.schedule" :as schedule)
+(import "stogir.a64.call-abi" :as abi)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; Register-result capture places are written by the caller after the call;
+;;; their address is not passed to the target. All other call data uses escape.
+(defn capture-place? [(graph g/Graph) (user i32) (operand i32)] (-> bool)
+  (let [node (get (.instructions graph) (cast i64 user))]
+    (if (and (or (= (n/opcode node) 79) (= (n/opcode node) 80))
+             (= operand 3))
+        (match (calls/signature graph
+                                (.op2 node)
+                                (n/type-id node)
+                                (- (get (.arities graph) (cast i64 user)) 2))
+          (Err [_] false)
+          (Ok [signature]
+              (match (strings/lookup (.strings graph) (.id signature))
+                (None [] false)
+                (Some [bytes] (= (.kind (results/decode bytes)) 1)))))
+        false)))
+
+;;; Prove that no current-frame address is observable by a later callee. Track
+;;; integer views too: converting a private pointer into bits does not make its
+;;; lifetime longer. Unknown uses conservatively retain the ordinary call/ret.
+(defn private-frame? [(graph g/Graph)
+                      (scheduled schedule/Schedule)
+                      (a (dyn Allocator))] (-> bool)
+  (let [(mut origins) (ArrayList::new [i32] a)
+        (mut register-result) false
+        (mut safe) true]
+    (match (calls/function-result graph)
+      (Err [_] (set! safe false))
+      (Ok [spec] (set! register-result (= (.kind spec) 1))))
+    (for reference (.nodes scheduled)
+      (let [node (get (.instructions graph) (cast i64 reference))
+            opcode (n/opcode node)]
+        (when (or (= opcode 65)
+                  (= opcode 66)
+                  (= opcode 81)
+                  (= opcode 83)
+                  (= opcode 89)
+                  (and register-result (= opcode 71) (= (.op3 node) 0)))
+          (push! (mut origins) reference))))
+    (when (and safe (> (len origins) 0))
+      (let [(mut edges) (uses/build graph a)
+            (mut seen) (bits/create (len (.instructions graph)) a)
+            (mut work) (q/create (len (.instructions graph)) a)]
+        (for origin origins
+          (bits/add! (mut seen) (cast i64 origin))
+          (q/add! (mut work) (cast i64 origin)))
+        (let [(mut next) (q/pop! (mut work))]
+          (while (and safe (>= next 0))
+            (let [range (get (.ranges edges) next)]
+              (for [i (.offset range) (+ (.offset range) (.count range))]
+                (let [edge (get (.edges edges) i)
+                      user (.user edge)
+                      position (.operand edge)
+                      node (get (.instructions graph) (cast i64 user))
+                      opcode (cast i32 (n/opcode node))
+                      kind (op/operand-code opcode position)]
+                  (when (or (= kind op/OPERAND-DEF) (= kind op/OPERAND-REF))
+                    (cond (or (= opcode 26)
+                              (= opcode 27)
+                              (= opcode 36)
+                              (= opcode 40)
+                              (= opcode 60)
+                              (= opcode 67)
+                              (= opcode 68))
+                            (unless (bits/contains? seen (cast i64 user))
+                              (bits/add! (mut seen) (cast i64 user))
+                              (q/add! (mut work) (cast i64 user)))
+                          (or (and (>= opcode 14) (<= opcode 23))
+                              (= opcode 116)
+                              (= opcode 117)
+                              (and (or (= opcode 91)
+                                       (= opcode 92)
+                                       (= opcode 93)
+                                       (= opcode 94))
+                                   (= position 2))
+                              (and (= opcode 84) (= position 2))
+                              (capture-place? graph user position))
+                            0
+                          :else (set! safe false))))))
+            (set! next (q/pop! (mut work)))))
+        (q/release! (mut work))
+        (bits/release! (mut seen))
+        (uses/release! (mut edges))))
+    (free! (mut origins))
+    safe))
+
+;;; Zero storage for functions without tail calls. Otherwise mode1 is a native
+;;; jump and mode2 is an ABI-preserving call/return fallback. The plan is invalid
+;;; after graph mutation, just like other persistent target matching metadata.
+(defn build [(graph g/Graph) (scheduled schedule/Schedule) (a (dyn Allocator))]
+  (-> (Result (ArrayList i32) (slice u8)))
+  (let [(mut modes) (ArrayList::new [i32] a)
+        (mut has-tail) false
+        (mut error) ""]
+    (for reference (.nodes scheduled)
+      (when (= (n/opcode (get (.instructions graph) (cast i64 reference))) 80)
+        (set! has-tail true)))
+    (when has-tail
+      (for [i 0 (len (.instructions graph))] (push! (mut modes) 0))
+      (let [safe (private-frame? graph scheduled a)]
+        (for reference (.nodes scheduled)
+          (when (and (= error "")
+                     (= (n/opcode (get (.instructions graph)
+                                       (cast i64 reference)))
+                        80))
+            (match (abi/layout graph reference a)
+              (Err [message] (set! error message))
+              (Ok [owned]
+                  (let [(mut layout) owned
+                        (mut native) safe]
+                    (for argument (.arguments layout)
+                      (when (or (= (.register argument) -1)
+                                (>= (.copy-offset argument) 0))
+                        (set! native false)))
+                    (set! (mut modes) (cast i64 reference) (if native 1 2))
+                    (abi/release! (mut layout)))))))))
+    (if (= error "") (Ok modes) (do (free! (mut modes)) (Err error)))))

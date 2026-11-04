@@ -2,11 +2,112 @@
 (import "stogir.calls" :as calls)
 (import "stogir.graph" :as g)
 (import "stogir.node" :as n)
+(import "stogir.builder" :as b)
+(import "stogir.call-results" :as results)
+(import "stogir.strings" :as strings)
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.arraylist" :use [ArrayList])
-(import "coil.result" :use [Ok Err])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [message] (panic "{}" message))))
+
+;;; Construction follows the pinned typed-call/UNREACHABLE representation.
+(defn tail-shape [(ty u8) (wrong bool)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        callee (require (b/scalar-constant! (mut graph) 6 0 8))]
+    (match (calls/create 0 ty [] a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+          (let [(mut target) owned]
+            (match (calls/create 0
+                                 (if wrong (if (= ty 11) (: 5 u8) 11) ty)
+                                 []
+                                 a)
+              (Err [message] (panic "{}" message))
+              (Ok [owned]
+                  (let [(mut own) owned]
+                    (require (calls/function! (mut graph) own a))
+                    (calls/release! (mut own)))))
+            (let [before (len (.instructions graph))]
+              (match (calls/emit-tail! (mut graph) target start callee [] 0 a)
+                (Err [message]
+                     (assert wrong)
+                     (assert (= before (len (.instructions graph)))))
+                (Ok [done]
+                    (assert (not wrong))
+                    (let [terminal (get (.instructions graph) (cast i64 done))
+                          call (.op1 terminal)
+                          node (get (.instructions graph) (cast i64 call))]
+                      (assert (= (n/opcode terminal) 121))
+                      (assert (= (n/opcode node) 80))
+                      (assert (= (n/type-id node) ty))
+                      (require (calls/verify graph))
+                      ; A second successor violates the close-once tail contract.
+                      (require (b/unreachable! (mut graph) call done))
+                      (match (calls/verify graph)
+                        (Err [_] 0)
+                        (Ok [_] (panic "multiply-used TAILCALL accepted")))))))
+            (calls/release! (mut target)))))
+    (g/release! (mut graph))))
+
+(defn aggregate-tail-shape [(kind i32) (wrong-place bool)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        name
+          (match (strings/intern! (mut (.strings graph)) "result")
+            (Some [id] id)
+            (None [] (panic "name space exhausted")))
+        place (require (b/emit! (mut graph) 71 6 [start name (: 0 i32)]))
+        other (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        callee (require (b/scalar-constant! (mut graph) 6 0 8))]
+    (match (calls/create-result 0
+                                [(: 6 u8)]
+                                []
+                                (if (= kind 1)
+                                    (results/pieces 5 2)
+                                    (results/indirect))
+                                a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+          (let [(mut prototype) owned]
+            (match (calls/create-result 0
+                                        [(: 6 u8) 6]
+                                        []
+                                        (.aggregate-result prototype)
+                                        a)
+              (Err [message] (panic "{}" message))
+              (Ok [owned]
+                  (let [(mut own) owned]
+                    (require (calls/function! (mut graph) own a))
+                    (calls/release! (mut own)))))
+            (let [before (len (.instructions graph))]
+              (match (calls/emit-tail! (mut graph)
+                                       prototype
+                                       start
+                                       callee
+                                       [(if wrong-place other place)]
+                                       0
+                                       a)
+                (Err [_]
+                     (assert wrong-place)
+                     (assert (= before (len (.instructions graph)))))
+                (Ok [_]
+                    (assert (not wrong-place))
+                    (require (calls/verify graph)))))
+            (calls/release! (mut prototype)))))
+    (g/release! (mut graph))))
 
 (defn main [] (-> i64)
+  (for ty [(: 0 u8) 1 2 3 4 5 6 7 8 9 10 11 12 13 21 37 52]
+    (tail-shape ty false)
+    (tail-shape ty true))
+  (for kind [(: 1 i32) 2]
+    (aggregate-tail-shape kind false)
+    (aggregate-tail-shape kind true))
   (let [allocator (malloc-allocator)
         (mut graph) (g/create allocator)
         (mut failures) 0]
