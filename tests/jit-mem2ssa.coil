@@ -10,6 +10,7 @@
 (import "stogir.liveness" :as live)
 (import "stogir.load-forward" :as forward)
 (import "stogir.node" :as n)
+(import "stogir.symbols" :as symbols)
 (import "stogir.types" :as types)
 (import "stogir.options" :as options)
 (import "stogir.sccp" :as sccp)
@@ -489,6 +490,98 @@
     (free! (mut roots))
     (g/release! (mut graph))))
 
+;;; Resolve the symbolic displacement to eight, deliberately different from
+;;; its string-table ID. This catches using metadata as a numeric byte offset.
+(defn symbolic-offset-execute [(code image/Image) (expected u64)] (-> void)
+  (let [a (malloc-allocator)
+        (mut values) (ArrayList::new [u64] a)
+        (mut found) (ArrayList::new [bool] a)]
+    (for symbol (.symbols code)
+      (let [external (image/same-name? code symbol "_offset")]
+        (push! (mut values) (if external (: 8 u64) 0))
+        (push! (mut found) external)))
+    (match (jit/map-image-resolved code (slice values) (slice found) a)
+      (Err [e] (panic "{}" e))
+      (Ok [loaded]
+          (let [(mut loaded) loaded
+                f
+                  (p/cast (fnptr (cc/C) [(ptr u8)] u64)
+                          (.base (.memory loaded)))
+                (mut storage) [(: 0x0807060504030201 u64) 0x100F0E0D0C0B0A09]
+                actual (f (p/cast (ptr u8) (mut storage)))]
+            (unless (= actual expected)
+              (panic "symbolic offset: expected {}, got {}" expected actual))
+            (jit/release-image! (mut loaded)))))
+    (free! (mut values))
+    (free! (mut found))))
+
+(defn symbolic-offset [(kind i32) (commuted bool) (write bool)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        base (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        named
+          (require (case kind
+                     73 (symbols/function-address! (mut graph) 8 0)
+                     74 (symbols/function! (mut graph) "_offset" 0)
+                     75 (symbols/symbol! (mut graph) "_offset")
+                     (symbols/string! (mut graph) "_offset")))
+        payload
+          (match (g/lookup graph named)
+            (None [] (panic "offset constant missing"))
+            (Some [value] (n/constant-bits value)))
+        number (require (b/scalar-constant! (mut graph) 6 payload 8))
+        first (require (b/emit! (mut graph) 26 6 [base number]))
+        second
+          (require (b/emit! (mut graph)
+                            26
+                            6
+                            (if commuted [named base] [base named])))
+        before (require (b/emit! (mut graph) 91 2 [start first]))
+        byte (require (b/scalar-constant! (mut graph) 2 147 8))
+        incoming
+          (if write
+              (require (b/emit! (mut graph) 93 0 [before second byte]))
+              before)
+        read
+          (require (b/emit! (mut graph) 91 2 [incoming (if write first second)]))
+        a-value (require (b/emit! (mut graph) 34 5 [before]))
+        b-value (require (b/emit! (mut graph) 34 5 [read]))
+        answer (require (b/emit! (mut graph) 48 5 [a-value b-value]))
+        ret (require (b/emit! (mut graph) 120 5 [read answer (: 0 i32)]))
+        expected
+          (if (= kind 73)
+              (if write (: 154 u64) 0)
+              (if write (: 0 u64) 11))
+        (mut working) (g/duplicate graph a)
+        (mut roots) (ArrayList::new [i32] a)]
+    (push! (mut roots) ret)
+    (require (rewrite/validate graph 8 a))
+    (when (!= kind 77)
+      (match (compile/image graph start [ret] "_symbolic_before" a)
+        (Err [e] (panic "{}" e))
+        (Ok [code]
+            (let [(mut code) code]
+              (symbolic-offset-execute code expected)
+              (image/release! (mut code))))))
+    (let [changes (require (forward/run! (mut working) (mut roots) 8 true a))]
+      ; Native checking precedes the structural assertion so the old bug
+      ; demonstrates wrong machine-code results, not just a missed guard.
+      (when (!= kind 77)
+        (match (compile/image working start (slice roots) "_symbolic_after" a)
+          (Err [e] (panic "{}" e))
+          (Ok [code]
+              (let [(mut code) code]
+                (symbolic-offset-execute code expected)
+                (image/release! (mut code))))))
+      (assert (= changes (if (= kind 73) 1 0))))
+    (when (!= kind 73)
+      (assert (= (.base (forward/address graph second)) second))
+      (assert (= (.value (forward/find graph read 8)) 0)))
+    (g/release! (mut working))
+    (free! (mut roots))
+    (g/release! (mut graph))))
+
 ;;; Keep an opaque memory-writing call in the native barrier cases.
 (defn late-opaque-write :cc (cc/C) [(pointer (ptr u8)) (value u64)] (-> void)
   (store! (p/cast (ptr u64) pointer) value))
@@ -830,6 +923,9 @@
     (g/release! (mut graph))))
 
 (defn main [] (-> i64)
+  (for kind [(: 73 i32) 74 75 77]
+    (for commuted [false true]
+      (for write [false true] (symbolic-offset kind commuted write))))
   (late-unreachable-observation)
   (late-direct-return)
   (for spec [[(: 2 i32) 2]
