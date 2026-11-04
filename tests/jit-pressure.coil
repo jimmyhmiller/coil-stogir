@@ -13,11 +13,12 @@
 (defn require [(result (Result i32 (slice u8)))] (-> i32)
   (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
 
-(defn phi-pressure [(count i64)] (-> i64)
+(defn phi-pressure [(count i64) (operation i32)] (-> i64)
   (let [allocator (malloc-allocator)
         (mut graph) (g/create allocator)
         start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
         parameter (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        four (require (b/scalar-constant! (mut graph) 11 4 8))
         zero (require (b/scalar-constant! (mut graph) 11 0 8))
         condition (require (b/emit! (mut graph) 16 1 [parameter zero]))
         split (require (b/emit! (mut graph) 116 0 [start condition]))
@@ -33,8 +34,14 @@
               (require (b/scalar-constant! (mut graph) 11 (cast u64 i) 8))
             left (require (b/emit! (mut graph) 26 11 [parameter constant]))
             right (require (b/emit! (mut graph) 27 11 [parameter constant]))]
-        (push! (mut phis)
-               (require (b/emit! (mut graph) 67 11 [merge left right])))))
+        (let [phi (require (b/emit! (mut graph) 67 11 [merge left right]))]
+          (push! (mut phis)
+                 (if (= operation 0)
+                     phi
+                     (require (b/emit! (mut graph)
+                                       operation
+                                       11
+                                       [phi four merge])))))))
     ; All Phis start together; reverse consumption makes newer values require
     ; registers before older owners. Edge copies must populate spilled prefixes.
     (let [(mut total) (get phis (- count 1))
@@ -43,7 +50,7 @@
         (set! total (require (b/emit! (mut graph) 26 11 [total (get phis i)])))
         (set! i (- i 1)))
       (let [ret (require (b/emit! (mut graph) 120 11 [merge total (: 0 i32)]))]
-        (when (= count 24)
+        (when (and (= count 24) (= operation 0))
           (match (compile/object graph
                                  start
                                  [ret]
@@ -72,12 +79,21 @@
                       (let [(mut owned) image
                             function
                               (primitive/cast (fnptr (cc/C) [i64] i64)
-                                              (.base owned))
-                            sum (/ (* count (+ count 1)) 2)]
+                                              (.base owned))]
                         (for [x -100 101]
-                          (when (!= (call-ptr function x)
-                                    (+ (* count x) (if (< x 0) sum (- 0 sum))))
-                            (set! failures (+ failures 1))))
+                          (let [(mut expected) (: 0 i128)]
+                            (for [i 1 (+ count 1)]
+                              (let [value
+                                      (cast i128 (+ x (if (< x 0) i (- 0 i))))
+                                    quotient (/ value (: 4 i128))]
+                                (set! expected
+                                      (+ expected
+                                         (case operation
+                                           29 quotient
+                                           30 (- value (* quotient 4))
+                                           value)))))
+                            (when (!= (call-ptr function x) (cast i64 expected))
+                              (set! failures (+ failures 1)))))
                         (jit/release! (mut owned)))))
                 (free! (mut bytes)))))))
     (free! (mut phis))
@@ -126,6 +142,7 @@
     (free! (mut values))
     (g/release! (mut graph))
     (for count [8 16 17 24 40]
-      (set! failures (+ failures (phi-pressure count))))
+      (for operation [(: 0 i32) 29 30]
+        (set! failures (+ failures (phi-pressure count operation)))))
     (println "native register pressure checks: {} failures" failures)
     (if (= failures 0) 0 1)))
