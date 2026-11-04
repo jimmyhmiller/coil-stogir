@@ -654,7 +654,111 @@
             (calls/release! (mut signature)))))
     (g/release! (mut graph))))
 
+(defn copied-tail-target :cc (cc/C) [(copy (ptr i64)) (original (ptr i64))]
+  (-> i64)
+  (let [answer (+ (load copy) 3)]
+    (store! copy 0)
+    (if (or (= copy original) (!= (& (primitive/cast u64 copy) 63) 0))
+        -999
+        answer)))
+
+(defn copied-tail [(explicit bool) (level i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        source (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        copy (require (b/argument-value! (mut graph) source 8 64))]
+    (match (calls/create 0 11 [(: 6 u8) 6] a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+          (let [(mut own) owned]
+            (require (calls/function! (mut graph) own a))
+            (calls/release! (mut own)))))
+    (match (calls/create 0 11 [(: 6 u8) 6] a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+          (let [(mut prototype) owned
+                done
+                  (if explicit
+                      (require (calls/emit-tail! (mut graph)
+                                                 prototype
+                                                 start
+                                                 target
+                                                 [copy source]
+                                                 0
+                                                 a))
+                      (let [call
+                              (require (calls/emit! (mut graph)
+                                                    prototype
+                                                    start
+                                                    target
+                                                    [copy source]
+                                                    a))]
+                        (require (b/emit! (mut graph)
+                                          120
+                                          11
+                                          [call call (: 0 i32)]))))]
+            (match (pipeline/prepare graph start [done] a)
+              (Err [message] (panic "copied tail prepare: {}" message))
+              (Ok [owned]
+                  (let [(mut prepared) owned]
+                    (match (tails/select graph
+                                         (.schedule prepared)
+                                         [done]
+                                         true
+                                         a)
+                      (Err [message] (panic "copied tail proof: {}" message))
+                      (Ok [owned]
+                          (let [(mut plan) owned]
+                            (assert (= (len (.returns plan)) 0))
+                            (when explicit
+                              (let [call
+                                      (.op1 (get (.instructions graph)
+                                                 (cast i64 done)))]
+                                (assert (= (get (.modes plan) (cast i64 call))
+                                           2))))
+                            (tails/release! (mut plan)))))
+                    (pipeline/release! (mut prepared)))))
+            (match (compile/image-with-options graph
+                                               start
+                                               [done]
+                                               "_copied_tail"
+                                               (options/Options :level level)
+                                               a)
+              (Err [message] (panic "copied tail compile: {}" message))
+              (Ok [owned]
+                  (let [(mut output) owned]
+                    (match (jit/map-image output a)
+                      (Err [message] (panic "copied tail map: {}" message))
+                      (Ok [owned]
+                          (let [(mut mapped) owned
+                                function
+                                  (primitive/cast (fnptr (cc/C)
+                                                         [u64 (ptr i64)]
+                                                         i64)
+                                                  (primitive/cast (ptr u8)
+                                                                  (get (.addresses mapped)
+                                                                       0)))
+                                target
+                                  (primitive/cast u64
+                                                  (primitive/cast (ptr u8)
+                                                                  (fnptr-of copied-tail-target)))
+                                (mut value) (: 37 i64)]
+                            (for [i 0 10]
+                              (assert (= (function target
+                                                   (primitive/cast (ptr i64)
+                                                                   (mut value)))
+                                         40))
+                              (assert (= value 37)))
+                            (jit/release-image! (mut mapped)))))
+                    (image/release! (mut output)))))
+            (calls/release! (mut prototype)))))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (for explicit [false true]
+    (for level [(: 1 i32) 2 3] (copied-tail explicit level)))
   (for kind [(: 0 i32) 1 2]
     (for explicit [false true]
       (for level [(: 1 i32) 2 3] (aggregate-tail kind explicit level))))
