@@ -1300,4 +1300,4 @@ word per node instead of repeating the opcode lookup for every operand. Preserve
 our full five-field reference classification rather than truncate to upstream
 input-prefix counts. The public decoder keeps its boundary behavior; the frozen
 string oracle, ASAN/debug uses/mutation/switch/verifier and all-backend native
-checksum pass. Timing not yet established; see [scope](USES_METADATA.md).
+checksum pass. Fixed-emitter native reduction improves stogir5.16%/5.00%, while LLVM is1.2%/2.0% slower and TPDE9.9%/9.7% faster. No compiler bootstrap claim; see [scope](USES_METADATA.md).
