@@ -545,7 +545,56 @@
               (analysis/release! (mut facts)))))
       (g/release! (mut graph)))))
 
+;;; An unused load remains in the validated SCCP result until iterative
+;;; cleanup. Its otherwise-unused address must remain valid in that result.
+(defn unused-load-address [(observed bool)] (-> void)
+  (let [a (malloc-allocator)
+        (mut storage) [(: 11 u64) 29]
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        pointer (require (b/scalar-constant! (mut graph) 6
+                          (p/cast u64 (p/cast (ptr u64) (mut storage))) 8))
+        offset (require (b/scalar-constant! (mut graph) 5 8 8))
+        address (require (b/emit! (mut graph) 26 6 [pointer offset]))
+        loaded (require (b/emit! (mut graph) 91 5 [start address]))
+        answer (require (b/scalar-constant! (mut graph) 5 73 8))
+        done (require (b/emit! (mut graph) 120 5 [loaded answer (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)]
+    (push! (mut roots) done)
+    (when observed (push! (mut roots) loaded))
+    (match (analysis/analyze-rooted graph 8 (slice roots) a)
+      (Err [message] (panic "unused load analysis: {}" message))
+      (Ok [owned]
+        (let [(mut facts) owned]
+          (match (rewrite/rewrite graph facts (slice roots) a)
+            (Err [message] (panic "unused load rewrite: {}" message))
+            (Ok [owned]
+              (let [(mut rewritten) owned]
+                (assert (= (n/opcode (get (.instructions (.graph rewritten))
+                                        (cast i64 loaded))) 91))
+                (assert (= (stable? rewritten) 0))
+                (match (compile/text (.graph rewritten) start
+                                     (slice (.roots rewritten)) a)
+                  (Err [message] (panic "unused load compile: {}" message))
+                  (Ok [owned]
+                    (let [(mut text) owned]
+                      (match (jit/map-text (slice text))
+                        (Err [message] (panic "unused load mapping: {}" message))
+                        (Ok [owned]
+                          (let [(mut mapped) owned
+                                function (p/cast (fnptr (cc/C) [] u64)
+                                                 (.base mapped))]
+                            (assert (= (function) 73))
+                            (jit/release! (mut mapped)))))
+                      (free! (mut text)))))
+                (rewrite/release! (mut rewritten)))))
+          (analysis/release! (mut facts)))))
+    (free! (mut roots))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (unused-load-address false)
+  (unused-load-address true)
   (late-phi-input false)
   (late-phi-input true)
   (let [(mut failures) 0]
