@@ -52,7 +52,7 @@
                     (jit/release-image! (mut loaded)))))
             (link/release! (mut module)))))))
 
-(defn check [(read-result bool)] (-> i64)
+(defn check [(read-result bool) (padding i32)] (-> i64)
   (let [a (malloc-allocator)
         (mut leaf) (g/create a)
         entry (require (b/emit! (mut leaf) 104 0 [(: 0 i32)]))
@@ -125,10 +125,26 @@
                 added (require (b/emit! (mut caller) 26 5 [sum pair]))
                 next (require (b/emit! (mut caller) 26 5 [index one]))
                 back (require (b/emit! (mut caller) 115 0 [hi]))
-                done (require (b/emit! (mut caller) 120 5 [exit sum (: 0 i32)]))]
+                done (require (b/emit! (mut caller) 120 5 [exit sum (: 0 i32)]))
+                (mut growth) (: 0 i32)]
             (require (b/patch! (mut caller) loop 2 back))
             (require (b/patch! (mut caller) index 3 next))
             (require (b/patch! (mut caller) sum 3 added))
+            ; Reserve NOPs only in the source: they have stable reference cells
+            ; but apply! does not clone them into the caller.
+            (for [i 0 (cast i64 padding)]
+              (require (b/emit! (mut leaf) 0 0 [])))
+            (match (inline/optimize caller [done] called
+                                    (inline/Callee :name "_stack_inline_leaf" :graph leaf
+                                      :entry entry :roots [returned] :observed [returned] :never false)
+                                    8 16384 a)
+              (Err [message] (panic "{}" message))
+              (Ok [probe]
+                  (let [(mut probe) probe]
+                    (assert (= (.changes probe) (if read-result 0 1)))
+                    (set! growth (cast i32 (- (len (.instructions (.graph probe)))
+                                              (len (.instructions caller)))))
+                    (rewrite/release! (mut probe)))))
             (match (inline/optimize caller
                                     [done]
                                     called
@@ -140,7 +156,7 @@
                                       :observed [returned]
                                       :never false)
                                     8
-                                    (cast i32 (len (.instructions leaf)))
+                                    (if read-result 0 (- growth 1))
                                     a)
               (Err [message] (panic "{}" message))
               (Ok [rejected]
@@ -158,7 +174,7 @@
                                       :observed [returned]
                                       :never false)
                                     8
-                                    (cast i32 (+ (len (.instructions leaf)) 1))
+                                    (if read-result 16384 growth)
                                     a)
               (Err [message] (panic "{}" message))
               (Ok [expanded]
@@ -201,4 +217,4 @@
     0))
 
 (defn main [] (-> i64)
-  (+ (check false) (check true)))
+  (+ (check false 0) (check true 0) (check false 1024)))
