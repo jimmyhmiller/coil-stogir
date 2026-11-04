@@ -13,6 +13,10 @@
   (let [allocator (malloc-allocator)
         count
           (if (args/has? "--small") 256 (if (args/has? "--large") 4096 1024))
+        registers (if (args/has? "--sparse") (: 64 i32) (: 8 i32))
+        populated (if (args/has? "--sparse") 1 8)
+        fragments (if (args/has? "--fragmented") 16 1)
+        stride (* fragments 3)
         indexed (args/has? "--events")
         stateful (args/has? "--state")
         (mut parts) (ArrayList::new [a/Part] allocator)
@@ -20,26 +24,30 @@
           (a/PressureIndex :known 0 :parts (ArrayList::new [i32] allocator))
         (mut events) (fixed/empty allocator)
         (mut assigned) (a/empty-assigned allocator)
-        (mut pressure) (a/pressure-buffer 8 allocator)
+        (mut pressure) (a/pressure-buffer registers allocator)
         (mut checksum) 0]
     (for [i 0 count]
       (let [(mut part) (a/create (cast i32 i) allocator)]
-        (range/add! (mut (.ranges part)) (* i 3) (+ (* i 3) 3))
+        (for [fragment 0 fragments]
+          (let [start (+ (* i stride) (* fragment 3))]
+            (range/add! (mut (.ranges part)) start (+ start 3))))
         (push! (mut parts) part)))
     (for [i 0 count]
-      (for [reg 0 8]
-        (assert (a/reserve! (mut parts)
-                            (cast i32 reg)
-                            (+ (* i 3) 1)
-                            (+ (* i 3) 2)
-                            allocator))))
+      (for [reg 0 populated]
+        (for [fragment 0 fragments]
+          (let [start (+ (* i stride) (* fragment 3))]
+            (assert (a/reserve! (mut parts)
+                                (cast i32 reg)
+                                (+ start 1)
+                                (+ start 2)
+                                allocator))))))
     (if (or indexed stateful)
-        (match (a/event-index parts 8 allocator)
+        (match (a/event-index parts registers allocator)
           (Err [message] (panic "{}" message))
           (Ok [built] (fixed/release! (mut events)) (set! events built)))
         (a/refresh-pressure! (mut old) parts))
     (when stateful
-      (match (a/assigned-index parts 8 allocator)
+      (match (a/assigned-index parts registers allocator)
         (Err [message] (panic "{}" message))
         (Ok [built] (a/release-assigned! (mut assigned)) (set! assigned built))))
     (for [i 0 count]
@@ -55,13 +63,13 @@
                                        (mut events)
                                        (mut pressure))
               (a/pressure-into! parts (cast i32 i) old (mut pressure))))
-      (for [reg 0 8]
+      (for [reg 0 populated]
         (set! checksum
               (+ checksum
                  (get (.fixed-at pressure) reg)
                  (get (.free pressure) reg)
                  (get (.next-use pressure) reg)))))
-    (let [expected (* 24 (+ (/ (* 3 count (- count 1)) 2) count))]
+    (let [expected (* (* 3 populated) (+ (/ (* stride count (- count 1)) 2) count))]
       (assert (= checksum expected)))
     (for [i 0 (len parts)] (a/release! (elem (mut parts) i)))
     (free! (mut parts))

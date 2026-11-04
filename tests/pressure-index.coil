@@ -1,6 +1,7 @@
 (module stogir.tests.pressure-index)
 (import "stogir.allocation" :as a)
 (import "stogir.fixed-uses" :as f)
+(import "stogir.reserved-ranges" :as reserved)
 (import "stogir.frame" :as frame)
 (import "stogir.interval-queue" :as queue)
 (import "coil.result" :use [Result Ok Err Some None])
@@ -206,8 +207,9 @@
     (a/release-pressure! (mut expected))
     failures))
 
-(defn check-assigned [(seed i64) (registers i32)] (-> i64)
+(defn check-assigned [(seed i64) (registers i32) (sparse bool)] (-> i64)
   (let [allocator (malloc-allocator)
+        populated (if sparse (: 1 i32) registers)
         (mut parts) (ArrayList::new [a/Part] allocator)
         (mut order) (ArrayList::new [queue/Item] allocator)
         (mut pressure) (a/pressure-buffer registers allocator)
@@ -218,26 +220,26 @@
         (range/add! (mut (.ranges part)) start (+ start 4))
         (range/add! (mut (.ranges part)) (+ start 16) (+ start 30))
         (when (= (% i 3) 0)
-          (set! (.register part) (cast i32 (% i (cast i64 registers)))))
+          (set! (.register part) (cast i32 (% i (cast i64 populated)))))
         (for [j 0 12]
           (assert (c/add! (mut (.uses part))
                           (+ (* j 9) (% (+ seed i) 4))
                           2
-                          (cast i32 (% (+ i j) (cast i64 registers))))))
+                          (cast i32 (% (+ i j) (cast i64 populated))))))
         (push! (mut parts) part)))
     (assert (a/reserve! (mut parts) 0 0 200 allocator))
-    (assert (a/reserve! (mut parts) (- registers 1) 0 17 allocator))
+    (assert (a/reserve! (mut parts) (- populated 1) 0 17 allocator))
     (for [i 0 24]
       (assert (a/reserve! (mut parts)
-                          (cast i32 (% i (cast i64 registers)))
+                          (cast i32 (% i (cast i64 populated)))
                           (+ (* i 4) 3)
                           (+ (* i 4) 4)
                           allocator)))
     (let [(mut unusual) (a/create -1 allocator)]
-      (set! (.register unusual) (- registers 1))
+      (set! (.register unusual) (- populated 1))
       (range/add! (mut (.ranges unusual)) 3 19)
       (range/add! (mut (.ranges unusual)) 40 60)
-      (assert (c/add! (mut (.uses unusual)) 0 2 (- registers 1)))
+      (assert (c/add! (mut (.uses unusual)) 0 2 (- populated 1)))
       (push! (mut parts) unusual))
     (let [(mut later) (a/create 24 allocator)]
       (range/add! (mut (.ranges later)) 100 140)
@@ -255,6 +257,11 @@
               (Err [message] (panic "{}" message))
               (Ok [built-state]
                   (let [(mut state) built-state]
+                    (when sparse
+                      (for reg [(: -1 i32) 0 1 63 64 2147483647]
+                        (assert (= (f/has-register? events reg) (= reg 0)))
+                        (assert (= (reserved/has-register? (.physical state) reg)
+                                   (= reg 0)))))
                     (while (> (len order) 0)
                       (match (queue/take! (mut order))
                         (None [] (panic "missing query"))
@@ -441,11 +448,21 @@
     failures))
 
 (defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut events) (f/empty allocator)
+        (mut physical) (reserved/empty allocator)]
+    (for reg [(: -1 i32) 0 1 63 64 2147483647]
+      (assert (not (f/has-register? events reg)))
+      (assert (not (reserved/has-register? physical reg))))
+    (f/release! (mut events))
+    (reserved/release! (mut physical)))
   (let [(mut failures) (+ (tracked-splits) (assigned-mutations))]
     (for registers [(: 1 i32) 4 16 64]
       (for [seed 0 16]
-        (set! failures (+ failures (check-assigned seed registers)))
+        (set! failures (+ failures (check-assigned seed registers false)))
         (set! failures (+ failures (check-events seed registers))))
+      (for [seed 0 16]
+        (set! failures (+ failures (check-assigned seed registers true))))
       (for [seed 0 64] (set! failures (+ failures (check seed registers)))))
     (println "indexed pressure oracle checks: {} failures" failures)
     (if (= failures 0) 0 1)))
