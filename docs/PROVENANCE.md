@@ -962,3 +962,18 @@ or observed saved pointers, explicit frees and result reads as fallback cases.
 Existing module/recursive/ABI tests and the complete memory/forwarding suite pass
 under ASAN. This preserves upstream stack operations in the existing graph; it
 introduces no alternative scoped representation or ABI shortcut.
+
+## Unguarded division/remainder in graph-call expansion
+
+Explicitly unguarded scalar DIV/MOD nodes (op3 zero) can now be cloned with their
+original operands/type. They are not replaced with a different arithmetic rule.
+Nonzero guard dependencies remain ineligible until block-start remapping is
+proved; their existing fallback remains. The actual verifier's graph.operand
+contains unguarded DIV/MOD for operand addressing, so the former unconditional
+exclusion prevented that helper from expanding regardless of its clone cost.
+
+The native/ASAN module oracle compares linked and expanded results for4752
+answers across eight integer widths/signedness variants and ADDR, including zero
+divisors, signed min/-1, extreme bit patterns and positive/negative divisors.
+Additional tests cover a floating divide, exact one-cell budgets, Never/zero
+budget, and a guarded division that remains a call. Existing module cases pass.

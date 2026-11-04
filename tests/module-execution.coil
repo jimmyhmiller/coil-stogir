@@ -1,6 +1,7 @@
 (module stogir.tests.module-execution)
 (import "stogir.graph" :as g)
 (import "stogir.node" :as n)
+(import "stogir.types" :as types)
 (import "stogir.builder" :as b)
 (import "stogir.symbols" :as symbols)
 (import "stogir.strings" :as strings)
@@ -431,7 +432,7 @@
                    (compatible bool)] (-> void)
   (let [a (malloc-allocator)
         pointer (or (= kind 3) (= kind 4) (= kind 7))
-        floating (or (= kind 5) (= kind 6) (= kind 9))
+        floating (or (= kind 5) (= kind 6) (= kind 9) (= kind 29))
         scalar (if floating (: 12 i32) 11)
         result (if (= kind 4) (: 0 i32) scalar)
         (mut callee) (g/create a)
@@ -488,6 +489,13 @@
                                                0x8000000000000000
                                                8)))
           :else 0)
+    (when (= kind 29)
+      (let [three (require (b/scalar-constant! (mut callee) 12 0x4008000000000000 8))]
+        (set! returned (require (b/emit! (mut callee) 29 12 [x three (: 0 i32)])))))
+    (when (or (= kind 26) (= kind 27) (= kind 28))
+      (let [four (require (b/scalar-constant! (mut callee) 11 4 8))]
+        (set! returned (require (b/emit! (mut callee) (if (= kind 27) 30 29) 11
+                                 [x four (if (= kind 28) start (: 0 i32))])))))
     (when (or (= kind 12) (= kind 13))
       (set! returned (require (b/conversion! (mut callee) 33 11 8 x))))
     (when (and (>= kind 14) (<= kind 16))
@@ -770,7 +778,8 @@
                   (Ok [output]
                       (let [(mut output) output
                             expected
-                              (if (or (= kind 21)
+                              (if (or (= kind 28)
+                                      (= kind 21)
                                       (= kind 22)
                                       (= kind 13)
                                       (= kind 16)
@@ -999,8 +1008,8 @@
                                                                                            (mut answer)))
                                                                      0x8000000000000000))
                                                           (assert (= answer
-                                                                     (+ value
-                                                                        3.0)))))))
+                                                                     (if (= kind 29) (/ value 3.0)
+                                                                         (+ value 3.0))))))))
                                                 (if pointer
                                                     (let [(mut slot) (: 0 i64)]
                                                       (for value [-100 -1 0 5
@@ -1038,7 +1047,9 @@
                                                                                    i64)
                                                                             (primitive/cast (ptr u8)
                                                                                             address))]
-                                                      (for value [-4294967296
+                                                      (for value [-9223372036854775808
+                                                                  9223372036854775807
+                                                                  -4294967296
                                                                   -100 -1 0 5
                                                                   222 2147483648
                                                                   4294967295]
@@ -1069,6 +1080,9 @@
                                                                                61))))
                                                                 (assert (= (function value)
                                                                            (case kind
+                                                                             26 (/ value 4)
+                                                                             27 (% value 4)
+                                                                             28 (/ value 4)
                                                                              25
                                                                                7
                                                                              24
@@ -1540,7 +1554,78 @@
     (g/release! (mut caller))
     (g/release! (mut callee))))
 
+;;; Cloning must preserve the native unchecked division contract at zero and
+;;; signed min/-1, all widths, as well as ordinary positive/negative divisors.
+(defn unguarded-division-inline [(opcode i32) (ty u8)] (-> void)
+  (let [a (malloc-allocator)
+        (mut leaf) (g/create a)
+        ls (require (b/emit! (mut leaf) 104 0 [(: 0 i32)]))
+        lx (require (b/emit! (mut leaf) 71 (cast i32 ty) [ls (: 0 i32) 0]))
+        ly (require (b/emit! (mut leaf) 71 (cast i32 ty) [ls (: 0 i32) 1]))
+        value (require (b/emit! (mut leaf) opcode (cast i32 ty) [lx ly (: 0 i32)]))
+        lr (require (b/emit! (mut leaf) 120 (cast i32 ty) [ls value (: 0 i32)]))
+        (mut caller) (g/create a)
+        start (require (b/emit! (mut caller) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut caller) 71 (cast i32 ty) [start (: 0 i32) 0]))
+        y (require (b/emit! (mut caller) 71 (cast i32 ty) [start (: 0 i32) 1]))
+        target (require (symbols/function! (mut caller) "_division_leaf" 0))]
+    (match (calls/create 0 ty [ty ty] a)
+      (Err [message] (panic "{}" message))
+      (Ok [signature]
+          (let [(mut signature) signature
+                called (require (calls/emit! (mut caller) signature start target [x y] a))
+                ret (require (b/emit! (mut caller) 120 (cast i32 ty) [called called (: 0 i32)]))]
+            (require (calls/function! (mut caller) signature a))
+            (require (calls/function! (mut leaf) signature a))
+            (match (inlining/optimize caller [ret called] called
+                                      (inlining/Callee :name "_division_leaf" :graph leaf
+                                        :entry ls :roots [lr] :observed [lr] :never false)
+                                      8 1 a)
+              (Err [message] (panic "{}" message))
+              (Ok [expanded]
+                  (let [(mut expanded) expanded
+                        width (* 8 (types/scalar-size (cast i32 ty) 8))
+                        modulus (<< (: 1 i128) (cast i128 width))
+                        mask (cast u64 (- modulus 1))
+                        sign (cast u64 (/ modulus 2))
+                        (mut leaf-code) (owned-image (compile/image leaf ls [lr] "_division_leaf" a))]
+                    (assert (= (.changes expanded) 1))
+                    (assert (= (len (.instructions (.graph expanded))) (+ (len (.instructions caller)) 1)))
+                    (for after [false true]
+                      (let [(mut code) (owned-image (compile/image (if after (.graph expanded) caller)
+                                                        start (if after (slice (.roots expanded)) [ret called]) "_division_caller" a))]
+                        (match (link/compose [code leaf-code] a)
+                          (Err [message] (panic "{}" message))
+                          (Ok [module]
+                              (let [(mut module) module]
+                                (match (jit/map-image (.image module) a)
+                                  (Err [message] (panic "{}" message))
+                                  (Ok [loaded]
+                                      (let [(mut loaded) loaded
+                                            index (find (.image module) "_division_caller")
+                                            function (primitive/cast (fnptr (cc/C) [u64 u64] u64)
+                                                         (primitive/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))]
+                                        (for left [(: 0 u64) 1 3 4 7 0x80 0x8000 0x80000000 0x8000000000000000 0x7FFFFFFFFFFFFFFF 0xFFFFFFFFFFFFFFFF 0xFEDCBA9876543210]
+                                          (for right [(: 0 u64) 1 2 3 4 7 0x80 0x8000 0x80000000 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
+                                            (let [xx (& left mask)
+                                                  yy (& right mask)
+                                                  sx (if (and (types/signed? (cast i32 ty)) (>= xx sign)) (- (cast i128 xx) modulus) (cast i128 xx))
+                                                  sy (if (and (types/signed? (cast i32 ty)) (>= yy sign)) (- (cast i128 yy) modulus) (cast i128 yy))
+                                                  quotient (if (= sy 0) (: 0 i128) (/ sx sy))
+                                                  wanted (& (cast u64 (if (= opcode 29) quotient (- sx (* quotient sy)))) mask)]
+                                              (assert (= (& (function left right) mask) wanted)))))
+                                        (jit/release-image! (mut loaded)))))
+                                (link/release! (mut module)))))
+                        (image/release! (mut code))))
+                    (image/release! (mut leaf-code))
+                    (rewrite/release! (mut expanded)))))
+            (calls/release! (mut signature)))))
+    (g/release! (mut caller))
+    (g/release! (mut leaf))))
+
 (defn main [] (-> i64)
+  (for ty [(: 2 u8) 3 4 5 6 8 9 10 11]
+    (for opcode [(: 29 i32) 30] (unguarded-division-inline opcode ty)))
   (for spec [[(: 5 u8) 2]
              [(: 11 u8) 2]
              [(: 12 u8) 2]
@@ -1559,6 +1644,12 @@
   (indirect-inline-case false 64)
   (indirect-inline-case true 64)
   (indirect-inline-case false 0)
+  (inline-case 29 false 1 true true)
+  (inline-case 26 false 1 true true)
+  (inline-case 27 false 1 true true)
+  (inline-case 28 false 128 true true)
+  (inline-case 26 true 128 true true)
+  (inline-case 27 false 0 true true)
   (inline-case 25 false 1 true true)
   (inline-case 25 false 0 true true)
   (inline-case 25 true 128 true true)
