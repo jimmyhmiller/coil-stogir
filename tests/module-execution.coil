@@ -64,11 +64,23 @@
       (free! (mut name))
       (free! (mut returns))
       (free! (mut observed))
+      (match (inlining/prioritize-registered-sites registry [site] a)
+        (Err [message] (panic "rank owned snapshot: {}" message))
+        (Ok [owned]
+            (let [(mut ordered) owned]
+              (assert (= (len ordered) 1))
+              (assert (= (.reference (get ordered 0)) called))
+              (assert (= (.callee (get ordered 0)) handle))
+              (free! (mut ordered)))))
       (for invalid [(: 0 i64)
                     -1
                     -9223372036854775808
                     9223372036854775807
                     (+ handle 1)]
+        (match (inlining/prioritize-registered-sites registry
+                    [(inlining/RegisteredSite :reference called :callee invalid)] a)
+          (Err [_] 0)
+          (Ok [ordered] (panic "invalid rank handle accepted")))
         (match (inlining/optimize-registered-if-changed registry
                                                         caller
                                                         roots
@@ -150,6 +162,8 @@
                                         (rewrite/release! (mut right)))))
                               (rewrite/release! (mut left))))))))))
       (inlining/registry-release! (mut registry))
+      (match (inlining/prioritize-registered-sites registry [] a)
+        (Err [_] 0) (Ok [_] (panic "released rank registry accepted")))
       (match (inlining/optimize-registered-if-changed registry
                                                       caller
                                                       roots
@@ -804,14 +818,16 @@
                                                   caller-signature
                                                   a))
                         (calls/release! (mut caller-signature)))))
-                (when (= kind 2)
+                (when (or (= kind 2) (= kind 7))
                   (let [(mut chain) (g/duplicate caller a)
                         second
                           (require (calls/emit! (mut chain)
                                                 signature
                                                 called
                                                 target
-                                                [called]
+                                                (if (= kind 2) [called]
+                                                    [input (require (b/emit! (mut chain) 26 11
+                                                      [called (require (b/scalar-constant! (mut chain) 11 3 8))]))])
                                                 a))
                         definition
                           (inlining/Callee
@@ -826,62 +842,68 @@
                            (inlining/Site :reference second :target definition)]]
                     (g/write-input-word! (mut chain) done 1 second)
                     (g/write-input-word! (mut chain) done 2 second)
-                    ; Each body clones exactly its one ADD, not PARAM/START/RETURN.
-                    (for limit [(: 0 i32) 1 2]
-                      (match (inlining/optimize-sites chain
-                                                      [done]
-                                                      sites
-                                                      8
-                                                      limit
-                                                      a)
-                        (Err [message] (panic "{}" message))
-                        (Ok [batch]
-                            (let [(mut batch) batch]
-                              (assert (= (.changes batch) limit))
-                              (assert (= (- (len (.instructions (.graph batch)))
-                                            (len (.instructions chain)))
-                                         (cast i64 limit)))
-                              (let [(mut code)
-                                      (owned-image (compile/image (.graph batch)
-                                                                  entry
-                                                                  (slice (.roots batch))
-                                                                  "_inline_batch"
-                                                                  a))
-                                    (mut leaf)
-                                      (owned-image (compile/image callee
-                                                                  start
-                                                                  [exit]
-                                                                  "_inline_leaf"
-                                                                  a))]
-                                (match (link/compose [code leaf] a)
-                                  (Err [message] (panic "{}" message))
-                                  (Ok [module]
-                                      (let [(mut module) module]
-                                        (match (jit/map-image (.image module) a)
-                                          (Err [message] (panic "{}" message))
-                                          (Ok [loaded]
-                                              (let [(mut loaded) loaded
-                                                    index
-                                                      (find (.image module)
-                                                            "_inline_batch")]
-                                                (assert (>= index 0))
-                                                (let [address
-                                                        (get (.addresses loaded)
-                                                             (cast i64 index))
-                                                      function
-                                                        (primitive/cast (fnptr (cc/C)
-                                                                               [i64]
-                                                                               i64)
-                                                                        (primitive/cast (ptr u8)
-                                                                                        address))]
-                                                  (for value [-100 -1 0 5 222]
-                                                    (assert (= (function value)
-                                                               (+ value 6)))))
-                                                (jit/release-image! (mut loaded)))))
-                                        (link/release! (mut module)))))
-                                (image/release! (mut code))
-                                (image/release! (mut leaf)))
-                              (rewrite/release! (mut batch))))))
+                    ; Exercise dependent calls in both input processing orders.
+                    (for reverse? [false true]
+                      (let [selected-sites (if reverse? [(get sites 1) (get sites 0)] sites)]
+                        ; Each body clones exactly its one ADD, not PARAM/START/RETURN.
+                        (for limit [(: 0 i32) 1 2]
+                          (match (inlining/optimize-sites chain
+                                                          [done]
+                                                          selected-sites
+                                                          8
+                                                          limit
+                                                          a)
+                            (Err [message] (panic "{}" message))
+                            (Ok [batch]
+                                (let [(mut batch) batch]
+                                  (assert (= (.changes batch) limit))
+                                  (assert (= (- (len (.instructions (.graph batch)))
+                                                (len (.instructions chain)))
+                                             (cast i64 limit)))
+                                  (let [(mut code)
+                                          (owned-image (compile/image (.graph batch)
+                                                                      entry
+                                                                      (slice (.roots batch))
+                                                                      "_inline_batch"
+                                                                      a))
+                                        (mut leaf)
+                                          (owned-image (compile/image callee
+                                                                      start
+                                                                      [exit]
+                                                                      "_inline_leaf"
+                                                                      a))]
+                                    (match (link/compose [code leaf] a)
+                                      (Err [message] (panic "{}" message))
+                                      (Ok [module]
+                                          (let [(mut module) module]
+                                            (match (jit/map-image (.image module) a)
+                                              (Err [message] (panic "{}" message))
+                                              (Ok [loaded]
+                                                  (let [(mut loaded) loaded
+                                                        index
+                                                          (find (.image module)
+                                                                "_inline_batch")]
+                                                    (assert (>= index 0))
+                                                    (let [address (get (.addresses loaded) (cast i64 index))]
+                                                      (if (= kind 2)
+                                                          (let [function (primitive/cast (fnptr (cc/C) [i64] i64)
+                                                                            (primitive/cast (ptr u8) address))]
+                                                            (for value [-100 -1 0 5 222]
+                                                              (assert (= (function value) (+ value 6)))))
+                                                          (let [function (primitive/cast (fnptr (cc/C) [(ptr i64) i64] i64)
+                                                                            (primitive/cast (ptr u8) address))
+                                                                (mut memory) (: 0 i64)]
+                                                            (for value [-100 -1 0 5 222]
+                                                              (set! memory 0)
+                                                              (assert (= (function (primitive/cast (ptr i64) (mut memory)) value)
+                                                                         (+ value 3)))
+                                                              (assert (= memory (+ value 3)))))))
+                                                    (jit/release-image! (mut loaded)))))
+                                            (link/release! (mut module)))))
+                                    (image/release! (mut code))
+                                    (image/release! (mut leaf)))
+                                  (rewrite/release! (mut batch))))))
+                      ))
                     (match (inlining/optimize-sites chain
                                                     [done]
                                                     [(get sites 0)
@@ -2207,7 +2229,72 @@
     (g/release! (mut caller))
     (g/release! (mut leaf))))
 
+;;; Sorting uses only registry snapshots; source graphs die before ranking.
+;;; Ties follow submission ordinals, independent of CALL reference or handle.
+(defn priority-order-check [] (-> void)
+  (let [a (malloc-allocator) (mut registry) (inlining/registry-create 8 a)
+        (mut sites) (ArrayList::new [inlining/RegisteredSite] a)]
+    (for count [(: 8 i64) 0 2 8 2 0]
+      (let [(mut graph) (g/create a)
+            start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+            param (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+            (mut value) param]
+        (for [i 0 count]
+          (set! value (require (b/emit! (mut graph) 68 5 [value (: 0 i32)]))))
+        (let [ret (require (b/emit! (mut graph) 120 5 [start value (: 0 i32)]))]
+          (match (calls/create 0 5 [(: 5 u8)] a)
+            (Err [message] (panic "rank prototype: {}" message))
+            (Ok [owned]
+                (let [(mut prototype) owned]
+                  (require (calls/function! (mut graph) prototype a))
+                  (calls/release! (mut prototype)))))
+          (match (inlining/register! (mut registry)
+                    (inlining/Callee :name "rank" :graph graph :entry start
+                                     :roots [ret] :observed [ret] :never (= (len sites) 5)))
+            (Err [message] (panic "rank register: {}" message))
+            (Ok [handle]
+                (push! (mut sites) (inlining/RegisteredSite
+                  :reference (cast i32 (- 1000 (* (len sites) 10))) :callee handle)))))
+        (g/release! (mut graph))))
+    (match (inlining/prioritize-registered-sites registry (slice sites) a)
+      (Err [message] (panic "rank: {}" message))
+      (Ok [owned]
+          (let [(mut ordered) owned expected [(: 2 i64) 6 3 5 1 4]]
+            (assert (= (len ordered) 6))
+            (for [i 0 6]
+              (assert (= (.callee (get ordered i)) (get expected i)))
+              (assert (= (.reference (get ordered i))
+                         (.reference (get sites (- (get expected i) 1)))))
+              (assert (= (.callee (get sites i)) (+ i 1))))
+            (free! (mut ordered)))))
+    (let [(mut many) (ArrayList::new [inlining/RegisteredSite] a)]
+      (for [i 0 1025]
+        (push! (mut many) (inlining/RegisteredSite
+          :reference (cast i32 (- 90000 i)) :callee (get [(: 2 i64) 3 1 6] (% i 4)))))
+      (match (inlining/prioritize-registered-sites registry (slice many) a)
+        (Err [message] (panic "large rank: {}" message))
+        (Ok [owned]
+            (let [(mut ordered) owned (mut at) 0]
+              (assert (= (len ordered) (len many)))
+              ; Independent three-bucket oracle, preserving each source sequence.
+              (for tier [(: 0 i64) 2 8]
+                (for [i 0 (len many)]
+                  (let [site (get many i)
+                        cost (case (.callee site) 2 0 6 0 3 2 8)]
+                    (when (= cost tier)
+                      (assert (= (.reference (get ordered at)) (.reference site)))
+                      (assert (= (.callee (get ordered at)) (.callee site)))
+                      (set! at (+ at 1))))))
+              (assert (= at (len many)))
+              (free! (mut ordered)))))
+      (free! (mut many)))
+    (match (inlining/prioritize-registered-sites registry [] a)
+      (Err [message] (panic "empty rank: {}" message))
+      (Ok [owned] (let [(mut ordered) owned] (assert (= (len ordered) 0)) (free! (mut ordered)))))
+    (free! (mut sites)) (inlining/registry-release! (mut registry))))
+
 (defn main [] (-> i64)
+  (priority-order-check)
   (for ty [(: 2 i32) 3 4 5 8 9 10 11]
     (for trap-default [false true]
       (for range-case? [false true] (switch-inline-case ty trap-default range-case?))))
