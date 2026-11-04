@@ -1,0 +1,51 @@
+(module stogir.benchmarks.compare-immediate)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [x] x) (Err [e] (panic "{}" e))))
+
+;;; Reduced compiler work: signed comparison with a constant, returned as BOOL.
+;;; The same graph must need no materialization of zero or minus one.
+(defn main [] (-> i64)
+  (for literal [(: 0 i64) -1 4096]
+    (let [a (malloc-allocator)
+          (mut graph) (g/create a)
+          start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+          source (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+          constant
+            (require (b/scalar-constant! (mut graph) 11 (cast u64 literal) 8))
+          result (require (b/emit! (mut graph) 16 1 [source constant]))
+          ret (require (b/emit! (mut graph) 120 1 [start result (: 0 i32)]))]
+      (match (compile/text graph start [ret] a)
+        (Err [e] (panic "{}" e))
+        (Ok [text]
+            (let [(mut text) text]
+              (println "constant={} instructions={}" literal (/ (len text) 4))
+              (for [i 0 (/ (len text) 4)]
+                (let [(mut word) (: 0 u32)]
+                  (for [j 0 4]
+                    (set! word
+                          (| word
+                             (<< (cast u32 (get text (+ (* i 4) j)))
+                                 (cast u32 (* j 8))))))
+                  (println "word={}" word)))
+              (match (jit/map-text (slice text))
+                (Err [e] (panic "{}" e))
+                (Ok [image]
+                    (let [(mut image) image
+                          f (p/cast (fnptr (cc/C) [i64] u64) (.base image))]
+                      (for x [-9223372036854775808 -2 -1 0 1 4095 4096
+                              9223372036854775807]
+                        (assert (= (f x) (if (< x literal) (: 1 u64) 0))))
+                      (jit/release! (mut image)))))
+              (free! (mut text)))))
+      (g/release! (mut graph))))
+  0)

@@ -1,0 +1,232 @@
+(module stogir.tests.jit-compare-immediate)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.types" :as types)
+(import "stogir.symbols" :as symbols)
+(import "stogir.a64.emit" :as emit)
+(import "stogir.a64.select" :as select)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [x] x) (Err [message] (panic "{}" message))))
+
+;;; Host integer comparisons are independent of AArch64 flags/encodings.
+(defn expected [(opcode i32) (bits i32) (left u64) (right u64)] (-> u64)
+  (let [modulus (<< (: 1 i128) (cast i128 bits))
+        mask (- modulus 1)
+        x (& (cast i128 left) mask)
+        y (& (cast i128 right) mask)
+        sign (/ modulus 2)
+        sx (if (>= x sign) (- x modulus) x)
+        sy (if (>= y sign) (- y modulus) y)
+        yes
+          (case opcode
+            14 (= x y)
+            15 (!= x y)
+            16 (< sx sy)
+            17 (>= sx sy)
+            18 (<= sx sy)
+            19 (> sx sy)
+            20 (< x y)
+            21 (>= x y)
+            22 (<= x y)
+            23 (> x y)
+            false)]
+    (if yes (: 1 u64) 0)))
+
+(defn check [(ty i32)
+             (opcode i32)
+             (literal u64)
+             (left-constant bool)
+             (mode i32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut roots) (ArrayList::new [i32] a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        argument (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        bits (* (types/scalar-size ty 8) 8)
+        modulus (<< (: 1 i128) (cast i128 bits))
+        normalized (& (cast i128 literal) (- modulus 1))
+        constant
+          (require (b/scalar-constant! (mut graph) ty (cast u64 normalized) 8))
+        comparison
+          (require (b/emit! (mut graph)
+                            opcode
+                            1
+                            (if left-constant
+                                [constant argument]
+                                [argument constant])))
+        signed-value
+          (if (and (or (>= bits 32) (and (>= opcode 16) (<= opcode 19)))
+                   (>= normalized (/ modulus 2)))
+              (- normalized modulus)
+              normalized)
+        magnitude
+          (if (< signed-value 0) (- (: 0 i128) signed-value) signed-value)
+        encodable
+          (or (<= magnitude 4095)
+              (and (= (% magnitude 4096) 0) (<= magnitude 16773120)))
+        (mut failures) 0]
+    (match (select/comparison graph comparison)
+      (Err [message] (panic "{}" message))
+      (Ok [tile]
+          (when (!= (= (.right tile) 0) encodable)
+            (set! failures (+ failures 1)))
+          (when (and encodable (!= (.left tile) argument))
+            (set! failures (+ failures 1)))))
+    (if (= mode 0)
+        (push! (mut roots)
+               (require (b/emit! (mut graph) 120 1 [start comparison (: 0 i32)])))
+        (let [split (require (b/emit! (mut graph) 116 0 [start comparison]))
+              yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+              no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+              one (require (b/scalar-constant! (mut graph) 5 1 8))
+              zero (require (b/scalar-constant! (mut graph) 5 0 8))]
+          (push! (mut roots)
+                 (require (b/emit! (mut graph) 120 5 [yes one (: 0 i32)])))
+          (push! (mut roots)
+                 (require (b/emit! (mut graph) 120 5 [no zero (: 0 i32)])))
+          (when (= mode 2) (push! (mut roots) comparison))))
+    (match (compile/text graph start (slice roots) a)
+      (Err [message] (panic "{}" message))
+      (Ok [text]
+          (let [(mut text) text]
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "{}" message))
+              (Ok [image]
+                  (let [(mut image) image
+                        function (p/cast (fnptr (cc/C) [u64] u64) (.base image))]
+                    (for value [(: 0 u64)
+                                1
+                                2
+                                7
+                                127
+                                128
+                                255
+                                256
+                                32767
+                                32768
+                                65535
+                                65536
+                                0x7FFFFFFF
+                                0x80000000
+                                0xFFFFFFFF
+                                0x100000000
+                                0x7FFFFFFFFFFFFFFF
+                                0x8000000000000000
+                                0xFFFFFFFFFFFFFFFF
+                                literal
+                                (- literal 1)
+                                (+ literal 1)]
+                      (when (or (!= ty 1) (<= value 1))
+                        (let [want
+                                (if left-constant
+                                    (expected opcode bits literal value)
+                                    (expected opcode bits value literal))
+                              got (function value)]
+                          (when (!= got want)
+                            (panic "compare ty={} op={} constant={} lhs={} mode={} input={} expected={} got={}"
+                                   ty
+                                   opcode
+                                   literal
+                                   left-constant
+                                   mode
+                                   value
+                                   want
+                                   got)))))
+                    (jit/release! (mut image)))))
+            (free! (mut text)))))
+    (free! (mut roots))
+    (g/release! (mut graph))
+    failures))
+
+(defn literal-kinds [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        argument (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))]
+    (for kind [(: 73 i32) 74 75 77]
+      (let [literal
+              (require (case kind
+                         73 (symbols/function-address! (mut graph) 4096 0)
+                         74 (symbols/function! (mut graph) "_not_a_number" 0)
+                         75 (symbols/symbol! (mut graph) "_not_a_number")
+                         (symbols/string! (mut graph) "_not_a_number")))]
+        (for lhs [false true]
+          (for opcode [(: 14 i32) 15 20 21 22 23]
+            (let [comparison
+                    (require (b/emit! (mut graph)
+                                      opcode
+                                      1
+                                      (if lhs
+                                          [literal argument]
+                                          [argument literal])))]
+              (match (select/comparison graph comparison)
+                (Err [message] (panic "{}" message))
+                (Ok [tile]
+                    (assert (= (= (.right tile) 0) (= kind 73)))
+                    (assert (= (.left tile)
+                               (if (and lhs (!= kind 73)) literal argument))))))))))
+    (g/release! (mut graph))))
+
+;;; Malformed persistent tiles must not append half a CMP/CSET pair.
+(defn invalid-immediates [] (-> void)
+  (let [a (malloc-allocator)
+        (mut text) (ArrayList::new [u8] a)]
+    (for bits [(: 4097 u64) 16777216 0xFFFFFFFFFFFFEFFF 0x8000000000000000]
+      (let [tile
+              (select/Tile
+                :rule 20
+                :wide true
+                :left 1
+                :right 0
+                :immediate bits)]
+        (match (emit/single! (mut text) tile 0 1 0)
+          (Ok [_] (panic "unencodable comparison immediate accepted"))
+          (Err [_] (assert (= (len text) 0))))))
+    (free! (mut text))))
+
+(defn main [] (-> i64)
+  ; Old selection must fail here before the full native matrix is attempted.
+  (assert (= (check 11 16 0 false 0) 0))
+  (literal-kinds)
+  (invalid-immediates)
+  (let [(mut failures) 0
+        (mut cases) 0]
+    (for ty [(: 1 i32) 2 3 4 5 6 8 9 10 11]
+      (for opcode [(: 14 i32) 15 16 17 18 19 20 21 22 23]
+        (for literal [(: 0 u64)
+                      1
+                      127
+                      128
+                      255
+                      256
+                      32767
+                      32768
+                      65535
+                      4095
+                      4096
+                      4097
+                      16773120
+                      16777216
+                      0xFFFFFFFF
+                      0xFFFFFFFFFFFFFFFF
+                      0xFFFFFFFFFFFFF000
+                      0xFFFFFFFFFFFFEFFF
+                      0x7FFFFFFFFFFFFFFF
+                      0x8000000000000000]
+          (when (or (!= ty 1) (<= literal 1))
+            (for lhs [false true]
+              (for mode [(: 0 i32) 1 2]
+                (set! failures (+ failures (check ty opcode literal lhs mode)))
+                (set! cases (+ cases 1))))))))
+    (println "immediate comparison native matrix: {} graphs, {} failures"
+             cases
+             failures)
+    (if (= failures 0) 0 1)))
