@@ -1162,3 +1162,12 @@ positive/negative references, absence, extrema, continuation cells, local storag
 void RETURN and competing malformed operands. Runtime-only measurement uses a
 fixed emitter and a checksum-verified retained before object; integrated compiler
 generation and delivery are not yet established.
+
+The integer verifier's left/right operand checks likewise consume checked cell
+borrows immediately and retain only type bytes. The validator's sequence of
+operand/result/right-type checks and diagnostic precedence is unchanged,
+including ADD/SUB pointer offsets and both target widths. ASAN verify, graph,
+integer typing, unary validation and native SCCP control suites pass. An added
+2420-case scalar/pointer/result-type matrix checks acceptance, counts and exact
+error priority. Fixed-emitter runtime comparisons preserve old and intermediate
+object hashes; performance acceptance and integrated generation remain separate.
