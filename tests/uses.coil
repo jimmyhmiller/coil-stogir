@@ -3,6 +3,8 @@
 (import "stogir.builder" :as b)
 (import "stogir.uses" :as u)
 (import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "stogir.verify" :as verify)
 (import "coil.result" :use [Result Ok Err])
 
 (defn require [(r (Result i32 (slice u8)))] (-> i32)
@@ -17,8 +19,34 @@
       (assert (= (.offset sentinel) 0)) (assert (= (.count sentinel) 0)))
     (u/release! (mut lists)) (g/release! (mut graph))))
 
+(defn wide-storage [] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        (mut inputs) (ArrayList::new [i32] a)]
+    ; A structural storage fixture exercises the full u16 variadic extent,
+    ; repeated references and continuation cells without a native CFG claim.
+    (for [i 0 65535] (push! (mut inputs) start))
+    (let [merge (require (b/emit! (mut graph) 112 0 (slice inputs)))
+          (mut lists) (u/build graph a)]
+      (match (verify/structure graph)
+        (Err [message] (panic "wide fixture structure: {}" message))
+        (Ok [_] 0))
+      (assert (= (len (.ranges lists)) (len (.instructions graph))))
+      (assert (= (len (.edges lists)) 65535))
+      (for [r 0 (len (.ranges lists))]
+        (let [range (get (.ranges lists) r)]
+          (assert (= (.count range) (if (= r (cast i64 start)) 65535 0)))
+          (assert (= (.offset range) (if (<= r (cast i64 start)) 0 65535)))))
+      (for [i 0 65535]
+        (let [edge (get (.edges lists) i)]
+          (assert (= (.user edge) merge))
+          (assert (= (.operand edge) (cast i32 (+ i 1))))))
+      (u/release! (mut lists)))
+    (free! (mut inputs)) (g/release! (mut graph))))
+
 (defn main [] (-> i64)
   (empty-graph)
+  (wide-storage)
   (let [allocator (malloc-allocator)
         (mut graph) (g/create allocator)
         start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
