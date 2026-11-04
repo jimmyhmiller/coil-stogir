@@ -103,7 +103,58 @@
     (g/release! (mut graph))
     failures))
 
+;;; Exact signed words across cell/header boundaries, independent of whether
+;;; the payload denotes a valid semantic reference. Graph storage is raw here.
+(defn operand-words [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut words) (ArrayList::new [i32] a)]
+    (assert (= (p/sizeof n/Node) 16))
+    (for count [(: 0 i64) 1 3 4 5 7 8 15 16 63 64 65 257 65535]
+      (clear! (mut words))
+      (for [i 0 count]
+        (push! (mut words)
+               (case (% i 8)
+                 0 (: -2147483648 i32)
+                 1 -1
+                 2 0
+                 3 1
+                 4 2147483647
+                 5 -2147483647
+                 6 0x12345678
+                 -1985229329)))
+      (let [reference
+              (require-ref (g/append-inputs! (mut graph) 112 0 (slice words)))]
+        (assert (> reference 0))
+        ; Force buffer growth after obtaining the stable instruction reference.
+        (let [capacity (.cap (.instructions graph))]
+          (while (= (.cap (.instructions graph)) capacity)
+            (assert (> (require-ref (g/append-inputs! (mut graph)
+                                                      114
+                                                      0
+                                                      [reference]))
+                       0))))
+        (for [i 0 count]
+          (match (g/operand graph reference (cast i32 (+ i 1)))
+            (None [] (panic "stored operand missing"))
+            (Some [actual] (assert (= actual (get words i))))))
+        (for index [(: -2147483648 i32) -1 0 (cast i32 (+ count 1)) 2147483647]
+          (match (g/operand graph reference index)
+            (None [] 0)
+            (Some [_] (panic "invalid operand index accepted"))))
+        (when (>= count 4)
+          (match (g/operand graph (+ reference 1) 1)
+            (None [] 0)
+            (Some [_] (panic "continuation accepted as instruction"))))))
+    (for reference [(: -2147483648 i32) -1 0 2147483647]
+      (match (g/operand graph reference 1)
+        (None [] 0)
+        (Some [_] (panic "invalid instruction accepted"))))
+    (free! (mut words))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (operand-words)
   (let [(mut graph) (g/create (malloc-allocator))
         (mut failures) 0
         (mut i) (: 1 i32)]
@@ -135,7 +186,8 @@
       (assert (not (g/contains? shortened 1)))
       (assert (not (g/contains? shortened 4096)))
       (match (g/lookup shortened 1)
-        (None [] 0) (Some [_] (panic "missing arity must not produce a node")))
+        (None [] 0)
+        (Some [_] (panic "missing arity must not produce a node")))
       (assert (= (g/borrow-node shortened 1) (p/cast (ptr n/Node) 0))))
     (let [payload [(: 0 u8) 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15]]
       (assert (< (require-ref (g/intern-vector! (mut graph)
