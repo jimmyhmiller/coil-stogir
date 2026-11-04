@@ -1222,3 +1222,10 @@ classifiers over 1,451,220 raw-storage cases spanning opcode/type/count shapes,
 positive/negative/absent/continuation references and mixed malformed operands.
 ASAN/debug verifier and exact diagnostic/count checks pass. Fixed-emitter
 source-algorithm timing evidence is recorded separately from compiler generation.
+
+Classification also consumes the first three operand fields already present in
+the validated cursor value. Continuation payload reads keep the checked graph
+accessor; every input reference retains checked membership. This scoped reuse
+does not introduce a new unchecked graph API. The same raw-storage predicate
+matrix passes. Repeated fixed-emitter CPU measurements and their limits are in
+[classification reads](benchmarks/classification-reads/README.md).
