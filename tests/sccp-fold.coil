@@ -5,6 +5,7 @@
 (import "stogir.conversion" :as conversion)
 (import "stogir.types" :as types)
 (import "stogir.integer-unary" :as unary)
+(import "stogir.sccp-fold" :as bridge)
 (import "stogir.sccp-analysis" :as analysis)
 (import "stogir.sccp-values" :as v)
 (import "stogir.bitqueue" :as q)
@@ -304,7 +305,31 @@
     (g/release! (mut graph))
     failures))
 
+;;; A grandchild can have a temporary constant fact while its AND consumer is
+;;; already Bottom. The consumer then need not propagate later fact changes.
+;;; Structural proofs must not turn that temporary bound into a constant result.
+(defn transient-mask [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        mask (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        masked (require (b/emit! (mut graph) 47 5 [x mask]))
+        compared (require (b/emit! (mut graph) 15 1 [masked zero]))
+        (mut domain) (v/create (len (.instructions graph)) a)]
+    (for [i 1 (len (.instructions graph))]
+      (v/kind! (mut domain) (cast i32 i) 131))
+    (for bits [(: 0 u64) 1 524288 0xFFFFFFFFFFFFFFFF]
+      (set! (mut (.values domain)) (cast i64 mask) (n/constant 5 5 0 bits))
+      (match (bridge/evaluate graph domain compared 8)
+        (Err [message] (panic "{}" message))
+        (Ok [decision] (assert (!= (.kind decision) 1)))))
+    (v/release! (mut domain))
+    (g/release! (mut graph))))
+
 (defn main [(argc i32) (argv (ptr (ptr i8)))] (-> i64)
+  (transient-mask)
   (args/init! argc argv)
   (let [oracle (args/has? "--oracle")
         (mut failures) 0]
