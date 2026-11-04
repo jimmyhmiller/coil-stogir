@@ -8,6 +8,13 @@
 (import "stogir.live-ranges" :as ranges)
 (import "stogir.a64.constraints" :as constraints)
 (import "stogir.a64.allocate" :as allocate)
+(import "stogir.a64.coalesce" :as coalesce)
+(import "stogir.allocation" :as parts)
+(import "stogir.allocation-check" :as check)
+(import "stogir.frame" :as frame)
+(import "stogir.constraints" :as uses)
+(import "stogir.interval" :as interval)
+(import "stogir.a64.registers" :as registers)
 (import "stogir.locations" :as locations)
 (import "stogir.a64.emit" :as emit)
 (import "stogir.a64.function" :as function)
@@ -23,7 +30,350 @@
 (defn require [(result (Result i32 (slice u8)))] (-> i32)
   (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
 
+;;; Synthetic ranges independently exercise the coalescing proof. Original
+;;; geometry and ordered use records remain available as the reference model.
+(defn coalesce-case [(source-type u8) (target-type u8) (shape i32) (fixed i32)]
+  (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        source
+          (require (b/emit! (mut graph)
+                            71
+                            (cast i32 source-type)
+                            [start (: 0 i32) 0]))
+        copy
+          (require (b/emit! (mut graph)
+                            (if (= source-type target-type) 68 36)
+                            (cast i32 target-type)
+                            (if (= source-type target-type)
+                                [source (: 1 i32)]
+                                [source])))
+        (mut parent) (parts/create source a)
+        (mut child) (parts/create copy a)
+        (mut values) (ArrayList::new [parts/Part] a)
+        (mut local) (ArrayList::new [i32] a)
+        (mut order) (ArrayList::new [i32] a)
+        (mut mapping) (ArrayList::new [i32] a)
+        expected
+          (and (!= shape 1)
+               (!= shape 2)
+               (!= shape 4)
+               (!= fixed 2)
+               (or (= source-type target-type) (!= target-type 1))
+               (= (registers/class-mask (cast i32 source-type))
+                  (registers/class-mask (cast i32 target-type))))]
+    (set! (.allowed parent) (registers/class-mask (cast i32 source-type)))
+    (set! (.allowed child) (registers/class-mask (cast i32 target-type)))
+    (push! (mut (.ranges parent)) (interval/Range :start 2 :end 10))
+    (push! (mut (.ranges parent)) (interval/Range :start 14 :end 20))
+    (case shape
+      0
+        (do
+          (push! (mut (.ranges child)) (interval/Range :start 4 :end 8))
+          (push! (mut (.ranges child)) (interval/Range :start 15 :end 19)))
+      1 (push! (mut (.ranges child)) (interval/Range :start 4 :end 15))
+      2 (push! (mut (.ranges child)) (interval/Range :start 10 :end 12))
+      3
+        (do
+          (push! (mut (.ranges child)) (interval/Range :start 2 :end 10))
+          (push! (mut (.ranges child)) (interval/Range :start 14 :end 20)))
+      4 0
+      (push! (mut (.ranges child)) (interval/Range :start 4 :end 8)))
+    (assert (uses/add! (mut (.uses parent)) 4 1 -1))
+    (assert (uses/add! (mut (.uses parent)) 6 (if (= fixed 0) 1 2) 0))
+    (assert (uses/add! (mut (.uses child)) 5 0 -1))
+    (assert (uses/add! (mut (.uses child)) 6 2 (if (= fixed 2) 1 0)))
+    (assert (uses/add! (mut (.uses child)) 7 1 -1))
+    (push! (mut values) parent)
+    (push! (mut values) child)
+    (for [i 0 (len (.instructions graph))] (push! (mut mapping) start))
+    (for r [start source copy] (push! (mut local) r))
+    (push! (mut order) start)
+    (let [(mut packed) (schedule/pack local mapping order a)
+          (mut aliases) (coalesce/run! (mut values) graph packed a)]
+      (assert (= (> (len aliases) 0) expected))
+      (let [p (at values 0)
+            c (at values 1)]
+        (if expected
+            (do
+              (assert (= (get aliases (cast i64 copy)) source))
+              (assert (= (len (.ranges c)) 0))
+              (assert (= (len (.uses c)) 0))
+              (assert (= (len (.uses p)) 4))
+              (for [i 0 4]
+                (let [u (get (.uses p) i)]
+                  (assert (= (.position u) (+ i 4)))
+                  (assert (= (.kind u) (case i 1 0 2 2 1)))))
+              (assert (= (len (.ranges p)) 2)))
+            (do
+              (assert (= (len (.uses p)) 2))
+              (assert (= (len (.uses c)) 3))
+              (assert (= (len (.ranges p)) 2)))))
+      (free! (mut aliases))
+      (schedule/release! (mut packed)))
+    (for [i 0 (len values)] (parts/release! (elem (mut values) i)))
+    (free! (mut values))
+    (free! (mut mapping))
+    (free! (mut local))
+    (free! (mut order))
+    (g/release! (mut graph))))
+
+;;; A large group must remember fixed constraints contributed by earlier
+;;; children, reject a later conflict, and preserve every alias through spills
+;;; and split transfers. None of the expected constraints come from merged data.
+(defn coalesce-fanout [(reserved bool)] (-> void)
+  (let [a (malloc-allocator)
+        count 128
+        common (+ (* count 2) 10)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        source (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        (mut values) (ArrayList::new [parts/Part] a)
+        (mut parent) (parts/create source a)
+        (mut local) (ArrayList::new [i32] a)
+        (mut order) (ArrayList::new [i32] a)
+        (mut mapping) (ArrayList::new [i32] a)
+        (mut copies) (ArrayList::new [i32] a)
+        (mut layout) (frame/create a)]
+    (push! (mut (.ranges parent)) (interval/Range :start 3 :end (+ common 4)))
+    (assert (uses/add! (mut (.uses parent)) 3 2 0))
+    (push! (mut values) parent)
+    (push! (mut local) start)
+    (push! (mut local) source)
+    (for [i 0 count]
+      (let [copy (require (b/emit! (mut graph) 68 5 [source (: 1 i32)]))
+            (mut child) (parts/create copy a)
+            position (+ (* i 2) 5)]
+        (push! (mut copies) copy)
+        (push! (mut local) copy)
+        (push! (mut (.ranges child))
+               (interval/Range :start position :end (+ common 1)))
+        (assert (uses/add! (mut (.uses child)) position 1 -1))
+        (assert (uses/add! (mut (.uses child)) common 2 (if (= i 1) 1 0)))
+        (push! (mut values) child)))
+    (for [i 0 (len (.instructions graph))] (push! (mut mapping) start))
+    (push! (mut order) start)
+    (let [(mut packed) (schedule/pack local mapping order a)
+          (mut aliases) (coalesce/run! (mut values) graph packed a)]
+      (for [i 0 count]
+        (let [copy (get copies i)]
+          (assert (= (get aliases (cast i64 copy)) (if (= i 1) copy source)))))
+      (when reserved (assert (parts/reserve! (mut values) 0 10 14 a)))
+      (require (parts/run! (mut values) (mut layout) 2 3 8 8 a))
+      (require (check/verify values 2 3))
+      (match (locations/build-index values (len (.instructions graph)) a)
+        (Err [e] (panic "{}" e))
+        (Ok [index]
+            (let [(mut index) index]
+              (coalesce/index! (mut index) aliases)
+              (for [i 0 count]
+                (let [copy (get copies i)
+                      position (+ (* i 2) 5)]
+                  (match (locations/lookup-indexed values index copy position)
+                    (Err [e] (panic "{}" e))
+                    (Ok [location] (assert (= (.kind location) 0))))
+                  (match (locations/lookup-indexed values index copy common)
+                    (Err [e] (panic "{}" e))
+                    (Ok [location]
+                        (assert (= (.kind location) 0))
+                        (assert (= (.value location) (if (= i 1) 1 0)))))))
+              (when reserved
+                (assert (> (len values) (+ count 2)))
+                (for position [(: 11 i64) 13]
+                  (match (locations/lookup-indexed values index source position)
+                    (Err [e] (panic "{}" e))
+                    (Ok [location] (assert (= (.value location) 1)))))
+                (assert (> (.size layout) 0)))
+              (let [(mut linear) (locations/contiguous values a)
+                    (mut indexed) (locations/contiguous-indexed values index a)]
+                (assert (= (len linear) (len indexed)))
+                (for [i 0 (len linear)]
+                  (let [x (get linear i)
+                        y (get indexed i)]
+                    (assert (= (.parent x) (.parent y)))
+                    (assert (= (.position x) (.position y)))
+                    (assert (locations/same? (.source x) (.source y)))
+                    (assert (locations/same? (.destination x) (.destination y)))))
+                (free! (mut linear))
+                (free! (mut indexed)))
+              (locations/release-index! (mut index)))))
+      (free! (mut aliases))
+      (schedule/release! (mut packed)))
+    (for [i 0 (len values)] (parts/release! (elem (mut values) i)))
+    (free! (mut values))
+    (frame/release! (mut layout))
+    (free! (mut copies))
+    (free! (mut mapping))
+    (free! (mut order))
+    (free! (mut local))
+    (g/release! (mut graph))))
+
+;;; Keep a source live past its copy. Both have identical bits, so upstream's
+;;; contained-lifetime reuse can coalesce them even though the ranges overlap.
+(defn contained-copy [(mode i32) (hard bool)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        param (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        source
+          (if (= mode 2) (require (b/emit! (mut graph) 35 2 [param])) param)
+        copy
+          (require (if (= mode 2)
+                       (b/emit! (mut graph) 36 1 [source])
+                       (if (= mode 1)
+                           (b/emit! (mut graph) 36 5 [param])
+                           (b/emit! (mut graph) 68 11 [param (if hard 1 0)]))))
+        value
+          (if (= mode 2)
+              (require (b/emit! (mut graph) 34 11 [copy]))
+              (if (= mode 1)
+                  (require (b/emit! (mut graph) 36 11 [copy]))
+                  copy))
+        original
+          (if (= mode 2) (require (b/emit! (mut graph) 34 11 [source])) param)
+        sum (require (b/emit! (mut graph) 26 11 [original value]))
+        ret (require (b/emit! (mut graph) 120 11 [start sum (: 0 i32)]))
+        (mut local) (ArrayList::new [i32] a)
+        (mut order) (ArrayList::new [i32] a)
+        (mut mapping) (ArrayList::new [i32] a)]
+    (for [i 0 (len (.instructions graph))] (push! (mut mapping) start))
+    (for node [start param] (push! (mut local) node))
+    (when (= mode 2) (push! (mut local) source))
+    (push! (mut local) copy)
+    (when (!= mode 0) (push! (mut local) value))
+    (when (= mode 2) (push! (mut local) original))
+    (for node [sum ret] (push! (mut local) node))
+    (push! (mut order) start)
+    (let [(mut packed) (schedule/pack local mapping order a)]
+      (match (cfg/build graph a)
+        (Err [e] (panic "{}" e))
+        (Ok [blocks]
+            (let [(mut owned) blocks
+                  (mut analysis) (live/analyze graph owned packed order a)
+                  (mut intervals) (ranges/build graph packed analysis order a)]
+              (match (constraints/build graph packed a)
+                (Err [e] (panic "{}" e))
+                (Ok [requirements]
+                    (let [(mut req) requirements]
+                      (match (allocate/build intervals req graph packed a)
+                        (Err [e] (panic "{}" e))
+                        (Ok [assigned]
+                            (let [(mut allocation) assigned
+                                  source
+                                    (match (locations/lookup-indexed (.parts allocation)
+                                                                     (.locations allocation)
+                                                                     source
+                                                                     (if (= mode
+                                                                            2)
+                                                                         7
+                                                                         5))
+                                      (Err [e] (panic "{}" e))
+                                      (Ok [x] x))
+                                  copied
+                                    (match (locations/lookup-indexed (.parts allocation)
+                                                                     (.locations allocation)
+                                                                     copy
+                                                                     (if (= mode
+                                                                            2)
+                                                                         7
+                                                                         5))
+                                      (Err [e] (panic "{}" e))
+                                      (Ok [x] x))]
+                              (unless (= (locations/same? source copied)
+                                         (!= mode 2))
+                                (panic "contained copy identity policy failed"))
+                              ; Independently check every original use against
+                              ; the final locations, including fixed ABI uses.
+                              (for [r 1 (len req)]
+                                (let [requirements (at req r)]
+                                  (for use (.uses requirements)
+                                    (match (locations/lookup-indexed (.parts allocation)
+                                                                     (.locations allocation)
+                                                                     (cast i32
+                                                                           r)
+                                                                     (.position use))
+                                      (Err [e] (panic "{}" e))
+                                      (Ok [location]
+                                          (when (>= (.kind use) 1)
+                                            (assert (= (.kind location) 0)))
+                                          (when (= (.kind use) 2)
+                                            (assert (= (.value location)
+                                                       (cast i64
+                                                             (.register use))))))))))
+                              (match (function/body graph
+                                                    packed
+                                                    allocation
+                                                    analysis
+                                                    req
+                                                    a)
+                                (Err [e] (panic "{}" e))
+                                (Ok [emitted]
+                                    (let [(mut code) emitted]
+                                      (match (jit/map-text (slice (.text code)))
+                                        (Err [e] (panic "{}" e))
+                                        (Ok [image]
+                                            (let [(mut image) image
+                                                  f
+                                                    (primitive/cast (fnptr (cc/C)
+                                                                           [i64]
+                                                                           i64)
+                                                                    (.base image))]
+                                              (for x [-0x3FFFFFFFFFFFFFFF -100
+                                                      -1 0 1 2 127 128 255 256
+                                                      100 0x3FFFFFFFFFFFFFFF]
+                                                (let [low
+                                                        (cast i64
+                                                              (primitive/cast u8
+                                                                              x))
+                                                      expected
+                                                        (if (= mode 2)
+                                                            (+ low
+                                                               (if (= low 0)
+                                                                   0
+                                                                   1))
+                                                            (+ x x))]
+                                                  (assert (= (call-ptr f x)
+                                                             expected))))
+                                              (jit/release! (mut image)))))
+                                      (buffer/release! (mut code)))))
+                              (allocate/release! (mut allocation)))))
+                      (constraints/release! (mut req)))))
+              (ranges/release! (mut intervals))
+              (live/release-analysis! (mut analysis))
+              (cfg/release! (mut owned)))))
+      (schedule/release! (mut packed)))
+    (free! (mut mapping))
+    (free! (mut order))
+    (free! (mut local))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (coalesce-fanout false)
+  (coalesce-fanout true)
+  (for pair [[(: 5 u8) 5]
+             [(: 11 u8) 5]
+             [(: 6 u8) 5]
+             [(: 2 u8) 8]
+             [(: 3 u8) 9]
+             [(: 4 u8) 10]
+             [(: 1 u8) 1]
+             [(: 2 u8) 1]
+             [(: 8 u8) 1]
+             [(: 1 u8) 2]
+             [(: 5 u8) 12]
+             [(: 4 u8) 13]
+             [(: 12 u8) 12]
+             [(: 13 u8) 13]
+             [(: 5 u8) 13]
+             [(: 12 u8) 4]]
+    (for shape [(: 0 i32) 1 2 3 4 5]
+      (for fixed [(: 0 i32) 1 2]
+        (coalesce-case (get pair 0) (get pair 1) shape fixed))))
+  (contained-copy 0 false)
+  (contained-copy 0 true)
+  (contained-copy 1 false)
+  (contained-copy 2 false)
   (let [a (malloc-allocator)
         (mut graph) (g/create a)
         start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))

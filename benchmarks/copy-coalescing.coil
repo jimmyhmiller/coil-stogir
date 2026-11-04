@@ -1,0 +1,75 @@
+(module stogir.benchmarks.copy-coalescing)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.schedule" :as schedule)
+(import "stogir.a64.coalesce" :as coalesce)
+(import "stogir.allocation" :as allocation)
+(import "stogir.constraints" :as constraints)
+(import "stogir.interval" :as interval)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.time" :as time)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [x] x) (Err [e] (panic "{}" e))))
+
+(defn now [] (-> i64)
+  (match (time/monotonic-now)
+    (Err [_] (panic "monotonic clock failed"))
+    (Ok [instant] (+ (* (.sec instant) 1000000000) (.nsec instant)))))
+
+;;; One source with many independently observed, short-lived copies. Exclude
+;;; fixture construction from timing; include the complete coalescing operation.
+(defn measure [(count i64)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        source (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        (mut local) (ArrayList::new [i32] a)
+        (mut order) (ArrayList::new [i32] a)
+        (mut mapping) (ArrayList::new [i32] a)
+        (mut copies) (ArrayList::new [i32] a)]
+    (push! (mut local) start)
+    (push! (mut local) source)
+    (for [i 0 count]
+      (let [copy (require (b/emit! (mut graph) 68 5 [source (: 1 i32)]))]
+        (push! (mut copies) copy)
+        (push! (mut local) copy)))
+    (for [i 0 (len (.instructions graph))] (push! (mut mapping) start))
+    (push! (mut order) start)
+    (let [(mut packed) (schedule/pack local mapping order a)]
+      (for [turn 0 5]
+        (let [(mut parts) (ArrayList::new [allocation/Part] a)
+              (mut parent) (allocation/create source a)
+              end (+ (* count 2) 8)]
+          (push! (mut (.ranges parent)) (interval/Range :start 3 :end end))
+          (assert (constraints/add! (mut (.uses parent)) 3 1 -1))
+          (assert (constraints/add! (mut (.uses parent)) (- end 1) 1 -1))
+          (push! (mut parts) parent)
+          (for [i 0 count]
+            (let [(mut child) (allocation/create (get copies i) a)
+                  position (+ (* i 2) 5)]
+              (push! (mut (.ranges child))
+                     (interval/Range :start position :end (+ position 1)))
+              (assert (constraints/add! (mut (.uses child)) position 1 -1))
+              (push! (mut parts) child)))
+          (let [begin (now)
+                (mut aliases) (coalesce/run! (mut parts) graph packed a)
+                elapsed (- (now) begin)]
+            (assert (= (len (.uses (at parts 0))) (+ count 2)))
+            (for copy copies (assert (= (get aliases (cast i64 copy)) source)))
+            (println "copies={} turn={} coalesce_ns={}" count turn elapsed)
+            (free! (mut aliases)))
+          (for [i 0 (len parts)] (allocation/release! (elem (mut parts) i)))
+          (free! (mut parts))))
+      (schedule/release! (mut packed)))
+    (free! (mut copies))
+    (free! (mut mapping))
+    (free! (mut order))
+    (free! (mut local))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (for count [(: 32 i64) 128 512 2048] (measure count))
+  0)
