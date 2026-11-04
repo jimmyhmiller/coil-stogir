@@ -1054,12 +1054,15 @@ a relaxation of validation or a persistent interior-pointer cache.
 
 Call expansion shares successful complete callee validation only for exact
 immutable validation read views in one invocation. The private key includes
-instruction/arity/constant/span storage pointers and lengths, binary string
-bytes/entries pointers and lengths, and function-prototype metadata. Target
-pointer width is fixed for that invocation. Interner caches/capacities are not
-read by these validators. A hash bucket is never proof: all thirteen scalar key
-words are compared, including for aliases sharing instruction storage. The cache
-is released before expansion or any return; no proof crosses mutation or calls.
-Caller validation and every per-site root, observation, CALL, capture, result,
-closed-control and budget check remain. This independent Coil orchestration
-optimization does not establish upstream pass parity or disable validation.
+instruction/arity/constant/span storage pointers, lengths and capacities; binary
+string bytes/entries pointers, lengths and capacities; and function-prototype
+metadata. Target pointer width is fixed for that invocation. Interner caches and
+allocator identities are not read by these validators; debug collection checks
+do inspect capacities. A hash bucket is never proof: all nineteen scalar key
+words are compared, including for aliases sharing instruction storage. One fixed
+key buffer is reused; successful keys and collision links use packed scalar
+storage. The cache is released before expansion or any return; no proof crosses
+mutation or calls. Caller validation and every per-site root, observation, CALL,
+capture, result, closed-control and budget check remain. This independent Coil
+orchestration optimization does not establish upstream pass parity or disable
+validation.
