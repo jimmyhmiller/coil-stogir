@@ -403,7 +403,7 @@
     (push! (mut roots) read)
     (assert (= (require (forward/run! (mut working) (mut roots) 8 false a)) 0))
     (assert (= (require (forward/run! (mut working) (mut roots) 8 true a))
-               (if (= blocked 0) 1 0)))
+               (if (or (= blocked 0) (= blocked 4)) 1 0)))
     (require (rewrite/validate working 8 a))
     (when (!= blocked 3)
       (match (compile/image graph start [ret] "_memory_before" a)
@@ -662,8 +662,72 @@
     (image/release! (mut second))
     (image/release! (mut first))))
 
+;;; Dynamic IF and SWITCH arms inherit memory from their unique predecessor. An unknown
+;;; write or volatile access blocks only its own arm. Both outcomes execute with
+;;; aliasing and distinct pointers; observed loads keep their typed value roots.
+(defn branch-forward [(barrier i32) (observed bool) (early bool) (dispatch i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        pointer (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        unknown (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        condition (require (b/emit! (mut graph) 14 1 [x zero]))
+        first (require (b/emit! (mut graph) 91 5 [start pointer]))
+        split (require (b/emit! (mut graph) (if (= dispatch 0) 116 117) 0
+                               [first (if (= dispatch 0) condition x)]))
+        yes (case dispatch
+              0 (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+              1 (require (b/case-value! (mut graph) split zero))
+              (require (b/case-range! (mut graph) split zero zero)))
+        no (if (= dispatch 0)
+               (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+               (require (b/case-default! (mut graph) split)))
+        yes-control
+          (case barrier
+            1 (require (b/emit! (mut graph) 93 0 [yes unknown x]))
+            2 (require (b/emit! (mut graph) 92 5 [yes unknown]))
+            yes)
+        yes-read (require (b/emit! (mut graph) 91 5 [yes-control pointer]))
+        no-read (require (b/emit! (mut graph) 91 5 [no pointer]))
+        yes-end (require (b/emit! (mut graph) 114 0 [yes-read]))
+        no-end (require (b/emit! (mut graph) 114 0 [no-read]))
+        merge (require (b/emit! (mut graph) 112 0 [yes-end no-end]))
+        selected (require (b/emit! (mut graph) 67 5 [merge yes-read no-read]))
+        ret (require (b/emit! (mut graph) 120 5 [merge selected (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)]
+    (push! (mut roots) ret)
+    (when observed
+      (push! (mut roots) yes-read)
+      (push! (mut roots) no-read))
+    (assert (= (.value (forward/find graph no-read 8)) first))
+    (assert (= (.value (forward/find graph yes-read 8))
+               (if (= barrier 0) first 0)))
+    (if early
+        (let [(mut after) (g/duplicate graph a)]
+          (assert (= (require (forward/run! (mut after) (mut roots) 8 true a))
+                     (if (= barrier 0) 2 1)))
+          (require (rewrite/validate after 8 a))
+          (late-native graph after ret (slice roots) 5)
+          (g/release! (mut after)))
+        (match (iter/optimize graph 8 (slice roots) [yes-read no-read] a)
+          (Err [e] (panic "branch forwarding: {}" e))
+          (Ok [rewritten]
+              (let [(mut rewritten) rewritten
+                    after (.graph rewritten)]
+                (assert (!= (n/opcode (get (.instructions after)
+                                          (cast i64 no-read))) 91))
+                (assert (= (= (n/opcode (get (.instructions after)
+                                           (cast i64 yes-read))) 91)
+                           (!= barrier 0)))
+                (late-native graph after ret (slice (.roots rewritten)) 5)
+                (rewrite/release! (mut rewritten))))))
+    (free! (mut roots))
+    (g/release! (mut graph))))
+
 ;;; Exercise the late worklist directly: early forwarding/promotion never runs.
-;;; Unknown stores/calls, volatility, block boundaries and partial views remain
+;;; Unknown stores/calls, volatility, joins and partial views remain
 ;;; barriers. Known stores and proven disjoint writes retain exact effects.
 (defn late-forward [(stored i32) (loaded i32) (barrier i32) (observation i32)]
   (-> void)
@@ -760,7 +824,7 @@
           (if (= barrier 6)
               (and (= result-bytes 1)
                    (forward/convertible? 2 (cast u8 loaded) 0 8))
-              (and (or (= barrier 0) (= barrier 1) (= barrier 5) (= barrier 8))
+              (and (or (= barrier 0) (= barrier 1) (= barrier 4) (= barrier 5) (= barrier 8))
                    (= bytes result-bytes)
                    (forward/convertible? (cast u8 stored) (cast u8 loaded) 0 8)))]
     (unless (= observation 4) (push! (mut roots) ret))
@@ -1028,6 +1092,11 @@
     (for barrier [(: 0 i32) 1 2 3 4 5 6 7 8]
       (for observation [(: 0 i32) 1 2 3 4]
         (late-forward (get spec 0) (get spec 1) barrier observation))))
+  (for barrier [(: 0 i32) 1 2]
+    (for observed [false true]
+      (for early [false true]
+        (for dispatch [(: 0 i32) 1 2]
+          (branch-forward barrier observed early dispatch)))))
   (rooted-effects false false)
   (rooted-effects false true)
   (rooted-effects true false)
@@ -1056,5 +1125,5 @@
     (for loaded [(: 4 i32) 10 13] (scalar-view stored loaded)))
   (for stored [(: 5 i32) 6 11 12]
     (for loaded [(: 5 i32) 6 11 12] (scalar-view stored loaded)))
-  (println "mem2ssa: 2115 late-forward cases, observation ordering, 1254 scalar-view answers and existing partition/barrier checks pass")
+  (println "mem2ssa: 2115 late-forward cases, observation ordering, 1254 scalar-view answers, 36 branch-forward cases and existing partition/barrier checks pass")
   0)
