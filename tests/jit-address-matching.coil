@@ -1,5 +1,7 @@
 (module stogir.tests.jit-address-matching)
 (import "stogir.graph" :as g)
+(import "stogir.a64.address" :as address)
+(import "stogir.symbols" :as symbols)
 (import "stogir.builder" :as b)
 (import "stogir.types" :as types)
 (import "stogir.pipeline" :as pipeline)
@@ -13,7 +15,7 @@
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.primitive" :as p)
 (import "coil.cc" :as cc)
-(import "coil.result" :use [Result Ok Err])
+(import "coil.result" :use [Result Ok Err Some None])
 
 (defn require [(value (Result i32 (slice u8)))] (-> i32)
   (match value (Ok [r] r) (Err [message] (panic "{}" message))))
@@ -25,17 +27,74 @@
            (= (% offset (cast i64 bytes)) 0)
            (< offset (* (cast i64 bytes) 4096)))))
 
+;;; Shape 0 is the old direct ADDR ADD. Shapes 1/2 use the compiler's
+;;; word ADD followed by a pointer cast; 3 commutes the constant, 4 has
+;;; multiple full-width views, 5 uses a numeric ADDR literal, 6 exceeds the
+;;; bounded view walk and must conservatively retain its original expression.
+(defn offset-address! [(graph (mut g/Graph))
+                       (base i32)
+                       (offset i64)
+                       (shape i32)] (-> i32)
+  (let [word-type (if (= shape 2) (: 11 i32) 5)
+        delta
+          (require (b/scalar-constant! (mut graph)
+                                       (if (= shape 5) 6 word-type)
+                                       (cast u64 offset)
+                                       8))
+        raw
+          (if (or (= shape 0) (= shape 5) (= shape 6))
+              (require (b/emit! (mut graph) 26 6 [base delta]))
+              (let [word (require (b/emit! (mut graph) 36 word-type [base]))
+                    sum
+                      (require (b/emit! (mut graph)
+                                        26
+                                        word-type
+                                        (if (= shape 3)
+                                            [delta word]
+                                            [word delta])))]
+                (require (b/emit! (mut graph) 36 6 [sum]))))
+        (mut result) raw]
+    (when (or (= shape 4) (= shape 6))
+      (for [i 0 (if (= shape 6) 21 3)]
+        (set! result
+              (require (b/emit! (mut graph)
+                                36
+                                (case (% i 3) 0 (: 5 i32) 1 11 6)
+                                [result])))))
+    result))
+
+(defn literal-kinds [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        base (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))]
+    (for kind [(: 6 i32) 73 74 75 77]
+      (let [delta
+              (require (case kind
+                         6 (b/scalar-constant! (mut graph) 6 8 8)
+                         73 (symbols/function-address! (mut graph) 8 0)
+                         74 (symbols/function! (mut graph) "_offset" 0)
+                         75 (symbols/symbol! (mut graph) "_offset")
+                         (symbols/string! (mut graph) "_offset")))
+            sum (require (b/emit! (mut graph) 26 6 [base delta]))]
+        (match (address/select graph sum 8)
+          (None [] (assert (and (!= kind 6) (!= kind 73))))
+          (Some [selected]
+                (assert (or (= kind 6) (= kind 73)))
+                (assert (= (.base selected) base))
+                (assert (= (.offset selected) 8))))))
+    (g/release! (mut graph))))
+
 ;;; Variant 0: ordinary shared address; 1: rooted address; 2: HARD COPY barrier;
 ;;; 3: address escapes as return; 4: mixed-width memory sharing.
-(defn check [(ty i32) (offset i64) (variant i32)] (-> i64)
+(defn check [(ty i32) (offset i64) (variant i32) (shape i32)] (-> i64)
   (let [a (malloc-allocator)
         (mut graph) (g/create a)
         start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
         source (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
         destination (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
-        delta (require (b/scalar-constant! (mut graph) 5 (cast u64 offset) 8))
-        address (require (b/emit! (mut graph) 26 6 [source delta]))
-        target (require (b/emit! (mut graph) 26 6 [destination delta]))
+        address (offset-address! (mut graph) source offset shape)
+        target (offset-address! (mut graph) destination offset shape)
         actual-address
           (if (= variant 2)
               (require (b/emit! (mut graph) 68 6 [address (: 1 i32)]))
@@ -48,14 +107,15 @@
         stored (require (b/emit! (mut graph) 93 0 [extra target loaded]))
         result
           (if (= variant 3)
-              (require (b/conversion! (mut graph) 36 5 8 address))
+              (require (b/emit! (mut graph) 36 5 [address]))
               (require (b/scalar-constant! (mut graph) 5 0 8)))
         returned (require (b/emit! (mut graph) 120 5 [stored result (: 0 i32)]))
         (mut roots) (ArrayList::new [i32] a)
         bytes (types/size ty 8)
-        selected (and (!= variant 2) (encodable? bytes offset))
+        selected (and (!= shape 6) (!= variant 2) (encodable? bytes offset))
         omitted
-          (and (!= variant 1)
+          (and (!= shape 6)
+               (!= variant 1)
                (!= variant 2)
                (!= variant 3)
                (encodable? bytes offset)
@@ -131,10 +191,11 @@
     (free! (mut roots))
     (g/release! (mut graph))
     (when (!= failures 0)
-      (println "address ty={} offset={} variant={} failures={}"
+      (println "address ty={} offset={} variant={} shape={} failures={}"
                ty
                offset
                variant
+               shape
                failures))
     failures))
 
@@ -155,6 +216,8 @@
     failures))
 
 (defn main [] (-> i64)
+  (assert (= (check 5 16 0 1) 0))
+  (literal-kinds)
   (let [(mut failures) (invalid-references)]
     (for ty [(: 2 i32)
              3
@@ -182,6 +245,13 @@
                      (* bytes 4095)
                      (* bytes 4096)]
           (for variant [(: 0 i32) 1 2 3 4]
-            (set! failures (+ failures (check ty offset variant)))))))
+            (set! failures (+ failures (check ty offset variant 0)))))))
+    (for ty [(: 2 i32) 5 13 (types/vector-type 2 16)]
+      (let [bytes (cast i64 (types/size ty 8))]
+        (for offset [(: -256 i64) -1 16 255 256 (* bytes 4095) (* bytes 4096)]
+          (for shape [(: 1 i32) 2 3 4 5]
+            (for variant [(: 0 i32) 1 2 3 4]
+              (set! failures (+ failures (check ty offset variant shape))))))))
+    (set! failures (+ failures (check 5 16 0 6)))
     (println "matched memory address checks: {} failures" failures)
     (if (= failures 0) 0 1)))
