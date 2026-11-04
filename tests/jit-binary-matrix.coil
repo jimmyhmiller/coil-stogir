@@ -5,6 +5,8 @@
 (import "stogir.types" :as types)
 (import "stogir.fold" :as fold)
 (import "stogir.a64.compile" :as compile)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.a64.match" :as matching)
 (import "stogir.a64.emit" :as emit)
 (import "stogir.a64.select" :as select)
 (import "stogir.a64.encode" :as encode)
@@ -327,6 +329,142 @@
             (free! (mut code)))))
     (g/release! (mut graph))))
 
+;;; Test selection, machine-use replacement and native results independently.
+;;; Shared/rooted shifts survive; two absorbed consumers can retire their shift.
+(defn extraction-case [(ty i32)
+                       (target i32)
+                       (opcode i32)
+                       (amount u64)
+                       (variant i32)]
+  (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        width (* 8 (types/scalar-size ty 8))
+        field (* 8 (types/scalar-size target 8))
+        fits
+          (and (!= target 1)
+               (<= (+ (& amount (cast u64 (- width 1))) (cast u64 field))
+                   (cast u64 width)))
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        input (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        literal
+          (require (b/scalar-constant! (mut graph)
+                                       ty
+                                       (cast u64
+                                             (% (cast u128 amount)
+                                                (<< (: 1 u128)
+                                                    (cast u128 width))))
+                                       8))
+        shift (require (b/emit! (mut graph) opcode ty [input literal]))
+        narrow (require (b/emit! (mut graph) 35 target [shift]))
+        tag (require (b/emit! (mut graph) 34 5 [narrow]))
+        second
+          (if (= variant 3)
+              (let [other (require (b/emit! (mut graph) 35 target [shift]))]
+                (require (b/emit! (mut graph) 34 5 [other])))
+              0)
+        kept
+          (if (= variant 2)
+              (require (b/emit! (mut graph) (if (= width 64) 36 34) 5 [shift]))
+              0)
+        result
+          (case variant
+            2 (require (b/emit! (mut graph) 48 5 [tag kept]))
+            3 (require (b/emit! (mut graph) 26 5 [tag second]))
+            tag)
+        ret (require (b/emit! (mut graph) 120 5 [start result (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)]
+    (push! (mut roots) ret)
+    (when (= variant 1) (push! (mut roots) shift))
+    (when (= variant 4) (push! (mut roots) narrow))
+    (match (pipeline/prepare graph start (slice roots) a)
+      (Err [message] (panic "extract prepare: {}" message))
+      (Ok [prepared]
+          (let [(mut prepared) prepared]
+            (for fuse [false true]
+              (match (matching/build graph
+                                     (.schedule prepared)
+                                     (slice roots)
+                                     fuse
+                                     a)
+                (Err [message] (panic "extract matching: {}" message))
+                (Ok [plan]
+                    (let [(mut plan) plan
+                          fused (and fits fuse)
+                          range
+                            (get (.ranges (.operands plan)) (cast i64 narrow))]
+                      (assert (= (> (get (.extractions plan) (cast i64 narrow))
+                                    0)
+                                 fused))
+                      (assert (= (get (.omitted (.operands plan))
+                                      (cast i64 shift))
+                                 (and fused
+                                      (or (= variant 0)
+                                          (= variant 3)
+                                          (= variant 4)))))
+                      (assert (= (.count range) 1))
+                      (assert (= (get (.inputs (.operands plan))
+                                      (.offset range))
+                                 (if fused input shift)))
+                      (matching/release! (mut plan))))))
+            (pipeline/release! (mut prepared)))))
+    (match (compile/text graph start (slice roots) a)
+      (Err [message] (panic "extract compile: {}" message))
+      (Ok [text]
+          (let [(mut text) text]
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "extract map: {}" message))
+              (Ok [mapped]
+                  (let [(mut mapped) mapped
+                        f
+                          (primitive/cast (fnptr (cc/C) [u64] u64)
+                                          (.base mapped))
+                        (mut seed) (: 0x123456789ABCDEF0 u64)]
+                    (for [i 0 80]
+                      (set! seed
+                            (+ (* seed 6364136223846793005) 1442695040888963407))
+                      (let [value
+                              (case i
+                                0 (: 0 u64)
+                                1 0xffffffffffffffff
+                                2 0x8000000000000000
+                                3 0x80000000
+                                4 0x7fffffff
+                                5 0x100000000
+                                seed)
+                            shifted
+                              (& (expected opcode ty value amount)
+                                 (cast u64
+                                       (- (<< (: 1 u128) (cast u128 width)) 1)))
+                            raw-tag
+                              (% (cast u128 shifted)
+                                 (<< (: 1 u128) (cast u128 field)))
+                            tag
+                              (if (= target 1)
+                                  (if (= raw-tag 0) (: 0 u128) 1)
+                                  raw-tag)
+                            want
+                              (cast u64
+                                    (case variant
+                                      2 (^ tag (cast u128 shifted))
+                                      3 (* tag 2)
+                                      tag))]
+                        (unless (= (f value) want)
+                          (panic "extract ty={} target={} op={} amount={} variant={} input={} want={} actual={} fits={}\n"
+                                 ty
+                                 target
+                                 opcode
+                                 amount
+                                 variant
+                                 value
+                                 want
+                                 (f value)
+                                 fits))))
+                    (jit/release! (mut mapped)))))
+            (free! (mut text)))))
+    (free! (mut roots))
+    (g/release! (mut graph))))
+
 (defn word! [(output (mut (ArrayList u8))) (value (Result u32 (slice u8)))]
   (-> void)
   (match value
@@ -378,6 +516,13 @@
     (free! (mut code))))
 
 (defn main [] (-> i64)
+  (for ty [(: 4 i32) 10 5 11]
+    (for target [(: 1 i32) 2 8 3 9 4 10]
+      (when (< (types/scalar-size target 8) (types/scalar-size ty 8))
+        (for opcode [(: 50 i32) 51]
+          (for amount [(: 0 u64) 1 8 16 24 31 32 48 56 63 64 65 0xffffffffffffffff]
+            (for variant [(: 0 i32) 1 2 3 4]
+              (extraction-case ty target opcode amount variant)))))))
   (for wide [false true]
     (for rule [(: 44 i32) 45 46 47]
       (for exponent [(: 0 i32) 1 2 15 30 31 32 62 63]
