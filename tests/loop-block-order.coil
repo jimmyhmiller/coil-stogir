@@ -4,7 +4,7 @@
 (import "stogir.dominators" :as dom)
 (import "stogir.loops" :as loops)
 (import "coil.arraylist" :use [ArrayList])
-(import "coil.alloc" :use [malloc-allocator])
+(import "coil.alloc" :use [Allocator malloc-allocator])
 (import "coil.result" :use [Ok Err])
 
 ;;; Literal scanning reference for pinned ir_gcm.c:ir_fix_bb_order, without heap.
@@ -54,6 +54,64 @@
         (= kind 1) (or (and (= from 5) (= to 3)) (and (= from 7) (= to 2)))
         (= kind 2) (and (or (= from 6) (= from 7)) (= to 2))
         false))
+
+;;; Multiple backedges to a header are unioned before increasing nesting depth.
+;;; Irreducible cycles require separate analysis; this counts natural loops only.
+(defn reference-depths [(blocks cfg/Blocks)
+              (predecessors adj/Index)
+              (idom (ArrayList i32))
+              (allocator (dyn Allocator))]
+  (-> (ArrayList i32))
+  (let [(mut depth) (ArrayList::new [i32] allocator)
+        (mut seen) (ArrayList::new [bool] allocator)
+        (mut work) (ArrayList::new [i32] allocator)
+        (mut i) 0]
+    (while (< i (len (.membership blocks)))
+      (push! (mut depth) 0)
+      (push! (mut seen) false)
+      (set! i (+ i 1)))
+    (for header (.starts blocks)
+      (clear! (mut work))
+      (set! i 0)
+      (while (< i (len seen)) (set! (mut seen) i false) (set! i (+ i 1)))
+      (set! (mut seen) (cast i64 header) true)
+      (let [incoming (get (.ranges predecessors) (cast i64 header))
+            (mut backedge?) false
+            (mut j) 0]
+        (while (< j (.count incoming))
+          (let [index (get (.edges predecessors) (+ (.offset incoming) j))
+                edge (get (.edges blocks) index)
+                source (.from edge)]
+            (when (dom/dominates? idom header source)
+              (set! backedge? true)
+              (when (not (get seen (cast i64 source)))
+                (set! (mut seen) (cast i64 source) true)
+                (push! (mut work) source))))
+          (set! j (+ j 1)))
+        (when backedge?
+          (let [(mut cursor) 0]
+            (while (< cursor (len work))
+              (let [block (get work cursor)
+                    range (get (.ranges predecessors) (cast i64 block))
+                    (mut k) 0]
+                (while (< k (.count range))
+                  (let [index (get (.edges predecessors) (+ (.offset range) k))
+                        edge (get (.edges blocks) index)
+                        source (.from edge)]
+                    (when (and (!= (get idom (cast i64 source)) 0)
+                               (not (get seen (cast i64 source))))
+                      (set! (mut seen) (cast i64 source) true)
+                      (push! (mut work) source)))
+                  (set! k (+ k 1))))
+              (set! cursor (+ cursor 1))))
+          (for block (.starts blocks)
+            (when (get seen (cast i64 block))
+              (set! (mut depth)
+                    (cast i64 block)
+                    (+ (get depth (cast i64 block)) 1)))))))
+    (free! (mut seen))
+    (free! (mut work))
+    depth))
 
 (defn check [(kind i32) (seed i32) (fanout i32)] (-> i64)
   (let [a (malloc-allocator)
@@ -133,8 +191,11 @@
           (mut order) (adj/reverse-postorder blocks succ 1 a)
           (mut idom) (dom/build blocks pred order a)
           (mut depth) (loops/depths blocks pred idom a)
+          (mut expected-depth) (reference-depths blocks pred idom a)
           (mut expected) (ArrayList::new [i32] a)
           (mut changed) false]
+      (assert (= (slice depth) (slice expected-depth)))
+      (free! (mut expected-depth))
       (if (= kind 3)
           (for node order (push! (mut expected) node))
           (if needs-fix
@@ -170,7 +231,59 @@
                failures))
     failures))
 
+;;; Dense Boolean full-clear reference versus stamped sparse membership. Cover
+;;; every three-vertex directed graph and sampled four-vertex graphs, including
+;;; detached/self/irreducible cycles, sparse references and duplicate backedges.
+(defn epoch-graph [(bits u64) (vertices i32) (stride i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut blocks) (cfg/Blocks :starts (ArrayList::new [i32] a)
+                                  :membership (ArrayList::new [i32] a)
+                                  :edges (ArrayList::new [cfg/Edge] a))]
+    (for [i 0 (+ 1 (* (cast i64 vertices) (cast i64 stride)))]
+      (push! (mut (.membership blocks)) 0))
+    (for [i 0 (cast i64 vertices)]
+      (let [reference (cast i32 (+ 1 (* i (cast i64 stride))))]
+        (push! (mut (.starts blocks)) reference)
+        (set! (mut (.membership blocks)) (cast i64 reference) reference)))
+    (for [from 0 (cast i64 vertices)]
+      (for [to 0 (cast i64 vertices)]
+        (when (!= (& bits (<< (: 1 u64) (cast u64 (+ (* from (cast i64 vertices)) to)))) 0)
+          (let [source (cast i32 (+ 1 (* from (cast i64 stride))))
+                target (cast i32 (+ 1 (* to (cast i64 stride))))
+                edge (cfg/Edge :from source :to target :source source :position 1)]
+            (push! (mut (.edges blocks)) edge)
+            (when (and (!= (& bits 128) 0) (= from (- (cast i64 vertices) 1)) (= to 1))
+              (push! (mut (.edges blocks)) edge))))))
+    (let [(mut pred) (adj/build blocks true a)
+          (mut succ) (adj/build blocks false a)
+          (mut order) (adj/reverse-postorder blocks succ 1 a)
+          (mut idom) (dom/build blocks pred order a)
+          (mut dominance) (dom/build-index idom a)
+          (mut actual) (loops/depths blocks pred idom a)
+          (mut expected) (reference-depths blocks pred idom a)]
+      (for ancestor (.starts blocks)
+        (for block (.starts blocks)
+          (assert (= (dom/dominates? idom ancestor block)
+                     (dom/indexed-dominates? dominance ancestor block)))))
+      (for invalid [(: 0 i32) -1 (cast i32 (+ (len idom) 1))]
+        (assert (not (dom/indexed-dominates? dominance invalid 1)))
+        (assert (not (dom/indexed-dominates? dominance 1 invalid))))
+      (dom/release-index! (mut dominance))
+      (assert (= (slice actual) (slice expected)))
+      (free! (mut actual))
+      (free! (mut expected))
+      (free! (mut idom))
+      (free! (mut order))
+      (adj/release! (mut succ))
+      (adj/release! (mut pred)))
+    (cfg/release! (mut blocks))))
+
 (defn main [] (-> i64)
+  (for [bits 0 512]
+    (epoch-graph (cast u64 bits) 3 1)
+    (epoch-graph (cast u64 bits) 3 17))
+  (for [seed 0 4096]
+    (epoch-graph (& (+ (* (cast u64 seed) 1103515245) 12345) 65535) 4 7))
   (let [(mut failures) 0
         (mut cases) 0]
     (for kind [(: 0 i32) 1 2 3 5]

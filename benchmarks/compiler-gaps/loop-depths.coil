@@ -1,0 +1,118 @@
+(module gaps.loop-depths)
+(import "stogir.cfg" :as cfg)
+(import "stogir.adjacency" :as adj)
+(import "stogir.dominators" :as dom)
+(import "stogir.loops" :as loops)
+(import "coil.alloc" :use [Allocator malloc-allocator box! destroy])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defstruct Scenario [(blocks cfg/Blocks) (pred adj/Index) (idom (ArrayList i32))])
+
+;;; Multiple backedges to a header are unioned before increasing nesting depth.
+;;; Irreducible cycles require separate analysis; this counts natural loops only.
+(defn legacy-depths [(blocks cfg/Blocks)
+              (predecessors adj/Index)
+              (idom (ArrayList i32))
+              (allocator (dyn Allocator))]
+  (-> (ArrayList i32))
+  (let [(mut depth) (ArrayList::new [i32] allocator)
+        (mut seen) (ArrayList::new [bool] allocator)
+        (mut work) (ArrayList::new [i32] allocator)
+        (mut i) 0]
+    (while (< i (len (.membership blocks)))
+      (push! (mut depth) 0)
+      (push! (mut seen) false)
+      (set! i (+ i 1)))
+    (for header (.starts blocks)
+      (clear! (mut work))
+      (set! i 0)
+      (while (< i (len seen)) (set! (mut seen) i false) (set! i (+ i 1)))
+      (set! (mut seen) (cast i64 header) true)
+      (let [incoming (get (.ranges predecessors) (cast i64 header))
+            (mut backedge?) false
+            (mut j) 0]
+        (while (< j (.count incoming))
+          (let [index (get (.edges predecessors) (+ (.offset incoming) j))
+                edge (get (.edges blocks) index)
+                source (.from edge)]
+            (when (dom/dominates? idom header source)
+              (set! backedge? true)
+              (when (not (get seen (cast i64 source)))
+                (set! (mut seen) (cast i64 source) true)
+                (push! (mut work) source))))
+          (set! j (+ j 1)))
+        (when backedge?
+          (let [(mut cursor) 0]
+            (while (< cursor (len work))
+              (let [block (get work cursor)
+                    range (get (.ranges predecessors) (cast i64 block))
+                    (mut k) 0]
+                (while (< k (.count range))
+                  (let [index (get (.edges predecessors) (+ (.offset range) k))
+                        edge (get (.edges blocks) index)
+                        source (.from edge)]
+                    (when (and (!= (get idom (cast i64 source)) 0)
+                               (not (get seen (cast i64 source))))
+                      (set! (mut seen) (cast i64 source) true)
+                      (push! (mut work) source)))
+                  (set! k (+ k 1))))
+              (set! cursor (+ cursor 1))))
+          (for block (.starts blocks)
+            (when (get seen (cast i64 block))
+              (set! (mut depth)
+                    (cast i64 block)
+                    (+ (get depth (cast i64 block)) 1)))))))
+    (free! (mut seen))
+    (free! (mut work))
+    depth))
+
+(defn make-scenario :cc (cc/C) [(count i64) (stride i64)] (-> (ptr u8))
+  (assert (and (>= count 4) (<= count 2048) (> stride 0) (<= stride 64)))
+  (let [a (malloc-allocator)
+        (mut blocks) (cfg/Blocks :starts (ArrayList::new [i32] a)
+                                  :membership (ArrayList::new [i32] a)
+                                  :edges (ArrayList::new [cfg/Edge] a))]
+    (for [i 0 (+ (* count stride) 1)] (push! (mut (.membership blocks)) 0))
+    (for [i 0 count]
+      (let [id (cast i32 (+ 1 (* i stride)))]
+        (push! (mut (.starts blocks)) id)
+        (set! (mut (.membership blocks)) (cast i64 id) id)
+        (when (> i 0)
+          (let [previous (cast i32 (+ 1 (* (- i 1) stride)))]
+            (push! (mut (.edges blocks)) (cfg/Edge :from previous :to id :source previous :position 1))))))
+    ; One outer loop, one nested loop with two latches; depths sum to2*N-4.
+    (for pair [[(- count 1) 1] [(- count 2) 2] [(- count 3) 2]]
+      (let [from (cast i32 (+ 1 (* (get pair 0) stride)))
+            to (cast i32 (+ 1 (* (get pair 1) stride)))]
+        (push! (mut (.edges blocks)) (cfg/Edge :from from :to to :source from :position 2))))
+    (let [pred (adj/build blocks true a)
+          (mut succ) (adj/build blocks false a)
+          (mut order) (adj/reverse-postorder blocks succ 1 a)
+          idom (dom/build blocks pred order a)
+          scenario (box! a Scenario (Scenario :blocks blocks :pred pred :idom idom))]
+      (free! (mut order))
+      (adj/release! (mut succ))
+      (p/cast (ptr u8) scenario))))
+
+(defn release-scenario :cc (cc/C) [(opaque (ptr u8))] (-> void)
+  (let [s (p/cast (ptr Scenario) opaque)]
+    (cfg/release! (mut (.blocks s)))
+    (adj/release! (mut (.pred s)))
+    (free! (mut (.idom s)))
+    (destroy [Scenario] (malloc-allocator) s)))
+
+(defn kernel :cc (cc/C) :inline (Never) [(opaque (ptr u8)) (legacy bool)] (-> i64)
+  (let [s (p/cast (ptr Scenario) opaque)
+        (mut depth) (if legacy
+                        (legacy-depths (.blocks s) (.pred s) (.idom s) (malloc-allocator))
+                        (loops/depths (.blocks s) (.pred s) (.idom s) (malloc-allocator)))
+        (mut sum) (: 0 i64)]
+    (for block (.starts (.blocks s)) (set! sum (+ sum (cast i64 (get depth (cast i64 block))))))
+    (free! (mut depth))
+    sum))
+
+(export-c [make-scenario :as "gap_loop_depth_create"]
+          [release-scenario :as "gap_loop_depth_release"]
+          [kernel :as "gap_loop_depth"])
