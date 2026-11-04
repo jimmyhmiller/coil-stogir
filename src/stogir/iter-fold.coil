@@ -11,7 +11,6 @@
 (import "stogir.symbols" :as symbols)
 (import "stogir.opcode" :as op)
 (import "stogir.sccp-fold" :as fold)
-(import "stogir.sccp-values" :as v)
 (import "stogir.sccp-rewrite" :as rewrite)
 (import "stogir.verify" :as verify)
 (import "stogir.uses" :as uses)
@@ -278,6 +277,7 @@
         left (.op1 node)
         right (.op2 node)
         (mut source) (: 0 i32)
+        (mut inverted) false
         (mut changed) false]
     (when (and (or (= opcode 14) (= opcode 15))
                (= (n/type-id node) 1)
@@ -290,21 +290,44 @@
                 (when (and (symbols/numeric? literal)
                            (= (n/type-id literal) (n/type-id value))
                            (<= (n/constant-bits literal) 1))
-                  (if (= (n/type-id value) 1)
-                      (set! source left)
-                      (when (and (or (= (n/opcode value) 33)
-                                     (= (n/opcode value) 34))
-                                 (= (.count (get (.ranges lists)
-                                                 (cast i64 left)))
-                                    1)
-                                 (not (bits/contains? protected (cast i64 left))))
-                        (match (g/lookup graph (.op1 value))
-                          (Some [base]
-                                (when (= (n/type-id base) 1)
-                                  (set! source (.op1 value))))
-                          (None [] 0))))
+                  ;;; Independent exact 0/1 projection of a Boolean choice.
+                  ;;; The COND can be shared/rooted: only its comparison changes.
+                  (when (and (= (n/opcode value) 60)
+                             (types/integer? (cast i32 (n/type-id value)))
+                             (> (.op1 value) 0)
+                             (< (.op2 value) 0)
+                             (< (.op3 value) 0))
+                    (let [condition (fold/structural-value graph (.op1 value))
+                          yes (fold/structural-value graph (.op2 value))
+                          no (fold/structural-value graph (.op3 value))]
+                      (when (and (= (n/type-id condition) 1)
+                                 (symbols/numeric? yes)
+                                 (symbols/numeric? no)
+                                 (= (n/type-id yes) (n/type-id value))
+                                 (= (n/type-id no) (n/type-id value))
+                                 (<= (n/constant-bits yes) 1)
+                                 (<= (n/constant-bits no) 1)
+                                 (!= (n/constant-bits yes) (n/constant-bits no)))
+                        (set! source (.op1 value))
+                        (set! inverted (= (n/constant-bits yes) 0)))))
+                  (when (= source 0)
+                    (if (= (n/type-id value) 1)
+                        (set! source left)
+                        (when (and (or (= (n/opcode value) 33)
+                                       (= (n/opcode value) 34))
+                                   (= (.count (get (.ranges lists)
+                                                   (cast i64 left)))
+                                      1)
+                                   (not (bits/contains? protected
+                                                        (cast i64 left))))
+                          (match (g/lookup graph (.op1 value))
+                            (Some [base]
+                                  (when (= (n/type-id base) 1)
+                                    (set! source (.op1 value))))
+                            (None [] 0)))))
                   (when (!= source 0)
-                    (if (= (= opcode 14) (= (n/constant-bits literal) 1))
+                    (if (!= (= (= opcode 14) (= (n/constant-bits literal) 1))
+                            inverted)
                         (set! changed
                               (replace! (mut graph)
                                         (mut lists)
@@ -523,14 +546,11 @@
                  (fold-control bool)
                  (a (dyn Allocator))]
   (-> (Result Progress (slice u8)))
-  (let [(mut domain) (v/create (len (.instructions graph)) a)
-        (mut changes) (: 0 i32)
+  (let [(mut changes) (: 0 i32)
         (mut control-changed) false
         (mut dead-context) (zeroed dead/Context)
         (mut error) ""
         (mut next) (q/pop! (mut queue))]
-    (for [i 1 (len (.instructions graph))]
-      (v/kind! (mut domain) (cast i32 i) 131))
     (while (and (>= next 0) (= error ""))
       (when (and fold-control
                  (control/fold-if! (mut graph)
@@ -586,7 +606,7 @@
             node (get (.instructions graph) next)
             opcode (cast i32 (n/opcode node))]
         (when (and (foldable? opcode) (!= opcode 67))
-          (match (fold/evaluate graph domain reference pointer-bytes)
+          (match (fold/evaluate-current graph reference pointer-bytes)
             (Err [message] (set! error message))
             (Ok [decision]
                 (let [(mut replacement) (: 0 i32)]
@@ -614,7 +634,6 @@
                                     replacement)
                       (set! changes (+ changes 1)))))))))
       (set! next (q/pop! (mut queue))))
-    (v/release! (mut domain))
     (if (= error "")
         (Ok (Progress :changes changes :control control-changed))
         (Err error))))
