@@ -91,3 +91,23 @@ matching and liveness are rebuilt afterward; it never substitutes emitter bytes
 or modifies source inlining annotations. Linked execution coverage lives in the
 existing `tests/module-execution.coil` program, including policy/budget fallbacks,
 ABI groups, branches/PHIs, dependent calls, memory effects and typed imports.
+
+
+### Private merge/test splitting
+
+The iterative control optimizer ports `ir_try_split_if` and
+`ir_try_split_if_cmp` from pinned `ir_sccp.c`. A two-input MERGE with exactly
+one private PHI and its exclusive IF can route constant predecessors directly
+and move a remaining test into the other predecessor. Integer comparisons use
+the existing typed fold oracle. Numeric literals are distinguished from named
+relocation payloads. Protected IF, comparison, PHI, and MERGE identities decline
+the transformation; the public observation contract is unchanged.
+
+Mutations maintain exact use positions and enqueue affected users. Same-truth
+constant inputs invalidate control reachability, using the existing control
+prune/rebuild boundary. Native original/optimized comparisons cover signed and
+unsigned 8/16/32/64-bit values, ten comparisons, reversed inputs, constant and
+dynamic predecessors, protected identities, and branch-local loads. The load
+cases pass null on the other path, checking that no access is speculated. The
+existing iterative suite passes ASAN/debug checks across 10,560 graphs and
+253,440 native answers, with independent exact-use-list comparisons.
