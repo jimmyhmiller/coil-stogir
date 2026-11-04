@@ -2,10 +2,88 @@
 (import "stogir.graph" :as g)
 (import "stogir.builder" :as b)
 (import "stogir.verify" :as v)
+(import "stogir.node" :as n)
 (import "coil.alloc" :use [malloc-allocator])
-(import "coil.result" :use [Ok Err Some None])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn same [(left (Result i32 (slice u8))) (right (Result i32 (slice u8)))]
+  (-> void)
+  (match left
+    (Ok [x]
+        (match right
+          (Ok [y] (assert (= x y)))
+          (Err [_] (panic "unexpected error"))))
+    (Err [x]
+         (match right
+           (Err [y] (assert (= x y)))
+           (Ok [_] (panic "missing error"))))))
+
+;;; Compare complete diagnostic priority and final counts with the original
+;;; sequential API composition, including multiple simultaneous corruptions.
+(defn composite-check [(graph g/Graph) (width i32)] (-> void)
+  (let [pair
+          (match (v/integer-operations-target graph width)
+            (Err [message] (Err [i32 (slice u8)] message))
+            (Ok [_] (v/phis graph)))
+        triple
+          (match (v/integer-operations-target graph width)
+            (Err [message] (Err [i32 (slice u8)] message))
+            (Ok [_]
+                (match (v/constants graph width)
+                  (Err [message] (Err [i32 (slice u8)] message))
+                  (Ok [_] (v/phis graph)))))]
+    (same pair (v/operations-and-phis-target graph width))
+    (same triple (v/operations-constants-and-phis-target graph width))))
+
+(defn composite-cases [] (-> void)
+  (for mode (range 0 12)
+    (let [(mut graph) (g/create (malloc-allocator))
+          start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+          input (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+          literal (require (b/scalar-constant! (mut graph) 5 42 8))
+          left (require (b/emit! (mut graph) 114 0 [start]))
+          right (require (b/emit! (mut graph) 114 0 [start]))
+          merge (require (b/emit! (mut graph) 112 0 [left right]))
+          phi (require (b/emit! (mut graph) 67 5 [merge input literal]))
+          ret (require (b/emit! (mut graph) 120 5 [merge phi (: 0 i32)]))]
+      (case mode
+        1 (g/set-operand! (mut graph) phi 1 start)
+        2 (g/set-operand! (mut graph) phi 2 999999)
+        3 (set! (mut (.arities graph)) (cast i64 phi) 2)
+        4
+          (set! (mut (.instructions graph))
+                (cast i64 phi)
+                (n/make 67 4 3 merge input literal))
+        5 (set! (mut (.constants graph)) 0 (n/constant 0 0 0 42))
+        6
+          (set! (mut (.instructions graph))
+                (cast i64 input)
+                (n/make 255 5 0 start 0 0))
+        7 (set! (mut (.arities graph)) (cast i64 start) -1)
+        8
+          (set! (mut (.instructions graph))
+                (cast i64 ret)
+                (n/make 120 4 0 merge phi 0))
+        9
+          (do
+            (set! (mut (.constants graph)) 0 (n/constant 0 0 0 42))
+            (g/set-operand! (mut graph) phi 1 start))
+        10
+          (do
+            (set! (mut (.constants graph)) 0 (n/constant 0 0 0 42))
+            (set! (mut (.instructions graph))
+                  (cast i64 ret)
+                  (n/make 120 4 0 merge phi 0)))
+        11 (pop! (mut (.arities graph)))
+        0)
+      (for width [(: 4 i32) 8] (composite-check graph width))
+      (g/release! (mut graph)))))
 
 (defn main [] (-> i64)
+  (composite-cases)
   (let [(mut graph) (g/create (malloc-allocator))
         (mut failures) 0]
     (match (b/scalar-constant! (mut graph) 11 42 8)
