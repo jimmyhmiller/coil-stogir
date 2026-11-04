@@ -3,6 +3,9 @@
 (import "stogir.builder" :as b)
 (import "stogir.verify" :as v)
 (import "stogir.node" :as n)
+(import "stogir.vector" :as vector)
+(import "stogir.floating" :as floating)
+(import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.result" :use [Result Ok Err Some None])
 
@@ -125,7 +128,48 @@
                             "dangling reference operand")))))
       (g/release! (mut graph)))))
 
+;;; Compare independent original classifiers on raw storage, including absent,
+;;; continuation, negative and ill-typed inputs. The classifier itself is pure;
+;;; structural validation still rejects malformed graphs before its caller runs.
+(defn classification-cases [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut inputs) (ArrayList::new [i32] a)]
+    (for ty [(: 0 u8) 1 5 6 11 12 13 18 37 44 127 255]
+      (match (g/append-inputs! (mut graph) 71 ty [(: 0 i32) 0 0])
+        (None [] (panic "classification input storage"))
+        (Some [r] (push! (mut inputs) r))))
+    (for ty [(: 5 u8) 12 37]
+      (match (g/intern-scalar! (mut graph) ty 0)
+        (None [] (panic "classification constant storage"))
+        (Some [r] (push! (mut inputs) r))))
+    (let [reference
+            (match (g/append-inputs! (mut graph) 67 5
+                                      [(: 0 i32) 0 0 0 0 0 0 0])
+              (None [] (panic "classification subject storage"))
+              (Some [r] r))]
+      (for r [(: 0 i32) 999999 -2147483648 (+ reference 1)]
+        (push! (mut inputs) r))
+      (for first inputs
+        (for second inputs
+          (set! (mut (.arities graph)) (cast i64 reference) 8)
+          (for i [(: 1 i32) 2 3 4 5 6 7 8]
+            (assert (g/set-operand! (mut graph) reference i
+                                     (if (= (% i 2) 0) second first))))
+          (for opcode (range 0 134)
+            (for ty [(: 0 u8) 1 5 12 37 255]
+              (for count [(: 0 i32) 1 2 4 8]
+                (set! (mut (.arities graph)) (cast i64 reference) count)
+                (let [node (n/make (cast u8 opcode) ty 0 first second first)]
+                  (set! (mut (.instructions graph)) (cast i64 reference) node)
+                  (let [actual (v/classifications graph reference node count)]
+                    (assert (= (.vector? actual) (vector/involves? graph reference)))
+                    (assert (= (.floating? actual) (floating/node? graph reference)))))))))))
+    (free! (mut inputs))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (classification-cases)
   (structure-reference-cases)
   (composite-cases)
   (let [(mut graph) (g/create (malloc-allocator))
