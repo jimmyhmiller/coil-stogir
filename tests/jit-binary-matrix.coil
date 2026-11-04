@@ -5,6 +5,11 @@
 (import "stogir.types" :as types)
 (import "stogir.fold" :as fold)
 (import "stogir.a64.compile" :as compile)
+(import "stogir.a64.emit" :as emit)
+(import "stogir.a64.select" :as select)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
 (import "stogir.jit.darwin" :as jit)
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.primitive" :as primitive)
@@ -243,7 +248,150 @@
     (g/release! (mut graph))
     failures))
 
+;;; Every power-of-two denominator, including signed top-bit fallback, uses
+;;; the wider arithmetic oracle above. Keep the dividend live in a second run
+;;; to exercise result/input interference instead of only dying-input reuse.
+(defn power-division [(opcode i32) (ty i32) (exponent i32) (keep-input bool)]
+  (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        width (* 8 (types/scalar-size ty 8))
+        denominator (<< (: 1 u64) (cast u64 exponent))
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        input (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        literal (require (b/scalar-constant! (mut graph) ty denominator 8))
+        value (require (b/emit! (mut graph) opcode ty [input literal start]))
+        used
+          (if keep-input
+              (require (b/emit! (mut graph) 48 ty [value input]))
+              value)
+        result-type (if (types/signed? ty) (: 11 i32) (: 5 i32))
+        result
+          (if (< width 64)
+              (require (b/emit! (mut graph)
+                                (if (types/signed? ty) 33 34)
+                                result-type
+                                [used]))
+              (if (= ty 6) (require (b/emit! (mut graph) 36 5 [used])) used))
+        ret
+          (require (b/emit! (mut graph)
+                            120
+                            result-type
+                            [start result (: 0 i32)]))]
+    (match (compile/text graph start [ret] a)
+      (Err [message] (panic "power division compile: {}" message))
+      (Ok [compiled]
+          (let [(mut code) compiled]
+            (match (jit/map-text (slice code))
+              (Err [message] (panic "power division map: {}" message))
+              (Ok [mapped]
+                  (let [(mut mapped) mapped
+                        f
+                          (primitive/cast (fnptr (cc/C) [u64] u64)
+                                          (.base mapped))
+                        (mut seed) (: 0x123456789ABCDEF0 u64)]
+                    (for i (range 0 (if (= width 8) 256 160))
+                      (set! seed
+                            (+ (* seed 6364136223846793005) 1442695040888963407))
+                      (let [input
+                              (if (= width 8)
+                                  (cast u64 i)
+                                  (case i
+                                    0 (: 0 u64)
+                                    1 (: 1 u64)
+                                    2 (- denominator 1)
+                                    3 denominator
+                                    4 (+ denominator 1)
+                                    5 (- (: 0 u64) denominator)
+                                    6 (- (- (: 0 u64) denominator) 1)
+                                    7 (+ (- (: 0 u64) denominator) 1)
+                                    8 0x8000000000000000
+                                    9 0x7FFFFFFFFFFFFFFF
+                                    10 0xFFFFFFFFFFFFFFFF
+                                    seed))
+                            quotient (expected opcode ty input denominator)
+                            want
+                              (if keep-input
+                                  (expected 48 ty quotient input)
+                                  quotient)]
+                        (unless (= (f input) want)
+                          (panic "power division op={} ty={} exponent={} keep={} input={} expected={} actual={}"
+                                 opcode
+                                 ty
+                                 exponent
+                                 keep-input
+                                 input
+                                 want
+                                 (f input)))))
+                    (jit/release! (mut mapped)))))
+            (free! (mut code)))))
+    (g/release! (mut graph))))
+
+(defn word! [(output (mut (ArrayList u8))) (value (Result u32 (slice u8)))]
+  (-> void)
+  (match value
+    (Err [message] (panic "{}" message))
+    (Ok [word] (bytes/append32! (mut output) word))))
+
+;;; Force all output/source aliases, including both reserved materialization
+;;; registers. These are real mapped instructions, independently checked above.
+(defn power-registers [(wide bool) (rule i32) (exponent i32) (rd i32) (rn i32)]
+  (-> void)
+  (let [(mut code) (ArrayList::new [u8] (malloc-allocator))
+        signed? (or (= rule 45) (= rule 47))
+        ty (if wide (if signed? 11 5) (if signed? 10 4))
+        tile
+          (select/Tile
+            :rule rule
+            :wide wide
+            :left 1
+            :right 0
+            :immediate (cast u64 exponent))]
+    (word! (mut code) (encode/logical-register true 1 rn 31 0))
+    (require (emit/arithmetic! (mut code) tile rd rn 0))
+    (word! (mut code)
+           (if wide
+               (encode/logical-register true 1 0 31 rd)
+               (encode/extend true signed? 32 0 rd)))
+    (word! (mut code) (encode/ret 30))
+    (match (jit/map-text (slice code))
+      (Err [message] (panic "{}" message))
+      (Ok [mapped]
+          (let [(mut mapped) mapped
+                f (primitive/cast (fnptr (cc/C) [u64] u64) (.base mapped))]
+            (for value [(: 0 u64)
+                        1
+                        3
+                        7
+                        0x7FFFFFFF
+                        0x80000000
+                        0xFFFFFFFF
+                        0x7FFFFFFFFFFFFFFF
+                        0x8000000000000000
+                        0xFFFFFFFFFFFFFFFF]
+              (assert (= (f value)
+                         (expected (if (>= rule 46) 30 29)
+                                   (cast i32 ty)
+                                   value
+                                   (<< (: 1 u64) (cast u64 exponent))))))
+            (jit/release! (mut mapped)))))
+    (free! (mut code))))
+
 (defn main [] (-> i64)
+  (for wide [false true]
+    (for rule [(: 44 i32) 45 46 47]
+      (for exponent [(: 0 i32) 1 2 15 30 31 32 62 63]
+        (when (< exponent
+                 (- (if wide (: 64 i32) (: 32 i32))
+                    (if (or (= rule 45) (= rule 47)) 1 0)))
+          (for rd [(: 0 i32) 1 16 17]
+            (for rn [(: 0 i32) 1 16 17]
+              (power-registers wide rule exponent rd rn)))))))
+  (for ty [(: 2 i32) 8 3 9 4 10 5 6 11]
+    (for exponent (range 0 (cast i64 (* 8 (types/scalar-size ty 8))))
+      (for opcode [(: 29 i32) 30]
+        (for keep [false true]
+          (power-division opcode ty (cast i32 exponent) keep)))))
   (let [(mut failures) 0]
     (for ty [(: 1 u8) 2 3 4 5 6 7 8 9 10 11]
       (for opcode [(: 14 i32)
