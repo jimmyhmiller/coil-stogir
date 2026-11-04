@@ -2,6 +2,7 @@
 (import "stogir.graph" :as g)
 (import "stogir.node" :as n)
 (import "stogir.types" :as types)
+(import "stogir.switch" :as switch)
 (import "stogir.builder" :as b)
 (import "stogir.symbols" :as symbols)
 (import "stogir.strings" :as strings)
@@ -534,7 +535,7 @@
 
 (extern exit-child :as "_exit" :cc (cc/C) [i32] (-> void))
 
-(extern signal :cc (cc/C) [i32 u64] (-> u64))
+(extern signal :cc (cc/C) [i32 (ptr i8)] (-> (ptr i8)))
 
 (extern alarm :cc (cc/C) [u32] (-> u32))
 
@@ -549,7 +550,7 @@
         (if (= child 0)
             (do
               (signal 5
-                      (primitive/cast u64
+                      (primitive/cast (ptr i8)
                                       (primitive/cast (ptr u8)
                                                       (fnptr-of inline-trap-handler))))
               (alarm 2)
@@ -2028,7 +2029,189 @@
     (when (= mode 28) (set! (.cap (.bytes (.strings callee))) 0))
     (g/release! (mut callee))))
 
+;;; A switch clone keeps the insertion order of predecessor/value pairs even
+;;; when case keys are unsorted. Stores and a terminal default are observable.
+(defn switch-inline-trapped? [(function (fnptr (cc/C) [u64 (ptr u64)] u64))
+                              (key u64)] (-> bool)
+  (let [child (fork)]
+    (if (< child 0) false
+        (if (= child 0)
+            (let [(mut counter) (: 0 u64)]
+              (signal 5 (primitive/cast (ptr i8)
+                                       (primitive/cast (ptr u8)
+                                                       (fnptr-of inline-trap-handler))))
+              (alarm 2)
+              (function key (mut counter))
+              (exit-child 99)
+              false)
+            (let [(mut status) (: 0 i32)]
+              (and (= (waitpid child (mut status) 0) child)
+                   (= (& status 127) 0) (= (& (>> status 8) 255) 77)))))))
+
+(defn switch-inline-case [(ty i32) (trap-default bool) (range-case? bool)] (-> void)
+  (let [a (malloc-allocator)
+        (mut leaf) (g/create a)
+        (mut caller) (g/create a)
+        start (require (b/emit! (mut leaf) 104 0 [(: 0 i32)]))
+        raw (require (b/emit! (mut leaf) 71 5 [start (: 0 i32) 0]))
+        pointer (require (b/emit! (mut leaf) 71 6 [start (: 0 i32) 1]))
+        selector (if (= ty 5) raw
+                     (require (b/conversion! (mut leaf)
+                                             (if (= (types/scalar-size ty 8) 8) 36 35)
+                                             ty 8 raw)))
+        split (require (b/switch! (mut leaf) start selector))
+        mask (cast u64 (- (<< (: 1 u128)
+                                (cast u128 (* 8 (types/scalar-size ty 8)))) 1))
+        bias (switch/sign-mask ty)
+        (mut ends) (ArrayList::new [i32] a)
+        (mut values) (ArrayList::new [i32] a)
+        (mut observed) (ArrayList::new [i32] a)]
+    (for id [(: 4 i32) 1 3 2]
+      (let [low (case id 1 (: 0 u64) 2 2 3 (if range-case? 9 1) (if range-case? mask 3))
+            high (if (and (= id 2) range-case?) (: 4 u64) low)
+            first (require (b/scalar-constant! (mut leaf) ty (^ low bias) 8))
+            last (require (b/scalar-constant! (mut leaf) ty (^ high bias) 8))
+            arm (if (= low high)
+                    (require (b/case-value! (mut leaf) split first))
+                    (require (b/case-range! (mut leaf) split first last)))
+            code (require (b/scalar-constant! (mut leaf) 5 (* (cast u64 id) 100) 8))
+            stored (require (b/emit! (mut leaf) 93 0 [arm pointer code]))
+            end (require (b/emit! (mut leaf) 114 0 [stored]))]
+        (push! (mut ends) end)
+        (push! (mut values) code)))
+    (let [fallback (require (b/case-default! (mut leaf) split))
+          code (require (b/scalar-constant! (mut leaf) 5 700 8))
+          stored (require (b/emit! (mut leaf) 93 0 [fallback pointer code]))]
+      (if trap-default
+          (push! (mut observed)
+                 (require (b/emit! (mut leaf) 121 0 [stored (: 0 i32) 0])))
+          (do (push! (mut ends) (require (b/emit! (mut leaf) 114 0 [stored])))
+              (push! (mut values) code))))
+    (let [merge (require (b/emit! (mut leaf) 112 0 (slice ends)))
+          (mut inputs) (ArrayList::new [i32] a)]
+      (push! (mut inputs) merge)
+      (for value values (push! (mut inputs) value))
+      (let [phi (require (b/emit! (mut leaf) 67 5 (slice inputs)))
+            returned (require (b/emit! (mut leaf) 120 5 [merge phi (: 0 i32)]))
+            entry (require (b/emit! (mut caller) 104 0 [(: 0 i32)]))
+            key (require (b/emit! (mut caller) 71 5 [entry (: 0 i32) 0]))
+            address (require (b/emit! (mut caller) 71 6 [entry (: 0 i32) 1]))
+            target (require (symbols/function! (mut caller) "_switch_inline_leaf" 0))]
+        (push! (mut observed) returned)
+        (match (calls/create 0 5 [(: 5 u8) 6] a)
+          (Err [message] (panic "{}" message))
+          (Ok [owned]
+              (let [(mut signature) owned
+                    call (require (calls/emit! (mut caller) signature entry target
+                                                [key address] a))
+                    loaded (require (b/emit! (mut caller) 91 5 [call address]))
+                    twice (require (b/emit! (mut caller) 26 5 [loaded loaded]))
+                    answer (require (b/emit! (mut caller) 26 5 [twice call]))
+                    done (require (b/emit! (mut caller) 120 5 [loaded answer (: 0 i32)]))]
+                (require (calls/function! (mut leaf) signature a))
+                (require (calls/function! (mut caller) signature a))
+                (calls/release! (mut signature))
+                (let [definition (inlining/Callee :name "_switch_inline_leaf"
+                                   :graph leaf :entry start :roots [returned]
+                                   :observed (slice observed) :never false)]
+                  ; A malformed case parent must fail preflight before cloning.
+                  (let [(mut invalid) (g/duplicate leaf a)
+                        (mut changed) false
+                        (mut r) 1]
+                    (while (and (not changed) (< r (len (.instructions invalid))))
+                      (when (= (n/opcode (get (.instructions invalid) r)) 109)
+                        (assert (g/set-operand! (mut invalid) (cast i32 r) 1 start))
+                        (set! changed true))
+                      (set! r (+ r (/ (+ (cast i64 (get (.arities invalid) r)) 4) 4))))
+                    (assert changed)
+                    (match (inlining/optimize caller [done call] call
+                              (inlining/Callee :name "_switch_inline_leaf"
+                                :graph invalid :entry start :roots [returned]
+                                :observed (slice observed) :never false) 8 512 a)
+                      (Err [_] 0)
+                      (Ok [_] (panic "malformed switch accepted by inline preflight")))
+                    (g/release! (mut invalid)))
+                  (for budget [(: 0 i32) 512]
+                    (match (inlining/optimize caller [done call] call definition 8 budget a)
+                      (Err [message] (panic "switch inline: {}" message))
+                      (Ok [owned]
+                          (let [(mut expanded) owned]
+                            (assert (= (.changes expanded) (if (= budget 0) 0 1)))
+                            (require (rewrite/validate (.graph expanded) 8 a))
+                            (when (= budget 512)
+                              (for after [false true]
+                                (let [(mut body)
+                                        (owned-image (compile/image
+                                          (if after (.graph expanded) caller) entry
+                                          (if after (slice (.roots expanded)) [done call])
+                                          "_switch_inline_caller" a))
+                                      (mut called)
+                                        (owned-image (compile/image leaf start (slice observed)
+                                                                    "_switch_inline_leaf" a))]
+                                  (match (link/compose [body called] a)
+                                    (Err [message] (panic "switch compose: {}" message))
+                                    (Ok [owned]
+                                        (let [(mut module) owned
+                                              ordinal (find (.image module) "_switch_inline_caller")]
+                                          (assert (>= ordinal 0))
+                                          (when (and after (not range-case?))
+                                            (assert (> (len (.text-data body)) 0)))
+                                          (when (and after range-case? (= ty 11) (not trap-default))
+                                            (match (macho/image-object (.image module) a)
+                                              (Err [message] (panic "{}" message))
+                                              (Ok [owned]
+                                                  (let [(mut object) owned]
+                                                    (match (fs/write-file a "/tmp/coil-stogir-inline-switch.o" (slice object))
+                                                      (Err [_] (panic "switch object write"))
+                                                      (Ok [_] 0))
+                                                    (free! (mut object))))))
+                                          (match (jit/map-image (.image module) a)
+                                            (Err [message] (panic "switch map: {}" message))
+                                            (Ok [owned]
+                                                (let [(mut mapped) owned
+                                                      function (primitive/cast
+                                                        (fnptr (cc/C) [u64 (ptr u64)] u64)
+                                                        (primitive/cast (ptr u8) (get (.addresses mapped) (cast i64 ordinal))))]
+                                                  (for ordered [(: 0 u64) 1 2 3 4 5 8 9 10 (- mask 1) mask]
+                                                    (let [input (^ ordered bias)
+                                                          code (cond (= ordered 0) (: 100 u64)
+                                                                     (and (>= ordered 2) (<= ordered (if range-case? 4 2))) 200
+                                                                     (= ordered (if range-case? 9 1)) 300
+                                                                     (= ordered (if range-case? mask 3)) 400
+                                                                     :else 700)
+                                                          (mut counter) (: 888 u64)]
+                                                      (if (and trap-default (= code 700))
+                                                          (assert (switch-inline-trapped? function input))
+                                                          (do (assert (= (function input (mut counter)) (* code 3)))
+                                                              (assert (= counter code))))))
+                                                  (jit/release-image! (mut mapped)))))
+                                          (link/release! (mut module)))))
+                                  (image/release! (mut called))
+                                  (image/release! (mut body)))))
+                            (rewrite/release! (mut expanded)))))))
+                  ; A provider omitting the terminal default must retain CALL.
+                  (when trap-default
+                    (let [incomplete (inlining/Callee :name "_switch_inline_leaf"
+                                       :graph leaf :entry start :roots [returned]
+                                       :observed [returned] :never false)]
+                      (match (inlining/optimize caller [done call] call incomplete 8 512 a)
+                        (Err [message] (panic "{}" message))
+                        (Ok [owned]
+                            (let [(mut kept) owned]
+                              (assert (= (.changes kept) 0))
+                              (rewrite/release! (mut kept)))))))))))
+      (free! (mut inputs)))
+    (free! (mut ends))
+    (free! (mut values))
+    (free! (mut observed))
+    (g/release! (mut caller))
+    (g/release! (mut leaf))))
+
 (defn main [] (-> i64)
+  (for ty [(: 2 i32) 3 4 5 8 9 10 11]
+    (for trap-default [false true]
+      (for range-case? [false true] (switch-inline-case ty trap-default range-case?))))
+
   (for mode (range 0 29)
     (for budget [(: 0 i32) 512] (repeated-validation (cast i32 mode) budget)))
   (for ty [(: 2 u8) 3 4 5 6 8 9 10 11]
