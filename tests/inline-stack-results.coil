@@ -1,0 +1,204 @@
+(module stogir.tests.inline-stack-results)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.call-results" :as results)
+(import "stogir.call-inline" :as inline)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.symbols" :as symbols)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn execute [(caller image/Image) (leaf image/Image)] (-> void)
+  (let [a (malloc-allocator)]
+    (match (link/compose [caller leaf] a)
+      (Err [message] (panic "{}" message))
+      (Ok [module]
+          (let [(mut module) module
+                (mut ordinal) (: -1 i64)]
+            (for [i 0 (len (.symbols (.image module)))]
+              (when (image/same-name? (.image module)
+                                      (get (.symbols (.image module)) i)
+                                      "_stack_inline_caller")
+                (set! ordinal i)))
+            (assert (>= ordinal 0))
+            (match (jit/map-image (.image module) a)
+              (Err [message] (panic "{}" message))
+              (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        function
+                          (p/cast (fnptr (cc/C) [u64] u64)
+                                  (p/cast (ptr u8)
+                                          (get (.addresses loaded) ordinal)))]
+                    (for count [(: 0 u64) 1 4 1000000]
+                      (let [(mut want) (: 0 u64)]
+                        (for [i 0 (cast i64 count)]
+                          (let [seed (- i 500000)]
+                            (set! want
+                                  (+ want
+                                     (cast u64 seed)
+                                     (if (< seed 0) (: 11 u64) 22)))))
+                        (assert (= (function count) want))))
+                    (jit/release-image! (mut loaded)))))
+            (link/release! (mut module)))))))
+
+(defn check [(read-result bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut leaf) (g/create a)
+        entry (require (b/emit! (mut leaf) 104 0 [(: 0 i32)]))
+        destination (require (b/emit! (mut leaf) 71 6 [entry (: 0 i32) 0]))
+        seed (require (b/emit! (mut leaf) 71 11 [entry (: 0 i32) 1]))
+        sixteen (require (b/scalar-constant! (mut leaf) 5 16 8))
+        eight (require (b/scalar-constant! (mut leaf) 5 8 8))
+        zero (require (b/scalar-constant! (mut leaf) 11 0 8))
+        eleven (require (b/scalar-constant! (mut leaf) 5 11 8))
+        twenty-two (require (b/scalar-constant! (mut leaf) 5 22 8))
+        local (require (b/stack-allocate! (mut leaf) entry sixteen 16))
+        high (require (b/emit! (mut leaf) 26 6 [local eight]))
+        condition (require (b/emit! (mut leaf) 16 1 [seed zero]))
+        branch (require (b/emit! (mut leaf) 116 0 [local condition]))
+        yes (require (b/emit! (mut leaf) 107 0 [branch (: 0 i32)]))
+        no (require (b/emit! (mut leaf) 108 0 [branch (: 0 i32)]))
+        yes-control
+          (if read-result
+              (require (b/emit! (mut leaf) 91 5 [yes destination]))
+              yes)
+        left (require (b/emit! (mut leaf) 93 0 [yes-control local seed]))
+        left (require (b/emit! (mut leaf) 93 0 [left high eleven]))
+        left (require (b/emit! (mut leaf) 114 0 [left]))
+        right (require (b/emit! (mut leaf) 93 0 [no local seed]))
+        right (require (b/emit! (mut leaf) 93 0 [right high twenty-two]))
+        right (require (b/emit! (mut leaf) 114 0 [right]))
+        merged (require (b/emit! (mut leaf) 112 0 [left right]))
+        first (require (b/emit! (mut leaf) 91 5 [merged local]))
+        second (require (b/emit! (mut leaf) 91 5 [first high]))
+        written (require (b/emit! (mut leaf) 93 0 [second destination first]))
+        out-high (require (b/emit! (mut leaf) 26 6 [destination eight]))
+        written (require (b/emit! (mut leaf) 93 0 [written out-high second]))
+        returned (require (b/emit! (mut leaf) 120 0 [written (: 0 i32) 0]))
+        (mut caller) (g/create a)
+        start (require (b/emit! (mut caller) 104 0 [(: 0 i32)]))
+        limit (require (b/emit! (mut caller) 71 5 [start (: 0 i32) 0]))
+        size (require (b/scalar-constant! (mut caller) 5 16 8))
+        zero (require (b/scalar-constant! (mut caller) 5 0 8))
+        one (require (b/scalar-constant! (mut caller) 5 1 8))
+        eight (require (b/scalar-constant! (mut caller) 5 8 8))
+        bias (require (b/scalar-constant! (mut caller) 11 500000 8))
+        capture (require (b/stack-allocate! (mut caller) start size 16))
+        enter (require (b/emit! (mut caller) 114 0 [capture]))
+        loop (require (b/loop-begin! (mut caller) enter))
+        index (require (b/loop-phi! (mut caller) loop zero))
+        sum (require (b/loop-phi! (mut caller) loop zero))
+        compare (require (b/emit! (mut caller) 20 1 [index limit]))
+        branch (require (b/emit! (mut caller) 116 0 [loop compare]))
+        body (require (b/emit! (mut caller) 107 0 [branch (: 0 i32)]))
+        exit (require (b/emit! (mut caller) 108 0 [branch (: 0 i32)]))
+        signed (require (b/emit! (mut caller) 36 11 [index]))
+        input (require (b/emit! (mut caller) 27 11 [signed bias]))
+        target (require (symbols/function! (mut caller) "_stack_inline_leaf" 0))]
+    (match (calls/create-result 0 [(: 6 u8) 11] [] (results/pieces 5 2) a)
+      (Err [message] (panic "{}" message))
+      (Ok [prototype]
+          (let [(mut prototype) prototype
+                _ (require (calls/function! (mut leaf) prototype a))
+                called
+                  (require (calls/emit! (mut caller)
+                                        prototype
+                                        body
+                                        target
+                                        [capture input]
+                                        a))
+                lo (require (b/emit! (mut caller) 91 5 [called capture]))
+                address (require (b/emit! (mut caller) 26 6 [capture eight]))
+                hi (require (b/emit! (mut caller) 91 5 [lo address]))
+                pair (require (b/emit! (mut caller) 26 5 [lo hi]))
+                added (require (b/emit! (mut caller) 26 5 [sum pair]))
+                next (require (b/emit! (mut caller) 26 5 [index one]))
+                back (require (b/emit! (mut caller) 115 0 [hi]))
+                done (require (b/emit! (mut caller) 120 5 [exit sum (: 0 i32)]))]
+            (require (b/patch! (mut caller) loop 2 back))
+            (require (b/patch! (mut caller) index 3 next))
+            (require (b/patch! (mut caller) sum 3 added))
+            (match (inline/optimize caller
+                                    [done]
+                                    called
+                                    (inline/Callee
+                                      :name "_stack_inline_leaf"
+                                      :graph leaf
+                                      :entry entry
+                                      :roots [returned]
+                                      :observed [returned]
+                                      :never false)
+                                    8
+                                    (cast i32 (len (.instructions leaf)))
+                                    a)
+              (Err [message] (panic "{}" message))
+              (Ok [rejected]
+                  (let [(mut rejected) rejected]
+                    (assert (= (.changes rejected) 0))
+                    (rewrite/release! (mut rejected)))))
+            (match (inline/optimize caller
+                                    [done]
+                                    called
+                                    (inline/Callee
+                                      :name "_stack_inline_leaf"
+                                      :graph leaf
+                                      :entry entry
+                                      :roots [returned]
+                                      :observed [returned]
+                                      :never false)
+                                    8
+                                    (cast i32 (+ (len (.instructions leaf)) 1))
+                                    a)
+              (Err [message] (panic "{}" message))
+              (Ok [expanded]
+                  (let [(mut expanded) expanded]
+                    (assert (= (.changes expanded) (if read-result 0 1)))
+                    (match (compile/image leaf
+                                          entry
+                                          [returned]
+                                          "_stack_inline_leaf"
+                                          a)
+                      (Err [message] (panic "{}" message))
+                      (Ok [leaf-image]
+                          (let [(mut leaf-image) leaf-image]
+                            (match (compile/image caller
+                                                  start
+                                                  [done]
+                                                  "_stack_inline_caller"
+                                                  a)
+                              (Err [message] (panic "{}" message))
+                              (Ok [before]
+                                  (let [(mut before) before]
+                                    (execute before leaf-image)
+                                    (image/release! (mut before)))))
+                            (match (compile/image (.graph expanded)
+                                                  start
+                                                  (slice (.roots expanded))
+                                                  "_stack_inline_caller"
+                                                  a)
+                              (Err [message] (panic "{}" message))
+                              (Ok [after]
+                                  (let [(mut after) after]
+                                    (execute after leaf-image)
+                                    (image/release! (mut after)))))
+                            (image/release! (mut leaf-image)))))
+                    (rewrite/release! (mut expanded)))))
+            (calls/release! (mut prototype)))))
+    (g/release! (mut caller))
+    (g/release! (mut leaf))
+    (println "scoped inline result loop (result-read={}): pass" read-result)
+    0))
+
+(defn main [] (-> i64)
+  (+ (check false) (check true)))
