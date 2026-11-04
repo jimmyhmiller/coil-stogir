@@ -27,6 +27,13 @@
 (import "coil.primitive" :as primitive)
 (import "coil.result" :use [Result Ok Err Some None])
 
+(defn first-start [(graph g/Graph)] (-> i32)
+  (let [(mut r) 1 (mut entry) (: 0 i32)]
+    (while (< r (len (.instructions graph)))
+      (when (= (n/opcode (get (.instructions graph) r)) 104) (set! entry (cast i32 r)))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    entry))
+
 ;;; Registered definitions own semantic storage, including metadata. Compare
 ;;; their output to ordinary checked expansion after destroying every input copy.
 (defn registered-inline-check [(caller g/Graph)
@@ -101,12 +108,10 @@
         (Ok [_] (panic "registered duplicate CALL accepted")))
       ; Repeated transactions exercise proof reuse across separate callers.
       (for [attempt 0 2]
-        (match (inlining/optimize-registered-if-changed registry
-                                                        caller
-                                                        roots
-                                                        [site]
-                                                        budget
-                                                        a)
+        (match (if (= attempt 0)
+                   (inlining/optimize-registered-if-changed registry caller roots [site] budget a)
+                   (inlining/optimize-registered-prioritized-if-changed registry caller
+                     (first-start caller) roots [site] budget a))
           (Err [message] (panic "registered inline: {}" message))
           (Ok [registered]
               (match (inlining/optimize-sites-if-changed caller
@@ -164,6 +169,9 @@
       (inlining/registry-release! (mut registry))
       (match (inlining/prioritize-registered-sites registry [] a)
         (Err [_] 0) (Ok [_] (panic "released rank registry accepted")))
+      (match (inlining/optimize-registered-prioritized-if-changed registry caller
+               (first-start caller) roots [] budget a)
+        (Err [_] 0) (Ok [_] (panic "released priority registry accepted")))
       (match (inlining/optimize-registered-if-changed registry
                                                       caller
                                                       roots
@@ -2293,7 +2301,98 @@
       (Ok [owned] (let [(mut ordered) owned] (assert (= (len ordered) 0)) (free! (mut ordered)))))
     (free! (mut sites)) (inlining/registry-release! (mut registry))))
 
+(defn loop-priority-check [] (-> void)
+  (let [a (malloc-allocator) (mut leaf) (g/create a) (mut caller) (g/create a)
+        start (require (b/emit! (mut leaf) 104 0 [(: 0 i32)]))
+        param (require (b/emit! (mut leaf) 71 5 [start (: 0 i32) 0]))
+        three (require (b/scalar-constant! (mut leaf) 5 3 8))
+        answer (require (b/emit! (mut leaf) 26 5 [param three]))
+        returned (require (b/emit! (mut leaf) 120 5 [start answer (: 0 i32)]))
+        entry (require (b/emit! (mut caller) 104 0 [(: 0 i32)]))
+        input (require (b/emit! (mut caller) 71 5 [entry (: 0 i32) 0]))
+        function (require (symbols/function! (mut caller) "_priority_leaf" 0))]
+    (match (calls/create 0 5 [(: 5 u8)] a)
+      (Err [message] (panic "priority loop signature: {}" message))
+      (Ok [owned]
+          (let [(mut signature) owned]
+            (require (calls/function! (mut leaf) signature a))
+            (require (calls/function! (mut caller) signature a))
+            (let [cold (require (calls/emit! (mut caller) signature entry function [input] a))
+                  zero (require (b/scalar-constant! (mut caller) 5 0 8))
+                  one (require (b/scalar-constant! (mut caller) 5 1 8))
+                  limit (require (b/scalar-constant! (mut caller) 5 3 8))
+                  enter (require (b/emit! (mut caller) 114 0 [cold]))
+                  loop (require (b/loop-begin! (mut caller) enter))
+                  index (require (b/loop-phi! (mut caller) loop zero))
+                  sum (require (b/loop-phi! (mut caller) loop cold))
+                  condition (require (b/emit! (mut caller) 16 1 [index limit]))
+                  split (require (b/emit! (mut caller) 116 0 [loop condition]))
+                  body (require (b/emit! (mut caller) 107 0 [split (: 0 i32)]))
+                  done (require (b/emit! (mut caller) 108 0 [split (: 0 i32)]))
+                  hot (require (calls/emit! (mut caller) signature body function [sum] a))
+                  next (require (b/emit! (mut caller) 26 5 [index one]))
+                  back (require (b/emit! (mut caller) 115 0 [hot]))
+                  result (require (b/emit! (mut caller) 120 5 [done sum (: 0 i32)]))
+                  (mut registry) (inlining/registry-create 8 a)]
+              (require (b/patch! (mut caller) loop 2 back))
+              (require (b/patch! (mut caller) index 3 next))
+              (require (b/patch! (mut caller) sum 3 hot))
+              (match (inlining/register! (mut registry)
+                        (inlining/Callee :name "_priority_leaf" :graph leaf :entry start
+                                         :roots [returned] :observed [returned] :never false))
+                (Err [message] (panic "priority loop register: {}" message))
+                (Ok [handle]
+                    (let [sites [(inlining/RegisteredSite :reference cold :callee handle)
+                                 (inlining/RegisteredSite :reference hot :callee handle)]]
+                      (for policy [false true]
+                        (let [outcome (if policy
+                                      (inlining/optimize-registered-prioritized-if-changed
+                                        registry caller entry [result] sites 1 a)
+                                      (inlining/optimize-registered-if-changed
+                                        registry caller [result] sites 1 a))]
+                          (match outcome
+                            (Err [message] (panic "priority loop expansion: {}" message))
+                            (Ok [maybe]
+                                (match maybe
+                                  (None [] (panic "priority loop did not expand"))
+                                  (Some [owned]
+                                        (let [(mut expanded) owned]
+                                          (assert (= (.changes expanded) 1))
+                                          (assert (= (len (.instructions (.graph expanded)))
+                                                     (+ (len (.instructions caller)) 1)))
+                                          (assert (= (= (n/opcode (get (.instructions (.graph expanded)) (cast i64 cold))) 79) policy))
+                                          (assert (= (= (n/opcode (get (.instructions (.graph expanded)) (cast i64 hot))) 79) (not policy)))
+                                          (let [(mut code) (owned-image (compile/image (.graph expanded) entry (slice (.roots expanded)) "_priority_loop" a))
+                                                (mut leaf-code) (owned-image (compile/image leaf start [returned] "_priority_leaf" a))]
+                                            (match (link/compose [code leaf-code] a)
+                                              (Err [message] (panic "priority link: {}" message))
+                                              (Ok [owned]
+                                                  (let [(mut module) owned]
+                                                    (match (jit/map-image (.image module) a)
+                                                      (Err [message] (panic "priority map: {}" message))
+                                                      (Ok [owned]
+                                                          (let [(mut loaded) owned
+                                                                symbol (find (.image module) "_priority_loop")]
+                                                            (assert (>= symbol 0))
+                                                            (let [invoke (primitive/cast (fnptr (cc/C) [u64] u64)
+                                                                         (primitive/cast (ptr u8) (get (.addresses loaded) (cast i64 symbol))))]
+                                                              (for value [(: 0 u64) 1 7 100] (assert (= (invoke value) (+ value 12)))))
+                                                            (jit/release-image! (mut loaded)))))
+                                                    (link/release! (mut module)))))
+                                            (image/release! (mut code)) (image/release! (mut leaf-code)))
+                                          (rewrite/release! (mut expanded)))))))))
+                      (match (inlining/optimize-registered-prioritized-if-changed registry caller entry [result] sites 0 a)
+                        (Err [message] (panic "zero priority: {}" message))
+                        (Ok [outcome] (match outcome (None [] 0) (Some [_] (panic "zero priority expanded")))))
+                      (for invalid [(: 0 i32) -1 input 2147483647]
+                        (match (inlining/optimize-registered-prioritized-if-changed registry caller invalid [result] sites 1 a)
+                          (Err [_] 0) (Ok [_] (panic "invalid priority entry accepted")))))))
+              (inlining/registry-release! (mut registry)))
+            (calls/release! (mut signature)))))
+    (g/release! (mut caller)) (g/release! (mut leaf))))
+
 (defn main [] (-> i64)
+  (loop-priority-check)
   (priority-order-check)
   (for ty [(: 2 i32) 3 4 5 8 9 10 11]
     (for trap-default [false true]
