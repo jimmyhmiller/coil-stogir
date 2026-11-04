@@ -3,6 +3,7 @@
 (import "stogir.builder" :as b)
 (import "stogir.node" :as n)
 (import "stogir.calls" :as calls)
+(import "stogir.conditional" :as conditional)
 (import "stogir.sccp-analysis" :as analysis)
 (import "stogir.sccp" :as sccp)
 (import "stogir.iter-fold" :as iter)
@@ -17,7 +18,7 @@
 (import "stogir.jit.darwin" :as jit)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [malloc-allocator])
-(import "coil.result" :use [Result Ok Err])
+(import "coil.result" :use [Result Ok Err Option Some None])
 (import "coil.primitive" :as p)
 (import "coil.cc" :as cc)
 
@@ -1183,7 +1184,222 @@
     (free! (mut roots))
     (g/release! (mut graph))))
 
+(defn predicate-code [(known (Option bool))] (-> i32)
+  (match known (None [] -1) (Some [truth] (if truth 1 0))))
+
+;;; A join or a new loop entry must discard the preceding arm's local fact.
+(defn predicate-boundaries [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        value (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        condition (require (b/emit! (mut graph) 15 1 [value zero]))
+        different (require (b/emit! (mut graph) 14 1 [value zero]))
+        first (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [first (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [first (: 0 i32)]))
+        end-yes (require (b/emit! (mut graph) 114 0 [yes]))
+        end-no (require (b/emit! (mut graph) 114 0 [no]))
+        merge (require (b/emit! (mut graph) 112 0 [end-yes end-no]))
+        loop (require (b/emit! (mut graph) 113 0 [end-yes end-yes]))
+        back (require (b/emit! (mut graph) 115 0 [loop]))
+        target (require (b/scalar-constant! (mut graph) 6 1 8))
+        guard (require (b/emit! (mut graph) 101 0 [start condition target]))
+        guard-not (require (b/emit! (mut graph) 102 0 [start condition target]))]
+    (require (b/patch! (mut graph) loop 2 back))
+    (assert (= (predicate-code (conditional/dominating-truth graph
+                                                             end-yes
+                                                             condition))
+               1))
+    (assert (= (predicate-code (conditional/dominating-truth graph
+                                                             end-no
+                                                             condition))
+               0))
+    (assert (= (predicate-code (conditional/dominating-truth graph
+                                                             guard
+                                                             condition))
+               1))
+    (assert (= (predicate-code (conditional/dominating-truth graph
+                                                             guard-not
+                                                             condition))
+               0))
+    (for control [merge loop start value]
+      (assert (= (predicate-code (conditional/dominating-truth graph
+                                                               control
+                                                               condition))
+                 -1)))
+    (assert (= (predicate-code (conditional/dominating-truth graph
+                                                             end-yes
+                                                             different))
+               -1))
+    (assert (= (predicate-code (conditional/dominating-truth graph end-yes zero))
+               -1))
+    (g/release! (mut graph))))
+
+(defn predicate-execute [(graph g/Graph)
+                         (roots (slice i32))
+                         (truth bool)
+                         (effect bool)] (-> void)
+  (let [a (malloc-allocator)]
+    (match (compile/text graph 1 roots a)
+      (Err [message] (panic "predicate compile: {}" message))
+      (Ok [owned]
+          (let [(mut text) owned]
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "predicate map: {}" message))
+              (Ok [owned]
+                  (let [(mut mapped) owned
+                        function
+                          (p/cast (fnptr (cc/C) [i64 (ptr i64)] i64)
+                                  (.base mapped))]
+                    (for input [(: -9223372036854775808 i64)
+                                -257
+                                -1
+                                0
+                                1
+                                256
+                                9223372036854775807]
+                      (let [(mut memory) (: 5 i64)
+                            selected (= (!= input 0) truth)]
+                        (assert (= (function input
+                                             (p/cast (ptr i64) (mut memory)))
+                                   (if selected 37 777)))
+                        (assert (= memory (if (and selected effect) 6 5)))))
+                    (jit/release! (mut mapped)))))
+            (free! (mut text)))))))
+
+(defn repeated-predicate [(truth bool)
+                          (effect bool)
+                          (observation i32)
+                          (late bool)]
+  (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        value (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        memory (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        answer (require (b/scalar-constant! (mut graph) 11 37 8))
+        other-answer (require (b/scalar-constant! (mut graph) 11 777 8))
+        wrong (require (b/scalar-constant! (mut graph) 11 999 8))
+        condition (require (b/emit! (mut graph) 15 1 [value zero]))
+        first (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [first (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [first (: 0 i32)]))
+        selected (if truth yes no)
+        before
+          (if effect
+              (let [loaded
+                      (require (b/emit! (mut graph) 91 11 [selected memory]))
+                    one (require (b/scalar-constant! (mut graph) 11 1 8))
+                    next (require (b/emit! (mut graph) 26 11 [loaded one]))]
+                (require (b/emit! (mut graph) 93 0 [loaded memory next])))
+              selected)
+        second (require (b/emit! (mut graph) 116 0 [before condition]))
+        inner-yes (require (b/emit! (mut graph) 107 0 [second (: 0 i32)]))
+        inner-no (require (b/emit! (mut graph) 108 0 [second (: 0 i32)]))
+        ret0
+          (require (b/emit! (mut graph)
+                            120
+                            11
+                            [(if truth no yes) other-answer (: 0 i32)]))
+        ret1
+          (require (b/emit! (mut graph)
+                            120
+                            11
+                            [inner-yes (if truth answer wrong) ret0]))
+        ret2
+          (require (b/emit! (mut graph)
+                            120
+                            11
+                            [inner-no (if truth wrong answer) ret1]))
+        (mut roots) (ArrayList::new [i32] a)
+        (mut predicate) condition]
+    ; Rewrite may introduce a later-numbered pure predicate. Control ancestry,
+    ; not a topological reference-number assumption, proves its earlier test.
+    (when late
+      (set! predicate (require (b/emit! (mut graph) 15 1 [value zero])))
+      (require (b/patch! (mut graph) first 2 predicate))
+      (require (b/patch! (mut graph) second 2 predicate)))
+    (for terminal [ret0 ret1 ret2] (push! (mut roots) terminal))
+    (when (= observation 1) (push! (mut roots) predicate))
+    (when (= observation 2) (push! (mut roots) second))
+    (match (calls/create 0 11 [(: 11 u8) 6] a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+          (let [(mut signature) owned]
+            (require (calls/function! (mut graph) signature a))
+            (calls/release! (mut signature)))))
+    (predicate-execute graph (slice roots) truth effect)
+    (match (iter/optimize graph 8 (slice roots) [second] a)
+      (Err [message] (panic "predicate optimize: {}" message))
+      (Ok [owned]
+          (let [(mut output) owned]
+            (assert (!= (n/opcode (get (.instructions (.graph output))
+                                       (cast i64 second)))
+                        116))
+            (predicate-execute (.graph output)
+                               (slice (.roots output))
+                               truth
+                               effect)
+            (rewrite/release! (mut output)))))
+    (assert (= (n/opcode (get (.instructions graph) (cast i64 second))) 116))
+    (free! (mut roots))
+    (g/release! (mut graph))))
+
+;;; Both incoming branches remain possible at the merge. A fact from either
+;;; predecessor must not turn the post-merge IF into an unconditional return.
+(defn joined-predicate [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        value (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        memory (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        answer (require (b/scalar-constant! (mut graph) 11 37 8))
+        other (require (b/scalar-constant! (mut graph) 11 777 8))
+        condition (require (b/emit! (mut graph) 15 1 [value zero]))
+        first (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [first (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [first (: 0 i32)]))
+        end-yes (require (b/emit! (mut graph) 114 0 [yes]))
+        end-no (require (b/emit! (mut graph) 114 0 [no]))
+        merge (require (b/emit! (mut graph) 112 0 [end-yes end-no]))
+        second (require (b/emit! (mut graph) 116 0 [merge condition]))
+        selected (require (b/emit! (mut graph) 107 0 [second (: 0 i32)]))
+        alternate (require (b/emit! (mut graph) 108 0 [second (: 0 i32)]))
+        ret0 (require (b/emit! (mut graph) 120 11 [selected answer (: 0 i32)]))
+        ret1 (require (b/emit! (mut graph) 120 11 [alternate other ret0]))]
+    (match (calls/create 0 11 [(: 11 u8) 6] a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+          (let [(mut own) owned]
+            (require (calls/function! (mut graph) own a))
+            (calls/release! (mut own)))))
+    (predicate-execute graph [ret0 ret1] true false)
+    (match (iter/optimize graph 8 [ret0 ret1] [second] a)
+      (Err [message] (panic "joined predicate optimize: {}" message))
+      (Ok [owned]
+          (let [(mut output) owned]
+            (assert (= (n/opcode (get (.instructions (.graph output))
+                                      (cast i64 second)))
+                       116))
+            (predicate-execute (.graph output)
+                               (slice (.roots output))
+                               true
+                               false)
+            (rewrite/release! (mut output)))))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (joined-predicate)
+  (predicate-boundaries)
+  (for truth [false true]
+    (for effect [false true]
+      (for observation [(: 0 i32) 1 2]
+        (for late [false true]
+          (repeated-predicate truth effect observation late)))))
   (for shape [(: 0 i32) 1 2 3 4 5]
     (for truth [false true]
       (for order [(: 0 i32) 1 2]
