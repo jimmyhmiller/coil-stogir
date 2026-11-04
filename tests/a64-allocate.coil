@@ -18,6 +18,8 @@
 (import "stogir.locations" :as locations)
 (import "stogir.a64.emit" :as emit)
 (import "stogir.a64.compile" :as compile)
+(import "stogir.calls" :as calls)
+(import "stogir.symbols" :as symbols)
 (import "stogir.a64.function" :as function)
 (import "stogir.a64.encode" :as encode)
 (import "stogir.bytes" :as bytes)
@@ -262,6 +264,136 @@
             (free! (mut text)))))
     (g/release! (mut graph))))
 
+(defn clobber-return :cc (cc/C) [] (-> u64)
+  99)
+
+;;; A soft return can stay spilled across a call. The call's real result in
+;;; x0 differs from the required value, so omitting ABI capture is observable.
+(defn spilled-return [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        param (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        address
+          (primitive/cast u64
+                          (primitive/cast (ptr u8)
+                                          (: (fnptr-of clobber-return)
+                                             (fnptr (cc/C) [] u64))))
+        target (require (symbols/function-address! (mut graph) address 0))
+        call
+          (match (calls/create 0 5 [] a)
+            (Err [e] (panic "{}" e))
+            (Ok [signature]
+                (let [(mut signature) signature
+                      reference
+                        (require (calls/emit! (mut graph)
+                                              signature
+                                              start
+                                              target
+                                              []
+                                              a))]
+                  (calls/release! (mut signature))
+                  reference)))
+        ret (require (b/emit! (mut graph) 120 5 [call param (: 0 i32)]))
+        (mut local) (ArrayList::new [i32] a)
+        (mut order) (ArrayList::new [i32] a)
+        (mut mapping) (ArrayList::new [i32] a)]
+    (for [i 0 (len (.instructions graph))] (push! (mut mapping) start))
+    (for node [start param call ret] (push! (mut local) node))
+    (push! (mut order) start)
+    (let [(mut packed) (schedule/pack local mapping order a)]
+      (match (cfg/build graph a)
+        (Err [e] (panic "{}" e))
+        (Ok [blocks]
+            (let [(mut blocks) blocks
+                  (mut analysis) (live/analyze graph blocks packed order a)
+                  (mut intervals) (ranges/build graph packed analysis order a)]
+              (match (constraints/build graph packed a)
+                (Err [e] (panic "{}" e))
+                (Ok [req]
+                    (let [(mut req) req]
+                      (match (allocate/build intervals req graph packed a)
+                        (Err [e] (panic "{}" e))
+                        (Ok [assigned]
+                            (let [(mut assigned) assigned]
+                              ; Keep the valid incoming/call reservations, make all
+                              ; saved GPRs unavailable, and reallocate original parts.
+                              (for [i 0 (len (.parts assigned))]
+                                (let [part (elem (mut (.parts assigned)) i)]
+                                  (when (>= (.parent part) 0)
+                                    (set! (.register part) -1)
+                                    (set! (.last-register part) -1))))
+                              (for reg [(: 19 i32) 20 21 22 23 24 25 26 27 28]
+                                (assert (parts/reserve! (mut (.parts assigned))
+                                                        reg
+                                                        4
+                                                        7
+                                                        a)))
+                              (require (parts/run! (mut (.parts assigned))
+                                                   (mut (.frame assigned))
+                                                   29
+                                                   0x1FFFFFFF
+                                                   8
+                                                   8
+                                                   a))
+                              (require (check/verify (.parts assigned)
+                                                     29
+                                                     0x1FFFFFFF))
+                              (match (locations/build-index (.parts assigned)
+                                                            (len (.instructions graph))
+                                                            a)
+                                (Err [e] (panic "{}" e))
+                                (Ok [index]
+                                    (locations/release-index! (mut (.locations assigned)))
+                                    (set! (.locations assigned) index)))
+                              (match (locations/lookup-indexed (.parts assigned)
+                                                               (.locations assigned)
+                                                               param
+                                                               6)
+                                (Err [e] (panic "{}" e))
+                                (Ok [location] (assert (= (.kind location) 1))))
+                              (match (function/body graph
+                                                    packed
+                                                    assigned
+                                                    analysis
+                                                    req
+                                                    a)
+                                (Err [e] (panic "{}" e))
+                                (Ok [code]
+                                    (let [(mut code) code]
+                                      (match (jit/map-text (slice (.text code)))
+                                        (Err [e] (panic "{}" e))
+                                        (Ok [image]
+                                            (let [(mut image) image
+                                                  f
+                                                    (primitive/cast (fnptr (cc/C)
+                                                                           [u64]
+                                                                           u64)
+                                                                    (.base image))]
+                                              (for value [(: 0 u64)
+                                                          1
+                                                          42
+                                                          100
+                                                          0x8000000000000000
+                                                          0xFFFFFFFFFFFFFFFF]
+                                                (let [actual (call-ptr f value)]
+                                                  (unless (= actual value)
+                                                    (panic "spilled return expected {}, got {}"
+                                                           value
+                                                           actual))))
+                                              (jit/release! (mut image)))))
+                                      (buffer/release! (mut code)))))
+                              (allocate/release! (mut assigned)))))
+                      (constraints/release! (mut req)))))
+              (ranges/release! (mut intervals))
+              (live/release-analysis! (mut analysis))
+              (cfg/release! (mut blocks)))))
+      (schedule/release! (mut packed)))
+    (free! (mut local))
+    (free! (mut order))
+    (free! (mut mapping))
+    (g/release! (mut graph))))
+
 ;;; Keep a source live past its copy. Both have identical bits, so upstream's
 ;;; contained-lifetime reuse can coalesce them even though the ranges overlap.
 (defn contained-copy [(mode i32) (hard bool)] (-> void)
@@ -425,6 +557,7 @@
     (g/release! (mut graph))))
 
 (defn main [] (-> i64)
+  (spilled-return)
   (copied-loop)
   (coalesce-fanout false)
   (coalesce-fanout true)

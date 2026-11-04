@@ -1,0 +1,52 @@
+(module stogir.benchmarks.last-use-copy)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [x] x) (Err [e] (panic "{}" e))))
+
+;;; The second argument dies at COPY's input. A preferred-register hint can
+;;; keep its register through the copy, then ADD directly into the return reg.
+;;; This exercises adjacent lifetimes, outside contained-overlap coalescing.
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        unused (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        source (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        copy (require (b/emit! (mut graph) 68 11 [source (: 1 i32)]))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        sum (require (b/emit! (mut graph) 26 11 [copy one]))
+        ret (require (b/emit! (mut graph) 120 11 [start sum (: 0 i32)]))]
+    (match (compile/text graph start [ret] a)
+      (Err [e] (panic "{}" e))
+      (Ok [text]
+          (let [(mut text) text]
+            (println "instructions={}" (/ (len text) 4))
+            (for [i 0 (/ (len text) 4)]
+              (let [(mut word) (: 0 u32)]
+                (for [j 0 4]
+                  (set! word
+                        (| word
+                           (<< (cast u32 (get text (+ (* i 4) j)))
+                               (cast u32 (* j 8))))))
+                (println "word={}" word)))
+            (match (jit/map-text (slice text))
+              (Err [e] (panic "{}" e))
+              (Ok [image]
+                  (let [(mut image) image
+                        f (p/cast (fnptr (cc/C) [i64 i64] i64) (.base image))]
+                    (for first [(: -100 i64) 0 100]
+                      (for second [(: -100 i64) -1 0 1 100]
+                        (assert (= (call-ptr f first second) (+ second 1)))))
+                    (jit/release! (mut image)))))
+            (free! (mut text)))))
+    (g/release! (mut graph))
+    0))
