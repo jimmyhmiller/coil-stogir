@@ -8,14 +8,78 @@
 (import "stogir.liveness" :as liveness)
 (import "stogir.placement" :as p)
 (import "stogir.schedule" :as schedule)
+(import "stogir.uses" :as uses)
+(import "stogir.pipeline" :as pipeline)
+(import "coil.arraylist" :use [ArrayList])
 (import "stogir.register-live" :as reg-live)
 (import "stogir.bitset" :as bits)
 (import "stogir.live-ranges" :as ranges)
-(import "coil.alloc" :use [malloc-allocator])
+(import "coil.alloc" :use [Allocator malloc-allocator])
 (import "coil.result" :use [Result Ok Err])
 
 (defn require [(r (Result i32 (slice u8)))] (-> i32)
   (match r (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+;;; Compare owning entry points with a single borrowed index, including errors.
+(defn check-shared [(graph g/Graph) (blocks cfg/Blocks)
+                    (idom (ArrayList i32)) (depth (ArrayList i32))
+                    (live (ArrayList bool)) (entry i32) (a (dyn Allocator))]
+  (-> void)
+  (match (p/pinned graph blocks a)
+    (Err [message] (panic "{}" message))
+    (Ok [mapping]
+        (let [(mut owned) mapping
+              (mut shared) (ArrayList::new [i32] a)
+              (mut users) (uses/build graph a)
+              (mut success) true]
+          (for value owned (push! (mut shared) value))
+          (match (p/early! graph (mut owned) idom entry a)
+            (Err [expected]
+                 (set! success false)
+                 (match (p/early-with-uses! graph (mut shared) idom entry users a)
+                   (Err [actual] (assert (= expected actual)))
+                   (Ok [_] (panic "borrowed early accepted a cycle"))))
+            (Ok [expected]
+                (match (p/early-with-uses! graph (mut shared) idom entry users a)
+                  (Err [message] (panic "{}" message))
+                  (Ok [actual] (assert (= expected actual))))))
+          (for [i 0 (len owned)] (assert (= (get owned i) (get shared i))))
+          (when success
+            (match (p/late! graph (mut owned) idom depth live a)
+              (Err [expected]
+                   (set! success false)
+                   (match (p/late-with-uses! graph (mut shared) idom depth live users a)
+                     (Err [actual] (assert (= expected actual)))
+                     (Ok [_] (panic "borrowed late accepted a cycle"))))
+              (Ok [expected]
+                  (match (p/late-with-uses! graph (mut shared) idom depth live users a)
+                    (Err [message] (panic "{}" message))
+                    (Ok [actual] (assert (= expected actual))))))
+            (for [i 0 (len owned)] (assert (= (get owned i) (get shared i)))))
+          (when success
+            (match (schedule/order graph owned live a)
+              (Err [expected]
+                   (match (schedule/order-with-uses graph shared live users a)
+                     (Err [actual] (assert (= expected actual)))
+                     (Ok [unexpected]
+                         (let [(mut result) unexpected]
+                           (free! (mut result))
+                           (panic "borrowed schedule accepted a cycle")))))
+              (Ok [expected]
+                  (let [(mut expected) expected]
+                    (match (schedule/order-with-uses graph shared live users a)
+                      (Err [message] (panic "{}" message))
+                      (Ok [actual]
+                          (let [(mut actual) actual]
+                            (assert (= (len expected) (len actual)))
+                            (for [i 0 (len expected)]
+                              (assert (= (get expected i) (get actual i))))
+                            (free! (mut actual)))))
+                    (free! (mut expected))))))
+          ; All three consumers borrowed the same storage; it remains releasable.
+          (uses/release! (mut users))
+          (free! (mut shared))
+          (free! (mut owned))))))
 
 (defn main [] (-> i64)
   (let [a (malloc-allocator)
@@ -41,6 +105,7 @@
                 (mut idom) (dom/build owned pred order a)
                 (mut depth) (loops/depths owned pred idom a)
                 (mut live) (liveness/mark graph [yes-return no-return] a)]
+            (check-shared graph owned idom depth live start a)
             (match (p/pinned graph owned a)
               (Err [_] (set! failures (+ failures 1)))
               (Ok [mapping]
@@ -56,6 +121,8 @@
                     (when (!= (get placed (cast i64 computation)) yes)
                       (set! failures (+ failures 1)))
                     (b/patch! (mut graph) no-return 2 computation)
+                    ; A graph mutation requires a newly built index.
+                    (check-shared graph owned idom depth live start a)
                     ; Recompute earliest placement before rerunning late scheduling.
                     (set! (mut placed) (cast i64 computation) 0)
                     (match (p/early! graph (mut placed) idom start a)
@@ -187,6 +254,15 @@
                               (schedule/release! (mut packed)))
                             (free! (mut owned-order)))))
                     (free! (mut placed)))))
+            (b/patch! (mut graph) computation 1 computation)
+            (check-shared graph owned idom depth live start a)
+            (match (pipeline/prepare graph start [yes-return no-return] a)
+              (Err [message]
+                   (assert (= message "unresolved floating dependency cycle or missing placement")))
+              (Ok [unexpected]
+                  (let [(mut result) unexpected]
+                    (pipeline/release! (mut result))
+                    (panic "pipeline accepted a floating cycle"))))
             (free! (mut live))
             (free! (mut depth))
             (free! (mut idom))
