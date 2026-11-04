@@ -164,6 +164,8 @@
                                 0xFFFFFFFF
                                 0x100000000
                                 0x7FFFFFFFFFFFFFFF
+                                0x7FF8000000000000
+                                0x7FF0000000000001
                                 0x8000000000000000
                                 0xFFFFFFFFFFFFFFFF
                                 0x5555555555555555
@@ -173,6 +175,85 @@
             (jit/release! (mut first)))))
     (free! (mut first-text))
     (free! (mut second-text))))
+
+;;; Integer comparison inversion and Boolean choice restarts must preserve
+;;; native answers, exact use edges, shared values and explicit observations.
+(defn boolean-restart-case [(ty i32) (opcode i32) (shape i32) (observed i32)]
+  (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        input (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        operand
+          (if (= ty 5)
+              input
+              (require (b/emit! (mut graph)
+                                (if (= (types/scalar-size ty 8) 8) 36 35)
+                                ty
+                                [input])))
+        literal (require (b/scalar-constant! (mut graph) ty 0 8))
+        comparison (require (b/emit! (mut graph) opcode 1 [operand literal]))
+        result-type (if (= shape 3) ty (: 1 i32))
+        zero (require (b/scalar-constant! (mut graph) result-type 0 8))
+        one (require (b/scalar-constant! (mut graph) result-type 1 8))
+        target
+          (if (= shape 0)
+              (require (b/emit! (mut graph) 45 1 [comparison]))
+              (require (b/emit! (mut graph)
+                                60
+                                result-type
+                                [comparison
+                                 (if (= shape 2) zero one)
+                                 (if (= shape 2) one zero)])))
+        result
+          (if (= result-type 11)
+              target
+              (require (b/emit! (mut graph)
+                                (if (= (types/scalar-size result-type 8) 8)
+                                    36
+                                    34)
+                                11
+                                [target])))
+        ret (require (b/emit! (mut graph) 120 11 [start result (: 0 i32)]))
+        shared
+          (if (= observed 3)
+              (require (b/emit! (mut graph) 68 1 [comparison (: 0 i32)]))
+              0)
+        (mut roots) (ArrayList::new [i32] a)
+        (mut lists) (uses/build graph a)
+        (mut queue) (q/create (len (.instructions graph)) a)
+        (mut protected) (bits/create (len (.instructions graph)) a)
+        (mut original) (g/duplicate graph a)]
+    (push! (mut roots) ret)
+    (when (= observed 1) (push! (mut roots) comparison))
+    (when (= observed 2) (push! (mut roots) target))
+    (when (= observed 3) (push! (mut roots) shared))
+    (for root roots (bits/add! (mut protected) (cast i64 root)))
+    (q/add! (mut queue) (cast i64 target))
+    (require (iter/run! (mut graph) (mut lists) (mut queue) protected 8 a))
+    (assert (= (check-uses graph lists) 0))
+    (require (rewrite/validate graph 8 a))
+    (let [after (get (.instructions graph) (cast i64 target))]
+      (if (and (= shape 0) (types/floating? ty))
+          (assert (= (n/opcode after) 45))
+          (if (= shape 0)
+              (assert (= (n/opcode after) (cast u8 (^ opcode 1))))
+              (assert (!= (n/opcode after) 60)))))
+    (masked-execute original graph (slice roots) (slice roots))
+    (q/add! (mut queue) (cast i64 target))
+    (assert (= (require (iter/run! (mut graph)
+                                   (mut lists)
+                                   (mut queue)
+                                   protected
+                                   8
+                                   a))
+               0))
+    (bits/release! (mut protected))
+    (q/release! (mut queue))
+    (uses/release! (mut lists))
+    (free! (mut roots))
+    (g/release! (mut original))
+    (g/release! (mut graph))))
 
 ;;; Compare raw native AND/conversion/CMP instructions against the optimized
 ;;; graph. Byte inputs are exhaustive, with wider sign/truncation boundaries.
@@ -545,6 +626,14 @@
     (g/release! (mut graph))))
 
 (defn main [] (-> i64)
+  (for ty [(: 2 i32) 8 3 9 4 10 5 11]
+    (for opcode [(: 14 i32) 15 16 17 18 19 20 21 22 23]
+      (for shape [(: 0 i32) 1 2 3]
+        (for observed [(: 0 i32) 1 2 3]
+          (boolean-restart-case ty opcode shape observed)))))
+  (for opcode [(: 14 i32) 15 16 17 18 19]
+    (for observed [(: 0 i32) 1 2 3]
+      (boolean-restart-case 12 opcode 0 observed)))
   (masked-case 2 16 127 131 3 false)
   (for ty [(: 2 i32) 8 3 9 4 10 5 11]
     (for opcode [(: 14 i32) 15 16 17 18 19 20 21 22 23]
