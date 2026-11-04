@@ -1276,3 +1276,9 @@ address-result fallback, both floating-result fallback types, and a32-bit
 pointer selector near UINT32_MAX. There are111 native differential fixtures,
 two FP no-change graphs and one32-bit pointer graph validation; all pass under
 ASAN/debug. The linked AOT driver also passes after this expansion.
+
+Lookup recognition shares the existing boolean-diamond merge walk and protected
+root set; a reusable plan avoids per-merge scratch allocation. Conditional motion
+exclusions are shared through conditional.coil. There is no extra SCCP graph scan.
+A112th native fixture covers all-equal lookup followed immediately by ordinary
+diamond folding with a pure default; new END bookkeeping grows before that fold.
