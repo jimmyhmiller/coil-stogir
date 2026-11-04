@@ -17,6 +17,7 @@
 (import "stogir.a64.registers" :as registers)
 (import "stogir.locations" :as locations)
 (import "stogir.a64.emit" :as emit)
+(import "stogir.a64.compile" :as compile)
 (import "stogir.a64.function" :as function)
 (import "stogir.a64.encode" :as encode)
 (import "stogir.bytes" :as bytes)
@@ -214,6 +215,53 @@
     (free! (mut local))
     (g/release! (mut graph))))
 
+;;; Phi updates and the prior iteration's copied bits must be transferred
+;;; simultaneously. The scalar copy remains explicit through optimization.
+(defn copied-loop [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        count (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        scale (require (b/scalar-constant! (mut graph) 11 1024 8))
+        entry (require (b/emit! (mut graph) 114 0 [start]))
+        loop (require (b/loop-begin! (mut graph) entry))
+        i (require (b/loop-phi! (mut graph) loop zero))
+        x (require (b/loop-phi! (mut graph) loop one))
+        lag (require (b/loop-phi! (mut graph) loop zero))
+        condition (require (b/emit! (mut graph) 16 1 [i count]))
+        branch (require (b/emit! (mut graph) 116 0 [loop condition]))
+        body (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        done (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        copied (require (b/emit! (mut graph) 68 11 [x (: 1 i32)]))
+        next-x (require (b/emit! (mut graph) 26 11 [x one]))
+        next-i (require (b/emit! (mut graph) 26 11 [i one]))
+        back (require (b/emit! (mut graph) 115 0 [body]))
+        weighted (require (b/emit! (mut graph) 28 11 [lag scale]))
+        answer (require (b/emit! (mut graph) 26 11 [x weighted]))
+        ret (require (b/emit! (mut graph) 120 11 [done answer (: 0 i32)]))]
+    (require (b/patch! (mut graph) loop 2 back))
+    (require (b/patch! (mut graph) i 3 next-i))
+    (require (b/patch! (mut graph) x 3 next-x))
+    (require (b/patch! (mut graph) lag 3 copied))
+    (match (compile/text graph start [ret back copied] a)
+      (Err [e] (panic "{}" e))
+      (Ok [text]
+          (let [(mut text) text]
+            (match (jit/map-text (slice text))
+              (Err [e] (panic "{}" e))
+              (Ok [image]
+                  (let [(mut image) image
+                        f
+                          (primitive/cast (fnptr (cc/C) [i64] i64)
+                                          (.base image))]
+                    (for n [(: 0 i64) 1 2 3 7 32 100]
+                      (assert (= (call-ptr f n) (+ (+ 1 n) (* 1024 n)))))
+                    (jit/release! (mut image)))))
+            (free! (mut text)))))
+    (g/release! (mut graph))))
+
 ;;; Keep a source live past its copy. Both have identical bits, so upstream's
 ;;; contained-lifetime reuse can coalesce them even though the ranges overlap.
 (defn contained-copy [(mode i32) (hard bool)] (-> void)
@@ -354,6 +402,7 @@
     (g/release! (mut graph))))
 
 (defn main [] (-> i64)
+  (copied-loop)
   (coalesce-fanout false)
   (coalesce-fanout true)
   (for pair [[(: 5 u8) 5]
