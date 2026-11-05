@@ -575,7 +575,45 @@
           (free! (mut text)))))
     (free! (mut roots)) (g/release! (mut graph))))
 
+;;; Exact width-wrapping reference, including sign bits and commuted constants.
+(defn multiply-constant [(ty i32) (factor u64) (commuted bool)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        input (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        constant (require (b/scalar-constant! (mut graph) ty factor 8))
+        value (require (b/emit! (mut graph) 28 ty (if commuted [constant input] [input constant])))
+        result (if (= ty 5) value
+                   (require (b/emit! (mut graph) (if (= ty 11) 36 (if (types/signed? ty) 33 34)) 5 [value])))
+        ret (require (b/emit! (mut graph) 120 5 [start result (: 0 i32)]))
+        plus-one (and (> factor 2) (= (& (- factor 1) (- factor 2)) 0))]
+    (match (select/arithmetic graph value)
+      (Err [e] (panic "{}" e))
+      (Ok [tile]
+        (assert (= (= (.rule tile) 52) plus-one))
+        (when plus-one (assert (= (.left tile) input)) (assert (= (.right tile) 0)))))
+    (match (compile/text graph start [ret] a)
+      (Err [e] (panic "{}" e))
+      (Ok [owned]
+        (let [(mut text) owned]
+          (match (jit/map-text (slice text))
+            (Err [e] (panic "{}" e))
+            (Ok [owned]
+              (let [(mut mapped) owned f (primitive/cast (fnptr (cc/C) [u64] u64) (.base mapped))]
+                (for x [(: 0 u64) 1 2 0x7FFFFFFF 0x80000000 0xFFFFFFFF
+                        0x8000000000000000 0xFFFFFFFFFFFFFFFF 0x123456789ABCDEF0]
+                  (assert (= (f x) (expected 28 ty x factor))))
+                (jit/release! (mut mapped)))))
+          (free! (mut text)))))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (for ty [(: 4 i32) 10 5 11]
+    (let [width (* 8 (types/scalar-size ty 8))]
+      (for commuted [false true]
+        (for factor [(: 0 u64) 1 2 6 7 31 63 0x7FFFFFFF 0xFFFFFFFF]
+          (multiply-constant ty factor commuted))
+        (for [k (: 1 i32) width]
+          (multiply-constant ty (+ (<< (: 1 u64) (cast u64 k)) 1) commuted)))))
   (for ty [(: 4 i32) 10 5 11]
     (for operation [(: 26 i32) 27]
       (for shift [(: 49 i32) 50 51]

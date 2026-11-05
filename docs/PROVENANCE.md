@@ -1388,3 +1388,9 @@ Return canonicalization is an independent control/value graph normalization,
 using the existing compact END/MERGE/PHI/RETURN and terminal membership shapes.
 It is not attributed as an upstream inlining rule. Full validation and the
 existing inliner eligibility proofs remain separate. See RETURN_MERGE.md.
+
+
+MUL by2^k+1 as a same-source shifted ADD is an independent AArch64 selection
+extension. Existing power-of-two multiplication follows pinned MUL_PWR2 and is
+unchanged. Word overflow semantics and persistent machine-use contracts remain
+unchanged. See CONSTANT_MULTIPLY.md.
