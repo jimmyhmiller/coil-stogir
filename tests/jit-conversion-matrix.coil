@@ -5,6 +5,11 @@
 (import "stogir.conversion" :as conversion)
 (import "stogir.calls" :as calls)
 (import "stogir.a64.compile" :as compile)
+(import "stogir.a64.convert" :as native)
+(import "stogir.a64.code" :as code)
+(import "stogir.allocation" :as allocation)
+(import "stogir.interval" :as interval)
+(import "coil.arraylist" :use [ArrayList])
 (import "stogir.jit.darwin" :as jit)
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.primitive" :as primitive)
@@ -139,8 +144,52 @@
     (g/release! (mut graph))
     failures))
 
+;;; Upstream ir_emit_bitcast emits no instruction for an integer word view
+;;; already in its destination register. Different registers need a W-register
+;;; move. Narrow byte/halfword and BOOL normalization remain separate policies.
+(defn word-view-emission [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut failures) 0]
+    (for source-type [(: 4 i32) 10]
+      (for destination-type [(: 4 i32) 10]
+        (for register [(: 0 i32) 1 19]
+          (let [(mut graph) (g/create a)
+                start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+                source
+                  (require (b/emit! (mut graph)
+                                    71
+                                    source-type
+                                    [start (: 0 i32) 0]))
+                view
+                  (require (b/emit! (mut graph) 36 destination-type [source]))
+                (mut parts) (ArrayList::new [allocation/Part] a)
+                (mut output) (code/create a)]
+            (let [(mut part) (allocation/create source a)]
+              (set! (.register part) 0)
+              (interval/add! (mut (.ranges part)) 0 1)
+              (push! (mut parts) part))
+            (let [(mut part) (allocation/create view a)]
+              (set! (.register part) register)
+              (interval/add! (mut (.ranges part)) 1 2)
+              (push! (mut parts) part))
+            (let [expected (if (= register 0) 0 4)
+                  emitted
+                    (require (native/emit! (mut output) graph parts view 0))]
+              (unless (and (= (cast i64 emitted) expected)
+                           (= (len (.text output)) expected))
+                (set! failures (+ failures 1)))
+              (when (= expected 4)
+                ; AArch64 SF=0 selects a W-register move, not an X move.
+                (when (!= (& (get (.text output) 3) (: 0x80 u8)) (: 0 u8))
+                  (set! failures (+ failures 1)))))
+            (for [i 0 (len parts)] (allocation/release! (elem (mut parts) i)))
+            (free! (mut parts))
+            (code/release! (mut output))
+            (g/release! (mut graph))))))
+    failures))
+
 (defn main [] (-> i64)
-  (let [(mut failures) 0
+  (let [(mut failures) (word-view-emission)
         (mut count) 0]
     (for src [(: 1 i32) 2 3 4 5 6 7 8 9 10 11]
       (for dst [(: 1 i32) 2 3 4 5 6 7 8 9 10 11]
