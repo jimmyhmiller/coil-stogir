@@ -1,0 +1,114 @@
+;;; Owned reference remapping; existing graph IDs and facts remain untouched.
+(module stogir.compact)
+(export Compacted compact release!)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.opcode" :as op)
+(import "stogir.uses" :as uses)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; references maps old positive headers to new IDs; zero means removed or a
+;;; continuation cell. Negative constants retain their IDs. No analysis survives.
+(defstruct Compacted [(graph g/Graph) (roots (ArrayList i32))
+                      (references (ArrayList i32)) (removed i64)])
+(defn release! [(value (mut Compacted))] (-> void)
+  (g/release! (mut (.graph value)))
+  (free! (mut (.roots value))) (free! (mut (.references value))))
+
+;;; Copy the unchanged negative-reference/string namespaces, without copying
+;;; the old instruction storage or its expression cache of positive references.
+(defn copy-pools [(source g/Graph) (a (dyn Allocator))] (-> g/Graph)
+  (let [(mut target) (g/create a)]
+    (extend! (mut (.constants target)) (.data (.constants source)) (len (.constants source)))
+    (extend! (mut (.constant-spans target)) (.data (.constant-spans source)) (len (.constant-spans source)))
+    (extend! (mut (.bytes (.strings target))) (.data (.bytes (.strings source))) (len (.bytes (.strings source))))
+    (extend! (mut (.entries (.strings target))) (.data (.entries (.strings source))) (len (.entries (.strings source))))
+    (for key (.constant-heads source)
+      (match (get (.constant-heads source) key)
+        (Some [value] (set! (mut (.constant-heads target)) key value))
+        (None [] (panic "constant interner changed during compaction"))))
+    (for key (.heads (.strings source))
+      (match (get (.heads (.strings source)) key)
+        (Some [value] (set! (mut (.heads (.strings target))) key value))
+        (None [] (panic "string interner changed during compaction"))))
+    (set! (.function-prototype target) (.function-prototype source))
+    target))
+
+;;; Remove only unreferenced, unobserved NOPs, never arbitrary dead operations.
+;;; Source validation precedes all edits; output validation uses a fresh epoch.
+(defn compact [(source g/Graph) (roots (slice i32)) (pointer-bytes i32)
+                (a (dyn Allocator))] (-> (Result Compacted (slice u8)))
+  (match (rewrite/validate source pointer-bytes a)
+    (Err [message] (Err message))
+    (Ok [_]
+      (let [(mut keep) (ArrayList::new [bool] a)
+            (mut references) (ArrayList::new [i32] a)
+            (mut error) "" (mut r) (: 1 i64)]
+        (for [i 0 (len (.instructions source))]
+          (push! (mut keep) false) (push! (mut references) 0))
+        (for root roots
+          (if (not (g/contains? source root)) (set! error "invalid compaction root")
+              (when (> root 0) (set! (mut keep) (cast i64 root) true))))
+        ; Include metadata reference edges (terminal lists, VAR/REG, labels and
+        ; guards), not just data/control liveness. Operand metadata is preserved.
+        (while (< r (len (.instructions source)))
+          (let [node (get (.instructions source) r)
+                count (get (.arities source) r)]
+            (for [j (: 1 i32) (+ count 1)]
+              (when (uses/edge-code? (op/operand-code (cast i32 (n/opcode node)) j))
+                (match (g/operand source (cast i32 r) j)
+                  (None [] (set! error "compaction operand storage missing"))
+                  (Some [value]
+                    (when (> value 0) (set! (mut keep) (cast i64 value) true))))))
+            (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
+        (let [result
+          (if (!= error "") (Err [Compacted (slice u8)] error)
+            (let [(mut graph) (copy-pools source a)
+                  (mut observed) (ArrayList::new [i32] a)
+                  (mut removed) (: 0 i64)]
+              (set! r 1)
+              (while (< r (len (.instructions source)))
+                (let [node (get (.instructions source) r)
+                      cells (/ (+ (cast i64 (get (.arities source) r)) 4) 4)]
+                  (if (and (= (n/opcode node) 0) (not (get keep r)))
+                      (set! removed (+ removed cells))
+                      (do
+                        (set! (mut references) r (cast i32 (len (.instructions graph))))
+                        ; Copy complete extents, including header auxiliary bits
+                        ; and continuation words, before rewriting any reference.
+                        (for [j 0 cells]
+                          (push! (mut (.instructions graph)) (get (.instructions source) (+ r j)))
+                          (push! (mut (.arities graph)) (get (.arities source) (+ r j))))))
+                  (set! r (+ r cells))))
+              (set! r 1)
+              (while (< r (len (.instructions source)))
+                (let [node (get (.instructions source) r)
+                      count (get (.arities source) r) target (get references r)]
+                  (when (> target 0)
+                    (for [j (: 1 i32) (+ count 1)]
+                      (when (uses/edge-code? (op/operand-code (cast i32 (n/opcode node)) j))
+                        (match (g/operand source (cast i32 r) j)
+                          (None [] (set! error "compaction operand storage missing"))
+                          (Some [old]
+                            (when (> old 0)
+                              (let [value (get references (cast i64 old))]
+                                (if (= value 0) (set! error "compaction reference has no mapping")
+                                    (unless (g/set-operand! (mut graph) target j value)
+                                      (set! error "compaction reference rewrite failed"))))))))))
+                  (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
+              (for root roots
+                (push! (mut observed) (if (< root 0) root (get references (cast i64 root)))))
+              (when (= error "")
+                (match (rewrite/validate graph pointer-bytes a)
+                  (Err [message] (set! error message)) (Ok [_] 0)))
+              (if (= error "")
+                  (Ok (Compacted :graph graph :roots observed :references references :removed removed))
+                  (do (g/release! (mut graph)) (free! (mut observed))
+                      (Err [Compacted (slice u8)] error)))))]
+          (free! (mut keep))
+          (match result
+            (Err [message] (free! (mut references)) (Err message))
+            (Ok [owned] (Ok owned))))))))

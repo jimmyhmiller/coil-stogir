@@ -1394,3 +1394,10 @@ MUL by2^k+1 as a same-source shifted ADD is an independent AArch64 selection
 extension. Existing power-of-two multiplication follows pinned MUL_PWR2 and is
 unchanged. Word overflow semantics and persistent machine-use contracts remain
 unchanged. See CONSTANT_MULTIPLY.md.
+
+
+Owned instruction compaction is an independent storage transformation, not a
+pinned upstream pass. It uses the same opcode/reference metadata, preserves
+negative constant/string namespaces, and rebuilds facts after explicit positive
+reference/root remapping. Pool copying follows graph/duplicate's representation.
+No validation is omitted. See OWNED_COMPACTION.md.

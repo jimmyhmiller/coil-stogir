@@ -1,0 +1,218 @@
+(module stogir.tests.jit-compact)
+(import "stogir.compact" :as compact)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.builder" :as b)
+(import "stogir.opcode" :as op)
+(import "stogir.uses" :as uses)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err Some None])
+(defn require [(x (Result i32 (slice u8)))] (-> i32)
+  (match x (Ok [v] v) (Err [e] (panic "{}" e))))
+(defn pad! [(graph (mut g/Graph))] (-> i32)
+  (let [(mut first) (: 0 i32)]
+    (for [i 0 32]
+      (let [r (require (b/emit! (mut graph) 0 0 []))]
+        (when (= first 0) (set! first r)))) first))
+(defn same [(a n/Node) (b n/Node)] (-> bool)
+  (and (= (.header a) (.header b)) (= (.op1 a) (.op1 b))
+       (= (.op2 a) (.op2 b)) (= (.op3 a) (.op3 b))))
+(defn reject [(value (Result compact/Compacted (slice u8)))] (-> void)
+  (match value (Err [_] 0) (Ok [owned]
+    (let [(mut owned) owned] (compact/release! (mut owned))
+      (panic "invalid compaction accepted")))))
+(defn mappings [(source g/Graph) (roots (slice i32)) (out compact/Compacted)] (-> void)
+  (let [target (.graph out) refs (.references out) (mut r) (: 1 i64)]
+    (assert (= (- (len (.instructions source)) (.removed out)) (len (.instructions target))))
+    (assert (= (len refs) (len (.instructions source))))
+    (assert (= (.function-prototype source) (.function-prototype target)))
+    (assert (= (len (.expressions target)) 0))
+    (while (< r (len (.instructions source)))
+      (let [node (get (.instructions source) r) mapped (get refs r)
+            count (get (.arities source) r) cells (/ (+ (cast i64 count) 4) 4)]
+        (if (= mapped 0) (assert (= (n/opcode node) 0))
+          (do
+            (assert (= count (get (.arities target) (cast i64 mapped))))
+            (assert (= (.header node) (.header (get (.instructions target) (cast i64 mapped)))))
+            (for [j (: 1 i32) (+ count 1)]
+              (match (g/operand source (cast i32 r) j)
+                (None [] (panic "source operand missing"))
+                (Some [old]
+                  (let [expected (if (and (> old 0) (uses/edge-code? (op/operand-code (cast i32 (n/opcode node)) j)))
+                                    (get refs (cast i64 old)) old)]
+                    (match (g/operand target mapped j)
+                      (None [] (panic "target operand missing"))
+                      (Some [actual] (assert (= actual expected))))))))))
+        (for [i 1 cells] (assert (= (get refs (+ r i)) 0)))
+        (set! r (+ r cells))))
+    (assert (= (len (.constants source)) (len (.constants target))))
+    (for [i 0 (len (.constants source))]
+      (assert (same (get (.constants source) i) (get (.constants target) i)))
+      (assert (= (get (.constant-spans source) i) (get (.constant-spans target) i))))
+    (for [i 0 (len (.bytes (.strings source)))]
+      (assert (= (get (.bytes (.strings source)) i) (get (.bytes (.strings target)) i))))
+    (for [i 0 (len roots)]
+      (let [root (get roots i)]
+        (assert (= (get (.roots out) i) (if (< root 0) root (get refs (cast i64 root)))))))))
+(defn mix :cc (cc/C) [(a i64) (b i64) (c i64) (d i64) (e i64)] (-> i64)
+  (+ (* a 3) (* b 5) (* c 7) (* d 11) (* e 13)))
+(defn execute [(graph g/Graph) (entry i32) (ret i32) (level i32) (packed bool)] (-> void)
+  (let [a (malloc-allocator)]
+    (match (if packed
+               (compile/image-compacted-with-options graph entry [ret] "_compact_loop" (options/Options :level level) a)
+               (compile/image-with-options graph entry [ret] "_compact_loop" (options/Options :level level) a))
+      (Err [e] (panic "{}" e))
+      (Ok [owned]
+        (let [(mut code) owned]
+          (match (jit/map-image code a)
+            (Err [e] (panic "{}" e))
+            (Ok [owned]
+              (let [(mut mapped) owned
+                    f (p/cast (fnptr (cc/C) [i64 u64] i64) (.base (.memory mapped)))
+                    target (p/cast u64 (p/cast (ptr u8) (fnptr-of mix)))]
+                (for [count -5 101]
+                  (let [sum (if (< count 0) 0 (/ (* count (- count 1)) 2))
+                        expected (^ (mix sum 1 count sum 1) 0x12345678)]
+                    (assert (= (f count target) expected))))
+                (jit/release-image! (mut mapped)))))
+          (image/release! (mut code)))))))
+(defn test [(fixed bool)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        kept (pad! (mut graph))
+        limit (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        extent (require (b/scalar-constant! (mut graph) 5 8 8))
+        sentinel (require (b/scalar-constant! (mut graph) 11 0x12345678 8))
+        slot (require (if fixed (b/frame-object! (mut graph) start extent 16)
+                          (b/stack-allocate! (mut graph) start extent 16)))
+        stored (require (b/emit! (mut graph) 93 0 [slot slot sentinel]))
+        entry (require (b/emit! (mut graph) 114 0 [stored]))
+        ignored (pad! (mut graph))
+        loop (require (b/loop-begin! (mut graph) entry))
+        index (require (b/loop-phi! (mut graph) loop zero))
+        sum (require (b/loop-phi! (mut graph) loop zero))
+        condition (require (b/emit! (mut graph) 16 1 [index limit]))
+        split (require (b/emit! (mut graph) 116 0 [loop condition]))
+        body (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        exit (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        next-index (require (b/emit! (mut graph) 26 11 [index one]))
+        next-sum (require (b/emit! (mut graph) 26 11 [sum index]))
+        back (require (b/emit! (mut graph) 115 0 [body]))]
+    (b/patch! (mut graph) loop 2 back)
+    (b/patch! (mut graph) index 3 next-index)
+    (b/patch! (mut graph) sum 3 next-sum)
+    (pad! (mut graph))
+    (match (calls/create 0 11 [(: 11 u8) 6] a)
+      (Err [e] (panic "{}" e))
+      (Ok [owned] (let [(mut proto) owned]
+        (require (calls/function! (mut graph) proto a)) (calls/release! (mut proto)))))
+    (match (calls/create 0 11 [(: 11 u8) 11 11 11 11] a)
+      (Err [e] (panic "{}" e))
+      (Ok [owned]
+        (let [(mut proto) owned
+              call (require (calls/emit! (mut graph) proto exit target [sum one limit sum one] a))
+              loaded (require (b/emit! (mut graph) 91 11 [call slot]))
+              value (require (b/emit! (mut graph) 48 11 [call loaded]))
+              ret (require (b/emit! (mut graph) 120 11 [loaded value (: 0 i32)]))
+              (mut payload) (ArrayList::new [u8] a)]
+          (unless fixed (b/patch! (mut graph) start 1 ret))
+          (for [i 0 16] (push! (mut payload) (cast u8 (+ (* i 17) 3))))
+          (let [vector (require (b/vector-constant! (mut graph) 37 8 (slice payload)))
+                cached (require (b/integer-binary! (mut graph) 26 11 8 limit one))
+                (mut before) (g/duplicate graph a)]
+            (reject (compact/compact graph [ret 999999] 8 a))
+            (reject (compact/compact graph [ret] 3 a))
+            (set! (mut (.arities graph)) (cast i64 call) 2)
+            (reject (compact/compact graph [ret] 8 a))
+            (set! (mut (.arities graph)) (cast i64 call) 7)
+            (for level [(: 1 i32) 2 3]
+              (for packed [false true] (execute graph start ret level packed)))
+            (match (compact/compact graph [ret kept vector] 8 a)
+              (Err [e] (panic "{}" e))
+              (Ok [owned]
+                (let [(mut out) owned refs (.references out)]
+                  (mappings graph [ret kept vector] out)
+                  (assert (> (.removed out) 90))
+                  (assert (> (get refs (cast i64 kept)) 0))
+                  (assert (= (get refs (cast i64 ignored)) 0))
+                  (for [i 0 (len (.instructions graph))]
+                    (assert (same (get (.instructions graph) i) (get (.instructions before) i)))
+                    (assert (= (get (.arities graph) i) (get (.arities before) i))))
+                  (execute (.graph out) (get refs (cast i64 start)) (get refs (cast i64 ret)) 1 false)
+                  (assert (= (require (b/scalar-constant! (mut (.graph out)) 11 1 8)) one))
+                  (let [length (len (.instructions (.graph out)))
+                        fresh (require (b/integer-binary! (mut (.graph out)) 26 11 8 (get refs (cast i64 limit)) one))]
+                    (assert (= (cast i64 fresh) length)))
+                  (compact/release! (mut out)))))
+            (g/release! (mut before)))
+          (free! (mut payload)) (calls/release! (mut proto)))))
+    (g/release! (mut graph))))
+;;; Variable-length MERGE/PHI extents and switch labels cross NOP gaps.
+(defn switch-case [] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        input (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        split (require (b/switch! (mut graph) start input))
+        (mut ends) (ArrayList::new [i32] a) (mut values) (ArrayList::new [i32] a)
+        (mut inputs) (ArrayList::new [i32] a)]
+    (for key [(: 2 u64) 0 1]
+      (let [literal (require (b/scalar-constant! (mut graph) 11 key 8))
+            branch (require (b/case-value! (mut graph) split literal))
+            end (require (b/emit! (mut graph) 114 0 [branch]))
+            value (require (b/scalar-constant! (mut graph) 11 (* (+ key 1) 100) 8))]
+        (push! (mut ends) end) (push! (mut values) value) (pad! (mut graph))))
+    (let [branch (require (b/case-default! (mut graph) split))
+          end (require (b/emit! (mut graph) 114 0 [branch]))
+          fallback (require (b/scalar-constant! (mut graph) 11 700 8))]
+      (push! (mut ends) end) (push! (mut values) fallback))
+    (let [region (require (b/emit! (mut graph) 112 0 (slice ends)))]
+      (push! (mut inputs) region)
+      (for value values (push! (mut inputs) value))
+      (let [phi (require (b/emit! (mut graph) 67 11 (slice inputs)))
+            ret (require (b/emit! (mut graph) 120 11 [region phi (: 0 i32)]))]
+        (b/patch! (mut graph) start 1 ret)
+        (match (compact/compact graph [ret] 8 a)
+          (Err [e] (panic "{}" e))
+          (Ok [owned]
+            (let [(mut out) owned refs (.references out)]
+              (mappings graph [ret] out)
+              (assert (= (get refs (cast i64 (+ region 1))) 0))
+              (assert (= (get refs (cast i64 (+ phi 1))) 0))
+              (match (compile/text (.graph out) (get refs (cast i64 start)) (slice (.roots out)) a)
+                (Err [e] (panic "{}" e))
+                (Ok [owned]
+                  (let [(mut text) owned]
+                    (match (compile/text graph start [ret] a)
+                      (Err [e] (panic "{}" e))
+                      (Ok [owned]
+                        (let [(mut original) owned]
+                          (assert (= (len original) (len text)))
+                          (for [i 0 (len text)] (assert (= (get text i) (get original i))))
+                          (free! (mut original)))))
+                    (match (jit/map-text (slice text))
+                      (Err [e] (panic "{}" e))
+                      (Ok [owned]
+                        (let [(mut mapped) owned f (p/cast (fnptr (cc/C) [i64] i64) (.base mapped))]
+                          (for [key -3 6]
+                            (assert (= (f key) (if (and (>= key 0) (<= key 2)) (* (+ key 1) 100) 700))))
+                          (jit/release! (mut mapped)))))
+                    (free! (mut text)))))
+              (compact/release! (mut out)))))))
+    (free! (mut ends)) (free! (mut values)) (free! (mut inputs))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (switch-case)
+  (for fixed [false true] (test fixed))
+  (println "owned compaction mapping and native checks: passed") 0)
