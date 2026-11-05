@@ -81,3 +81,19 @@ After correction: both regression tests PASS debug/ASAN; small executable graph
 checks 1005 selector/input combinations. Call-pressure and a64-allocate suites
 rerun PASS. The compiler integration retry is pending. The earlier small timing
 belongs to 5bc1bad6, not this corrected candidate.
+
+## Corrected candidate verified and measured
+
+Compiler 6eb62d2e completes the whole-bootstrap diagnostic. All generated hosts
+emit the exact seed Stogir object; current generation 12.071326 s versus LLVM
+34.363617 s, runtime 36.946802 s versus LLVM 17.395787 s. Same-source prior
+backend comparison: generation 11.386598 -> 12.071326 s (6.01% worse), runtime
+38.057127 -> 36.946802 s (2.92% better). One diagnostic sample, no acceptance.
+
+Repeated corrected actual-verifier medians (four generation/16 CPU samples after
+warmups): before/candidate/LLVM generation 97.391/103.160/369.1665 ms; CPU
+28.9565/27.471/9.6995 ms. All three verifier objects exactly match the first
+comparison, showing the redefinition fix does not affect this kernel's output.
+The full-bootstrap goal remains unmet. Complete evidence is in the Coil
+worktree `.worktrees/stogir-phi-preallocation-coalescing`, under
+`docs/benchmarks/phi-preallocation-coalescing`.
