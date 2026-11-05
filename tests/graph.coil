@@ -1,6 +1,7 @@
 (module stogir.tests.graph)
 (import "stogir.graph" :as g)
 (import "stogir.node" :as n)
+(import "stogir.symbols" :as symbols)
 (import "stogir.types" :as types)
 (import "coil.primitive" :as p)
 (import "coil.alloc" :use [malloc-allocator])
@@ -153,7 +154,50 @@
     (free! (mut words))
     (g/release! (mut graph))))
 
+(defn rebuilt-constant-index [] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        first (require-ref (g/intern-scalar! (mut graph) 5 0))
+        second (require-ref (g/intern-scalar! (mut graph) 11 0x0E00000000000000))
+        payload [(: 0 u8) 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15]
+        vector (require-ref (g/intern-vector! (mut graph) 52 8 payload))
+        hash (match (g/lookup graph vector) (Some [node] (n/constant-bits node))
+                (None [] (panic "missing vector") (: 0 u64)))
+        bits (^ hash 0x0500000000000000)
+        collision (require-ref (g/intern-scalar! (mut graph) 5 bits))
+        named (match (symbols/symbol! (mut graph) "_index_symbol")
+                (Ok [x] x) (Err [message] (panic "{}" message) (: 0 i32)))
+        (mut original) (g/duplicate graph a)]
+    (for reference [first second vector collision named] (assert (< reference 0)))
+    (clear! (mut (.constant-heads graph)))
+    (match (g/rebuild-constant-index! (mut graph) 8)
+      (Err [message] (panic "{}" message)) (Ok [count] (assert (= count 5))))
+    (assert (= (require-ref (g/intern-scalar! (mut graph) 5 0)) first))
+    (assert (= (require-ref (g/intern-scalar! (mut graph) 11 0x0E00000000000000)) second))
+    (assert (= (require-ref (g/intern-scalar! (mut graph) 5 bits)) collision))
+    (assert (= (require-ref (g/intern-vector! (mut graph) 52 8 payload)) vector))
+    (match (symbols/symbol! (mut graph) "_index_symbol")
+      (Err [message] (panic "{}" message)) (Ok [reference] (assert (= reference named))))
+    (assert (= (len (.constants graph)) (len (.constants original))))
+    (for [i 0 (len (.constants graph))]
+      (let [before (get (.constants original) i) after (get (.constants graph) i)]
+        (assert (= (.header before) (.header after)))
+        (assert (= (.op1 before) (.op1 after)))
+        (assert (= (.op2 before) (.op2 after)))
+        (assert (= (.op3 before) (.op3 after)))))
+    (let [index (- -1 (cast i64 vector))
+          span (get (.constant-spans graph) index)
+          heads (len (.constant-heads graph))]
+      (set! (mut (.constant-spans graph)) index 1)
+      (match (g/rebuild-constant-index! (mut graph) 8)
+        (Err [_] 0) (Ok [_] (panic "invalid vector geometry indexed")))
+      (assert (= heads (len (.constant-heads graph))))
+      (for [i 0 (len (.constants graph))]
+        (assert (= (.op1 (get (.constants graph) i)) (.op1 (get (.constants original) i)))))
+      (set! (mut (.constant-spans graph)) index span))
+    (g/release! (mut original)) (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (rebuilt-constant-index)
   (operand-words)
   (let [(mut graph) (g/create (malloc-allocator))
         (mut failures) 0

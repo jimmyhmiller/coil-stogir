@@ -57,3 +57,40 @@ or preparation cost. Trace and hash receipt are retained with validation.
 The native budget reduction also passes with extra branch/control observations
 retained alongside RETURN, as compiler templates do. Ordinary inliner identity,
 closed-control and exact-budget checks still pass, with minimum17→8cells.
+
+
+## Opt-in registered context cache
+
+optimize-registered-specialized-if-changed validates the entire original batch
+first. Only its private same-invocation path reuses the caller validation proof;
+the caller is unchanged until the ordinary owned-copy transaction begins.
+Every original target must pass ordinary common and private-result eligibility
+before specialization. Derived contexts remain private to their original owned
+registry handle, with exact numeric conditions and target width checked on use.
+No unconditional specialized handle is exposed. Context costs enter the existing
+loop/cost ranking before cloning; all clones share the unchanged exact ledger.
+
+Preparation workspace uses the invocation allocator. Only immutable semantic
+storage and conditions are copied into the registry allocator, excluding mutable
+construction indexes and pending optimizer work. Unprofitable results are cached
+as well. Each registry permits at most128 preparations and32768 retained semantic
+cells (including string bytes/entries); hitting either limit falls back to
+ordinary inlining, while existing contexts remain usable. These are experimental
+resource limits requiring compiler measurements, not performance acceptance.
+
+Frozen snapshots omit construction constant indexes. Before SCCP, specialization
+rebuilds the owned constant index with scalar/named/LONG_CONST hash and chain
+conventions; it preserves every value ID and payload. Complete geometry is
+checked before index mutation. Mixed scalar/vector hash collisions and malformed
+payload markers have transactional tests. This restores optional construction
+metadata, not an unchecked semantic-validation shortcut.
+
+Debug/ASAN: repeated reuse, changed arguments, two immutable handles with the
+same name/prototype but different bodies, Never and zero budget, invalid batch
+inputs before preparation,128-context exhaustion with correct ordinary fallback,
+and reuse after exhaustion pass. A9-site batch grows the cache while borrowed
+callee descriptors are live; only one expansion reserves8cells under one shared
+8-cell ledger. Native canaries/returns check changed-argument and resource-fallback
+paths. Existing graph/constants/vector constants/JIT vector constants/module
+execution and29700 validation-transaction checks pass. Evidence: validation/
+specialization-cache. No compiler integration or performance adoption yet.

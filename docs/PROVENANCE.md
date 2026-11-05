@@ -1368,3 +1368,10 @@ bindings into a private copy of the compact graph and invokes the existing
 pinned-upstream-shaped SCCP pipeline. Its context conditions are retained,
 not promoted to unconditional callee equivalence. No upstream constant, opcode
 or validation semantics are changed. See PARAMETER_SPECIALIZATION.md.
+
+
+The registered context cache is an independent bounded policy over immutable
+callee snapshots and existing SCCP/inlining. Constant-index reconstruction uses
+the same scalar key and LONG_CONST header/hash/payload conventions as existing
+graph construction; negative IDs and payloads remain intact. Original validation
+and exact clone-growth contracts remain required.

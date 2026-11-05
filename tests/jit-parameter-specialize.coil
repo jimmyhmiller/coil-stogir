@@ -11,6 +11,7 @@
 (import "stogir.image" :as image)
 (import "stogir.jit.darwin" :as jit)
 (import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
 (import "coil.primitive" :as p)
 (import "coil.cc" :as cc)
 (import "coil.result" :use [Result Ok Err])
@@ -45,7 +46,7 @@
                 (assert (jit/release-image! (mut loaded))))))
           (image/release! (mut code)))))))
 
-(defn execute-caller [(graph g/Graph) (roots (slice i32))] (-> void)
+(defn execute-caller [(graph g/Graph) (roots (slice i32)) (bound u64) (zero-result bool)] (-> void)
   (let [a (malloc-allocator)]
     (match (compile/image graph 1 roots "_specialized_caller" a)
       (Err [message] (panic "{}" message))
@@ -56,12 +57,36 @@
             (Ok [loaded]
               (let [(mut loaded) loaded
                     f (p/cast (fnptr (cc/C) [u64 (ptr u64)] bool) (.base (.memory loaded)))]
-                (for [x 0 32]
-                  (let [(mut out) (: 42 u64)]
-                    (assert (= (f (cast u64 x) (p/cast (ptr u64) (mut out))) (= x 0)))
-                    (assert (= out 42))))
+                (for [i 0 33]
+                  (let [x (if (= i 32) bound (cast u64 i)) (mut out) (: 42 u64)]
+                    (assert (= (f x (p/cast (ptr u64) (mut out)))
+                               (and zero-result (= x 0) (= bound 0))))
+                    (assert (= out (if (and (= x bound) (!= x 0)) (: 99 u64) 42)))))
                 (assert (jit/release-image! (mut loaded))))))
           (image/release! (mut code)))))))
+
+(defn reject-inline [(result (Result (Option rewrite/Rewritten) (slice u8)))] (-> void)
+  (match result
+    (Err [_] 0)
+    (Ok [outcome]
+      (match outcome
+        (None [] (panic "invalid inline request accepted"))
+        (Some [owned]
+          (let [(mut owned) owned]
+            (rewrite/release! (mut owned)) (panic "invalid inline request expanded")))))))
+
+(defn applied [(result (Result (Option rewrite/Rewritten) (slice u8)))
+               (bound u64) (zero-result bool)] (-> void)
+  (match result
+    (Err [message] (panic "{}" message))
+    (Ok [outcome]
+      (match outcome
+        (None [] (panic "expected expansion"))
+        (Some [owned]
+          (let [(mut owned) owned]
+            (assert (= (.changes owned) 1))
+            (execute-caller (.graph owned) (slice (.roots owned)) bound zero-result)
+            (rewrite/release! (mut owned))))))))
 
 (defn check-caller [(original g/Graph) (ret i32) (specialized specialize/Specialized)] (-> void)
   (let [a (malloc-allocator) (mut caller) (g/create a)
@@ -118,8 +143,125 @@
                 (Some [owned]
                   (let [(mut rewritten) owned]
                     (assert (= (.changes rewritten) 1))
-                    (execute-caller (.graph rewritten) (slice (.roots rewritten)))
+                    (execute-caller (.graph rewritten) (slice (.roots rewritten)) 0 true)
                     (rewrite/release! (mut rewritten)))))))
+          (let [(mut registry) (inlining/registry-create 8 a)
+                handle (match (inlining/register! (mut registry) original-target)
+                         (Err [message] (panic "{}" message) (: 0 i64)) (Ok [x] x))
+                site (inlining/RegisteredSite :reference called :callee handle)]
+            (match (inlining/optimize-registered-specialized-if-changed registry caller start [returned] [site] 0 a)
+              (Err [message] (panic "{}" message))
+              (Ok [outcome] (match outcome (None [] 0)
+                (Some [owned] (let [(mut owned) owned] (rewrite/release! (mut owned))
+                                    (panic "zero-budget request expanded"))))))
+            (reject-inline (inlining/optimize-registered-specialized-if-changed registry caller start [returned]
+                            [site site] new-min a))
+            (reject-inline (inlining/optimize-registered-specialized-if-changed registry caller start [999999]
+                            [site] new-min a))
+            (reject-inline (inlining/optimize-registered-specialized-if-changed registry caller start [returned]
+                            [(inlining/RegisteredSite :reference called :callee 999999)] new-min a))
+            (reject-inline (inlining/optimize-registered-specialized-if-changed registry caller start [returned]
+                            [site] -1 a))
+            (assert (= (inlining/specialization-count registry) 0))
+            (for [turn 0 3]
+              (match (inlining/optimize-registered-specialized-if-changed registry caller start [returned] [site] new-min a)
+                (Err [message] (panic "{}" message))
+                (Ok [result]
+                  (match result
+                    (None [] (panic "cached specialization missed expansion"))
+                    (Some [owned]
+                      (let [(mut owned) owned]
+                        (execute-caller (.graph owned) (slice (.roots owned)) 0 true)
+                        (rewrite/release! (mut owned)))))))
+              (assert (= (inlining/specialization-count registry) 1)))
+            (assert (g/set-operand! (mut caller) called 4 one))
+            (match (inlining/optimize-registered-specialized-if-changed registry caller start [returned] [site] 128 a)
+              (Err [message] (panic "{}" message))
+              (Ok [result]
+                (match result (None [] (panic "changed argument did not expand"))
+                  (Some [owned]
+                    (let [(mut owned) owned]
+                      (execute-caller (.graph owned) (slice (.roots owned)) 1 true)
+                      (rewrite/release! (mut owned)))))))
+            (assert (= (inlining/specialization-count registry) 2))
+            (assert (g/set-operand! (mut caller) called 4 zero))
+            (let [(mut variant) (g/duplicate original a)
+                  no (require (b/scalar-constant! (mut variant) 1 0 8))]
+              (assert (g/set-operand! (mut variant) ret 2 no))
+              (let [handle2
+                      (match (inlining/register! (mut registry)
+                        (inlining/Callee :name "_parameter_case" :graph variant :entry 1
+                                         :roots [ret] :observed [ret] :never false))
+                        (Err [message] (panic "{}" message) (: 0 i64)) (Ok [x] x))]
+                (g/release! (mut variant))
+                (applied (inlining/optimize-registered-specialized-if-changed registry caller start [returned]
+                           [(inlining/RegisteredSite :reference called :callee handle2)] new-min a) 0 false)
+                (assert (= (inlining/specialization-count registry) 3))))
+            (applied (inlining/optimize-registered-specialized-if-changed registry caller start [returned]
+                       [site] new-min a) 0 true)
+            (for [bits 2 132]
+              (let [literal (require (b/scalar-constant! (mut caller) 5 (cast u64 bits) 8))]
+                (assert (g/set-operand! (mut caller) called 4 literal))
+                (match (inlining/optimize-registered-specialized-if-changed registry caller start [returned]
+                         [site] 128 a)
+                  (Err [message] (panic "{}" message))
+                  (Ok [outcome]
+                    (match outcome (None [] (panic "resource fallback missed ordinary inline"))
+                      (Some [owned] (let [(mut owned) owned] (rewrite/release! (mut owned)))))))))
+            (assert (= (inlining/specialization-count registry) 128))
+            (applied (inlining/optimize-registered-specialized-if-changed registry caller start [returned]
+                       [site] 128 a) 131 true)
+            (assert (g/set-operand! (mut caller) called 4 zero))
+            (applied (inlining/optimize-registered-specialized-if-changed registry caller start [returned]
+                       [site] new-min a) 0 true)
+            (assert (= (inlining/specialization-count registry) 128))
+            (inlining/registry-release! (mut registry))
+            (assert (= (inlining/specialization-count registry) 0)))
+          (let [(mut registry) (inlining/registry-create 8 a)
+                handle (match (inlining/register! (mut registry) original-target)
+                         (Err [message] (panic "{}" message) (: 0 i64)) (Ok [x] x))
+                (mut batch) (g/duplicate caller a)
+                (mut sites) (ArrayList::new [inlining/RegisteredSite] a)
+                (mut control) called]
+            (push! (mut sites) (inlining/RegisteredSite :reference called :callee handle))
+            (for [i 1 9]
+              (let [literal (require (b/scalar-constant! (mut batch) 5 (cast u64 i) 8))
+                    next (require (calls/emit! (mut batch) proto control function [x literal out] a))]
+                (push! (mut sites) (inlining/RegisteredSite :reference next :callee handle))
+                (set! control next)))
+            (assert (g/set-operand! (mut batch) returned 1 control))
+            (assert (g/set-operand! (mut batch) returned 2 control))
+            (let [before (len (.instructions batch))]
+              (match (inlining/optimize-registered-specialized-if-changed registry batch start [returned]
+                       (slice sites) new-min a)
+                (Err [message] (panic "{}" message))
+                (Ok [outcome]
+                  (match outcome (None [] (panic "batch specialization missed expansion"))
+                    (Some [owned]
+                      (let [(mut owned) owned (mut count) 0 (mut r) (: 1 i64)
+                            body (.graph owned)]
+                        (assert (= (.changes owned) 1))
+                        (assert (= (- (len (.instructions body)) before) (cast i64 new-min)))
+                        (while (< r (len (.instructions body)))
+                          (when (= (n/opcode (get (.instructions body) r)) 79) (set! count (+ count 1)))
+                          (set! r (+ r (/ (+ (cast i64 (get (.arities body) r)) 4) 4))))
+                        (assert (= count 8))
+                        (rewrite/release! (mut owned))))))))
+            (assert (= (inlining/specialization-count registry) 9))
+            (inlining/registry-release! (mut registry))
+            (free! (mut sites)) (g/release! (mut batch)))
+          (let [(mut registry) (inlining/registry-create 8 a)
+                never-target (inlining/Callee :name "_parameter_case" :graph original :entry 1
+                                             :roots [ret] :observed [ret] :never true)
+                handle (match (inlining/register! (mut registry) never-target)
+                         (Err [message] (panic "{}" message) (: 0 i64)) (Ok [x] x))]
+            (match (inlining/optimize-registered-specialized-if-changed registry caller start [returned]
+                     [(inlining/RegisteredSite :reference called :callee handle)] 128 a)
+              (Err [message] (panic "{}" message))
+              (Ok [outcome] (match outcome (None [] 0)
+                (Some [owned] (let [(mut owned) owned] (rewrite/release! (mut owned)) (panic "Never expanded"))))))
+            (assert (= (inlining/specialization-count registry) 0))
+            (inlining/registry-release! (mut registry)))
           (calls/release! (mut proto)))))
     (g/release! (mut caller))))
 
