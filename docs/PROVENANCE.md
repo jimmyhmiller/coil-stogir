@@ -1394,3 +1394,32 @@ MUL by2^k+1 as a same-source shifted ADD is an independent AArch64 selection
 extension. Existing power-of-two multiplication follows pinned MUL_PWR2 and is
 unchanged. Word overflow semantics and persistent machine-use contracts remain
 unchanged. See CONSTANT_MULTIPLY.md.
+
+## Preallocation Phi coalescing
+
+`a64/phi-coalesce.coil` follows pinned `ir_ra.c:ir_coalesce`,
+`ir_vregs_overlap`, `ir_vregs_join`, and `ir_vregs_coalesce`: predecessor-block
+ordering, exact non-overlap, preference for an existing coalesced group and then
+original reference order, union of ranges/uses, and exclusion of Phi groups from
+the subsequent contained-copy reuse stage. The comparator is consumed in reverse
+upstream, hence shallow depth first and descending CFG block ordinal here. Phi
+ties use deterministic scheduled order; identical upstream use-list ordering is
+not claimed. Constants and multi-successor predecessors retain resolver moves.
+The optional overlapping two-address operand swap is not ported; our ordinary
+AArch64 arithmetic tiles are three-address operations.
+
+Sparse candidate lists, union-find path compression, dense ref-to-part lookup,
+and linear sorted-array unions adapt the upstream linked representations to
+Coil. Graph identities, roots and machine definitions remain unchanged. Exact
+IR type and allocation-class checks additionally preserve spill geometry.
+The prepared pipeline supplies its existing CFG/depth epoch; low-level allocation
+callers without those facts retain contained-copy reuse.
+
+Phi unions expose future interference at odd definition subpositions. The target
+cannot generally move a live register to another register there before an
+instruction without potentially destroying an input. Free-range allocation now
+caps partial assignments at legal even input boundaries before register choice.
+Complete assignments, generic allocation APIs, odd spill stores and explicit
+call transitions retain their existing semantics. This is a target-position
+adaptation, not a claim to port upstream's loop-aware optimal split placement.
+The emitter's unsupported-boundary guard is retained.
