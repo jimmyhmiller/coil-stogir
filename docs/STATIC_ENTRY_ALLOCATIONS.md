@@ -61,3 +61,8 @@ jit-aggregate-results, inline-stack-results, and verify. Bulk pressure now cover
 both raw and fixed objects with calls and spills; inline result cases cover both
 storage declarations. Logs, C caller, assembly and source hashes are archived in
 validation/static-entry-allocations.
+
+The native pipeline additionally rejects forged markers with nonentry control,
+variable or zero extent, unknown marker bits and wrong result type. Constructor
+rejections preserve graph length; tests mutate headers directly to exercise the
+validator independently of the checked builder.
