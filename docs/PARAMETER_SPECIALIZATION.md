@@ -121,3 +121,16 @@ four equality sites are positive LOAD91/typeU64 nodes, including empty-string
 length. Its object exactly equalsafdf07bb. Literal-only specialization therefore
 has no applicable argument at those sites. Caller preparation/pass ordering,
 not raising the cache cap, is the next reduction. No load is assumed constant.
+
+
+### Dynamic-argument prefilter
+
+The opt-in registry path first scans the already validated CALL actuals (including
+its final operand). If none is a canonical negative scalar literal, a nonempty
+numeric context cannot match or be constructed. It returns to ordinary inlining
+before inspecting the original callee for specialization. Batch validation and
+ordinary expansion proofs remain unchanged; every potentially selected derived
+callee still passes the existing full eligibility proof. This does not change
+cache keys, budgets, or selected specializations. The native specialization test
+also checks that an all-dynamic call still expands ordinarily and creates no
+context. No generation-time improvement is claimed until measured in Coil.
