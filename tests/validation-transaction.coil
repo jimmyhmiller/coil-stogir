@@ -1,0 +1,160 @@
+(module stogir.tests.validation-transaction)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as node)
+(import "stogir.opcode" :as opcode)
+(import "stogir.verify" :as verify)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.switch" :as switch)
+(import "stogir.terminal" :as terminal)
+(import "stogir.argument-value" :as argval)
+(import "stogir.calls" :as calls)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; Frozen pre-change pipeline validator, including both structural walks.
+(defn legacy-input [(graph g/Graph) (entry i32) (roots (slice i32))]
+  (-> (Result i32 (slice u8)))
+  (match (verify/structure graph)
+    (Err [msg] (Err msg))
+    (Ok [_]
+        (let [(mut error) ""]
+          (match (g/lookup graph entry)
+            (None [] (set! error "entry missing"))
+            (Some [instruction]
+                  (when (or (<= entry 0)
+                            (not (opcode/block-start? (cast i32
+                                                            (node/opcode instruction)))))
+                    (set! error "entry must be a block start"))))
+          (when (= (len roots) 0)
+            (set! error "compilation requires observable roots"))
+          (for root roots
+            (when (or (<= root 0) (not (g/contains? graph root)))
+              (set! error "invalid root reference")))
+          (if (= error "") (verify/phis graph) (Err error))))))
+
+(defn legacy-native-operations [(graph g/Graph)] (-> (Result i32 (slice u8)))
+  (match (verify/constants graph 8)
+    (Err [msg] (Err msg))
+    (Ok [_]
+        (match (verify/integer-operations graph)
+          (Err [msg] (Err msg))
+          (Ok [_]
+              (match (switch/verify graph (.alc (.instructions graph)))
+                (Err [msg] (Err msg))
+                (Ok [_]
+                    (match (terminal/verify-chains graph
+                                                   (.alc (.instructions graph)))
+                      (Err [msg] (Err msg))
+                      (Ok [_]
+                          (match (argval/verify graph
+                                                (.alc (.instructions graph)))
+                            (Err [message] (Err message))
+                            (Ok [_] (calls/verify graph))))))))))))
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [message] (panic "{}" message))))
+
+(defn compare-basic [(graph g/Graph) (entry i32) (roots (slice i32))] (-> void)
+  (match (legacy-input graph entry roots)
+    (Ok [expected]
+      (match (pipeline/validate-input graph entry roots)
+        (Err [message] (panic "unexpected rejection: {}" message))
+        (Ok [actual] (assert (= actual expected)))))
+    (Err [expected]
+      (match (pipeline/validate-input graph entry roots)
+        (Ok [_] (panic "invalid input accepted: {}" expected))
+        (Err [actual] (assert (= expected actual)))))))
+
+(defn compare [(graph g/Graph) (entry i32) (roots (slice i32))] (-> void)
+  (compare-basic graph entry roots)
+  (match (legacy-native-operations graph)
+    (Ok [expected]
+      (assert (= (require (compile/validate graph)) expected)))
+    (Err [expected]
+      (match (compile/validate graph)
+        (Ok [_] (panic "native operations accepted invalid graph"))
+        (Err [actual] (assert (= expected actual))))))
+  (let [previous (match (legacy-native-operations graph)
+                   (Err [message] (Err [i32 (slice u8)] message))
+                   (Ok [_] (legacy-input graph entry roots)))]
+    (match previous
+      (Ok [expected]
+        (assert (= (require (verify/native-input graph entry roots)) expected)))
+      (Err [expected]
+        (match (verify/native-input graph entry roots)
+          (Ok [_] (panic "native input accepted invalid graph"))
+          (Err [actual] (assert (= expected actual))))))))
+
+(defn root-cases [(graph g/Graph) (start i32) (x i32) (constant i32) (ret i32)] (-> void)
+  (let [(mut roots) (ArrayList::new [i32] (malloc-allocator))]
+    (for [mode 0 5]
+      (clear! (mut roots))
+      (when (!= mode 0)
+        (push! (mut roots) (case mode 1 ret 2 (: 0 i32) 3 x (: 999999 i32))))
+      (for entry [start x (: 0 i32) constant (: 999999 i32)]
+        (compare graph entry (slice roots))))
+    (free! (mut roots))))
+
+(defn wide-storage [] (-> void)
+  (let [(mut graph) (g/create (malloc-allocator))
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        (mut inputs) (ArrayList::new [i32] (malloc-allocator))]
+    (for [i 0 65535] (push! (mut inputs) start))
+    (require (b/emit! (mut graph) 112 0 (slice inputs)))
+    (compare-basic graph start [start])
+    (free! (mut inputs)) (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (wide-storage)
+  (let [(mut graph) (g/create (malloc-allocator))
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        y (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        c (require (b/scalar-constant! (mut graph) 5 7 8))
+        cmp (require (b/emit! (mut graph) 16 1 [x y]))
+        split (require (b/emit! (mut graph) 116 0 [start cmp]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        yes-end (require (b/emit! (mut graph) 114 0 [yes]))
+        no-end (require (b/emit! (mut graph) 114 0 [no]))
+        merge (require (b/emit! (mut graph) 112 0 [yes-end no-end]))
+        phi (require (b/emit! (mut graph) 67 5 [merge x y]))
+        ret (require (b/emit! (mut graph) 120 5 [merge phi (: 0 i32)]))
+        (mut mutations) (: 0 i64)]
+    (assert (= (require (pipeline/validate-input graph start [ret])) 1))
+    (root-cases graph start x c ret)
+    (for [r 1 (len (.instructions graph))]
+      (let [original (get (.instructions graph) r)
+            arity (get (.arities graph) r)]
+        (for value [(: -2147483648 i32) -2 -1 0 1 2 3 4 7 8 15 255 65535 65536 2147483647]
+          (set! (mut (.arities graph)) r value)
+          (root-cases graph start x c ret)
+          (set! mutations (+ mutations 1)))
+        (set! (mut (.arities graph)) r arity)
+        (for slot [(: 0 i32) 1 2 3]
+          (for value [(: -2147483648 i32) -2 -1 0 1 2 3 4 7 8 14 26 67 72 104 112 120 127 255 65535 2147483647]
+            (let [(mut changed) original]
+              (case slot
+                0 (do (set! (.header changed) (cast u32 value)) 0)
+                1 (do (set! (.op1 changed) value) 0)
+                2 (do (set! (.op2 changed) value) 0)
+                (do (set! (.op3 changed) value) 0))
+              (set! (mut (.instructions graph)) r changed)
+              (root-cases graph start x c ret)
+              (set! mutations (+ mutations 1)))))
+        (set! (mut (.instructions graph)) r original)))
+    (let [original (get (.constants graph) 0)]
+      (for header [(: 0 u32) 255 65535 4294967295]
+        (let [(mut changed) original]
+          (set! (.header changed) header)
+          (set! (mut (.constants graph)) 0 changed)
+          (root-cases graph start x c ret)))
+      (set! (mut (.constants graph)) 0 original))
+    (push! (mut (.arities graph)) 0)
+    (root-cases graph start x c ret)
+    (g/release! (mut graph))
+    (println "validation transaction: {} mutations x25 entry/root cases passed" mutations))
+  0)
