@@ -36,6 +36,10 @@ counts with matching frame-alignment rounding, nested objects and calls.
 BLOCK_BEGIN/BLOCK_END save and restore whole dynamic stack scopes; snapshots
 survive register spills and calls while fixed storage stays anchored.
 Over-aligned frames preserve entry SP for incoming arguments and exact restoration.
+Explicit `builder/frame-object!` declarations support fixed positive-extent
+function-lifetime objects without changing raw ALLOCA/SP-snapshot semantics.
+The first native stage retains address registers; rematerialization is unfinished.
+See [static entry objects](docs/STATIC_ENTRY_ALLOCATIONS.md).
 FRAME_ADDR establishes a real frame record, including in leaf functions; fixed
 storage accesses then use an explicit x29-based frame context.
 

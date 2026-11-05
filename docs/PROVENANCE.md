@@ -1328,3 +1328,14 @@ ASAN/debug CFG/dom/loops/live/schedule/native module and AOT checks pass. The
 independently checked opaque preparation reduction improves stogir4.33%/5.31%,
 LLVM6.55%/5.29%, TPDE3.89%/4.17%; no full bootstrap claim. See
 [analysis storage](ANALYSIS_STORAGE.md).
+
+## Fixed function-lifetime object declarations
+
+The native fixed-entry object selection/layout references IR_STATIC_ALLOCA in
+pinned ir_aarch64.dasc. Explicit builder/frame-object! and ALLOCA auxiliary32768
+are an independent Coil semantic extension: ordinary ALLOCA still changes raw
+SP, including zero-size snapshots. Marked entry-prefix objects have positive
+constant extent and function lifetime. Native matching and frame-slot layout
+implement the first stage; address rematerialization is unfinished. Inline
+cloning lowers marked callee objects to the existing call-local save/restore
+scope. No upstream/LLVM/TPDE implementation is imported. See STATIC_ENTRY_ALLOCATIONS.md.

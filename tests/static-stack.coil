@@ -1,0 +1,97 @@
+(module stogir.tests.static-stack)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.a64.match" :as matching)
+(import "stogir.a64.static-stack" :as fixed)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.aot.macho" :as macho)
+(import "coil.fs" :as fs)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [x] x) (Err [e] (panic "{}" e))))
+
+(defn fixture [(mode i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        bytes (require (b/scalar-constant! (mut graph) 5
+                                         (if (= mode 6) 0 (if (= mode 7) 8193 16)) 8))
+        thirteen (require (b/scalar-constant! (mut graph) 5 13 8))
+        prior (cond (= mode 2)
+                      (let [end (require (b/emit! (mut graph) 114 0 [start]))]
+                        (require (b/emit! (mut graph) 106 0 [end (: 0 i32)])))
+                    (= mode 3) (require (b/emit! (mut graph) 83 6 [start]))
+                    :else start)
+        slot (require (if (or (= mode 0) (= mode 5) (= mode 7) (= mode 8) (= mode 9))
+                          (b/frame-object! (mut graph) prior bytes (if (= mode 7) 64 16))
+                          (b/stack-allocate! (mut graph) prior (if (= mode 1) x bytes) 16)))
+        extra (cond (= mode 5) (require (b/frame-object! (mut graph) slot bytes 16))
+                    (= mode 9) (require (b/stack-allocate! (mut graph) slot x 16))
+                    :else slot)
+        value (require (b/emit! (mut graph) 26 5 [x thirteen]))
+        stored (if (= mode 6) extra
+                   (require (b/emit! (mut graph) 93 0 [extra slot value])))
+        snapshot (if (= mode 8) (require (b/emit! (mut graph) 83 6 [stored])) stored)
+        loaded (if (= mode 6) value
+                   (require (b/emit! (mut graph) 91 5 [snapshot slot])))
+        last-control (cond (= mode 9)
+                             (require (b/stack-free! (mut graph) loaded x))
+                           (= mode 8)
+                             (require (b/emit! (mut graph) 84 0 [loaded snapshot]))
+                           (= mode 3)
+                             (require (b/emit! (mut graph) 84 0 [loaded prior]))
+                           (= mode 4)
+                             (require (b/stack-free! (mut graph) loaded bytes))
+                           :else (if (= mode 6) extra loaded))
+        ret (require (b/emit! (mut graph) 120 5 [last-control loaded (: 0 i32)]))]
+    (match (pipeline/prepare graph start [ret] a)
+      (Err [e] (panic "{}" e))
+      (Ok [prepared]
+          (let [(mut prepared) prepared]
+            (match (matching/build graph (.schedule prepared) [ret] true a)
+              (Err [e] (panic "{}" e))
+              (Ok [plan]
+                  (let [(mut plan) plan
+                        expected (if (or (= mode 0) (= mode 5) (= mode 8) (= mode 9)) (: 16 i64)
+                                     (if (= mode 7) 8208 0))]
+                    (assert (= (fixed/size (.static-sizes plan) slot) expected))
+                    (when (= mode 5)
+                      (assert (= (fixed/size (.static-sizes plan) extra) 16)))
+                    (matching/release! (mut plan)))))
+            (pipeline/release! (mut prepared)))))
+    (match (compile/image graph start [ret] "_static_stack" a)
+      (Err [e] (panic "{}" e))
+      (Ok [code]
+          (let [(mut code) code]
+            (match (jit/map-image code a)
+              (Err [e] (panic "{}" e))
+              (Ok [mapped]
+                  (let [(mut mapped) mapped
+                        f (p/cast (fnptr (cc/C) [u64] u64) (.base (.memory mapped)))]
+                    (for x [(: 16 u64) 32 64 128]
+                      (assert (= (f x) (+ x 13))))
+                    (jit/release-image! (mut mapped)))))
+            (when (= mode 7)
+              (match (macho/image-object code a)
+                (Err [e] (panic "{}" e))
+                (Ok [object]
+                    (let [(mut object) object]
+                      (match (fs/write-file a "/tmp/coil-stogir-static-stack.o" (slice object))
+                        (Err [_] (panic "static object write failed"))
+                        (Ok [_] 0))
+                      (free! (mut object))))))
+            (image/release! (mut code)))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (for mode [(: 0 i32) 1 2 3 4 5 6 7 8 9] (fixture mode))
+  (println "static entry objects, dynamic counts/blocks, scopes/frees, zero size and over-alignment pass")
+  0)
