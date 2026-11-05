@@ -5,6 +5,7 @@
 (import "stogir.conversion" :as conversion)
 (import "stogir.calls" :as calls)
 (import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
 (import "stogir.a64.convert" :as native)
 (import "stogir.a64.code" :as code)
 (import "stogir.allocation" :as allocation)
@@ -192,7 +193,44 @@
               (g/release! (mut graph)))))))
     failures))
 
+;;; Constant address words must also work when the consumer changes register
+;;; banks or observes only low bits. Raw emit keeps the view visible to matching.
+(defn address-word-consumer [(ty i32) (mode i32) (bits u64)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        input (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        constant (require (b/scalar-constant! (mut graph) 6 bits 8))
+        view (require (b/emit! (mut graph) 36 ty [constant]))
+        output (case mode
+                 1 (let [floating (require (b/emit! (mut graph) 36 12 [view]))]
+                     (require (b/emit! (mut graph) 36 5 [floating])))
+                 2 (let [word (require (b/emit! (mut graph) 35 4 [view]))]
+                     (require (b/emit! (mut graph) 34 5 [word])))
+                 3 (require (b/emit! (mut graph) 26 ty [view input]))
+                 view)
+        result-type (if (or (= mode 1) (= mode 2)) 5 ty)
+        ret (require (b/emit! (mut graph) 120 result-type [start output (: 0 i32)]))]
+    (match (compile/image graph start [ret] "_address_word_consumer" a)
+      (Err [e] (panic "{}" e))
+      (Ok [code]
+        (let [(mut code) code]
+          (g/release! (mut graph))
+          (match (jit/map-image code a)
+            (Err [e] (panic "{}" e))
+            (Ok [loaded]
+              (let [(mut loaded) loaded
+                    f (primitive/cast (fnptr (cc/C) [u64] u64) (.base (.memory loaded)))]
+                (for input [(: 0 u64) 1 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
+                  (let [want (case mode 2 (& bits 0xFFFFFFFF) 3 (+ bits input) bits)]
+                    (assert (= (call-ptr f input) want))))
+                (jit/release-image! (mut loaded)))))
+          (image/release! (mut code)))))))
+
 (defn main [] (-> i64)
+  (for bits [(: 0 u64) 1 0xFFFFFFFF 0x8000000000000000 0x7FF8123456789ABC 0xFFFFFFFFFFFFFFFF]
+    (for ty [(: 5 i32) 11]
+      (for [mode 0 4] (address-word-consumer ty (cast i32 mode) bits)))
+    (address-word-consumer 6 0 bits))
   (let [(mut failures) (word-view-emission)
         (mut count) 0]
     (for src [(: 1 i32) 2 3 4 5 6 7 8 9 10 11]

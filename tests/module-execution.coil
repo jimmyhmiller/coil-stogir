@@ -784,7 +784,7 @@
                                                         a))
                               (calls/release! (mut definition)))))
                       (require (calls/function! (mut callee) signature a)))
-                  (match (calls/create 32 (cast u8 result) (slice parameters) a)
+                  (match (calls/create 9 (cast u8 result) (slice parameters) a)
                     (Err [message] (panic "{}" message))
                     (Ok [definition]
                         (let [(mut definition) definition]
@@ -2391,7 +2391,100 @@
             (calls/release! (mut signature)))))
     (g/release! (mut caller)) (g/release! (mut leaf))))
 
+;;; Symbolic word views must survive Phi edges, GP/stack arguments, frame
+;;; recipes and return capture without acquiring long-lived virtual registers.
+(defn symbol-probe-cell [] (-> (ptr u64)) (primitive/alloc-static u64))
+(defn symbol-probe :cc (cc/C)
+  [(v0 u64) (v1 u64) (v2 u64) (v3 u64) (v4 u64) (v5 u64) (v6 u64)
+   (v7 u64) (v8 u64) (v9 u64) (v10 u64) (v11 u64) (v12 u64)] (-> u64)
+  (assert (and (= v0 v4) (= v0 v7) (= v0 v10)))
+  (assert (and (= v1 v5) (= v1 v8) (= v1 v11)))
+  (assert (and (= v2 v6) (= v2 v12)))
+  (assert (!= v3 v9))
+  (let [(mut packed) (: 0 u64) (mut shift) (: 0 u64)]
+    (for address [v0 v1 v2 v3 v4 v5 v6 v7 v8 v9 v10 v11 v12]
+      (let [byte (primitive/load (primitive/cast (ptr u8) address))]
+        (set! packed (| packed (<< (cast u64 (& byte (: 15 u8))) shift))))
+      (set! shift (+ shift 4)))
+    (primitive/store! (symbol-probe-cell) packed)
+    packed))
+
+(defn symbol-word-cases [(kind i32) (return-mode i32)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        selector (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        size (require (b/scalar-constant! (mut graph) 5 8 8))
+        frame1 (require (b/frame-object! (mut graph) start size 8))
+        static-left (primitive/alloc-static u64) static-right (primitive/alloc-static u64)
+        first (require (if (= kind 0) (symbols/string! (mut graph) "A")
+                          (symbols/function-address! (mut graph) (primitive/cast u64 static-left) 0)))
+        left (require (b/conversion! (mut graph) 36 5 8 first))
+        second (require (if (= kind 0) (symbols/string! (mut graph) "B")
+                           (symbols/function-address! (mut graph) (primitive/cast u64 static-right) 0)))
+        right (require (b/conversion! (mut graph) 36 11 8 second))
+        frame2 (require (b/frame-object! (mut graph) frame1 size 8))
+        frame1-word (require (b/conversion! (mut graph) 36 5 8 frame1))
+        frame2-word (require (b/conversion! (mut graph) 36 5 8 frame2))
+        c42 (require (b/scalar-constant! (mut graph) 5 42 8))
+        c43 (require (b/scalar-constant! (mut graph) 5 43 8))
+        stored1 (require (b/emit! (mut graph) 93 0 [frame2 frame1 c42]))
+        stored2 (require (b/emit! (mut graph) 93 0 [stored1 frame2 c43]))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        condition (require (b/emit! (mut graph) 14 1 [selector zero]))
+        split (require (b/emit! (mut graph) 116 0 [stored2 condition]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        yes-end (require (b/emit! (mut graph) 114 0 [yes]))
+        no-end (require (b/emit! (mut graph) 114 0 [no]))
+        merge (require (b/emit! (mut graph) 112 0 [yes-end no-end]))
+        right-word (require (b/conversion! (mut graph) 36 5 8 right))
+        phi (require (b/emit! (mut graph) 67 5 [merge left right-word]))]
+    (primitive/store! static-left 0x4343434343434343)
+    (primitive/store! static-right 0x4444444444444444)
+    (match (calls/create 0 5 [(: 5 u8) 11 5 5 5 11 5 5 11 5 5 11 5] a)
+      (Err [e] (panic "{}" e))
+      (Ok [prototype]
+        (let [(mut prototype) prototype
+              called (require (calls/emit! (mut graph) prototype merge target
+                       [left right phi frame1-word left right phi
+                        left right frame2-word left right phi] a))
+              returned (case return-mode 0 phi 1 left right-word)
+              ret (require (b/emit! (mut graph) 120 5 [called returned (: 0 i32)]))]
+          (match (compile/image-with-options graph start [ret] "_symbol_words_abi"
+                   (options/Options :level 3) a)
+            (Err [e] (panic "{}" e))
+            (Ok [code]
+              (let [(mut code) code]
+                ; Relocations and literal bytes must be owned by the image.
+                (g/release! (mut graph))
+                (match (jit/map-image code a)
+                  (Err [e] (panic "{}" e))
+                  (Ok [loaded]
+                    (let [(mut loaded) loaded
+                          f (primitive/cast (fnptr (cc/C) [u64 u64] u64) (.base (.memory loaded)))
+                          callback (primitive/cast u64 (primitive/cast (ptr u8) (fnptr-of symbol-probe)))]
+                      (for choice [(: 0 u64) 1 0xFFFFFFFFFFFFFFFF]
+                        (let [l (: (if (= kind 0) 65 67) u64)
+                              r (: (if (= kind 0) 66 68) u64)
+                              selected (if (= choice 0) l r)
+                              (mut expected) (: 0 u64) (mut shift) (: 0 u64)]
+                          (for byte [l r selected (: 42 u64) l r selected l r (: 43 u64) l r selected]
+                            (set! expected (| expected (<< (& byte 15) shift)))
+                            (set! shift (+ shift 4)))
+                          (primitive/store! (symbol-probe-cell) 0)
+                          (let [answer (call-ptr f choice callback)]
+                            (assert (= (primitive/load (primitive/cast (ptr u8) answer))
+                                       (cast u8 (case return-mode 0 selected 1 l r)))))
+                          (assert (= (primitive/load (symbol-probe-cell)) expected))))
+                      (jit/release-image! (mut loaded)))))
+                (image/release! (mut code)))))
+          (calls/release! (mut prototype)))))
+    0))
+
 (defn main [] (-> i64)
+  (for kind [(: 0 i32) 1]
+    (for mode [(: 0 i32) 1 2] (symbol-word-cases kind mode)))
   (loop-priority-check)
   (priority-order-check)
   (for ty [(: 2 i32) 3 4 5 8 9 10 11]
