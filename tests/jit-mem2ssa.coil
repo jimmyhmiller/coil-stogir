@@ -40,6 +40,67 @@
               (assert (= (f x y) (+ (+ x 3) (* y 7))))))
           (jit/release-image! (mut loaded))))))
 
+;;; Compare semantic graph storage, not allocator addresses or CSE cache layout.
+(defn same-graph [(left g/Graph) (right g/Graph)] (-> void)
+  (assert (= (len (.instructions left)) (len (.instructions right))))
+  (assert (= (len (.constants left)) (len (.constants right))))
+  (assert (= (.function-prototype left) (.function-prototype right)))
+  (for [i 0 (len (.instructions left))]
+    (let [l (get (.instructions left) i) r (get (.instructions right) i)]
+      (assert (= (.header l) (.header r))) (assert (= (.op1 l) (.op1 r)))
+      (assert (= (.op2 l) (.op2 r))) (assert (= (.op3 l) (.op3 r)))
+      (assert (= (get (.arities left) i) (get (.arities right) i)))))
+  (for [i 0 (len (.constants left))]
+    (let [l (get (.constants left) i) r (get (.constants right) i)]
+      (assert (= (.header l) (.header r))) (assert (= (.op1 l) (.op1 r)))
+      (assert (= (.op2 l) (.op2 r))) (assert (= (.op3 l) (.op3 r)))
+      (assert (= (get (.constant-spans left) i) (get (.constant-spans right) i)))))
+  (assert (= (slice (.bytes (.strings left))) (slice (.bytes (.strings right))))))
+
+;;; Both APIs must produce identical graphs and native text. Releasing the
+;;; mutable source before generating proves that its returned graph is owned.
+(defn check-memory-entry-points [(graph g/Graph) (start i32) (roots (slice i32))
+                                (pointer-bytes i32) (little-endian bool)]
+  (-> void)
+  (let [a (malloc-allocator) (mut original) (g/duplicate graph a)
+        (mut working) (g/duplicate graph a)]
+    (match (sccp/optimize-memory graph pointer-bytes roots little-endian a)
+      (Err [e]
+        (match (sccp/optimize-memory! (mut working) pointer-bytes roots little-endian a)
+          (Ok [unexpected]
+            (let [(mut unexpected) unexpected]
+              (rewrite/release! (mut unexpected))
+              (panic "mutable API accepted immutable rejection: {}" e)))
+          (Err [actual]
+            (assert (= e actual))
+            (same-graph graph original)
+            (g/release! (mut working)))))
+      (Ok [first]
+        (let [(mut first) first]
+          (match (sccp/optimize-memory! (mut working) pointer-bytes roots little-endian a)
+            (Err [e] (panic "mutable: {}" e))
+            (Ok [second]
+              (let [(mut second) second]
+                (same-graph graph original)
+                (same-graph (.graph first) (.graph second))
+                (assert (= (slice (.roots first)) (slice (.roots second))))
+                (g/release! (mut working))
+                (match (compile/image (.graph first) start (slice (.roots first)) "_owned_memory" a)
+                  (Err [e] (panic "{}" e))
+                  (Ok [before]
+                    (let [(mut before) before]
+                      (match (compile/image (.graph second) start (slice (.roots second)) "_owned_memory" a)
+                        (Err [e] (panic "{}" e))
+                        (Ok [after]
+                          (let [(mut after) after]
+                            (assert (= (slice (.text before)) (slice (.text after))))
+                            (execute after)
+                            (image/release! (mut after)))))
+                      (image/release! (mut before)))))
+                (rewrite/release! (mut second)))))
+          (rewrite/release! (mut first)))))
+    (g/release! (mut original))))
+
 (defn fixture [(escape bool)
                (overlap bool)
                (volatile bool)
@@ -93,6 +154,9 @@
     ; An unobserved overlapping read is dead; root it to exercise the actual
     ; incompatible-view guard rather than depending on missing dead-load DCE.
     (when overlap (push! (mut roots) extra))
+    (for pointer-bytes [(: 4 i32) 8]
+      (for little-endian [false true]
+        (check-memory-entry-points graph start (slice roots) pointer-bytes little-endian)))
     (match (compile/image graph start [ret] "_before" a)
       (Err [e] (panic "{}" e))
       (Ok [code]
