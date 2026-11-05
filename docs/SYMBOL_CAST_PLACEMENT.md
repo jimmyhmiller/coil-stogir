@@ -37,3 +37,23 @@ in validation/symbol-cast-placement. Compiler integration is not yet adopted.
 Broader debug/ASAN placement, native loop, switch-loop, call and composed-module
 execution suites pass. Validation transactions retain all1188x25 diagnostic
 cases. No full compiler result, installation or adoption is established.
+
+
+## Real verifier checkpoint
+
+Compiler candidate4055b1b1 integrates placement.coil only onto the retained
+scalar source. The actual verifier source is unchanged. A single independent
+LLVM-built caller checks a2048-node opaque graph, three invalid categories and
+128 valid results.16 rotating child-CPU samples after excluded warmups: before
+32.4970ms, candidate32.0325ms, LLVM9.1030ms. The1.43% difference is small and
+does not explain the runtime gap. Structure's frame falls384→304bytes and its
+static load/store instruction count265→235 (not dynamic/spill counts).
+
+No full bootstrap run is justified by this result yet. Inline tracing produces
+a byte-identical object and records23 structurally eligible sites in structure,
+15 applied expansions; remaining string-equality calls survive in its loop.
+The generic equality callee has only32 base clone cells and102 finalized cells.
+Budget/priority and constant-argument specialization are next hypotheses, not
+a proven explanation of the entire gap. No source-specific Eq rewrite or
+inline-budget increase is introduced. Evidence includes compressed actual
+assembly and trace, verifier-results.json and measure-verifier.py.
