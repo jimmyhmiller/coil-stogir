@@ -33,3 +33,7 @@ The new analysis allocates two graph-sized integer arrays plus one cell-sized
 array and scans the access index twice. Existing prefix queries are cached per
 owner. Integrated compile-time cost and actual compiler-code opportunities must
 be measured before considering adoption. No installed toolchain changes yet.
+
+Additional debug-check/AddressSanitizer suites pass: jit-call-frame,
+jit-call-stack, jit-sccp-control, jit-aggregate-results, and stack. Captured
+logs and exact source hashes are in validation/scoped-promotion.
