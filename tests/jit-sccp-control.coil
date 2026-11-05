@@ -16,6 +16,7 @@
 (import "stogir.sccp-rewrite" :as rewrite)
 (import "stogir.a64.compile" :as compile)
 (import "stogir.jit.darwin" :as jit)
+(import "stogir.image" :as image)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.fs" :as fs)
@@ -1196,7 +1197,9 @@
         value (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
         zero (require (b/scalar-constant! (mut graph) 11 0 8))
         condition (require (b/emit! (mut graph) 15 1 [value zero]))
-        different (require (b/emit! (mut graph) 14 1 [value zero]))
+        inverse (require (b/emit! (mut graph) 14 1 [value zero]))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        different (require (b/emit! (mut graph) 14 1 [value one]))
         first (require (b/emit! (mut graph) 116 0 [start condition]))
         yes (require (b/emit! (mut graph) 107 0 [first (: 0 i32)]))
         no (require (b/emit! (mut graph) 108 0 [first (: 0 i32)]))
@@ -1234,6 +1237,11 @@
                                                                control
                                                                condition))
                  -1)))
+    (for pair [[end-yes (: 0 i32)] [end-no 1] [guard 0] [guard-not 1]]
+      (assert (= (predicate-code (conditional/dominating-truth graph (get pair 0) inverse))
+                 (get pair 1))))
+    (for control [merge loop start value external label cycle]
+      (assert (= (predicate-code (conditional/dominating-truth graph control inverse)) -1)))
     (assert (= (predicate-code (conditional/dominating-truth graph
                                                              end-yes
                                                              different))
@@ -1428,7 +1436,89 @@
             (rewrite/release! (mut output)))))
     (g/release! (mut graph))))
 
+;;; Ordered floating comparisons are not complements for NaNs. Even exact
+;;; operand matches cannot supply the integer-only inference.
+(defn floating-predicate-boundary [(type i32)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        input (require (b/emit! (mut graph) 71 type [start (: 0 i32) 0]))
+        zero (require (b/scalar-constant! (mut graph) type 0 8))]
+    (for opcode [(: 14 i32) 15 16 17 18 19]
+      (let [condition (require (b/emit! (mut graph) opcode 1 [input zero]))
+            inverse (require (b/emit! (mut graph) (^ opcode 1) 1 [input zero]))
+            branch (require (b/emit! (mut graph) 116 0 [start condition]))
+            yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+            no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))]
+        (for control [yes no]
+          (assert (= (predicate-code (conditional/dominating-truth graph control inverse)) -1)))))
+    (g/release! (mut graph))))
+
+;;; Complementary predicates have distinct SSA references and often one use
+;;; each. Compare native behavior against ordinary signed/unsigned operators.
+(defn complement-answer [(opcode i32) (x i64)] (-> bool)
+  (case opcode
+    14 (= x 7) 15 (!= x 7) 16 (< x 7) 17 (>= x 7)
+    18 (<= x 7) 19 (> x 7)
+    20 (< (p/cast u64 x) 7) 21 (>= (p/cast u64 x) 7)
+    22 (<= (p/cast u64 x) 7) 23 (> (p/cast u64 x) 7)
+    false))
+
+(defn complement-execute [(graph g/Graph) (roots (slice i32))
+                          (opcode i32) (truth bool)] (-> void)
+  (let [a (malloc-allocator)]
+    (match (compile/image graph 1 roots "_integer_complement" a)
+      (Err [message] (panic "complement compile: {}" message))
+      (Ok [owned]
+        (let [(mut code) owned]
+          (match (jit/map-image code a)
+            (Err [message] (panic "complement map: {}" message))
+            (Ok [owned]
+              (let [(mut loaded) owned
+                    function (p/cast (fnptr (cc/C) [i64] i64)
+                                     (.base (.memory loaded)))]
+                (for x [-9223372036854775808 -1 0 1 6 7 8 9223372036854775807]
+                  (assert (= (function x)
+                             (if (= (complement-answer opcode x) truth) 37 777))))
+                (jit/release-image! (mut loaded)))))
+          (image/release! (mut code)))))))
+
+(defn complementary-predicate [(opcode i32) (truth bool)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        value (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))
+        condition (require (b/emit! (mut graph) opcode 1 [value seven]))
+        inverse (require (b/emit! (mut graph) (^ opcode 1) 1 [value seven]))
+        answer (require (b/scalar-constant! (mut graph) 11 37 8))
+        other (require (b/scalar-constant! (mut graph) 11 777 8))
+        wrong (require (b/scalar-constant! (mut graph) 11 999 8))
+        first (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [first (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [first (: 0 i32)]))
+        second (require (b/emit! (mut graph) 116 0 [(if truth yes no) inverse]))
+        inner-yes (require (b/emit! (mut graph) 107 0 [second (: 0 i32)]))
+        inner-no (require (b/emit! (mut graph) 108 0 [second (: 0 i32)]))
+        ret0 (require (b/emit! (mut graph) 120 11 [(if truth no yes) other (: 0 i32)]))
+        ret1 (require (b/emit! (mut graph) 120 11 [inner-yes (if truth wrong answer) ret0]))
+        ret2 (require (b/emit! (mut graph) 120 11 [inner-no (if truth answer wrong) ret1]))
+        roots [ret0 ret1 ret2]]
+    (complement-execute graph roots opcode truth)
+    (match (iter/optimize graph 8 roots [second] a)
+      (Err [message] (panic "complement optimize: {}" message))
+      (Ok [owned]
+        (let [(mut output) owned]
+          (assert (!= (n/opcode (get (.instructions (.graph output))
+                                     (cast i64 second))) 116))
+          (complement-execute (.graph output) (slice (.roots output)) opcode truth)
+          (rewrite/release! (mut output)))))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (floating-predicate-boundary 12)
+  (floating-predicate-boundary 13)
+  (for opcode [(: 14 i32) 15 16 17 18 19 20 21 22 23]
+    (for truth [false true] (complementary-predicate opcode truth)))
   (joined-predicate)
   (predicate-boundaries)
   (for truth [false true]
