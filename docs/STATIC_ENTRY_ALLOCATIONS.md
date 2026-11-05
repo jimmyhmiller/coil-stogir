@@ -83,3 +83,27 @@ Independent C checks link all three Mach-O objects. Parallel copies additionally
 preserve NZCV; error cases cover incompatible bases and negative offsets. The
 original2640 raw stack variants, scoped/dynamic stack suites, aggregate-result
 ABI checks and allocation/transfer/edge regression suites still pass.
+
+## Direct frame memory operands
+
+After layout, memory emission resolves each positive address once. A fixed address
+plus the selected field displacement uses the actual SP/x29 base directly when
+checked addition is encodable. Overflow or an unencodable combined offset retains
+the original materialized-address path and original displacement. This follows
+the pinned backend's static-object address forms without changing graph identity
+or creating a late allocation requirement.
+
+112 scalar/vector memory-view configurations exercise all13 non-void scalar types and a
+128-bit vector, aligned/unaligned fields, SP/FP and64KiB frame positions. Each is
+run at O1/O2/O3 (336 executions). An independently compiled callback copies from
+the requested root+byte offset and mutates that field; generated loads must see
+the mutation. BOOL remains canonical. A large neighboring object's final byte
+is separately guarded. Thus paired store/load mistakes cannot hide an incorrect
+displacement, and an immutable address is not confused with immutable contents.
+The high-offset vector case is also linked and checked from C.
+
+The callback also writes new bytes into each field, and generated code copies
+the post-call value separately. First and second copies and their surrounding
+guards are checked independently. Evidence, source hashes and independent C
+link results are in validation/static-frame-addressing. No performance benefit
+for this subsequent encoding change is claimed before integration measurements.

@@ -13,6 +13,8 @@
 (import "stogir.locations" :as locations)
 (import "stogir.options" :as options)
 (import "stogir.calls" :as calls)
+(import "stogir.types" :as types)
+(import "coil.arraylist" :use [ArrayList])
 (import "stogir.aot.macho" :as macho)
 (import "coil.fs" :as fs)
 (import "stogir.jit.darwin" :as jit)
@@ -63,25 +65,28 @@
         start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
         x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
         bytes (require (b/scalar-constant! (mut graph) 5
-                                         (if (= mode 6) 0 (if (= mode 7) 8193 16)) 8))
+                                         (if (= mode 6) 0 (if (= mode 7) 8193 (if (or (= mode 10) (= mode 11)) 65536 16))) 8))
+        small-size (require (b/scalar-constant! (mut graph) 5 16 8))
         thirteen (require (b/scalar-constant! (mut graph) 5 13 8))
         prior (cond (= mode 2)
                       (let [end (require (b/emit! (mut graph) 114 0 [start]))]
                         (require (b/emit! (mut graph) 106 0 [end (: 0 i32)])))
                     (= mode 3) (require (b/emit! (mut graph) 83 6 [start]))
                     :else start)
-        slot (require (if (or (= mode 0) (= mode 5) (= mode 7) (= mode 8) (= mode 9))
-                          (b/frame-object! (mut graph) prior bytes (if (= mode 7) 64 16))
+        slot (require (if (or (= mode 0) (= mode 5) (= mode 7) (= mode 8) (= mode 9) (= mode 10) (= mode 11))
+                          (b/frame-object! (mut graph) prior bytes (if (or (= mode 7) (= mode 11)) 64 16))
                           (b/stack-allocate! (mut graph) prior (if (= mode 1) x bytes) 16)))
-        extra (cond (= mode 5) (require (b/frame-object! (mut graph) slot bytes 16))
+        extra (cond (or (= mode 5) (= mode 10) (= mode 11))
+                      (require (b/frame-object! (mut graph) slot small-size 16))
                     (= mode 9) (require (b/stack-allocate! (mut graph) slot x 16))
                     :else slot)
+        place (if (or (= mode 10) (= mode 11)) extra slot)
         value (require (b/emit! (mut graph) 26 5 [x thirteen]))
         stored (if (= mode 6) extra
-                   (require (b/emit! (mut graph) 93 0 [extra slot value])))
+                   (require (b/emit! (mut graph) 93 0 [extra place value])))
         snapshot (if (= mode 8) (require (b/emit! (mut graph) 83 6 [stored])) stored)
         loaded (if (= mode 6) value
-                   (require (b/emit! (mut graph) 91 5 [snapshot slot])))
+                   (require (b/emit! (mut graph) 91 5 [snapshot place])))
         last-control (cond (= mode 9)
                              (require (b/stack-free! (mut graph) loaded x))
                            (= mode 8)
@@ -101,9 +106,9 @@
               (Ok [plan]
                   (let [(mut plan) plan
                         expected (if (or (= mode 0) (= mode 5) (= mode 8) (= mode 9)) (: 16 i64)
-                                     (if (= mode 7) 8208 0))]
+                                     (if (= mode 7) 8208 (if (or (= mode 10) (= mode 11)) 65536 0)))]
                     (assert (= (fixed/size (.static-sizes plan) slot) expected))
-                    (when (= mode 5)
+                    (when (or (= mode 5) (= mode 10) (= mode 11))
                       (assert (= (fixed/size (.static-sizes plan) extra) 16)))
                     (check-allocation graph prepared plan)
                     (matching/release! (mut plan)))))
@@ -212,9 +217,110 @@
                               (image/release! (mut code))))))))))))
     (g/release! (mut graph))))
 
+(defn copy-frame-bytes :cc (cc/C) [(destination (ptr u8)) (source (ptr u8))
+                                   (offset u64) (count u64) (padding (ptr u8)) (large u64) (mask u64)]
+  (-> u64)
+  (for [i 0 (cast i64 count)]
+    (let [address (p/cast (ptr u8) (+ (p/cast u64 source) offset (cast u64 i)))
+          value (load address)]
+      (store! (p/cast (ptr u8) (+ (p/cast u64 destination) (cast u64 i))) value)
+      (store! address (^ value (cast u8 mask)))))
+  (if (and (!= large 0)
+           (!= (load (p/cast (ptr u8) (+ (p/cast u64 padding) 65535))) (: 0x5A u8)))
+      (: 0 u64) 13))
+
+(defn memory-views [(ty i32) (offset i64) (anchored bool) (large bool)] (-> void)
+  (let [a (malloc-allocator)
+        width (types/size ty 8)
+        bits (if (= ty 1) (: 1 u64)
+                 (if (>= width 8) (: 0xF1E2D3C4B5A69788 u64)
+                     (& (: 0xF1E2D3C4B5A69788 u64)
+                        (- (<< (: 1 u64) (cast u64 (* width 8))) 1))))
+        (mut payload) (ArrayList::new [u8] a)
+        (mut output) (ArrayList::new [u8] a)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        destination (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        extent (require (b/scalar-constant! (mut graph) 5 32 8))
+        padding (if large
+                    (let [size (require (b/scalar-constant! (mut graph) 5 65536 8))]
+                      (require (b/frame-object! (mut graph) start size 16))) start)
+        object (require (b/frame-object! (mut graph) padding extent 16))
+        control (if anchored (require (b/stack-allocate! (mut graph) object extent 16)) object)
+        displacement (require (b/scalar-constant! (mut graph) 6 (cast u64 offset) 8))
+        address (if (= offset 0) object (require (b/emit! (mut graph) 26 6 [object displacement])))]
+    (for [i 0 (cast i64 width)]
+      (push! (mut payload) (if (= ty 52) (cast u8 (+ (* i 37) 19))
+                              (cast u8 (>> bits (cast u64 (* i 8)))))))
+    (for [i 0 48] (push! (mut output) 0xA5))
+    (let [initialized
+            (if large
+                (let [end (require (b/scalar-constant! (mut graph) 6 65535 8))
+                      address (require (b/emit! (mut graph) 26 6 [padding end]))
+                      sentinel (require (b/scalar-constant! (mut graph) 2 0x5A 8))]
+                  (require (b/emit! (mut graph) 93 0 [control address sentinel]))) control)
+          literal (require (if (= ty 52)
+                              (b/vector-constant! (mut graph) ty 8 (slice payload))
+                              (b/scalar-constant! (mut graph) ty bits 8)))
+          stored (require (b/emit! (mut graph) 93 0 [initialized address literal]))
+          offset-word (require (b/scalar-constant! (mut graph) 5 (cast u64 offset) 8))
+          count-word (require (b/scalar-constant! (mut graph) 5 (cast u64 width) 8))
+          large-word (require (b/scalar-constant! (mut graph) 5 (if large 1 0) 8))
+          mask (if (= ty 1) (: 1 u8) 0xA7)
+          mask-word (require (b/scalar-constant! (mut graph) 5 (cast u64 mask) 8))]
+      (match (calls/create 0 5 [(: 6 u8) 6 5 5 6 5 5] a)
+        (Err [e] (panic "{}" e))
+        (Ok [prototype]
+            (let [(mut prototype) prototype
+                  called (require (calls/emit! (mut graph) prototype stored target
+                                                [destination object offset-word count-word
+                                                 (if large padding object) large-word mask-word] a))
+                  loaded (require (b/emit! (mut graph) 91 ty [called address]))
+                  next-offset (require (b/scalar-constant! (mut graph) 6 (cast u64 width) 8))
+                  next (require (b/emit! (mut graph) 26 6 [destination next-offset]))
+                  copied (require (b/emit! (mut graph) 93 0 [loaded next loaded]))
+                  ret (require (b/emit! (mut graph) 120 5 [copied called (: 0 i32)]))]
+              (calls/release! (mut prototype))
+              (for level [(: 1 i32) 2 3]
+              (match (compile/image-with-options graph start [ret] "_static_views"
+                                                 (options/Options :level level) a)
+                (Err [e] (panic "{}" e))
+                (Ok [code]
+                    (let [(mut code) code]
+                      (when (and (= level 1) (= ty 52) (= offset 1) anchored large)
+                        (match (macho/image-object code a)
+                          (Err [e] (panic "{}" e))
+                          (Ok [object]
+                              (let [(mut object) object]
+                                (match (fs/write-file a "/tmp/coil-stogir-static-views.o" (slice object))
+                                  (Err [_] (panic "static views object write failed"))
+                                  (Ok [_] 0))
+                                (free! (mut object))))))
+                      (match (jit/map-image code a)
+                        (Err [e] (panic "{}" e))
+                        (Ok [mapped]
+                            (let [(mut mapped) mapped
+                                  f (p/cast (fnptr (cc/C) [(ptr u8) u64] u64) (.base (.memory mapped)))
+                                  callback (p/cast u64 (p/cast (ptr u8) (fnptr-of copy-frame-bytes)))]
+                              (assert (= (f (elem (mut output) 1) callback) 13))
+                              (for [i 0 48]
+                                (assert (= (get output i)
+                                           (if (and (> i 0) (<= i (* 2 (cast i64 width))))
+                                               (^ (get payload (% (- i 1) (cast i64 width)))
+                                                  (if (> i (cast i64 width)) mask (: 0 u8)))
+                                               (: 0xA5 u8)))))
+                              (jit/release-image! (mut mapped)))))
+                      (image/release! (mut code))))))))))
+    (g/release! (mut graph)) (free! (mut output)) (free! (mut payload))))
+
 (defn main [] (-> i64)
+  (for ty [(: 1 i32) 2 3 4 5 6 7 8 9 10 11 12 13 52]
+    (for offset [(: 0 i64) 1]
+      (for anchored [false true]
+        (for large [false true] (memory-views ty offset anchored large)))))
   (phi-and-calls false)
   (phi-and-calls true)
-  (for mode [(: 0 i32) 1 2 3 4 5 6 7 8 9] (fixture mode))
+  (for mode [(: 0 i32) 1 2 3 4 5 6 7 8 9 10 11] (fixture mode))
   (println "static entry objects, dynamic counts/blocks, scopes/frees, zero size and over-alignment pass")
   0)

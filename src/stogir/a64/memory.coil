@@ -8,6 +8,8 @@
 (import "stogir.a64.value" :as value)
 (import "stogir.a64.registers" :as registers)
 (import "stogir.a64.encode" :as encode)
+(import "stogir.a64.address" :as address-match)
+(import "stogir.a64.frame-address" :as frame)
 (import "stogir.bytes" :as bytes)
 (import "stogir.a64.code" :as code)
 (import "coil.arraylist" :use [ArrayList])
@@ -61,16 +63,38 @@
               (mut temporary) (code/create (.alc (.text output)))
               (mut error) ""
               (mut base) (: -1 i32)
+              (mut displacement) offset
               (mut reg) (: -1 i32)]
-          (match (value/register-with-locations! (mut temporary)
-                                                 graph
-                                                 parts
-                                                 address
-                                                 position
-                                                 16
-                                                 62)
-            (Err [message] (set! error message))
-            (Ok [r] (set! base r)))
+          ; Resolve positive operands once. Fixed addresses can become physical
+          ; frame operands after layout; overflowing or unencodable combinations
+          ; retain materialization and the original selected displacement.
+          (if (> address 0)
+              (match (loc/resolve parts address position)
+                (Err [message] (set! error message))
+                (Ok [location]
+                    (if (loc/rematerialized? location)
+                        (let [(mut direct) false]
+                          (when (and (>= (.value location) 0)
+                                     (or (<= offset 0)
+                                         (<= (.value location) (- 0x7FFFFFFFFFFFFFFF offset))))
+                            (let [combined (+ (.value location) offset)]
+                              (when (address-match/encodable? width combined)
+                                (set! direct true)
+                                (set! base (loc/address-base location))
+                                (set! displacement combined))))
+                          (unless direct
+                            (match (frame/address! (mut (.text temporary)) 16
+                                                   (loc/address-base location) (.value location))
+                              (Err [message] (set! error message))
+                              (Ok [_] (set! base 16)))))
+                        (if (and (= (.kind location) 0)
+                                 (registers/allocatable? 6 (cast i32 (.value location))))
+                            (set! base (cast i32 (.value location)))
+                            (set! error "memory address requires a GPR or fixed frame source")))))
+              (match (value/register-with-locations! (mut temporary) graph parts
+                                                     address position 16 62)
+                (Err [message] (set! error message))
+                (Ok [r] (set! base r))))
           (if load?
               (match (loc/resolve parts reference (+ position 1))
                 (Err [message] (set! error message))
@@ -92,20 +116,20 @@
                 (Err [message] (set! error message))
                 (Ok [r] (set! reg r))))
           (when (= error "")
-            (match (if (and (>= offset 0)
-                            (= (% offset (cast i64 width)) 0)
-                            (<= (/ offset (cast i64 width)) 4095))
+            (match (if (and (>= displacement 0)
+                            (= (% displacement (cast i64 width)) 0)
+                            (<= (/ displacement (cast i64 width)) 4095))
                        (if (registers/simd? reg)
                            (encode/floating-load-store load?
                                                        width
                                                        (registers/physical reg)
                                                        base
-                                                       offset)
+                                                       displacement)
                            (if (and load?
                                     (types/signed? (cast i32 (n/type-id node)))
                                     (< width 4))
-                               (encode/signed-load false width reg base offset)
-                               (encode/load-store load? width reg base offset)))
+                               (encode/signed-load false width reg base displacement)
+                               (encode/load-store load? width reg base displacement)))
                        (encode/unscaled-load-store load?
                                                    (registers/simd? reg)
                                                    (and load?
@@ -117,7 +141,7 @@
                                                    width
                                                    (registers/physical reg)
                                                    base
-                                                   offset))
+                                                   displacement))
               (Err [message] (set! error message))
               (Ok [word] (bytes/append32! (mut (.text temporary)) word))))
           (let [count (cast i32 (len (.text temporary)))]

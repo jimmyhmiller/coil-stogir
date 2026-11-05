@@ -1340,3 +1340,8 @@ index, machine constraints and call/edge transfers rematerialize them without
 virtual address ranges; frame-address and spill-content identities stay distinct. Inline
 cloning lowers marked callee objects to the existing call-local save/restore
 scope. No upstream/LLVM/TPDE implementation is imported. See STATIC_ENTRY_ALLOCATIONS.md.
+
+Static-object memory operands use the pinned AArch64 frame-base/offset forms.
+Checked offset combination and per-access register fallback are independent Coil
+implementation details. The ordinary selected displacement and materialization
+path remain available for out-of-range frames.
