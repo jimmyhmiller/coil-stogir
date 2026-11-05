@@ -231,7 +231,62 @@
     (println "scoped inline result loop (result-read={}): pass" read-result)
     0))
 
+;;; Effect declarations do not change ABI compatibility or consume inline
+;;; eligibility. Other convention/control flags retain their exact boundary.
+(defn effect-prototype [(declared u8) (called-flags u8) (accepted bool)] (-> void)
+  (let [a (malloc-allocator) (mut leaf) (g/create a)
+        entry (require (b/emit! (mut leaf) 104 0 [(: 0 i32)]))
+        input (require (b/emit! (mut leaf) 71 5 [entry (: 0 i32) 0]))
+        seven (require (b/scalar-constant! (mut leaf) 5 7 8))
+        added (require (b/emit! (mut leaf) 26 5 [input seven]))
+        returned (require (b/emit! (mut leaf) 120 5 [entry added (: 0 i32)]))
+        (mut caller) (g/create a)
+        start (require (b/emit! (mut caller) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut caller) 71 5 [start (: 0 i32) 0]))
+        target (require (symbols/function! (mut caller) "_effect_leaf" 0))]
+    (match (calls/create declared 5 [(: 5 u8)] a)
+      (Err [e] (panic "{}" e))
+      (Ok [prototype]
+        (let [(mut prototype) prototype]
+          (require (calls/function! (mut leaf) prototype a))
+          (calls/release! (mut prototype)))))
+    (match (calls/create called-flags 5 [(: 5 u8)] a)
+      (Err [e] (panic "{}" e))
+      (Ok [prototype]
+        (let [(mut prototype) prototype
+              call (require (calls/emit! (mut caller) prototype start target [x] a))
+              ret (require (b/emit! (mut caller) 120 5 [call call (: 0 i32)]))]
+          (match (inline/optimize caller [ret] call
+                   (inline/Callee :name "_effect_leaf" :graph leaf :entry entry
+                                  :roots [returned] :observed [returned] :never false) 8 128 a)
+            (Err [e] (panic "{}" e))
+            (Ok [out]
+              (let [(mut out) out]
+                (assert (= (> (.changes out) 0) accepted))
+                (when accepted
+                  (match (compile/image (.graph out) start (slice (.roots out)) "_effect_caller" a)
+                    (Err [e] (panic "{}" e))
+                    (Ok [code]
+                      (let [(mut code) code]
+                        (match (jit/map-image code a)
+                          (Err [e] (panic "{}" e))
+                          (Ok [loaded]
+                            (let [(mut loaded) loaded
+                                  f (p/cast (fnptr (cc/C) [u64] u64) (.base (.memory loaded)))]
+                              (for value [(: 0 u64) 1 0x7FFFFFFFFFFFFFFF 0xFFFFFFFFFFFFFFFF]
+                                (assert (= (call-ptr f value) (+ value 7))))
+                              (jit/release-image! (mut loaded)))))
+                        (image/release! (mut code))))))
+                (rewrite/release! (mut out)))))
+          (calls/release! (mut prototype)))))
+    (g/release! (mut caller)) (g/release! (mut leaf))))
+
 (defn main [] (-> i64)
+  (for declared [(: 0 u8) 32 64 96]
+    (for called [(: 0 u8) 32 64 96] (effect-prototype declared called true)))
+  (effect-prototype 0 9 false)
+  (effect-prototype 9 0 false)
+  (effect-prototype 0 16 false)
   (+ (check false 0 0) (check true 0 0) (check false 1024 0)
      (check false 0 1) (check false 0 2) (check false 0 3)
      (check false 0 4) (check false 0 5) (check true 0 1)))

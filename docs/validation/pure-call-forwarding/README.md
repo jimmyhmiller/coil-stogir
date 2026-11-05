@@ -28,3 +28,14 @@ within the conservative opcode whitelist, with30 static call relocations to
 13 such candidates among98 total. These are static candidate counts, not a
 full body proof, dynamic counts or performance evidence. See prevalence JSON.
 No compiler inference or whole-bootstrap gain is claimed by this checkpoint.
+
+## Effect flags and inlining
+
+Initial compiler inference regressed the actual verifier because the inliner
+compared every prototype flag bit. PURE_FUNC changed eligible calls into ABI
+rejections:55→77 emitted functions. Compatibility now ignores only CONST/PURE
+bits32/64, preserving all other flags, result and group metadata. The expanded
+inline-stack-results suite checks16 effect-flag pairs with64 native answers,
+three convention/variadic rejection cases and the existing native scoped
+aggregate/stack loops under debug/ASAN. Parameter-specialization suite also
+passes. This fixes compatibility; performance must be remeasured separately.
