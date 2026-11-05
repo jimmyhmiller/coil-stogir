@@ -153,6 +153,70 @@
     (free! (mut work))
     valid))
 
+;;; Extend entry-prefix promotion only to private objects whose entire access
+;;; lifetime is in the initial entry control segment, before any SP restoration.
+;;; After restoration a new object could alias an older, still-observed pointer.
+;;; Index control order once, not numeric reference order. Require a local store
+;;; before every load, so no incoming or previous-iteration value is invented.
+(defn scoped-lifetimes! [(graph g/Graph)
+                         (blocks (ArrayList i32))
+                         (next (ArrayList i32))
+                         (accesses (ArrayList i32))
+                         (cells (ArrayList Cell))
+                         (eligible (mut (ArrayList i32)))
+                         (a (dyn Allocator))] (-> void)
+  (let [size (len (.instructions graph))
+        (mut order) (zeros size a)
+        (mut entry) (zeros size a)
+        (mut written) (zeros (len cells) a)
+        (mut initial) (: 0 i32)]
+    (for block blocks
+      (let [node (get (.instructions graph) (cast i64 block))]
+        (when (and (= (n/opcode node) 104) (= (.op1 node) 0))
+          (set! initial block))))
+    (for cell cells
+      (let [owner (.owner cell)]
+        (when (and (> (get eligible (cast i64 owner)) 0)
+                   (= (get entry (cast i64 owner)) 0))
+          (set! (mut entry) (cast i64 owner)
+                (if (stack/entry-allocation? graph owner) 1 -1)))))
+    (let [(mut current) initial
+          (mut rank) (: 1 i32)]
+      (while (and (> current 0) (= (get order (cast i64 current)) 0))
+        (let [opcode (n/opcode (get (.instructions graph) (cast i64 current)))]
+          (if (or (= opcode 82) (= opcode 84))
+              (set! current 0)
+              (do
+                (set! (mut order) (cast i64 current) rank)
+                (set! rank (+ rank 1))
+                (set! current (get next (cast i64 current))))))))
+    (for [r 1 (len accesses)]
+      (let [id (get accesses r)]
+        (when (> id 0)
+          (let [index (cast i64 (- id 1))
+                owner (cast i64 (.owner (get cells index)))
+                rank (get order r)]
+            (when (and (> (get eligible owner) 0) (< (get entry owner) 0))
+              (if (or (= (get order owner) 0) (<= rank (get order owner)))
+                  (set! (mut eligible) owner 0)
+                  (when (= (n/opcode (get (.instructions graph) r)) 93)
+                    (when (or (= (get written index) 0) (< rank (get written index)))
+                      (set! (mut written) index rank)))))))))
+    (for [r 1 (len accesses)]
+      (let [id (get accesses r)]
+        (when (> id 0)
+          (let [index (cast i64 (- id 1))
+                owner (cast i64 (.owner (get cells index)))]
+            (when (and (> (get eligible owner) 0)
+                       (< (get entry owner) 0)
+                       (= (n/opcode (get (.instructions graph) r)) 91)
+                       (or (= (get written index) 0)
+                           (<= (get order r) (get written index))))
+              (set! (mut eligible) owner 0))))))
+    (free! (mut written))
+    (free! (mut entry))
+    (free! (mut order))))
+
 ;;; Requires a structurally verified 64-bit-target graph and valid positive roots.
 ;;; Mutates an owned graph, preserving reference numbers. Roots are updated for
 ;;; bypassed control effects; a rooted forwarded load remains an observable COPY.
@@ -207,7 +271,6 @@
                       (None [] 0))]
               (when (and (= (n/opcode node) 81)
                          scopes-safe
-                         (or (not scoped) (stack/entry-allocation? graph owner))
                          (classify! graph
                                     edges
                                     owner
@@ -235,6 +298,8 @@
                       (set! (mut next) prev (cast i32 r)))))
               (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4)))))
           (unless forked
+            (when scoped
+              (scoped-lifetimes! graph blocks next accesses cells (mut eligible) a))
             (match (flow/apply! (mut graph)
                                 blocks
                                 next

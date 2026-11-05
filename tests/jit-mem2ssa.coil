@@ -1044,7 +1044,8 @@
     (assert (= (n/opcode (get (.instructions graph) (cast i64 read))) 91))
     (g/release! (mut graph))))
 
-; Only original entry-prefix objects may cross opaque stack scopes. Exercise
+; Only original entry-prefix objects may cross opaque stack scopes; private
+; initial-segment objects may be eliminated before restoration. Exercise
 ; inner objects, copied/observed saved pointers, and explicit frees as fallbacks.
 (defn scoped-entry [(mode i32)] (-> void)
   (let [a (malloc-allocator)
@@ -1078,11 +1079,15 @@
       (unless before
         (require (mem/promote! (mut working) (mut roots) a))
         (assert (= (n/opcode (get (.instructions working) (cast i64 slot)))
-                   (if (= mode 0) (: 0 u8) 81))))
+                   (if (or (= mode 0) (= mode 1)) (: 0 u8) 81))))
       (match (compile/image (if before graph working) start (slice roots) "_scoped" a)
         (Err [e] (panic "{}" e))
         (Ok [code]
-            (let [(mut code) code] (execute code) (image/release! (mut code))))))
+            (let [(mut code) code]
+              (when (= mode 1)
+                (println "scoped initial temporary before={} text-bytes={}" before (len (.text code))))
+              (execute code)
+              (image/release! (mut code))))))
     (for level [(: 2 i32) 3]
       (match (compile/image-with-options graph start [ret] "_scoped_public"
                                          (options/Options :level level) a)
@@ -1093,7 +1098,67 @@
     (g/release! (mut working))
     (g/release! (mut graph))))
 
+; Restoration may reuse the old object's address. A private new object is
+; not independent of an older pointer merely because its own uses are private.
+(defn scoped-reuse [(old-read bool)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        y (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        size (require (b/scalar-constant! (mut graph) 5 8 8))
+        three (require (b/scalar-constant! (mut graph) 11 3 8))
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))
+        saved (require (b/emit! (mut graph) 83 6 [start]))
+        old (require (b/stack-allocate! (mut graph) saved size 16))
+        first (require (b/emit! (mut graph) 93 0 [old old x]))
+        restored (require (b/emit! (mut graph) 84 0 [first saved]))
+        fresh (require (b/stack-allocate! (mut graph) restored size 16))
+        xx (require (b/emit! (mut graph) 26 11 [x three]))
+        yy (require (b/emit! (mut graph) 28 11 [y seven]))
+        sum (require (b/emit! (mut graph) 26 11 [xx yy]))
+        stored (require (b/emit! (mut graph) 93 0 [fresh fresh sum]))
+        loaded (require (b/emit! (mut graph) 91 11 [stored (if old-read old fresh)]))
+        ret (require (b/emit! (mut graph) 120 11 [loaded loaded (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)
+        (mut working) (g/duplicate graph a)]
+    (push! (mut roots) ret)
+    (require (mem/promote! (mut working) (mut roots) a))
+    (assert (= (n/opcode (get (.instructions working) (cast i64 fresh))) 81))
+    (when old-read
+      (assert (= (n/opcode (get (.instructions working) (cast i64 old))) 81)))
+    (for before [true false]
+      (match (compile/image (if before graph working) start (slice roots) "_scope_reuse" a)
+        (Err [e] (panic "{}" e))
+        (Ok [code]
+            (let [(mut code) code] (execute code) (image/release! (mut code))))))
+    (free! (mut roots))
+    (g/release! (mut working))
+    (g/release! (mut graph))))
+
+(defn scoped-uninitialized [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        size (require (b/scalar-constant! (mut graph) 5 8 8))
+        saved (require (b/emit! (mut graph) 83 6 [start]))
+        slot (require (b/stack-allocate! (mut graph) saved size 16))
+        read (require (b/emit! (mut graph) 91 11 [slot slot]))
+        restored (require (b/emit! (mut graph) 84 0 [read saved]))
+        ret (require (b/emit! (mut graph) 120 11 [restored read (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)]
+    (push! (mut roots) ret)
+    (require (mem/promote! (mut graph) (mut roots) a))
+    (assert (= (n/opcode (get (.instructions graph) (cast i64 slot))) 81))
+    (assert (= (n/opcode (get (.instructions graph) (cast i64 read))) 91))
+    ; Its uninitialized value has no deterministic native oracle. Preserve it.
+    (free! (mut roots))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (scoped-uninitialized)
+  (scoped-reuse true)
+  (scoped-reuse false)
   (for kind [(: 73 i32) 74 75 77] (symbolic-private-offset kind))
   (for mode [(: 0 i32) 1 2 3 4] (scoped-entry mode))
   (for kind [(: 73 i32) 74 75 77]
