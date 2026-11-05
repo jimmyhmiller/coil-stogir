@@ -114,3 +114,10 @@ Raw results, all library source hashes, caller/object hashes and compressed
 assembly/trace are in validation/context-cache-verifier. No bootstrap run or
 performance adoption is claimed. Compiler source/evidence is committed separately
 and is not installed globally or pushed; FAST has not run.
+
+
+Diagnostic29275e1d confirms all16actual argument occurrences across structure's
+four equality sites are positive LOAD91/typeU64 nodes, including empty-string
+length. Its object exactly equalsafdf07bb. Literal-only specialization therefore
+has no applicable argument at those sites. Caller preparation/pass ordering,
+not raising the cache cap, is the next reduction. No load is assumed constant.
