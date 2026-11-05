@@ -79,7 +79,9 @@ with `sccp-rewrite.release!`; inputs and all callee storage stay immutable.
 
 Eligible definitions have one scalar/void return and closed returning control (including loops),
 ordinary scalar or grouped scalar parameters, numeric/named constants, supported
-pure operations and normal loads/stores. Flags, result and ABI grouping match;
+pure operations and normal scalar/vector loads/stores. Internal vector SSA values
+retain their types; nonpointer-lane LONG_CONST values clone their entire owned
+payload. Vector call parameter/result ABI eligibility is unchanged. Flags, result and ABI grouping match;
 same-width signed/unsigned integer arguments get explicit BITCAST nodes. Private
 strings, frame operations, nested calls and variadic calls remain intact.
 Aggregate results require the private-buffer proofs described below. Never policy is explicit. The module provider must retain symbol

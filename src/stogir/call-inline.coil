@@ -11,6 +11,7 @@
 (import "stogir.dominators" :as dom)
 (import "stogir.loops" :as loops)
 (import "stogir.node" :as n)
+(import "stogir.long-constant" :as long)
 (import "stogir.opcode" :as op)
 (import "stogir.types" :as types)
 (import "stogir.strings" :as strings)
@@ -44,6 +45,19 @@
 
 (defn scalar? [(type u8)] (-> bool)
   (and (> type 0) (types/valid-scalar? (cast i32 type))))
+
+;;; Local SSA values may be scalar or vector; call boundary types keep their
+;;; separate scalar/grouped ABI checks. Vector pointer constants remain outside
+;;; this cloning contract because their geometry depends on pointer width.
+(defn internal-type? [(type u8)] (-> bool)
+  (and (> type 0) (types/valid? (cast i32 type))))
+
+(defn inline-constant? [(value n/Node)] (-> bool)
+  (or (and (scalar? (n/type-id value))
+           (or (= (n/opcode value) (n/type-id value))
+               (= (n/opcode value) 74) (= (n/opcode value) 75)))
+      (and (long/valid-header? value 8)
+           (!= (types/base-type (cast i32 (n/type-id value))) 6))))
 
 ;;; Frame/register access and explicit division guards remain ineligible.
 ;;; Closed returning loops retain their PHIs and backedges; validated private
@@ -552,7 +566,7 @@
                                                                     (do
                                                                       (when (and (= opcode
                                                                                     91)
-                                                                                 (not (scalar? (n/type-id node))))
+                                                                                 (not (internal-type? (n/type-id node))))
                                                                         (set! good
                                                                               false)))
                                                                   ; Preflight validates complete typed dispatches.
@@ -585,7 +599,7 @@
                                                                        (scalar? (n/type-id node)))
                                                                     0
                                                                   (and (pure? opcode)
-                                                                       (scalar? (n/type-id node)))
+                                                                       (internal-type? (n/type-id node)))
                                                                     0
                                                                   :else
                                                                     (set! good
@@ -609,13 +623,7 @@
                                                                           (match (g/lookup callee
                                                                                            input)
                                                                             (Some [value]
-                                                                                  (when (or (not (scalar? (n/type-id value)))
-                                                                                            (not (or (= (n/opcode value)
-                                                                                                        (n/type-id value))
-                                                                                                     (= (n/opcode value)
-                                                                                                        74)
-                                                                                                     (= (n/opcode value)
-                                                                                                        75))))
+                                                                                  (when (not (inline-constant? value))
                                                                                     (set! good
                                                                                           false)))
                                                                             (None []
@@ -674,10 +682,31 @@
         (uses/release! (mut edges))))
     (SiteProof :common common :caller-private capture :private-result complete :result-kind (.kind spec))))
 
-(defn constant! [(caller (mut g/Graph)) (callee g/Graph) (value n/Node)]
+(defn clone-vector-constant! [(caller (mut g/Graph)) (callee g/Graph)
+                              (reference i32) (value n/Node)]
+  (-> (Result i32 (slice u8)))
+  (let [(mut payload) (ArrayList::new [u8] (.alc (.instructions caller)))
+        (mut error) ""]
+    (for [i 0 (cast i64 (n/auxiliary value))]
+      (match (g/long-byte callee reference i)
+        (None [] (set! error "inline vector constant payload missing"))
+        (Some [byte] (push! (mut payload) byte))))
+    (let [result
+            (if (!= error "") (Err [i32 (slice u8)] error)
+                ; Eligible vector constants have nonpointer lanes, whose byte
+                ; geometry is identical for the two supported pointer widths.
+                (match (g/intern-vector! (mut caller) (cast i32 (n/type-id value)) 8 (slice payload))
+                  (None [] (Err [i32 (slice u8)] "inline vector constant space exhausted"))
+                  (Some [new] (Ok [i32 (slice u8)] new))))]
+      (free! (mut payload))
+      result)))
+
+(defn constant! [(caller (mut g/Graph)) (callee g/Graph) (reference i32) (value n/Node)]
   (-> (Result i32 (slice u8)))
   (let [opcode (n/opcode value)]
-    (if (or (= opcode 74) (= opcode 75))
+    (if (= opcode 78)
+        (clone-vector-constant! (mut caller) callee reference value)
+        (if (or (= opcode 74) (= opcode 75))
         (match (strings/lookup (.strings callee)
                                (cast i32 (n/constant-bits value)))
           (None [] (Err "inline symbol name missing"))
@@ -704,7 +733,7 @@
                                    (n/auxiliary value)
                                    (n/constant-bits value))
           (None [] (Err "inline constant reference space exhausted"))
-          (Some [reference] (Ok reference))))))
+          (Some [reference] (Ok reference)))))))
 
 (defn mapped! [(caller (mut g/Graph))
                (callee g/Graph)
@@ -725,7 +754,7 @@
             (match (g/lookup callee reference)
               (None [] (Err "inline constant missing"))
               (Some [value]
-                    (match (constant! (mut caller) callee value)
+                    (match (constant! (mut caller) callee reference value)
                       (Err [message] (Err message))
                       (Ok [new] (set! (mut constants) index new) (Ok new)))))))))
 

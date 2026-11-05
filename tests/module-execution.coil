@@ -2391,7 +2391,100 @@
             (calls/release! (mut signature)))))
     (g/release! (mut caller)) (g/release! (mut leaf))))
 
+;;; SIMD temporaries and LONG_CONST payloads are local graph values. The
+;;; function boundary remains scalar; both original and cloned modules run.
+(defn internal-vector-inline [(type i32) (with-constant bool) (never bool)
+                              (budget i32)] (-> void)
+  (let [a (malloc-allocator) (mut callee) (g/create a) (mut caller) (g/create a)
+        start (require (b/emit! (mut callee) 104 0 [(: 0 i32)]))
+        destination (require (b/emit! (mut callee) 71 6 [start (: 0 i32) 0]))
+        source (require (b/emit! (mut callee) 71 6 [start (: 0 i32) 1]))
+        loaded (require (b/emit! (mut callee) 91 type [start source]))
+        width (cast i64 (types/size type 8))
+        (mut payload) (ArrayList::new [u8] a)]
+    (for [i 0 width] (push! (mut payload) (cast u8 (+ 128 (* i 7)))))
+    (let [value (if with-constant
+                   (let [mask (require (b/vector-constant! (mut callee) type 8 (slice payload)))]
+                     (require (b/emit! (mut callee) 48 type [loaded mask]))) loaded)
+          stored (require (b/emit! (mut callee) 93 0 [loaded destination value]))
+          answer (require (b/scalar-constant! (mut callee) 5 37 8))
+          returned (require (b/emit! (mut callee) 120 5 [stored answer (: 0 i32)]))
+          entry (require (b/emit! (mut caller) 104 0 [(: 0 i32)]))
+          dst (require (b/emit! (mut caller) 71 6 [entry (: 0 i32) 0]))
+          src (require (b/emit! (mut caller) 71 6 [entry (: 0 i32) 1]))
+          target (require (symbols/function! (mut caller) "_internal_vector_leaf" 0))]
+      (match (calls/create 0 5 [(: 6 u8) 6] a)
+        (Err [message] (panic "{}" message))
+        (Ok [owned]
+          (let [(mut proto) owned]
+            (require (calls/function! (mut callee) proto a))
+            (require (calls/function! (mut caller) proto a))
+            (let [called (require (calls/emit! (mut caller) proto entry target [dst src] a))
+                  ret (require (b/emit! (mut caller) 120 5 [called called (: 0 i32)]))
+                  definition (inlining/Callee :name "_internal_vector_leaf" :graph callee
+                               :entry start :roots [returned] :observed [returned] :never never)]
+              (match (inlining/optimize caller [ret] called definition 8 budget a)
+                (Err [message] (panic "vector inline: {}" message))
+                (Ok [owned]
+                  (let [(mut expanded) owned
+                        expected (if (and (not never) (> budget 0)) (: 1 i32) 0)
+                        (mut before) (require-image (compile/image caller entry [ret] "_internal_vector_caller" a))
+                        (mut after) (require-image (compile/image (.graph expanded) entry (slice (.roots expanded)) "_internal_vector_caller" a))
+                        (mut leaf) (require-image (compile/image callee start [returned] "_internal_vector_leaf" a))]
+                    (registered-inline-check caller [ret] called definition 8 budget)
+                    (for changed [false true]
+                      (match (link/compose [(if changed after before) leaf] a)
+                        (Err [message] (panic "{}" message))
+                        (Ok [owned]
+                          (let [(mut module) owned]
+                            (when (and changed (= type 52) with-constant (not never) (> budget 0))
+                              (match (macho/image-object (.image module) a)
+                                (Err [message] (panic "vector inline AOT: {}" message))
+                                (Ok [owned]
+                                  (let [(mut object) owned]
+                                    (match (fs/write-file a "/tmp/coil-stogir-inline-vector.o" (slice object))
+                                      (Err [_] (panic "vector inline object write")) (Ok [_] 0))
+                                    (free! (mut object))))))
+                            (match (jit/map-image (.image module) a)
+                              (Err [message] (panic "{}" message))
+                              (Ok [owned]
+                                (let [(mut mapped) owned
+                                      index (find (.image module) "_internal_vector_caller")
+                                      f (primitive/cast (fnptr (cc/C) [(ptr u8) (ptr u8)] u64)
+                                           (primitive/cast (ptr u8) (get (.addresses mapped) (cast i64 index))))
+                                      (mut input) (ArrayList::new [u8] a)
+                                      (mut output) (ArrayList::new [u8] a)]
+                                  (for [i 0 64] (push! (mut input) (cast u8 (% (+ (* i 37) 19) 251))) (push! (mut output) 0))
+                                  (for [alignment 0 16]
+                                    (for [i 0 64] (set! (mut output) i 0xA5))
+                                    (assert (= (f (primitive/index (.data output) alignment)
+                                                  (primitive/index (.data input) alignment)) 37))
+                                    (for [i 0 64]
+                                      (let [original (cast u8 (% (+ (* i 37) 19) 251))
+                                            expected (if (and (>= i alignment) (< i (+ alignment width)))
+                                                         (^ original (if with-constant (get payload (- i alignment)) (: 0 u8)))
+                                                         (: 0xA5 u8))]
+                                        (assert (= (get input i) original))
+                                        (when (!= (get output i) expected)
+                                          (eprintln "vector inline bytes: type={} constant={} never={} budget={} changed={} alignment={} byte={} actual={} wanted={}"
+                                            type with-constant never budget changed alignment i (get output i) expected))
+                                        (assert (= (get output i) expected)))))
+                                  (free! (mut input)) (free! (mut output))
+                                  (jit/release-image! (mut mapped)))))
+                            (link/release! (mut module))))))
+                    (assert (= (.changes expanded) expected))
+                    (image/release! (mut before)) (image/release! (mut after)) (image/release! (mut leaf))
+                    (rewrite/release! (mut expanded))))))
+            (calls/release! (mut proto))))))
+    (free! (mut payload))
+    (g/release! (mut callee)) (g/release! (mut caller))))
+
 (defn main [] (-> i64)
+  (for type [(: 36 i32) 52]
+    (for with-constant [false true]
+      (internal-vector-inline type with-constant false 512)
+      (internal-vector-inline type with-constant true 512)
+      (internal-vector-inline type with-constant false 0)))
   (loop-priority-check)
   (priority-order-check)
   (for ty [(: 2 i32) 3 4 5 8 9 10 11]

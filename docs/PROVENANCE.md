@@ -1364,3 +1364,10 @@ Wide bulk streaming independently lowers exact16-byte copy/move chunks into the
 existing upstream-compatible vector type geometry and normal LOAD/STORE/control
 IR. The128-byte scalar expansion budget, byte-tail bounds, overlap ordering and
 public byte-count contracts remain. No new upstream pass-parity claim is made.
+
+The independent graph-call inliner now preserves supported vector SSA values
+inside scalar/grouped call boundaries. Nonpointer-lane vector LONG_CONST payloads
+are copied through checked byte access and re-interned in caller-owned storage,
+following the existing pinned LONG_CONST geometry. Scalar/grouped prototypes,
+call metadata, guard rules, growth accounting and private result proofs remain.
+Vector-pointer constants and unsupported vector call ABIs retain fallback.
