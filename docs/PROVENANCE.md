@@ -1359,3 +1359,8 @@ count/prefix/fill use lists and immutable verified graph preparation. The
 specialized scans and shared in-call structural validation are independent Coil
 implementations, with the same existing attribution and public validation
 requirements. They do not claim full upstream pass parity.
+
+Wide bulk streaming independently lowers exact16-byte copy/move chunks into the
+existing upstream-compatible vector type geometry and normal LOAD/STORE/control
+IR. The128-byte scalar expansion budget, byte-tail bounds, overlap ordering and
+public byte-count contracts remain. No new upstream pass-parity claim is made.

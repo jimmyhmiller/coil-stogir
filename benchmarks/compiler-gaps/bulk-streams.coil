@@ -1,0 +1,42 @@
+(module gaps.bulk-streams)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.bulk" :as bulk)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.options" :as options)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [x] x) (Err [message] (panic "{}" message))))
+
+(defn emit-kernel [(fixed i64) (mode i32) (level i32) (path (slice u8))] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        destination (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        source (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        size (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        count (if (< fixed 0) size (require (b/scalar-constant! (mut graph) 5 (cast u64 fixed) 8)))
+        control (require (case mode
+                           0 (bulk/copy! (mut graph) start destination source count)
+                           1 (bulk/move! (mut graph) start destination source count)
+                           (bulk/zero! (mut graph) start destination count)))
+        ret (require (b/emit! (mut graph) 120 0 [control (: 0 i32) 0]))]
+    (match (compile/object-with-options graph start [ret] "_bulk_stream_kernel"
+             (options/Options :level level) a)
+      (Err [message] (panic "{}" message))
+      (Ok [object]
+        (let [(mut object) object]
+          (match (fs/write-file a path (slice object))
+            (Err [_] (panic "object write failed")) (Ok [_] 0))
+          (free! (mut object)))))
+    (println "emitted {}: fixed={} mode={} level={} graph-cells={}" path fixed mode level (len (.instructions graph)))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (emit-kernel 416 0 3 "build/bulk-streams/copy416.o")
+  (emit-kernel -1 0 3 "build/bulk-streams/copy-dynamic.o")
+  (emit-kernel -1 1 3 "build/bulk-streams/move-dynamic.o")
+  (emit-kernel -1 2 3 "build/bulk-streams/zero-dynamic.o")
+  0)
