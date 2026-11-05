@@ -19,3 +19,8 @@ summation loop loses one register transfer per iteration: ADD x1,x2,x1 followed
 by MOV x2,x1 becomes ADD x2,x2,x1. Text shrinks from48 to44 bytes. Independent
 unoptimized/optimized assembly is archived under validation/phi-register-hints.
 No verifier or whole-compiler performance gain is established yet.
+
+Debug checks and AddressSanitizer also pass allocation, jit-phi,
+jit-floating-phi, jit-floating-loop (including swap), jit-switch-loop,
+jit-pressure, jit-call-pressure and jit-floating-pressure (24 live FP values
+across a call). Logs and source hashes are archived alongside loop assembly.
