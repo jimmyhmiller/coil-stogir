@@ -1335,7 +1335,8 @@ The native fixed-entry object selection/layout references IR_STATIC_ALLOCA in
 pinned ir_aarch64.dasc. Explicit builder/frame-object! and ALLOCA auxiliary32768
 are an independent Coil semantic extension: ordinary ALLOCA still changes raw
 SP, including zero-size snapshots. Marked entry-prefix objects have positive
-constant extent and function lifetime. Native matching and frame-slot layout
-implement the first stage; address rematerialization is unfinished. Inline
+constant extent and function lifetime. Native matching selects read-only frame addresses before liveness. The location
+index, machine constraints and call/edge transfers rematerialize them without
+virtual address ranges; frame-address and spill-content identities stay distinct. Inline
 cloning lowers marked callee objects to the existing call-local save/restore
 scope. No upstream/LLVM/TPDE implementation is imported. See STATIC_ENTRY_ALLOCATIONS.md.

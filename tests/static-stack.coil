@@ -6,6 +6,13 @@
 (import "stogir.a64.static-stack" :as fixed)
 (import "stogir.a64.compile" :as compile)
 (import "stogir.image" :as image)
+(import "stogir.register-live" :as live)
+(import "stogir.live-ranges" :as ranges)
+(import "stogir.a64.constraints" :as constraints)
+(import "stogir.a64.allocate" :as allocate)
+(import "stogir.locations" :as locations)
+(import "stogir.options" :as options)
+(import "stogir.calls" :as calls)
 (import "stogir.aot.macho" :as macho)
 (import "coil.fs" :as fs)
 (import "stogir.jit.darwin" :as jit)
@@ -16,6 +23,39 @@
 
 (defn require [(r (Result i32 (slice u8)))] (-> i32)
   (match r (Ok [x] x) (Err [e] (panic "{}" e))))
+
+(defn check-allocation [(graph g/Graph) (prepared pipeline/Prepared) (plan matching/Plan)]
+  (-> void)
+  (let [a (malloc-allocator)
+        (mut analysis) (live/analyze-matched graph (.blocks prepared) (.schedule prepared)
+                                             (.order prepared) (.operands plan) a)
+        (mut intervals) (ranges/build-matched graph (.schedule prepared) analysis
+                                              (.order prepared) (.operands plan) a)]
+    (match (constraints/build-matched graph (.schedule prepared) plan a)
+      (Err [e] (panic "{}" e))
+      (Ok [req]
+          (let [(mut req) req]
+            (match (allocate/build-selected intervals req graph (.schedule prepared)
+                                             (.static-sizes plan) a)
+              (Err [e] (panic "{}" e))
+              (Ok [assigned]
+                  (let [(mut assigned) assigned]
+                    (for [r 1 (len (.static-sizes plan))]
+                      (when (> (fixed/size (.static-sizes plan) (cast i32 r)) 0)
+                        (assert (= (len (.ranges (get intervals r))) 0))
+                        (assert (= (len (.uses (get req r))) 0))
+                        (assert (= (locations/owner (.parts assigned) (.locations assigned) (cast i32 r)) (cast i32 r)))
+                        (match (locations/lookup-indexed (.parts assigned) (.locations assigned) (cast i32 r) -1)
+                          (Err [_] 0) (Ok [_] (panic "negative frame-address position accepted")))
+                        (for part (.parts assigned) (assert (!= (.parent part) (cast i32 r))))
+                        (match (locations/lookup-indexed (.parts assigned) (.locations assigned)
+                                                         (cast i32 r) 0)
+                          (Err [e] (panic "{}" e))
+                          (Ok [location] (assert (locations/rematerialized? location))))))
+                    (allocate/release! (mut assigned)))))
+            (constraints/release! (mut req)))))
+    (ranges/release! (mut intervals))
+    (live/release-analysis! (mut analysis))))
 
 (defn fixture [(mode i32)] (-> void)
   (let [a (malloc-allocator)
@@ -65,6 +105,7 @@
                     (assert (= (fixed/size (.static-sizes plan) slot) expected))
                     (when (= mode 5)
                       (assert (= (fixed/size (.static-sizes plan) extra) 16)))
+                    (check-allocation graph prepared plan)
                     (matching/release! (mut plan)))))
             (pipeline/release! (mut prepared)))))
     (match (compile/image graph start [ret] "_static_stack" a)
@@ -91,7 +132,89 @@
             (image/release! (mut code)))))
     (g/release! (mut graph))))
 
+(defn read-slot :cc (cc/C) [(address (ptr u64))] (-> u64) (load address))
+(defn read-nine :cc (cc/C) [(a (ptr u64)) (b (ptr u64)) (c (ptr u64))
+                           (d (ptr u64)) (e (ptr u64)) (f (ptr u64))
+                           (g (ptr u64)) (h (ptr u64)) (i (ptr u64))] (-> u64)
+  (+ (load a) (* (load i) 2)))
+
+(defn phi-and-calls [(dynamic bool)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        wide-target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        size (require (b/scalar-constant! (mut graph) 5 16 8))
+        thirteen (require (b/scalar-constant! (mut graph) 5 13 8))
+        twenty-six (require (b/scalar-constant! (mut graph) 5 26 8))
+        first (require (b/frame-object! (mut graph) start size 16))
+        second (require (b/frame-object! (mut graph) first size 16))
+        dynamic-place (if dynamic (require (b/stack-allocate! (mut graph) second size 16)) second)
+        v1 (require (b/emit! (mut graph) 26 5 [x thirteen]))
+        v2 (require (b/emit! (mut graph) 26 5 [x twenty-six]))
+        s1 (require (b/emit! (mut graph) 93 0 [dynamic-place first v1]))
+        raw-stored (if dynamic (require (b/emit! (mut graph) 93 0 [s1 dynamic-place v1])) s1)
+        s2 (require (b/emit! (mut graph) 93 0 [raw-stored second v2]))
+        condition (require (b/emit! (mut graph) 14 1 [x thirteen]))
+        branch (require (b/emit! (mut graph) 116 0 [s2 condition]))
+        yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        left (require (b/emit! (mut graph) 114 0 [yes]))
+        right (require (b/emit! (mut graph) 114 0 [no]))
+        merge (require (b/emit! (mut graph) 112 0 [left right]))
+        phi (require (b/emit! (mut graph) 67 6 [merge first second]))]
+    (match (calls/create 0 5 [(: 6 u8)] a)
+      (Err [e] (panic "{}" e))
+      (Ok [proto]
+          (let [(mut proto) proto
+                called (require (calls/emit! (mut graph) proto merge target [phi] a))]
+            (calls/release! (mut proto))
+            (match (calls/create 0 5 [(: 6 u8) 6 6 6 6 6 6 6 6] a)
+              (Err [e] (panic "{}" e))
+              (Ok [wide]
+                  (let [(mut wide) wide
+                        called2 (require (calls/emit! (mut graph) wide called wide-target
+                                                      [first second dynamic-place second first second first second second] a))
+                        loaded (require (b/emit! (mut graph) 91 5 [called2 second]))
+                        sum (require (b/emit! (mut graph) 26 5 [called called2]))
+                        sum (require (b/emit! (mut graph) 26 5 [sum loaded]))
+                        ret (require (b/emit! (mut graph) 120 5 [loaded sum (: 0 i32)]))]
+                    (calls/release! (mut wide))
+                    (for level [(: 1 i32) 2 3]
+                      (match (compile/image-with-options graph start [ret] "_static_phi_calls"
+                                                         (options/Options :level level) a)
+                        (Err [e] (panic "{}" e))
+                        (Ok [code]
+                            (let [(mut code) code]
+                              (when (= level 1)
+                                (match (macho/image-object code a)
+                                  (Err [e] (panic "{}" e))
+                                  (Ok [object]
+                                      (let [(mut object) object]
+                                        (match (fs/write-file a (if dynamic "/tmp/coil-stogir-static-phi-calls-dynamic.o"
+                                                                            "/tmp/coil-stogir-static-phi-calls.o") (slice object))
+                                          (Err [_] (panic "static Phi/call object write failed"))
+                                          (Ok [_] 0))
+                                        (free! (mut object))))))
+                              (match (jit/map-image code a)
+                                (Err [e] (panic "{}" e))
+                                (Ok [mapped]
+                                    (let [(mut mapped) mapped
+                                          f (p/cast (fnptr (cc/C) [u64 u64 u64] u64) (.base (.memory mapped)))
+                                          target (p/cast u64 (p/cast (ptr u8) (fnptr-of read-slot)))
+                                          wide-target (p/cast u64 (p/cast (ptr u8) (fnptr-of read-nine)))]
+                                      (for x [(: 0 u64) 1 13 16 1000 0xFFFFFFFFFFFFFFF0]
+                                        (let [v1 (+ x 13) v2 (+ x 26)
+                                              expected (+ (if (= x 13) v1 v2) v1 (* v2 2) v2)]
+                                          (assert (= (f target wide-target x) expected))))
+                                      (jit/release-image! (mut mapped)))))
+                              (image/release! (mut code))))))))))))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (phi-and-calls false)
+  (phi-and-calls true)
   (for mode [(: 0 i32) 1 2 3 4 5 6 7 8 9] (fixture mode))
   (println "static entry objects, dynamic counts/blocks, scopes/frees, zero size and over-alignment pass")
   0)

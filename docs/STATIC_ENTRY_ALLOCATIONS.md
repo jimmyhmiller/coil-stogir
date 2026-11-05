@@ -1,9 +1,8 @@
-# Fixed function-lifetime objects: first stage
+# Fixed function-lifetime objects and rematerialization
 
-This is incomplete performance work, based on bulk128 source0d6d545. No compiler
-integration or bootstrap speedup is claimed. The virtual address definition and
-its ordinary register interval are deliberately still present. Removing that
-interval and rematerializing the address in all consumers is the next stage.
+Based on bulk128 source0d6d545. Native frame storage and address rematerialization
+are implemented. Compiler integration and bootstrap performance acceptance remain
+open. No whole-compiler speedup is claimed.
 
 ## Semantics and provenance
 
@@ -34,16 +33,19 @@ in LICENSE, NOTICE and PROVENANCE.
 
 Matching records an immutable graph-reference-indexed size plan before liveness.
 Frame layout allocates distinct checked aligned local slots, separate from spills
-and outgoing arguments. Static definitions materialize the frame-relative address
-in their ordinary assigned GPR; they do not change SP. Dynamic storage still
-establishes the anchored frame and follows the original lowering. Compatibility
-allocation entry points select the same object plan.
+and outgoing arguments. Fixed definitions have no virtual-register ranges or
+constraints. Their source locations are immutable x29- or SP-relative addresses,
+not memory contents. The finalized location index records them in reference order.
+Dynamic storage still establishes the anchored frame and follows original lowering.
 
-This stage does not yet remove GPR pressure from object addresses. Future work
-must represent rematerializable frame addresses in machine uses, constraints,
-locations and all call/edge/return transfers. A frame address is not the contents
-of a spill slot. No location check or required-register constraint may simply
-be bypassed.
+Scalar operands materialize addresses in reserved temporaries, just as literal
+addresses do. Call/return capture and typed/untyped simultaneous copies support
+these read-only sources. Parallel-copy identities include both kind and offset,
+so a spill slot's contents and its address remain distinct. Read-only destinations,
+narrow/wide address transfers, duplicate destinations, and invalid scratch/base
+combinations fail transactionally without appending bytes. Phi edge sources are
+excluded from register liveness and rematerialized into their selected destination.
+Generic identity plans retain this intrinsic frame-object behavior too.
 
 ## Validation
 
@@ -66,3 +68,18 @@ The native pipeline additionally rejects forged markers with nonentry control,
 variable or zero extent, unknown marker bits and wrong result type. Constructor
 rejections preserve graph length; tests mutate headers directly to exercise the
 validator independently of the checked builder.
+
+Additional rematerialization validation covers72 native simultaneous-copy answers:
+SP and x29 bases, moved SP under an anchored frame, two copy orders, large offsets,
+GPR cycles, SIMD captures and mixed widths. Rejection cases verify output atomicity.
+Pointer Phis and nine-pointer calls (including a stack argument and live call
+results) pass independent arithmetic answers at O1/O2/O3. Allocation checks prove
+fixed objects have no ranges, uses or allocation parts. Independent C AOT tests
+also exercise the Phi/call object, including unsigned wraparound.
+
+Rematerialization evidence is in validation/static-entry-rematerialization. The
+call/Phi checks run with both fixed SP and a displaced dynamic SP anchored by x29.
+Independent C checks link all three Mach-O objects. Parallel copies additionally
+preserve NZCV; error cases cover incompatible bases and negative offsets. The
+original2640 raw stack variants, scoped/dynamic stack suites, aggregate-result
+ABI checks and allocation/transfer/edge regression suites still pass.

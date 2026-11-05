@@ -8,8 +8,6 @@
 (import "stogir.frame" :as frame)
 (import "stogir.locations" :as locations)
 (import "stogir.a64.frame-address" :as address)
-(import "stogir.a64.code" :as code)
-(import "stogir.a64.registers" :as registers)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [Allocator])
 (import "coil.result" :use [Result Some None Ok Err])
@@ -38,27 +36,27 @@
       (get sizes (cast i64 reference))
       0))
 
-;;; First-stage static definition retains its ordinary allocated GPR. All fixed
-;;; addresses share checked frame geometry; no dynamic SP adjustment occurs.
-(defn emit! [(output (mut code/Buffer))
-              (parts locations/View)
-              (frame frame/Frame)
-              (reference i32)
-              (position i64)
-              (base address/Base)] (-> (Result i32 (slice u8)))
-  (match (get (.locals frame) reference)
-    (None [] (Err "static allocation has no frame object"))
-    (Some [index]
-          (let [slot (get (.slots frame) index)]
-            (match (address/offset base (.offset slot))
-              (Err [message] (Err message))
-              (Ok [offset]
-                  (match (locations/resolve parts reference (+ position 1))
-                    (Err [message] (Err message))
-                    (Ok [destination]
-                        (if (or (!= (.kind destination) 0)
-                                (not (registers/allocatable? 6 (cast i32 (.value destination)))))
-                            (Err "static allocation definition requires an allocatable GPR")
-                            (address/address! (mut (.text output))
-                                              (cast i32 (.value destination))
-                                              (.reg base) offset))))))))))
+;;; Fixed addresses are immutable read-only sources, indexed in reference order.
+;;; They have no virtual allocation bucket and never denote spill contents.
+(defn index! [(index (mut locations/Index)) (frame frame/Frame)
+               (sizes (ArrayList i64)) (base address/Base)]
+  (-> (Result i32 (slice u8)))
+  (let [(mut error) "" (mut count) (: 0 i32)]
+    (for [r 1 (len sizes)]
+      (when (and (= error "") (> (get sizes r) 0))
+        (if (or (>= r (len (.parents index)))
+                (!= (.count (get (.parents index) r)) 0))
+            (set! error "static frame address still has a virtual allocation")
+            (match (get (.locals frame) (cast i32 r))
+              (None [] (set! error "static allocation has no frame object"))
+              (Some [slot]
+                    (match (address/offset base (.offset (get (.slots frame) slot)))
+                      (Err [message] (set! error message))
+                      (Ok [offset]
+                          (push! (mut (.rematerialized index))
+                                 (locations/Rematerialized
+                                   :parent (cast i32 r)
+                                   :location (locations/Location :kind (if (= (.reg base) 29) 2 3)
+                                                                 :value offset)))
+                          (set! count (+ count 1)))))))))
+    (if (= error "") (Ok count) (Err error))))
