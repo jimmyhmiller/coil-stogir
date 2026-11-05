@@ -1375,3 +1375,10 @@ callee snapshots and existing SCCP/inlining. Constant-index reconstruction uses
 the same scalar key and LONG_CONST header/hash/payload conventions as existing
 graph construction; negative IDs and payloads remain intact. Original validation
 and exact clone-growth contracts remain required.
+
+
+Shifted word ADD/SUB selection is an independent AArch64 target extension.
+Pinned ir_aarch64.dasc ir_emit_binop_int (around2861..2900) uses ordinary
+register ADD/SUB for this case. This extension uses the existing immutable-graph,
+persistent target-plan and pre-allocation machine-use contract; it is not a
+claim of upstream rule parity. See docs/SHIFTED_ARITHMETIC.md.
