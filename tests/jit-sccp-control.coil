@@ -18,6 +18,7 @@
 (import "stogir.jit.darwin" :as jit)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [malloc-allocator])
+(import "coil.fs" :as fs)
 (import "coil.result" :use [Result Ok Err Option Some None])
 (import "coil.primitive" :as p)
 (import "coil.cc" :as cc)
@@ -1205,6 +1206,9 @@
         loop (require (b/emit! (mut graph) 113 0 [end-yes end-yes]))
         back (require (b/emit! (mut graph) 115 0 [loop]))
         target (require (b/scalar-constant! (mut graph) 6 1 8))
+        external (require (b/emit! (mut graph) 105 0 [end-yes (: 0 i32)]))
+        label (require (b/emit! (mut graph) 106 0 [end-yes (: 1 i32)]))
+        cycle (require (b/emit! (mut graph) 106 0 [end-yes (: 0 i32)]))
         guard (require (b/emit! (mut graph) 101 0 [start condition target]))
         guard-not (require (b/emit! (mut graph) 102 0 [start condition target]))]
     (require (b/patch! (mut graph) loop 2 back))
@@ -1224,7 +1228,8 @@
                                                              guard-not
                                                              condition))
                0))
-    (for control [merge loop start value]
+    (require (b/patch! (mut graph) cycle 1 cycle))
+    (for control [merge loop start value external label cycle]
       (assert (= (predicate-code (conditional/dominating-truth graph
                                                                control
                                                                condition))
@@ -1272,11 +1277,22 @@
 (defn repeated-predicate [(truth bool)
                           (effect bool)
                           (observation i32)
-                          (late bool)]
+                          (late bool)
+                          (preallocated bool)]
   (-> void)
   (let [a (malloc-allocator)
         (mut graph) (g/create a)
         start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        ; The Coil adapter reserves block headers before their predicates and
+        ; effect chains. Raw forward references are patched before validation.
+        reserved-yes (if preallocated
+                        (match (g/append-inputs! (mut graph) 107 0 [(: 0 i32) 0])
+                          (None [] (panic "predicate true reservation")) (Some [r] r))
+                        (: 0 i32))
+        reserved-no (if preallocated
+                       (match (g/append-inputs! (mut graph) 108 0 [(: 0 i32) 0])
+                         (None [] (panic "predicate false reservation")) (Some [r] r))
+                       (: 0 i32))
         value (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
         memory (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
         zero (require (b/scalar-constant! (mut graph) 11 0 8))
@@ -1285,17 +1301,25 @@
         wrong (require (b/scalar-constant! (mut graph) 11 999 8))
         condition (require (b/emit! (mut graph) 15 1 [value zero]))
         first (require (b/emit! (mut graph) 116 0 [start condition]))
-        yes (require (b/emit! (mut graph) 107 0 [first (: 0 i32)]))
-        no (require (b/emit! (mut graph) 108 0 [first (: 0 i32)]))
+        yes (if preallocated
+                (do (require (b/patch! (mut graph) reserved-yes 1 first)) reserved-yes)
+                (require (b/emit! (mut graph) 107 0 [first (: 0 i32)])))
+        no (if preallocated
+               (do (require (b/patch! (mut graph) reserved-no 1 first)) reserved-no)
+               (require (b/emit! (mut graph) 108 0 [first (: 0 i32)])))
         selected (if truth yes no)
+        linear (if preallocated
+                   (let [end (require (b/emit! (mut graph) 114 0 [selected]))]
+                     (require (b/emit! (mut graph) 106 0 [end (: 0 i32)])))
+                   selected)
         before
           (if effect
               (let [loaded
-                      (require (b/emit! (mut graph) 91 11 [selected memory]))
+                      (require (b/emit! (mut graph) 91 11 [linear memory]))
                     one (require (b/scalar-constant! (mut graph) 11 1 8))
                     next (require (b/emit! (mut graph) 26 11 [loaded one]))]
                 (require (b/emit! (mut graph) 93 0 [loaded memory next])))
-              selected)
+              linear)
         second (require (b/emit! (mut graph) 116 0 [before condition]))
         inner-yes (require (b/emit! (mut graph) 107 0 [second (: 0 i32)]))
         inner-no (require (b/emit! (mut graph) 108 0 [second (: 0 i32)]))
@@ -1322,6 +1346,9 @@
       (set! predicate (require (b/emit! (mut graph) 15 1 [value zero])))
       (require (b/patch! (mut graph) first 2 predicate))
       (require (b/patch! (mut graph) second 2 predicate)))
+    (when (and preallocated (not late))
+      (assert (< selected predicate))
+      (assert (> before predicate)))
     (for terminal [ret0 ret1 ret2] (push! (mut roots) terminal))
     (when (= observation 1) (push! (mut roots) predicate))
     (when (= observation 2) (push! (mut roots) second))
@@ -1343,6 +1370,15 @@
                                (slice (.roots output))
                                truth
                                effect)
+            (when (and preallocated truth effect (= observation 0) (not late))
+              (match (compile/object (.graph output) 1 (slice (.roots output)) "_sccp_forward_predicate" a)
+                (Err [message] (panic "forward predicate object: {}" message))
+                (Ok [owned]
+                    (let [(mut object) owned]
+                      (match (fs/write-file a "/tmp/coil-stogir-forward-predicate.o" (slice object))
+                        (Err [_] (panic "forward predicate object write"))
+                        (Ok [_] 0))
+                      (free! (mut object))))))
             (rewrite/release! (mut output)))))
     (assert (= (n/opcode (get (.instructions graph) (cast i64 second))) 116))
     (free! (mut roots))
@@ -1399,7 +1435,8 @@
     (for effect [false true]
       (for observation [(: 0 i32) 1 2]
         (for late [false true]
-          (repeated-predicate truth effect observation late)))))
+          (for preallocated [false true]
+            (repeated-predicate truth effect observation late preallocated))))))
   (for shape [(: 0 i32) 1 2 3 4 5]
     (for truth [false true]
       (for order [(: 0 i32) 1 2]
