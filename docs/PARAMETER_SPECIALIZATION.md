@@ -94,3 +94,23 @@ callee descriptors are live; only one expansion reserves8cells under one shared
 paths. Existing graph/constants/vector constants/JIT vector constants/module
 execution and29700 validation-transaction checks pass. Evidence: validation/
 specialization-cache. No compiler integration or performance adoption yet.
+
+
+## First actual-verifier integration: no demonstrated gain
+
+Coil candidateafdf07bb uses the opt-in path before ranking. Same verifier source
+and LLVM-built caller: baseline32.1790ms, candidate32.2165ms, LLVM9.0380ms median
+CPU (16 rotating samples after warmup). Median IR generation over4alternating
+samples after warmup:89.6555/90.3430/351.7025ms. Both optimizer preparation and
+final emission remain inside the existing generation boundary. No clear gain.
+
+The trace is object-byte-identical to untraced output. Structure still expands
+15of23sites, reserves509cells and leaves3; its two string-equality calls remain.
+Only5contexts exist by then, so resource-cap exhaustion is ruled out. Inspect
+actual caller argument forms next: requiring literal known arguments may miss
+values whose constants emerge only in a later caller optimization epoch. This
+is a hypothesis, not yet proof of their form. No budget/cap increase is justified.
+Raw results, all library source hashes, caller/object hashes and compressed
+assembly/trace are in validation/context-cache-verifier. No bootstrap run or
+performance adoption is claimed. Compiler source/evidence is committed separately
+and is not installed globally or pushed; FAST has not run.
