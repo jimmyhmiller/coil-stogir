@@ -40,6 +40,8 @@ boundaries. Do not inherit the reproduced wrong-code behavior in pursuit of
 parity or performance. Shared expressions and observed wide values must retain
 their original types and values.
 
-No integer-width-propagation port is implemented yet. This audit selects the
-next original upstream stage to implement; it does not establish a performance
-improvement or complete the5x/within10% bootstrap goal.
+The initial modular integer-width port is implemented in `iter-fold.coil`.
+It uses preflight plans, explicit traversal storage, touched-reference reset,
+exact-use updates and existing protected-root replacement. MIN/MAX/ABS, BOOL
+and pointer conversion boundaries remain excluded. Validation is in progress;
+this does not establish a whole-bootstrap speedup or meet the 5×/within 10% goal.
