@@ -43,8 +43,8 @@ competing build/test during measurement. Source/system differ from earlier full
 checkpoints; do not infer a controlled historical runtime improvement. This
 run compares current Stogir and LLVM on the same current compiler source.
 
-Native debug/ASAN return/side-effect/inlining tests pass; additional surviving
-terminal-list test and compiler quick gate are being finalized. Full FAST not
-run. Source committed; compiler NOT pushed, NOT installed. No performance
+Native debug/ASAN return/side-effect/inlining tests pass, including a surviving
+side exit between replaced returns in the terminal membership list. Compiler
+quick9-step gate PASS53.6s. Full FAST not run. Source committed; compiler NOT pushed, NOT installed. No performance
 adoption or goal completion. Raw scripts/hashes/observations/host snapshots are
 archived beside this report.
