@@ -107,3 +107,9 @@ the post-call value separately. First and second copies and their surrounding
 guards are checked independently. Evidence, source hashes and independent C
 link results are in validation/static-frame-addressing. No performance benefit
 for this subsequent encoding change is claimed before integration measurements.
+
+The single location query retains the original graph-reference and physical
+register-class checks. A positive renderer control first succeeds; malformed
+floating/GPR and nonexistent-reference replacements then fail without changing
+output. The regression reproduces the omitted type check against99d3b99, before
+it was restored. This did not affect the frozen a58918c7 checkpoint.

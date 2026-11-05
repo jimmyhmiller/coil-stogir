@@ -10,6 +10,10 @@
 (import "stogir.live-ranges" :as ranges)
 (import "stogir.a64.constraints" :as constraints)
 (import "stogir.a64.allocate" :as allocate)
+(import "stogir.allocation" :as parts)
+(import "stogir.interval" :as interval)
+(import "stogir.a64.memory" :as memory)
+(import "stogir.a64.code" :as code)
 (import "stogir.locations" :as locations)
 (import "stogir.options" :as options)
 (import "stogir.calls" :as calls)
@@ -314,7 +318,43 @@
                       (image/release! (mut code))))))))))
     (g/release! (mut graph)) (free! (mut output)) (free! (mut payload))))
 
+(defn invalid-address-replacements [] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        pointer (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        floating (require (b/emit! (mut graph) 71 12 [start (: 0 i32) 1]))
+        read (require (b/emit! (mut graph) 91 5 [start pointer]))
+        (mut assigned) (ArrayList::new [parts/Part] a)
+        (mut output) (code/create a)]
+    ; A complete positive control proves the graph, output and destination are
+    ; usable. The malformed sources then isolate checks formerly done by value.
+    (for reference [pointer floating read (: 1000 i32)]
+      (let [(mut part) (parts/create reference a)]
+        (interval/add! (mut (.ranges part)) (if (= reference 1000) 2 0)
+                                              (if (= reference floating) 2 5))
+        (set! (.register part) (if (= reference pointer) 2 (if (= reference read) 1 0)))
+        (push! (mut assigned) part)))
+    (match (locations/build-index assigned 1001 a)
+      (Err [e] (panic "{}" e))
+      (Ok [index]
+          (let [(mut index) index
+                view (locations/indexed-view assigned index)]
+            (for byte [(: 0x1F u8) 0x20 0x03 0xD5] (push! (mut (.text output)) byte))
+            (match (memory/emit-address-with-locations! (mut output) graph view read 0 pointer 0)
+              (Err [e] (panic "positive memory control failed: {}" e))
+              (Ok [_] (assert (= (len (.text output)) 8))))
+            (for spec [[floating (: 0 i32)] [(: 1000 i32) 2]]
+              (match (memory/emit-address-with-locations! (mut output) graph view read
+                                                         (cast i64 (get spec 1)) (get spec 0) 0)
+                (Err [_] 0)
+                (Ok [_] (panic "memory renderer accepted invalid address replacement")))
+              (assert (= (len (.text output)) 8)))
+            (locations/release-index! (mut index)))))
+    (for [i 0 (len assigned)] (parts/release! (elem (mut assigned) i)))
+    (free! (mut assigned)) (code/release! (mut output)) (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (invalid-address-replacements)
   (for ty [(: 1 i32) 2 3 4 5 6 7 8 9 10 11 12 13 52]
     (for offset [(: 0 i64) 1]
       (for anchored [false true]
