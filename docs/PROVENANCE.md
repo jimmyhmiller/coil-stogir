@@ -1371,3 +1371,12 @@ are copied through checked byte access and re-interned in caller-owned storage,
 following the existing pinned LONG_CONST geometry. Scalar/grouped prototypes,
 call metadata, guard rules, growth accounting and private result proofs remain.
 Vector-pointer constants and unsupported vector call ABIs retain fallback.
+
+
+### Narrow logical operand normalization
+
+The byte/halfword bitwise emission reduction independently uses truncation's
+commutation with AND/OR/XOR. Pinned ir_aarch64.dasc:ir_emit_binop_int also selects
+direct register logical instructions. Coil keeps its existing result extension
+and physical use/definition contract; no upstream semantic parity is implied.
+See NARROW_LOGICAL_INPUTS.md for proof and hardware tests.

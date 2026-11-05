@@ -24,7 +24,7 @@
   (let [a (malloc-allocator)
         (mut code) (ArrayList::new [u8] a)
         (mut cases) (ArrayList::new [LogicalCase] a)
-        (mut failures) (logical-native-check)]
+        (mut failures) 0]
     (for wide [false true]
       (let [width (if wide 64 32)
             (mut element) 2]
@@ -216,9 +216,50 @@
     (g/release! (mut graph))
     failures))
 
+;;; Direct selected emission accepts full u64 ABI inputs, deliberately retaining
+;;; dirty upper bits. Check low-width semantics independently, including rd
+;;; aliasing either source, unsigned/signed extension, and boolean byte width.
+(defn narrow-register-check [] (-> i64)
+  (let [a (malloc-allocator) (mut failures) 0]
+    (for ty [(: 1 i32) 2 3 7 8 9]
+      (let [bits (if (or (= ty 3) (= ty 9)) (: 16 i32) 8)
+            mask (if (= bits 8) (: 255 u64) 65535)
+            signed? (or (= ty 7) (= ty 8) (= ty 9))]
+        (for opcode [(: 46 i32) 47 48]
+          (for destination [(: 0 i32) 1 2]
+            (let [(mut code) (ArrayList::new [u8] a)
+                  tile (select/Tile :rule (+ 6 (- opcode 46)) :wide false
+                                     :left 1 :right 2 :immediate 0)]
+              (match (emit/narrow! (mut code) tile opcode ty bits destination 0 1)
+                (Err [message] (panic "{}" message)) (Ok [_] 0))
+              (when (!= destination 0)
+                (match (e/logical-shifted false 1 0 31 destination 0)
+                  (Err [message] (panic "{}" message))
+                  (Ok [word] (bytes/append32! (mut code) word))))
+              (bytes/append32! (mut code) 0xD65F03C0)
+              (match (jit/map-text (slice code))
+                (Err [message] (panic "{}" message))
+                (Ok [owned]
+                  (let [(mut image) owned
+                        f (primitive/cast (fnptr (cc/C) [u64 u64] u64) (.base image))]
+                    (for left [(: 0 u64) 1 127 128 255 32768 65535
+                               0x123456789ABCDEF0 0xFFFFFFFFFFFFFFFF]
+                      (for right [(: 0 u64) 1 128 255 32768 65535
+                                  0xFEDCBA9876543210 0xFFFFFFFFFFFFFFFF]
+                        (let [raw (& mask (case opcode 46 (| left right)
+                                                   47 (& left right) (^ left right)))
+                              expected (if (and signed?
+                                                (!= (& raw (<< (: 1 u64) (cast u64 (- bits 1)))) 0))
+                                           (| raw (& (^ mask 0xFFFFFFFFFFFFFFFF) 0xFFFFFFFF)) raw)]
+                          (when (!= (f left right) expected)
+                            (set! failures (+ failures 1))))))
+                    (unless (jit/release! (mut image)) (set! failures (+ failures 1))))))
+              (free! (mut code)))))))
+    failures))
+
 (defn main [] (-> i64)
   (let [(mut text) (ArrayList::new [u8] (malloc-allocator))
-        (mut failures) 0]
+        (mut failures) (+ (logical-native-check) (narrow-register-check))]
     (let [(mut graph) (g/create (malloc-allocator))
           start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
           p (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))

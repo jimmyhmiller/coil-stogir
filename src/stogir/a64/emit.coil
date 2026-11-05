@@ -158,6 +158,9 @@
 
 ;;; Normalize into reserved scratches without altering still-live operands.
 ;;; Repeated byte/halfword patterns make a 32-bit ROR a narrow rotate.
+;;; Bitwise AND/OR/XOR commute with truncation: compute directly from the
+;;; original registers and retain the existing result extension. Upper operand
+;;; bits cannot affect the low byte/halfword, even for noncanonical ABI inputs.
 (defn narrow! [(output (mut (ArrayList u8)))
                (tile select/Tile)
                (opcode i32)
@@ -169,6 +172,7 @@
   (-> (Result i32 (slice u8)))
   (let [start (len output)
         (mut error) ""
+        logical? (or (= opcode 46) (= opcode 47) (= opcode 48))
         comparison? (and (>= opcode 14) (<= opcode 23))
         signed-compare? (and (>= opcode 16) (<= opcode 19))
         signed-values?
@@ -176,14 +180,15 @@
                (types/signed? ty))
         shift? (and (>= opcode 49) (<= opcode 51))
         rotate? (or (= opcode 52) (= opcode 53))]
-    (word! (mut output)
-           (mut error)
-           (encode/extend false
-                          (or signed-compare? signed-values? (= opcode 51))
-                          bits
-                          16
-                          rn))
-    (when (!= (.right tile) 0)
+    (unless logical?
+      (word! (mut output)
+             (mut error)
+             (encode/extend false
+                            (or signed-compare? signed-values? (= opcode 51))
+                            bits
+                            16
+                            rn)))
+    (when (and (not logical?) (!= (.right tile) 0))
       (word! (mut output)
              (mut error)
              (encode/extend false
@@ -203,8 +208,9 @@
       (match (arithmetic! (mut output)
                           tile
                           rd
-                          16
-                          (if (= (.right tile) 0) (: 0 i32) (: 17 i32)))
+                          (if logical? rn (: 16 i32))
+                          (if (= (.right tile) 0) (: 0 i32)
+                              (if logical? rm (: 17 i32))))
         (Err [message] (set! error message))
         (Ok [_] 0)))
     (when (not comparison?)
