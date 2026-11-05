@@ -1382,3 +1382,9 @@ Pinned ir_aarch64.dasc ir_emit_binop_int (around2861..2900) uses ordinary
 register ADD/SUB for this case. This extension uses the existing immutable-graph,
 persistent target-plan and pre-allocation machine-use contract; it is not a
 claim of upstream rule parity. See docs/SHIFTED_ARITHMETIC.md.
+
+
+Return canonicalization is an independent control/value graph normalization,
+using the existing compact END/MERGE/PHI/RETURN and terminal membership shapes.
+It is not attributed as an upstream inlining rule. Full validation and the
+existing inliner eligibility proofs remain separate. See RETURN_MERGE.md.
