@@ -1,0 +1,194 @@
+(module stogir.tests.jit-parameter-specialize)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.symbols" :as symbols)
+(import "stogir.call-inline" :as inlining)
+(import "stogir.parameter-specialize" :as specialize)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [x] x) (Err [message] (panic "{}" message))))
+
+(defn reject [(result (Result specialize/Specialized (slice u8)))] (-> void)
+  (match result
+    (Err [_] 0)
+    (Ok [owned]
+      (let [(mut owned) owned]
+        (specialize/release! (mut owned))
+        (panic "invalid specialization accepted")))))
+
+(defn execute [(graph g/Graph) (roots (slice i32)) (bound u64)] (-> void)
+  (let [a (malloc-allocator)]
+    (match (compile/image graph 1 roots "_specialize_test" a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+        (let [(mut code) owned]
+          (match (jit/map-image code a)
+            (Err [message] (panic "{}" message))
+            (Ok [loaded]
+              (let [(mut loaded) loaded
+                    f (p/cast (fnptr (cc/C) [u64 u64 (ptr u64)] bool) (.base (.memory loaded)))]
+                (for x [(: 0 u64) 1 2 7 127 256 65536 0xFFFFFFFFFFFFFFFF]
+                  (let [(mut out) [(: 42 u64) 123456]]
+                    (assert (= (f x bound (p/cast (ptr u64) (mut out))) (and (= x bound) (= x 0))))
+                    (assert (= (get out 0) (if (and (= x bound) (!= x 0)) (: 99 u64) 42)))
+                    (assert (= (get out 1) 123456))))
+                (assert (jit/release-image! (mut loaded))))))
+          (image/release! (mut code)))))))
+
+(defn execute-caller [(graph g/Graph) (roots (slice i32))] (-> void)
+  (let [a (malloc-allocator)]
+    (match (compile/image graph 1 roots "_specialized_caller" a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+        (let [(mut code) owned]
+          (match (jit/map-image code a)
+            (Err [message] (panic "{}" message))
+            (Ok [loaded]
+              (let [(mut loaded) loaded
+                    f (p/cast (fnptr (cc/C) [u64 (ptr u64)] bool) (.base (.memory loaded)))]
+                (for [x 0 32]
+                  (let [(mut out) (: 42 u64)]
+                    (assert (= (f (cast u64 x) (p/cast (ptr u64) (mut out))) (= x 0)))
+                    (assert (= out 42))))
+                (assert (jit/release-image! (mut loaded))))))
+          (image/release! (mut code)))))))
+
+(defn check-caller [(original g/Graph) (ret i32) (specialized specialize/Specialized)] (-> void)
+  (let [a (malloc-allocator) (mut caller) (g/create a)
+        start (require (b/emit! (mut caller) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut caller) 71 5 [start (: 0 i32) 0]))
+        out (require (b/emit! (mut caller) 71 6 [start (: 0 i32) 1]))
+        zero (require (b/scalar-constant! (mut caller) 5 0 8))
+        one (require (b/scalar-constant! (mut caller) 5 1 8))
+        function (require (symbols/function! (mut caller) "_parameter_case" 0))]
+    (match (calls/create 0 1 [(: 5 u8) 5 6] a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+        (let [(mut proto) owned
+              called (require (calls/emit! (mut caller) proto start function [x zero out] a))
+              returned (require (b/emit! (mut caller) 120 1 [called called (: 0 i32)]))
+              original-target (inlining/Callee :name "_parameter_case" :graph original :entry 1
+                                              :roots [ret] :observed [ret] :never false)
+              body (.graph (.body specialized))
+              roots (slice (.roots (.body specialized)))
+              specialized-target (inlining/Callee :name "_parameter_case" :graph body :entry 1
+                                                 :roots roots :observed roots :never false)
+              (mut old-min) (: -1 i32) (mut new-min) (: -1 i32)]
+          (assert (specialize/bindings-match? specialized caller called 8))
+          (assert (not (specialize/bindings-match? specialized caller start 8)))
+          (assert (not (specialize/bindings-match? specialized caller called 4)))
+          (for replacement [one x]
+            (assert (g/set-operand! (mut caller) called 4 replacement))
+            (assert (not (specialize/bindings-match? specialized caller called 8))))
+          (assert (g/set-operand! (mut caller) called 4 zero))
+          (for [budget 0 128]
+            (when (and (< old-min 0)
+                       (.common (inlining/inspect-verified-site caller [returned] called original-target 8 (cast i32 budget) a)))
+              (set! old-min (cast i32 budget)))
+            (when (and (< new-min 0)
+                       (.common (inlining/inspect-verified-site caller [returned] called specialized-target 8 (cast i32 budget) a)))
+              (set! new-min (cast i32 budget))))
+          (println "exact preflight minimum: original {}, specialized {}" old-min new-min)
+          (assert (and (> old-min 0) (> new-min 0) (< new-min old-min)))
+          (match (inlining/optimize-sites-if-changed caller [returned]
+                   [(inlining/Site :reference called :target original-target)] 8 new-min a)
+            (Err [message] (panic "{}" message))
+            (Ok [result]
+              (match result (None [] 0)
+                (Some [owned]
+                  (let [(mut owned) owned]
+                    (rewrite/release! (mut owned))
+                    (panic "unspecialized target unexpectedly fit"))))))
+          (match (inlining/optimize-sites-if-changed caller [returned]
+                   [(inlining/Site :reference called :target specialized-target)] 8 new-min a)
+            (Err [message] (panic "{}" message))
+            (Ok [result]
+              (match result
+                (None [] (panic "specialized call did not fit its exact budget"))
+                (Some [owned]
+                  (let [(mut rewritten) owned]
+                    (assert (= (.changes rewritten) 1))
+                    (execute-caller (.graph rewritten) (slice (.roots rewritten)))
+                    (rewrite/release! (mut rewritten)))))))
+          (calls/release! (mut proto)))))
+    (g/release! (mut caller))))
+
+(defn main [] (-> i64)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        y (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        output (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        yes (require (b/scalar-constant! (mut graph) 1 1 8))
+        no (require (b/scalar-constant! (mut graph) 1 0 8))
+        literal (require (b/scalar-constant! (mut graph) 5 99 8))
+        unequal (require (b/emit! (mut graph) 15 1 [x y]))
+        first (require (b/emit! (mut graph) 116 0 [start unequal]))
+        different (require (b/emit! (mut graph) 107 0 [first (: 0 i32)]))
+        equal (require (b/emit! (mut graph) 108 0 [first (: 0 i32)]))
+        first-end (require (b/emit! (mut graph) 114 0 [different]))
+        empty (require (b/emit! (mut graph) 14 1 [x zero]))
+        second (require (b/emit! (mut graph) 116 0 [equal empty]))
+        empty-path (require (b/emit! (mut graph) 107 0 [second (: 0 i32)]))
+        full-path (require (b/emit! (mut graph) 108 0 [second (: 0 i32)]))
+        stored (require (b/emit! (mut graph) 93 0 [full-path output literal]))
+        empty-end (require (b/emit! (mut graph) 114 0 [empty-path]))
+        full-end (require (b/emit! (mut graph) 114 0 [stored]))
+        inner (require (b/emit! (mut graph) 112 0 [empty-end full-end]))
+        inner-value (require (b/emit! (mut graph) 67 1 [inner yes no]))
+        inner-end (require (b/emit! (mut graph) 114 0 [inner]))
+        outer (require (b/emit! (mut graph) 112 0 [first-end inner-end]))
+        value (require (b/emit! (mut graph) 67 1 [outer no inner-value]))
+        ret (require (b/emit! (mut graph) 120 1 [outer value (: 0 i32)]))]
+    (match (calls/create 0 1 [(: 5 u8) 5 6] a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+        (let [(mut proto) owned]
+          (require (calls/function! (mut graph) proto a))
+          (calls/release! (mut proto)))))
+    (reject (specialize/specialize graph [ret] [] 8 a))
+    (for parameter [(: -1 i32) 0 ret 999999]
+      (reject (specialize/specialize graph [ret] [(specialize/Binding :parameter parameter :bits 0)] 8 a)))
+    (reject (specialize/specialize graph [ret]
+              [(specialize/Binding :parameter y :bits 0) (specialize/Binding :parameter y :bits 1)] 8 a))
+    (reject (specialize/specialize graph [999999] [(specialize/Binding :parameter y :bits 0)] 8 a))
+    (reject (specialize/specialize graph [ret] [(specialize/Binding :parameter y :bits 0)] 3 a))
+    (set! (mut (.arities graph)) (cast i64 y) 2)
+    (reject (specialize/specialize graph [ret] [(specialize/Binding :parameter y :bits 0)] 8 a))
+    (set! (mut (.arities graph)) (cast i64 y) 3)
+    (reject (specialize/specialize graph [ret] [(specialize/Binding :parameter output :bits 0x100000000)] 4 a))
+    (execute graph [ret] 0)
+    (execute graph [ret] 1)
+    (execute graph [ret] 7)
+    (match (specialize/specialize graph [ret] [(specialize/Binding :parameter y :bits 0)] 8 a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+        (let [(mut specialized) owned body (.graph (.body specialized))
+              (mut stores) 0 (mut active) 0 (mut r) (: 1 i64)]
+          (assert (= (len (.conditions specialized)) 1))
+          (assert (= (.ordinal (get (.conditions specialized) 0)) 1))
+          (assert (= (n/opcode (get (.instructions graph) (cast i64 y))) 71))
+          (while (< r (len (.instructions body)))
+            (let [opcode (n/opcode (get (.instructions body) r))]
+              (when (= opcode 93) (set! stores (+ stores 1)))
+              (when (!= opcode 0) (set! active (+ active 1))))
+            (set! r (+ r (/ (+ (cast i64 (get (.arities body) r)) 4) 4))))
+          (println "specialized graph: {} active nodes, {} stores" active stores)
+          (assert (= stores 0))
+          (execute body (slice (.roots (.body specialized))) 0)
+          (check-caller graph ret specialized)
+          (specialize/release! (mut specialized)))))
+    (g/release! (mut graph))
+    (println "parameter specialization native checks: passed")
+    0))

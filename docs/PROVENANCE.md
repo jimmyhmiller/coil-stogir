@@ -1359,3 +1359,12 @@ count/prefix/fill use lists and immutable verified graph preparation. The
 specialized scans and shared in-call structural validation are independent Coil
 implementations, with the same existing attribution and public validation
 requirements. They do not claim full upstream pass parity.
+
+
+### Context-bound parameter specialization
+
+parameter-specialize independently substitutes explicit numeric argument
+bindings into a private copy of the compact graph and invokes the existing
+pinned-upstream-shaped SCCP pipeline. Its context conditions are retained,
+not promoted to unconditional callee equivalence. No upstream constant, opcode
+or validation semantics are changed. See PARAMETER_SPECIALIZATION.md.
