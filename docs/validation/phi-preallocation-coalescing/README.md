@@ -27,7 +27,11 @@ Native tests use the preserved LLVM-built 88e09ce2 compiler with
 `run TEST --debug-checks --sanitize=address` on macOS/arm64.
 Passing: phi-coalesce, jit-phi, jit-loop, jit-pressure, jit-switch-pressure,
 jit-call-frame, jit-loop-vectorize-stencil, allocation.
-Further call-pressure/FP/binary/allocation integration checks are in progress.
+Also passing: jit-call-pressure, jit-floating-phi, jit-binary-matrix,
+a64-allocate. The initial blanket even-boundary policy failed six call-pressure
+cases; explicit sorted call-definition boundaries restore the call emitter's
+supported transitions. All four affected suites were rerun and passed after
+that correction. The new unit suite checks this exception as well.
 
 Compiler integration, comparative performance and full bootstrap acceptance
 remain outstanding. Nothing installed globally.
