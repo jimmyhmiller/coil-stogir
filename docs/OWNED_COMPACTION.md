@@ -35,3 +35,21 @@ is checked. Switch cases cover4-way MERGE and5-input PHI extents; native results
 match and original/compacted switch machine bytes are identical. Old and opt-in
 image APIs execute across O1/O2/O3. Invalid roots, pointer width and malformed
 original CALL geometry reject before edits. Performance remains unproven.
+
+
+Additional checks preserve empty instruction namespaces with constant roots,
+reject continuation/payload roots, exercise VAR and REG operands across a C call,
+verify idempotence, and read embedded-NUL string data after the compacted graph
+has been released by the native image API. The captured stencil adds the opt-in
+O3 mode, exercising successful vectorization before compaction and native results.
+A signed-reference bound guards construction of retained positive headers.
+
+Compiler experiment7a10f894 pins the initial1c369bd pass. Its four-sample median
+looked3.5%lower but varied widely. A12-pair alternating-order generation repeat
+after excluded warmups yields median paired candidate/baseline0.991384; before
+100.849ms versus candidate99.165ms as separate medians. All28objects have the
+same SHA256bc4c18ace8f4f32cc3d637cd8c377ed72b07a512c1b111a1b61fa7efbfa3b171.
+This establishes byte-identical output, not a useful compile-time speedup.
+No runtime improvement is attributable to compaction and no backend adoption is
+justified. The later empty-namespace/bound correction is standalone only; no
+performance number is assigned to it. The whole-bootstrap goal stays unmet.

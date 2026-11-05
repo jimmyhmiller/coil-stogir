@@ -6,6 +6,7 @@
 (import "stogir.opcode" :as op)
 (import "stogir.uses" :as uses)
 (import "stogir.calls" :as calls)
+(import "stogir.symbols" :as symbols)
 (import "stogir.options" :as options)
 (import "stogir.a64.compile" :as compile)
 (import "stogir.image" :as image)
@@ -46,7 +47,7 @@
               (match (g/operand source (cast i32 r) j)
                 (None [] (panic "source operand missing"))
                 (Some [old]
-                  (let [expected (if (and (> old 0) (uses/edge-code? (op/operand-code (cast i32 (n/opcode node)) j)))
+                  (let [expected (if (and (> old 0) (uses/edge-kind? (op/operand-kind (cast i32 (n/opcode node)) j)))
                                     (get refs (cast i64 old)) old)]
                     (match (g/operand target mapped j)
                       (None [] (panic "target operand missing"))
@@ -80,7 +81,9 @@
                     target (p/cast u64 (p/cast (ptr u8) (fnptr-of mix)))]
                 (for [count -5 101]
                   (let [sum (if (< count 0) 0 (/ (* count (- count 1)) 2))
-                        expected (^ (mix sum 1 count sum 1) 0x12345678)]
+                        index (& count 3)
+                        byte (case index 0 65 1 0 2 66 90)
+                        expected (^ (^ (^ (mix sum 1 count sum 1) 0x12345678) 0x55AA) byte)]
                     (assert (= (f count target) expected))))
                 (jit/release-image! (mut mapped)))))
           (image/release! (mut code)))))))
@@ -97,7 +100,10 @@
         slot (require (if fixed (b/frame-object! (mut graph) start extent 16)
                           (b/stack-allocate! (mut graph) start extent 16)))
         stored (require (b/emit! (mut graph) 93 0 [slot slot sentinel]))
-        entry (require (b/emit! (mut graph) 114 0 [stored]))
+        variable (require (b/variable! (mut graph) 11 start "local" 8))
+        local-value (require (b/scalar-constant! (mut graph) 11 0x55AA 8))
+        local-stored (require (b/emit! (mut graph) (if fixed 88 87) 0 [stored variable local-value]))
+        entry (require (b/emit! (mut graph) 114 0 [local-stored]))
         ignored (pad! (mut graph))
         loop (require (b/loop-begin! (mut graph) entry))
         index (require (b/loop-phi! (mut graph) loop zero))
@@ -123,8 +129,17 @@
         (let [(mut proto) owned
               call (require (calls/emit! (mut graph) proto exit target [sum one limit sum one] a))
               loaded (require (b/emit! (mut graph) 91 11 [call slot]))
-              value (require (b/emit! (mut graph) 48 11 [call loaded]))
-              ret (require (b/emit! (mut graph) 120 11 [loaded value (: 0 i32)]))
+              local-loaded (require (b/emit! (mut graph) (if fixed 86 85) 11 [loaded variable]))
+              text (require (symbols/string! (mut graph) "A\0BZ"))
+              mask (require (b/scalar-constant! (mut graph) 11 3 8))
+              offset (require (b/emit! (mut graph) 47 11 [limit mask]))
+              address (require (b/emit! (mut graph) 26 6 [text offset]))
+              byte (require (b/emit! (mut graph) 91 2 [local-loaded address]))
+              wide (require (b/emit! (mut graph) 34 11 [byte]))
+              combined (require (b/emit! (mut graph) 48 11 [call loaded]))
+              with-local (require (b/emit! (mut graph) 48 11 [combined local-loaded]))
+              value (require (b/emit! (mut graph) 48 11 [with-local wide]))
+              ret (require (b/emit! (mut graph) 120 11 [byte value (: 0 i32)]))
               (mut payload) (ArrayList::new [u8] a)]
           (unless fixed (b/patch! (mut graph) start 1 ret))
           (for [i 0 16] (push! (mut payload) (cast u8 (+ (* i 17) 3))))
@@ -132,6 +147,8 @@
                 cached (require (b/integer-binary! (mut graph) 26 11 8 limit one))
                 (mut before) (g/duplicate graph a)]
             (reject (compact/compact graph [ret 999999] 8 a))
+            (reject (compact/compact graph [ret (+ call 1)] 8 a))
+            (reject (compact/compact graph [ret (+ vector 1)] 8 a))
             (reject (compact/compact graph [ret] 3 a))
             (set! (mut (.arities graph)) (cast i64 call) 2)
             (reject (compact/compact graph [ret] 8 a))
@@ -143,6 +160,13 @@
               (Ok [owned]
                 (let [(mut out) owned refs (.references out)]
                   (mappings graph [ret kept vector] out)
+                  (match (compact/compact (.graph out) (slice (.roots out)) 8 a)
+                    (Err [e] (panic "{}" e))
+                    (Ok [owned]
+                      (let [(mut again) owned]
+                        (assert (= (.removed again) 0))
+                        (assert (= (len (.instructions (.graph again))) (len (.instructions (.graph out)))))
+                        (compact/release! (mut again)))))
                   (assert (> (.removed out) 90))
                   (assert (> (get refs (cast i64 kept)) 0))
                   (assert (= (get refs (cast i64 ignored)) 0))
@@ -212,7 +236,23 @@
     (free! (mut ends)) (free! (mut values)) (free! (mut inputs))
     (g/release! (mut graph))))
 
+(defn empty-instructions [] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        literal (require (b/scalar-constant! (mut graph) 5 1234 8))]
+    (clear! (mut (.instructions graph))) (clear! (mut (.arities graph)))
+    (match (compact/compact graph [literal] 8 a)
+      (Err [e] (panic "{}" e))
+      (Ok [owned]
+        (let [(mut out) owned]
+          (assert (= (.removed out) 0))
+          (assert (= (len (.instructions (.graph out))) 0))
+          (assert (= (len (.references out)) 0))
+          (assert (= (get (.roots out) 0) literal))
+          (compact/release! (mut out)))))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (empty-instructions)
   (switch-case)
   (for fixed [false true] (test fixed))
   (println "owned compaction mapping and native checks: passed") 0)
