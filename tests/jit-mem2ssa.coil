@@ -1093,7 +1093,79 @@
     (g/release! (mut working))
     (g/release! (mut graph))))
 
+;;; Joined full-width stores with a narrower integer view. Other modes retain
+;;; memory: partial stores, missing initialization, or unspecified byte order.
+(defn contained-join [(stored-type i32) (loaded-type i32) (mode i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        input (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        selector (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        width (types/size (cast i32 stored-type) 8)
+        small-width (types/size (cast i32 loaded-type) 8)
+        extent (require (b/scalar-constant! (mut graph) 5 8 8))
+        slot (require (b/stack-allocate! (mut graph) start extent 16))
+        value (if (= width 8)
+                  (if (= stored-type 5) input
+                      (require (b/emit! (mut graph) 36 stored-type [input])))
+                  (require (b/emit! (mut graph) 35 stored-type [input])))
+        other (require (b/scalar-constant! (mut graph) stored-type 0xA5 8))
+        branch (require (b/emit! (mut graph) 116 0 [slot selector]))
+        yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        first (require (b/emit! (mut graph) 93 0 [yes slot value]))
+        partial (if (= mode 1)
+                    (require (b/emit! (mut graph) 35 loaded-type [other])) other)
+        second (if (= mode 2) no
+                    (require (b/emit! (mut graph) 93 0 [no slot partial])))
+        end1 (require (b/emit! (mut graph) 114 0 [first]))
+        end2 (require (b/emit! (mut graph) 114 0 [second]))
+        join (require (b/emit! (mut graph) 112 0 [end2 end1]))
+        read (require (b/emit! (mut graph) 91 loaded-type [join slot]))
+        result (require (b/emit! (mut graph)
+                                 (if (types/signed? (cast i32 loaded-type)) 33 34)
+                                 5 [read]))
+        ret (require (b/emit! (mut graph) 120 5 [read result (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)]
+    (push! (mut roots) ret)
+    (require (mem/promote-ordered! (mut graph) (mut roots) (!= mode 3) a))
+    (assert (= (n/opcode (get (.instructions graph) (cast i64 slot)))
+               (if (= mode 0) (: 0 u8) (: 81 u8))))
+    (assert (= (n/opcode (get (.instructions graph) (cast i64 read)))
+               (if (= mode 0) (: 35 u8) (: 91 u8))))
+    (when (or (= mode 0) (= mode 3))
+      (for level [(: 1 i32) 2 3]
+        (match (compile/image-with-options graph start (slice roots) "_contained_join"
+                 (options/Options :level level) a)
+          (Err [e] (panic "contained join: {}" e))
+          (Ok [code]
+            (let [(mut code) code]
+              (match (jit/map-image code a)
+                (Err [e] (panic "{}" e))
+                (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        f (p/cast (fnptr (cc/C) [u64 i64] u64)
+                                  (.base (.memory loaded)))
+                        mask (- (<< (: 1 u64) (cast u64 (* 8 small-width))) 1)
+                        sign (<< (: 1 u64) (cast u64 (- (* 8 small-width) 1)))]
+                    (for x [(: 0 u64) 1 127 128 255 65535 0x80000000
+                            0x123456789ABCDEF0 0xFFFFFFFFFFFFFFFF]
+                      (for choose [(: 0 i64) 1 -1]
+                        (let [raw (& (if (= choose 0) (: 0xA5 u64) x) mask)
+                              expected (if (and (types/signed? (cast i32 loaded-type))
+                                                (!= (& raw sign) 0))
+                                           (| raw (^ mask 0xFFFFFFFFFFFFFFFF)) raw)]
+                          (assert (= (f x choose) expected)))))
+                    (jit/release-image! (mut loaded)))))
+              (image/release! (mut code)))))))
+    (free! (mut roots))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (for spec [[(: 5 i32) 2] [5 8] [5 3] [5 9] [5 4] [5 10]
+             [11 2] [11 4] [4 2] [4 9] [10 3] [3 2] [9 8]]
+    (for mode [(: 0 i32) 1 2 3]
+      (contained-join (get spec 0) (get spec 1) mode)))
   (for kind [(: 73 i32) 74 75 77] (symbolic-private-offset kind))
   (for mode [(: 0 i32) 1 2 3 4] (scoped-entry mode))
   (for kind [(: 73 i32) 74 75 77]
@@ -1184,5 +1256,5 @@
     (for loaded [(: 4 i32) 10 13] (scalar-view stored loaded)))
   (for stored [(: 5 i32) 6 11 12]
     (for loaded [(: 5 i32) 6 11 12] (scalar-view stored loaded)))
-  (println "mem2ssa: 2115 late-forward cases, observation ordering, 1254 scalar-view answers, 36 branch-forward cases and existing partition/barrier checks pass")
+  (println "mem2ssa: 52 contained-view policies / 2106 native answers, 2115 late-forward cases, observation ordering, 1254 scalar-view answers, 36 branch-forward cases and existing partition/barrier checks pass")
   0)
