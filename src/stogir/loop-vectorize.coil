@@ -9,6 +9,7 @@
 (import "stogir.pipeline" :as pipeline)
 (import "stogir.adjacency" :as adjacency)
 (import "stogir.loop-shape" :as shape)
+(import "stogir.loop-byte-copy" :as byte-copy)
 (import "stogir.loop-affine" :as affine)
 (import "stogir.loop-data" :as data)
 (import "stogir.loop-guard" :as guard)
@@ -646,7 +647,7 @@
 ;;; Visit only original headers, once each. No copy or structural preparation
 ;;; is needed when there are no candidates. Rejected candidates share facts;
 ;;; every successful edit starts a new analysis epoch.
-(defn optimize [(source g/Graph)
+(defn optimize-core [(source g/Graph)
                 (entry i32)
                 (roots (slice i32))
                 (unroll i32)
@@ -679,3 +680,22 @@
         (if (!= error "")
             (do (when owned (g/release! (mut working))) (Err error))
             (if owned (Ok (Some working)) (Ok (None)))))))
+
+;;; Normalize byte-counter copies only after scalar inlining/memory cleanup.
+;;; Each edited graph starts a fresh analysis epoch. If no guarded vectorization
+;;; succeeds, retain the original scalar graph rather than counter-only changes.
+(defn optimize [(source g/Graph) (entry i32) (roots (slice i32))
+                (unroll i32) (a (dyn Allocator))]
+  (-> (Result (Option g/Graph) (slice u8)))
+  (if (not (or (= unroll 1) (= unroll 2) (= unroll 4)))
+      (Err "vector unroll must be one, two or four")
+      (match (byte-copy/normalize source entry roots a)
+        (Err [message] (Err message))
+        (Ok [candidate]
+          (match candidate
+            (None [] (optimize-core source entry roots unroll a))
+            (Some [owned]
+              (let [(mut normalized) owned
+                    result (optimize-core normalized entry roots unroll a)]
+                (g/release! (mut normalized))
+                result)))))))

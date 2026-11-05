@@ -1,0 +1,117 @@
+;;; Normalize a checked forward byte-index copy loop for the late vectorizer.
+;;; This changes counter units only; memory order and alias semantics are intact.
+(module stogir.loop-byte-copy)
+(export normalize)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.symbols" :as symbols)
+(import "stogir.builder" :as b)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+(defstruct Plan [(phi i32) (header i32) (back-slot i32) (condition i32) (bound i32)])
+
+(defn node [(graph g/Graph) (reference i32)] (-> n/Node)
+  (match (g/lookup graph reference) (Some [value] value) (None [] (n/make 0 0 0 0 0 0))))
+
+(defn literal? [(graph g/Graph) (reference i32) (bits u64)] (-> bool)
+  (let [value (node graph reference)]
+    (and (< reference 0) (= (n/type-id value) 5)
+         (symbols/numeric? value) (= (n/constant-bits value) bits))))
+
+(defn aligned-bound? [(graph g/Graph) (reference i32)] (-> bool)
+  (let [value (node graph reference)]
+    (and (= (n/type-id value) 5)
+         (if (< reference 0)
+             (and (symbols/numeric? value) (= (& (n/constant-bits value) 7) 0))
+             (and (= (n/opcode value) 47)
+                  (or (let [mask (node graph (.op1 value))]
+                        (and (< (.op1 value) 0) (= (n/type-id mask) 5)
+                             (symbols/numeric? mask) (= (& (n/constant-bits mask) 7) 0)))
+                      (let [mask (node graph (.op2 value))]
+                        (and (< (.op2 value) 0) (= (n/type-id mask) 5)
+                             (symbols/numeric? mask) (= (& (n/constant-bits mask) 7) 0)))))))))
+
+;;; Exact guarded backedge: header -> IF_TRUE -> LOAD -> STORE -> LOOP_END.
+;;; Initial zero and an aligned unsigned bound prove byte-index addition cannot
+;;; wrap. Other users keep the old byte-valued reference after normalization.
+(defn candidate [(graph g/Graph) (reference i32)] (-> (Option Plan))
+  (let [phi (node graph reference) header (.op1 phi) region (node graph header)
+        (mut answer) (None [Plan])]
+    (when (and (> header 0) (= (n/opcode phi) 67) (= (n/type-id phi) 5)
+               (= (n/opcode region) 113)
+               (= (get (.arities graph) (cast i64 header)) 2))
+      (for slot [(: 1 i32) 2]
+        (let [back (node graph (if (= slot 1) (.op1 region) (.op2 region)))
+              stored (node graph (.op1 back)) loaded (node graph (.op1 stored))
+              projection (node graph (.op1 loaded)) branch (node graph (.op1 projection))
+              condition (node graph (.op2 branch))
+              initial (if (= slot 1) (.op3 phi) (.op2 phi))
+              next (node graph (if (= slot 1) (.op2 phi) (.op3 phi)))]
+          (when (and (= (n/opcode back) 115) (= (n/opcode stored) 93)
+                     (= (n/opcode loaded) 91) (= (n/type-id loaded) 5)
+                     (= (.op3 stored) (.op1 stored))
+                     (= (n/opcode projection) 107) (= (n/opcode branch) 116)
+                     (= (.op1 branch) header) (= (n/opcode condition) 20)
+                     (= (.op1 condition) reference)
+                     (aligned-bound? graph (.op2 condition))
+                     (literal? graph initial 0)
+                     (= (n/opcode next) 26) (= (n/type-id next) 5)
+                     (or (and (= (.op1 next) reference) (literal? graph (.op2 next) 8))
+                         (and (= (.op2 next) reference) (literal? graph (.op1 next) 8))))
+            (set! answer (Some (Plan :phi reference :header header :back-slot slot
+                                     :condition (.op2 branch) :bound (.op2 condition))))))))
+    answer))
+
+(defn capture [(value (Result i32 (slice u8))) (error (mut (slice u8)))] (-> i32)
+  (match value (Ok [x] x) (Err [message] (set! error message) 0)))
+
+;;; None does not certify validity; native/public vector preparation still checks
+;;; its input. Before any edit, run the existing checked preparation transaction.
+;;; Return an owned graph only on an actual, validated counter transformation.
+(defn normalize [(source g/Graph) (entry i32) (roots (slice i32)) (a (dyn Allocator))]
+  (-> (Result (Option g/Graph) (slice u8)))
+  (let [(mut plans) (ArrayList::new [Plan] a) (mut r) (: 1 i64)
+        (mut error) ""]
+    (when (!= (len (.instructions source)) (len (.arities source)))
+      (set! error "instruction and arity storage lengths differ"))
+    (while (and (= error "") (< r (len (.instructions source))))
+      (let [count (get (.arities source) r)]
+        (if (or (< count 0) (> count 65535))
+            (set! error "invalid node start or operand count")
+            (do
+              (when (= (n/opcode (get (.instructions source) r)) 67)
+                (match (candidate source (cast i32 r)) (None [] 0)
+                  (Some [plan] (push! (mut plans) plan))))
+              (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))))
+    (let [result
+      (if (!= error "") (Err [(Option g/Graph) (slice u8)] error)
+        (if (= (len plans) 0) (Ok [(Option g/Graph) (slice u8)] (None))
+          (match (pipeline/prepare source entry roots a)
+            (Err [message] (Err [(Option g/Graph) (slice u8)] message))
+            (Ok [owned]
+              (let [(mut prepared) owned (mut graph) (g/duplicate source a)]
+                (pipeline/release! (mut prepared))
+                (let [zero (capture (b/scalar-constant! (mut graph) 5 0 8) (mut error))
+                      one (capture (b/scalar-constant! (mut graph) 5 1 8) (mut error))
+                      three (capture (b/scalar-constant! (mut graph) 5 3 8) (mut error))
+                      eight (capture (b/scalar-constant! (mut graph) 5 8 8) (mut error))]
+                  (for plan plans
+                    (when (= error "")
+                      (let [phi (capture (b/emit! (mut graph) 67 5 [(.header plan) zero zero]) (mut error))
+                            next (capture (b/integer-binary! (mut graph) 26 5 8 phi one) (mut error))
+                            bound (capture (b/integer-binary! (mut graph) 50 5 8 (.bound plan) three) (mut error))]
+                        (when (= error "")
+                          (capture (b/patch! (mut graph) phi (+ (.back-slot plan) 1) next) (mut error))
+                          (unless (and (g/rewrite-inputs! (mut graph) (.phi plan) 28 5 [phi eight])
+                                       (g/rewrite-inputs! (mut graph) (.condition plan) 20 1 [phi bound]))
+                            (set! error "byte-copy counter rewrite failed")))))))
+                (when (= error "")
+                  (match (rewrite/validate graph 8 a) (Err [message] (set! error message)) (Ok [_] 0)))
+                (if (= error "") (Ok [(Option g/Graph) (slice u8)] (Some graph))
+                    (do (g/release! (mut graph)) (Err [(Option g/Graph) (slice u8)] error))))))))]
+      (free! (mut plans))
+      result)))

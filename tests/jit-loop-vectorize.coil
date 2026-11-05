@@ -4,6 +4,7 @@
 (import "stogir.node" :as n)
 (import "stogir.types" :as types)
 (import "stogir.loop-vectorize" :as vectorize)
+(import "stogir.loop-byte-copy" :as byte-copy)
 (import "stogir.a64.compile" :as compile)
 (import "stogir.aot.macho" :as macho)
 (import "stogir.image" :as image)
@@ -309,7 +310,111 @@
     (g/release! (mut graph))
     failures))
 
+;;; Ordinary forward word-copy semantics include hazardous overlapping ranges.
+;;; A reference snapshots each8-byte read before its write, so an incorrectly
+;;; widened unguarded loop disagrees for small positive destination distances.
+(defn execute-byte-copy [(code image/Image)] (-> void)
+  (let [a (malloc-allocator) (mut actual) (ArrayList::new [u8] a)
+        (mut expected) (ArrayList::new [u8] a) (mut temporary) (ArrayList::new [u8] a)]
+    (for [i 0 2048] (push! (mut actual) 0) (push! (mut expected) 0))
+    (for [i 0 8] (push! (mut temporary) 0))
+    (match (jit/map-image code a)
+      (Err [message] (panic "byte-copy map: {}" message))
+      (Ok [owned]
+        (let [(mut loaded) owned
+              f (p/cast (fnptr (cc/C) [(ptr u8) (ptr u8) u64] u64) (.base (.memory loaded)))]
+          (assert (= (f (p/cast (ptr u8) 0) (p/cast (ptr u8) 0) 0) 0))
+          (assert (= (f (p/cast (ptr u8) 0) (p/cast (ptr u8) 0) 7) 0))
+          (for count [(: 0 i64) 1 7 8 15 16 24 31 32 33 127 128 129 255 256 257 415 416 417]
+            (for delta [(: -31 i64) -17 -16 -8 -7 -1 0 1 7 8 15 16 17 31 600]
+              (for alignment [(: 0 i64) 1 7 15]
+                (let [source (+ 64 alignment) destination (+ source delta)
+                      bound (& count -8)]
+                  (for [i 0 2048]
+                    (let [byte (cast u8 (% (+ (* i 37) 19) 251))]
+                      (set! (mut actual) i byte) (set! (mut expected) i byte)))
+                  (let [(mut offset) 0]
+                    (while (< offset bound)
+                      (for [i 0 8] (set! (mut temporary) i (get expected (+ source offset i))))
+                      (for [i 0 8] (set! (mut expected) (+ destination offset i) (get temporary i)))
+                      (set! offset (+ offset 8))))
+                  (assert (= (f (p/index (.data actual) destination)
+                                (p/index (.data actual) source) (cast u64 count)) (cast u64 bound)))
+                  (for [i 0 2048] (assert (= (get actual i) (get expected i))))))))
+          (jit/release-image! (mut loaded)))))
+    (free! (mut actual)) (free! (mut expected)) (free! (mut temporary))))
+
+(defn byte-copy-case [(mode i32) (observed bool)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        dst (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        src (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        count (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        eight (require (b/scalar-constant! (mut graph) 5 (if (= mode 2) 16 8) 8))
+        mask (require (b/scalar-constant! (mut graph) 5 0xFFFFFFFFFFFFFFF8 8))
+        bound (if (= mode 1) count (require (b/emit! (mut graph) 47 5 [count mask])))
+        entry (require (b/emit! (mut graph) 114 0 [start]))
+        header (require (b/loop-begin! (mut graph) entry))
+        iv (require (b/loop-phi! (mut graph) header (if (= mode 6) eight zero)))
+        condition (require (b/emit! (mut graph) 20 1 [iv bound]))
+        split (require (b/emit! (mut graph) 116 0 [header condition]))
+        body (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        exit (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        source (require (b/emit! (mut graph) 26 6 [src iv]))
+        destination (require (b/emit! (mut graph) 26 6 [dst iv]))
+        loaded (require (b/emit! (mut graph) (if (= mode 4) 92 91) 5 [body source]))
+        value (if (= mode 5) (require (b/emit! (mut graph) 26 5 [loaded eight])) loaded)
+        stored (require (b/emit! (mut graph) 93 0 [loaded destination value]))
+        next (require (b/emit! (mut graph) (if (= mode 3) 27 26) 5 [iv eight]))
+        back (require (b/emit! (mut graph) 115 0 [stored]))
+        returned (require (b/emit! (mut graph) 120 5 [exit (if observed iv bound) (: 0 i32)]))]
+    (require (b/patch! (mut graph) header 2 back))
+    (require (b/patch! (mut graph) iv 3 next))
+    (when (= mode 7)
+      (unless (g/rewrite-inputs! (mut graph) header 113 0 [back entry]) (panic "reverse byte header"))
+      (require (b/patch! (mut graph) iv 2 next))
+      (require (b/patch! (mut graph) iv 3 zero)))
+    (match (byte-copy/normalize graph start [returned] a)
+      (Err [message] (panic "byte-copy normalize: {}" message))
+      (Ok [candidate]
+        (match candidate
+          (None [] (assert (not (or (= mode 0) (= mode 7)))))
+          (Some [owned]
+            (let [(mut normalized) owned]
+              (assert (or (= mode 0) (= mode 7)))
+              (assert (= (n/opcode (get (.instructions normalized) (cast i64 iv))) 28))
+              (for changed [false true]
+                (let [(mut code) (image! (compile/image (if changed normalized graph) start [returned] "_byte_copy" a))]
+                  (execute-byte-copy code) (image/release! (mut code))))
+              (g/release! (mut normalized)))))))
+    (when (or (= mode 0) (= mode 7))
+      (match (vectorize/optimize graph start [returned] 2 a)
+        (Err [message] (panic "byte-copy vectorize: {}" message))
+        (Ok [candidate]
+          (match candidate
+            (None [] (assert observed))
+            (Some [owned]
+              (let [(mut working) owned (mut vectors) 0]
+                (assert (not observed))
+                (for [i 1 (len (.instructions working))]
+                  (when (and (>= (get (.arities working) i) 0)
+                             (= (n/opcode (get (.instructions working) i)) 91)
+                             (types/vector? (cast i32 (n/type-id (get (.instructions working) i)))))
+                    (set! vectors (+ vectors 1))))
+                (assert (> vectors 0))
+                (let [(mut code) (image! (compile/image working start [returned] "_late_byte_copy" a))]
+                  (execute-byte-copy code) (image/release! (mut code)))
+                (g/release! (mut working))))))))
+    (assert (= (n/opcode (get (.instructions graph) (cast i64 iv))) 67))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (byte-copy-case 0 false)
+  (byte-copy-case 0 true)
+  (byte-copy-case 7 false)
+  (byte-copy-case 7 true)
+  (for mode [(: 1 i32) 2 3 4 5 6] (byte-copy-case mode false))
   (let [(mut failures) 0]
     (for bytes [(: 1 i32) 2 4 8]
       (for unroll [(: 1 i32) 2 4]
