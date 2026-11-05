@@ -1,0 +1,97 @@
+;;; Equivalent arithmetic with explicit word containers versus native i32 SSA.
+(module gaps.word-width)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [value] value) (Err [message] (panic "{}" message))))
+
+(defn operation [(step i64)] (-> i32)
+  (case (% step 3) 0 26 1 28 48))
+
+;;; Unsigned 64-bit products of32-bit operands fit; mask after every step.
+(defn expected [(left i64) (right i64)] (-> i64)
+  (let [(mut value) (cast u64 (cast u32 left))
+        other (cast u64 (cast u32 right))]
+    (for [step 0 18]
+      (set! value
+            (& (case (% step 3)
+                 0 (+ value other)
+                 1 (* value other)
+                 (^ value other))
+               (: 0xFFFFFFFF u64))))
+    (cast i64 (cast i32 value))))
+
+(defn exercise [(narrow? bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        left (require (b/emit! (mut graph) 71 10 [start (: 0 i32) 0]))
+        right (require (b/emit! (mut graph) 71 10 [start (: 0 i32) 1]))
+        other (if narrow? right (require (b/emit! (mut graph) 33 11 [right])))
+        (mut value)
+          (if narrow? left (require (b/emit! (mut graph) 33 11 [left])))
+        (mut failures) 0]
+    (for [step 0 18]
+      (set! value
+            (require (b/emit! (mut graph)
+                              (operation step)
+                              (if narrow? 10 11)
+                              [value other])))
+      (unless narrow?
+        (set! value (require (b/emit! (mut graph) 35 10 [value])))
+        (set! value (require (b/emit! (mut graph) 33 11 [value])))))
+    (when narrow? (set! value (require (b/emit! (mut graph) 33 11 [value]))))
+    (let [ret (require (b/emit! (mut graph) 120 11 [start value (: 0 i32)]))]
+      (match (calls/create 9 11 [(: 10 u8) 10] a)
+        (Err [message] (panic "{}" message))
+        (Ok [owned]
+            (let [(mut prototype) owned]
+              (require (calls/function! (mut graph) prototype a))
+              (calls/release! (mut prototype)))))
+      (match (compile/image-with-options graph
+                                         start
+                                         [ret]
+                                         "_gap_word_width"
+                                         (options/Options :level 3)
+                                         a)
+        (Err [message] (panic "{}" message))
+        (Ok [owned]
+            (let [(mut code) owned]
+              ; These pure arithmetic functions have no external image references.
+              (match (jit/map-text (slice (.text code)))
+                (Err [message] (panic "{}" message))
+                (Ok [mapped]
+                    (let [(mut executable) mapped
+                          f
+                            (p/cast (fnptr (cc/C) [i64 i64] i64)
+                                    (.base executable))]
+                      ; Deliberately dirty high X bits exercise the32-bit ABI view.
+                      (for x [-9223372036854775808 -2147483649 -2147483648 -1 0
+                              1 2 2147483647 2147483648 4294967295 4294967296
+                              9223372036854775807]
+                        (for y [-2147483649 -2147483648 -1 0 1 2 3 2147483647
+                                2147483648 4294967295]
+                          (unless (= (call-ptr f x y) (expected x y))
+                            (set! failures (+ failures 1)))))
+                      (jit/release! (mut executable)))))
+              (println "word-width narrow={}: {} bytes,120 checked inputs,{} failures"
+                       narrow?
+                       (len (.text code))
+                       failures)
+              (image/release! (mut code))))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures (+ (exercise false) (exercise true))]
+    (if (= failures 0) 0 1)))
