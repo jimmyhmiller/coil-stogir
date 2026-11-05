@@ -62,3 +62,22 @@ This improves the scalar case but remains outside the10% runtime target even
 on this kernel. Assembly exposes substantial unfurled guard arithmetic after
 late vectorization. Evidence is in validation/late-bulk-vectorization. No
 compiler bootstrap adoption or goal achievement is claimed.
+
+
+## Checked folding of generated guards
+
+Guard binary construction now uses the existing checked integer binary/compare
+builders instead of raw pure emits. This folds constant predicates and address
+arithmetic without deleting any address-range or alias precondition. It does
+not add another whole-graph optimization transaction. Dynamic inputs retain the
+same predicates. The independent i128 interval oracle, vector prefix suite,
+captured stencil suite, O3 bulk memory suite and linked AOT guard suite all pass
+with debug checks and ASAN.
+
+A fresh eight-sample run measured aligned scalar17.5765ms, late7.7345ms and
+LLVM5.6300ms. At alignments1/7/15: scalar17.6355/17.4915/17.4005ms;
+late7.8515/7.8850/7.9130ms; LLVM6.0055/5.9435/5.9075ms. Compare backends within
+this run; system conditions differ from prior runs. The late object assembly
+listing shrinks from133 to103 lines. Raw results include all library source
+hashes. This is still outside the10% kernel runtime target and supplies no
+whole-bootstrap performance evidence. Compiler integration remains pending.
