@@ -42,3 +42,18 @@ no compile-time or bootstrap runtime improvement is claimed. Integration still
 needs a bounded cache tied to immutable callee identity and exact binding
 conditions, preserving original validation and one nonreplenishing clone ledger.
 Avoid one whole-callee optimization per call site; measure preparation overhead.
+
+
+## Verified actual budget pressure
+
+Diagnostic compilereda0391c adds reserved/remaining cells to existing verbose
+inline tracing, without changing inline policy. Its actual verifier expansion
+reserves509 of512cells over15 of23sites, leaving3cells. The string-equality
+callee has32 base clone cells. The verifier object is byte-identical to the
+88e09ce2 baseline. This verifies budget pressure rather than merely inferring
+it from surviving calls; it does not show specialization's eventual runtime
+or preparation cost. Trace and hash receipt are retained with validation.
+
+The native budget reduction also passes with extra branch/control observations
+retained alongside RETURN, as compiler templates do. Ordinary inliner identity,
+closed-control and exact-budget checks still pass, with minimum17→8cells.
