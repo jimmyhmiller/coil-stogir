@@ -35,3 +35,10 @@ not measure its code-quality effect on that verifier. Its integrated benefit
 requires rebuilding the Coil backend. No bootstrap improvement or target
 acceptance is claimed. The full goal remains5x IR generation advantage and
 generated bootstrap compiler runtime within10% of LLVM O3.
+
+The subsequent word-TRUNC correction follows pinned `ir_emit_trunc` as well:
+TRUNC-to32 is a register view, elided when source and destination registers match.
+Such a view is no longer classified as already zero-extended for a later ZEXT;
+actual extensions keep their required normalization. The165-variant raw-register
+matrix passes with24direct BITCAST/TRUNC same/different-register encoding cases.
+Broader ABI/arithmetic/pressure validation and integrated measurements are pending.
