@@ -1,0 +1,61 @@
+(module stogir.tests.jit-phi-call-redefinition)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn transform :cc (cc/C) [(x i64)] (-> i64) (+ (* x 3) 7))
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+;;; Third ABI argument enters x2; a one-argument call consumes x0 and returns
+;;; x0. The call result and original input join the same Phi on different paths.
+;;; Their adjacent lifetimes must not invent a pre-call preservation copy.
+(defn main [] (-> i64)
+  (let [a (malloc-allocator) (mut failures) 0
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        selector (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        input (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        cmp (require (b/emit! (mut graph) 16 1 [selector zero]))
+        branch (require (b/emit! (mut graph) 116 0 [start cmp]))
+        yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))]
+    (match (calls/create 0 11 [(: 11 u8)] a)
+      (Err [message] (panic "{}" message))
+      (Ok [spec]
+        (let [(mut prototype) spec
+              call (require (calls/emit! (mut graph) prototype yes target [input] a))
+              left (require (b/emit! (mut graph) 114 0 [call]))
+              right (require (b/emit! (mut graph) 114 0 [no]))
+              merge (require (b/emit! (mut graph) 112 0 [left right]))
+              phi (require (b/emit! (mut graph) 67 11 [merge call input]))
+              ret (require (b/emit! (mut graph) 120 11 [merge phi (: 0 i32)]))]
+          (calls/release! (mut prototype))
+          (match (compile/text graph start [ret] a)
+            (Err [message] (println "{}" message) (set! failures 1))
+            (Ok [text]
+              (let [(mut bytes) text]
+                (match (jit/map-text (slice bytes))
+                  (Err [message] (println "{}" message) (set! failures 1))
+                  (Ok [mapped]
+                    (let [(mut image) mapped
+                          f (p/cast (fnptr (cc/C) [u64 i64 i64] i64) (.base image))
+                          address (p/cast u64 (p/cast (ptr u8) (fnptr-of transform)))]
+                      (for [selector -2 3]
+                        (for [input -100 101]
+                          (let [expected (if (< selector 0) (transform input) input)]
+                            (when (!= (call-ptr f address selector input) expected)
+                              (set! failures (+ failures 1))))))
+                      (jit/release! (mut image)))))
+                (free! (mut bytes))))))))
+    (g/release! (mut graph))
+    (println "Phi call redefinition: {} failures" failures)
+    (if (= failures 0) 0 1)))
