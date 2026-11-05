@@ -1359,3 +1359,12 @@ count/prefix/fill use lists and immutable verified graph preparation. The
 specialized scans and shared in-call structural validation are independent Coil
 implementations, with the same existing attribution and public validation
 requirements. They do not claim full upstream pass parity.
+
+
+### Symbolic materialization placement experiment
+
+The latest-legal-block preference for BITCASTs of named constants is an
+independent GCM cost policy. Existing earliest/latest dominance and Phi-use
+placement follows the pinned pipeline; this preference is not claimed as an
+upstream rule. References and relocation semantics stay unchanged. See
+SYMBOL_CAST_PLACEMENT.md for the proof, limits and controlled experiment.

@@ -2,6 +2,7 @@
 (module stogir.placement)
 (import "stogir.graph" :as g)
 (import "stogir.node" :as n)
+(import "stogir.symbols" :as symbols)
 (import "stogir.opcode" :as op)
 (import "stogir.cfg" :as cfg)
 (import "stogir.dominators" :as dom)
@@ -213,6 +214,16 @@
             (set! best current)))
         (Ok best))))
 
+;;; A reinterpretation of a named constant materializes a relocatable address,
+;;; not a memory read. Prefer its latest legal common-use block to loop hoisting:
+;;; keeping cold symbol addresses live across a hot loop consumes registers.
+;;; The signed reference and relocation remain unchanged; no value is cloned.
+(defn symbol-cast? [(graph g/Graph) (reference i32)] (-> bool)
+  (let [node (get (.instructions graph) (cast i64 reference))]
+    (and (= (n/opcode node) 36) (< (.op1 node) 0)
+         (match (g/lookup graph (.op1 node))
+           (None [] false) (Some [source] (symbols/named? (n/opcode source)))))))
+
 ;;; Finalize live floating nodes after their users. Pinned users are already final.
 (defn late! [(graph g/Graph)
              (mapping (mut (ArrayList i32)))
@@ -288,7 +299,9 @@
                                  (get mapping (cast i64 value))
                                  bound)
               (Err [msg] (set! error msg))
-              (Ok [block] (set! (mut mapping) (cast i64 value) block))))
+              (Ok [block]
+                  (set! (mut mapping) (cast i64 value)
+                        (if (symbol-cast? graph value) bound block)))))
           (when (= error "")
             (set! unresolved (- unresolved 1))
             (let [node (get (.instructions graph) (cast i64 value))
