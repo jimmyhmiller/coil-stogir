@@ -2059,3 +2059,12 @@ The frozen pairwise oracle agrees on 1,200 scenarios; pressure/call/FP/switch
 integration and ASAN pass. See ALLOCATION_VERIFICATION.md and its raw scaling
 data. Full compiler measurements and installed delivery are separate gates;
 small-case wins do not establish the full compiler performance target.
+
+## Verifier dispatch and pinned word-view emission
+
+Source2c2323a/d6d0b0b replaces repeated verifier family classification with a
+checked mask table while preserving validator order. Same-register32-bit integer
+BITCAST emission now follows pinned AArch64 ir_emit_bitcast. Thirteen interacting
+debug/ASAN programs pass; the actual-verifier dispatch sample improves locally,
+but an integrated emitter measurement and whole-bootstrap evidence are pending.
+See VALIDATOR_DISPATCH.md and validation/validator-dispatch/. No goal acceptance.
