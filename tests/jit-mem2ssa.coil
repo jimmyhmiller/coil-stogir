@@ -10,6 +10,7 @@
 (import "stogir.mem2ssa" :as mem)
 (import "stogir.liveness" :as live)
 (import "stogir.load-forward" :as forward)
+(import "stogir.address-alias" :as alias)
 (import "stogir.node" :as n)
 (import "stogir.symbols" :as symbols)
 (import "stogir.strings" :as strings)
@@ -1287,7 +1288,260 @@
     (assert (= (forward/nonwriting-verified-body? graph) (not (or write volatile))))
     (g/release! (mut graph))))
 
+;;; Check signed footprint arithmetic independently of the implementation's
+;;; modular-distance overlap test, and require UNKNOWN for distinct indices.
+(defn alias-footprints [] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        pointer (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        other (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        index (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        index2 (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 3]))
+        size (require (b/scalar-constant! (mut graph) 5 32 8))
+        first (require (b/frame-object! (mut graph) start size 16))
+        second (require (b/frame-object! (mut graph) first size 16))
+        raw (require (b/stack-allocate! (mut graph) second size 16))
+        var (require (b/variable! (mut graph) 5 start "alias-var" 8))
+        vaddr (require (b/emit! (mut graph) 65 6 [var]))
+        vaddr2 (require (b/emit! (mut graph) 65 6 [var]))
+        sym1 (require (symbols/symbol! (mut graph) "alias_one"))
+        sym2 (require (symbols/symbol! (mut graph) "alias_two"))
+        zero (alias/Address :base first :index 0 :offset 0)]
+    (for [left -16 17]
+      (for [right -16 17]
+        (for width [(: 1 i64) 2 4 8 16]
+          (for width2 [(: 1 i64) 2 4 8 16]
+            (let [l (alias/Address :base pointer :index index :offset left)
+                  r (alias/Address :base pointer :index index :offset right)
+                  expected (or (<= (+ left width) right) (<= (+ right width2) left))]
+              (assert (= (alias/disjoint? graph l r width width2 8) expected))
+              (assert (= (alias/disjoint? graph r l width2 width 8) expected)))))))
+    (for right [pointer other sym1 sym2 second]
+      (let [value (alias/decompose graph right 8)]
+        (assert (alias/disjoint? graph zero value 8 8 8))
+        (assert (alias/disjoint? graph value zero 8 8 8))))
+    (for reference [raw pointer sym1]
+      (assert (not (alias/disjoint? graph (alias/decompose graph raw 8)
+                                     (alias/decompose graph reference 8) 8 8 8))))
+    (assert (not (alias/disjoint? graph (alias/decompose graph sym1 8)
+                                   (alias/decompose graph sym2 8) 8 8 8)))
+    (assert (not (alias/disjoint? graph (alias/decompose graph pointer 8)
+                                   (alias/decompose graph other 8) 8 8 8)))
+    (assert (alias/same-origin? (alias/decompose graph vaddr 8)
+                                (alias/decompose graph vaddr2 8)))
+    (assert (alias/disjoint? graph zero (alias/decompose graph vaddr 8) 8 8 8))
+    (for displacement [(: -8 i64) 25 32 0x7FFFFFFFFFFFFFFF]
+      (assert (not (alias/disjoint? graph
+                      (alias/Address :base first :index 0 :offset displacement)
+                      (alias/decompose graph pointer 8) 8 8 8))))
+    (assert (not (alias/disjoint? graph zero
+                    (alias/Address :base first :index index2 :offset 16) 8 8 8)))
+    (assert (not (alias/disjoint? graph
+                    (alias/Address :base first :index index :offset 0)
+                    (alias/decompose graph pointer 8) 8 8 8)))
+    ; Normalize commuted address/index ADD and nested signed SUB displacements.
+    (let [eight (require (b/scalar-constant! (mut graph) 5 8 8))
+          plus (require (b/emit! (mut graph) 26 5 [index eight]))
+          minus (require (b/emit! (mut graph) 27 5 [index eight]))
+          l (require (b/emit! (mut graph) 26 6 [pointer plus]))
+          r (require (b/emit! (mut graph) 26 6 [pointer plus]))
+          below (require (b/emit! (mut graph) 26 6 [pointer minus]))
+          ld (alias/decompose graph l 8) rd (alias/decompose graph r 8)
+          bd (alias/decompose graph below 8)]
+      (assert (= (.base ld) pointer)) (assert (= (.index ld) index))
+      (assert (= (.offset ld) 8))
+      (assert (alias/same-origin? ld rd)) (assert (= (.offset rd) 8))
+      (assert (alias/same-origin? ld bd)) (assert (= (.offset bd) -8))
+      (assert (alias/disjoint? graph ld bd 8 8 8)))
+    ; Independent byte-set oracle also checks32/64-bit modular address wrap.
+    (for pointer-bytes [(: 4 i32) 8]
+      (for left [(: -9223372036854775808 i64) -9223372036854775807 -17 -1 0 1 17
+                 4294967295 4294967296 9223372036854775806 9223372036854775807]
+        (for right [(: -9223372036854775808 i64) -9223372036854775807 -17 -1 0 1 17
+                    4294967295 4294967296 9223372036854775806 9223372036854775807]
+          (for width [(: 1 i64) 2 4 8 16]
+            (for width2 [(: 1 i64) 2 4 8 16]
+              (let [(mut overlap) false
+                    mask (if (= pointer-bytes 4) (: 0xFFFFFFFF u64) (: 0xFFFFFFFFFFFFFFFF u64))]
+                (for [i 0 width]
+                  (for [j 0 width2]
+                    (when (= (& (+ (cast u64 left) (cast u64 i)) mask)
+                             (& (+ (cast u64 right) (cast u64 j)) mask))
+                      (set! overlap true))))
+                (assert (= (alias/disjoint? graph
+                              (alias/Address :base pointer :index 0 :offset left)
+                              (alias/Address :base pointer :index 0 :offset right)
+                              width width2 pointer-bytes)
+                           (not overlap)))))))))
+    (let [eight (require (b/scalar-constant! (mut graph) 6 8 8))
+          left (require (b/emit! (mut graph) 26 6 [pointer eight]))
+          right (require (b/emit! (mut graph) 26 6 [eight pointer]))
+          l (alias/decompose graph left 8) r (alias/decompose graph right 8)]
+      (assert (alias/same-origin? l r)) (assert (= (.offset l) (.offset r))))
+    (require (rewrite/validate graph 8 a))
+    (g/release! (mut graph))))
+
+;;; A local store may not overwrite an incoming allocation. Conversely, two
+;;; caller pointers and distinct symbolic indices may alias at runtime.
+(defn area-forward [(mode i32)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        pointer (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        other (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        value (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        size (require (b/scalar-constant! (mut graph) 5 32 8))
+        first (require (b/frame-object! (mut graph) start size 16))
+        second (require (b/frame-object! (mut graph) first size 16))
+        local (require (b/variable! (mut graph) 5 start "area-local" 8))
+        local-address (require (b/emit! (mut graph) 65 6 [local]))
+        (mut control) second
+        target (if (= mode 1) first pointer)
+        destination (case mode 0 first 1 second 2 other 3 local-address pointer)
+        init (require (b/emit! (mut graph) 93 0 [control target value]))
+        load (require (b/emit! (mut graph) 91 5 [init target]))
+        changed (require (b/scalar-constant! (mut graph) 5 0x123456789ABCDEF0 8))
+        store (require (b/emit! (mut graph) 93 0 [load destination changed]))
+        read (require (b/emit! (mut graph) 91 5 [store target]))
+        result (require (b/emit! (mut graph) 48 5 [load read]))
+        ret (require (b/emit! (mut graph) 120 5 [read result (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)
+        (mut working) (g/duplicate graph a)]
+    (push! (mut roots) ret)
+    (let [found (forward/find graph read 8)]
+      (assert (= (.value found) (if (= mode 2) 0
+                                (if (or (= mode 0) (= mode 1) (= mode 3)) load changed)))))
+    ; For different caller parameters the latest STORE is a MAY_ALIAS barrier.
+    (when (= mode 2) (assert (= (.value (forward/find graph read 8)) 0)))
+    (require (forward/run! (mut working) (mut roots) 8 true a))
+    (require (rewrite/validate working 8 a))
+    (for variant [(: 0 i32) 1 2]
+      (match (if (= variant 2)
+                 (compile/image-with-options graph start [ret] "_area_alias"
+                                               (options/Options :level 3) a)
+                 (compile/image (if (= variant 0) graph working) start
+                                  (if (= variant 0) [ret] (slice roots)) "_area_alias" a))
+        (Err [e] (panic "{}" e))
+        (Ok [owned]
+            (let [(mut code) owned]
+              (when (and (< variant 2) (or (= mode 0) (= mode 2)))
+                (match (macho/image-object code a)
+                  (Err [e] (panic "{}" e))
+                  (Ok [owned]
+                      (let [(mut object) owned
+                            path (if (= mode 0)
+                                     (if (= variant 0) "/tmp/coil-alias-private-before.o" "/tmp/coil-alias-private-after.o")
+                                     (if (= variant 0) "/tmp/coil-alias-parameter-before.o" "/tmp/coil-alias-parameter-after.o"))]
+                        (match (fs/write-file a path (slice object))
+                          (Err [_] (panic "alias object write failed")) (Ok [_] 0))
+                        (free! (mut object))))))
+              (match (jit/map-image code a)
+                (Err [e] (panic "{}" e))
+                (Ok [owned]
+                    (let [(mut mapped) owned
+                          f (p/cast (fnptr (cc/C) [(ptr u64) (ptr u64) u64] u64)
+                                     (.base (.memory mapped)))
+                          (mut words) (ArrayList::new [u64] a)]
+                      (for [i 0 4] (push! (mut words) 0))
+                      (for x [(: 0 u64) 1 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
+                        (for shared [false true]
+                          (set! (mut words) 0 0xAABBCCDDEEFF0011)
+                          (set! (mut words) 3 0xAABBCCDDEEFF0011)
+                          (set! (mut words) 1 0) (set! (mut words) 2 0)
+                          (let [p1 (p/index (.data words) 1)
+                                p2 (p/index (.data words) (if shared 1 2))
+                                expected (if (or (= mode 4) (and (= mode 2) shared))
+                                             (^ x 0x123456789ABCDEF0) (: 0 u64))]
+                            (assert (= (f p1 p2 x) expected))
+                            (assert (= (get words 0) 0xAABBCCDDEEFF0011))
+                            (assert (= (get words 3) 0xAABBCCDDEEFF0011))
+                            (assert (= (get words 1)
+                                       (if (= mode 1) (: 0 u64)
+                                           (if (or (= mode 4) (and (= mode 2) shared))
+                                               0x123456789ABCDEF0 x))))
+                            (unless shared
+                              (assert (= (get words 2) (if (= mode 2) 0x123456789ABCDEF0 0)))))))
+                      (free! (mut words))
+                      (jit/release-image! (mut mapped)))))
+              (image/release! (mut code))))))
+    (g/release! (mut working)) (free! (mut roots)) (g/release! (mut graph))))
+
+(defn indexed-area-forward [(mode i32)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        pointer (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        i (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        j (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 3]))
+        eight (require (b/scalar-constant! (mut graph) 5 (if (= mode 3) 4 8) 8))
+        target (require (b/emit! (mut graph) 26 6 [pointer i]))
+        next-index (require (b/emit! (mut graph) (if (= mode 2) 27 26) 5 [i eight]))
+        destination (require (b/emit! (mut graph) 26 6 [pointer (if (= mode 1) j next-index)]))
+        changed (require (b/scalar-constant! (mut graph) (if (= mode 3) 4 5)
+                                             (if (= mode 3) 0x9ABCDEF0 0x123456789ABCDEF0) 8))
+        init (require (b/emit! (mut graph) 93 0 [start target x]))
+        before (require (b/emit! (mut graph) 91 5 [init target]))
+        store (require (b/emit! (mut graph) 93 0 [before destination changed]))
+        after (require (b/emit! (mut graph) 91 5 [store target]))
+        sum (require (b/emit! (mut graph) 48 5 [before after]))
+        ret (require (b/emit! (mut graph) 120 5 [after sum (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)
+        (mut working) (g/duplicate graph a)]
+    (assert (= (.value (forward/find graph after 8)) (if (or (= mode 1) (= mode 3)) 0 before)))
+    (push! (mut roots) ret)
+    (require (forward/run! (mut working) (mut roots) 8 true a))
+    (require (rewrite/validate working 8 a))
+    (for variant [(: 0 i32) 1 2]
+      (match (if (= variant 2)
+                 (compile/image-with-options graph start [ret] "_indexed_alias"
+                                               (options/Options :level 3) a)
+                 (compile/image (if (= variant 0) graph working) start
+                                  (if (= variant 0) [ret] (slice roots)) "_indexed_alias" a))
+        (Err [e] (panic "{}" e))
+        (Ok [owned]
+            (let [(mut code) owned]
+              (when (and (< variant 2) (!= mode 2))
+                (match (macho/image-object code a)
+                  (Err [e] (panic "{}" e))
+                  (Ok [owned]
+                      (let [(mut object) owned
+                            path (case mode
+                                   0 (if (= variant 0) "/tmp/coil-alias-index-before.o" "/tmp/coil-alias-index-after.o")
+                                   1 (if (= variant 0) "/tmp/coil-alias-unknown-before.o" "/tmp/coil-alias-unknown-after.o")
+                                   (if (= variant 0) "/tmp/coil-alias-partial-before.o" "/tmp/coil-alias-partial-after.o"))]
+                        (match (fs/write-file a path (slice object))
+                          (Err [_] (panic "alias object write failed")) (Ok [_] 0))
+                        (free! (mut object))))))
+              (match (jit/map-image code a)
+                (Err [e] (panic "{}" e))
+                (Ok [owned]
+                    (let [(mut mapped) owned
+                          f (p/cast (fnptr (cc/C) [(ptr u64) u64 u64 u64] u64)
+                                     (.base (.memory mapped)))
+                          (mut words) (ArrayList::new [u64] a)]
+                      (for [k 0 8] (push! (mut words) 0))
+                      (for x [(: 0 u64) 1 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
+                        (for i [(: 8 u64) 16]
+                          (for j [(: 8 u64) 16]
+                            (for [k 0 8] (set! (mut words) k 0))
+                            (set! (mut words) 0 0xAABBCCDDEEFF0011)
+                            (set! (mut words) 7 0xAABBCCDDEEFF0011)
+                            (let [updated (if (= mode 3)
+                                              (| (& x 0xFFFFFFFF) 0x9ABCDEF000000000)
+                                              (if (and (= mode 1) (= i j))
+                                                  0x123456789ABCDEF0 x))]
+                              (assert (= (f (p/index (.data words) 1) i j x) (^ x updated)))
+                              (assert (= (get words (+ 1 (cast i64 (/ i 8)))) updated))
+                              (assert (= (get words 0) 0xAABBCCDDEEFF0011))
+                              (assert (= (get words 7) 0xAABBCCDDEEFF0011))))))
+                      (free! (mut words))
+                      (jit/release-image! (mut mapped)))))
+              (image/release! (mut code))))))
+    (g/release! (mut working)) (free! (mut roots)) (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (alias-footprints)
+  (for [mode 0 4] (indexed-area-forward (cast i32 mode)))
+  (for [mode 0 5] (area-forward (cast i32 mode)))
   (for write [false true]
     (for volatile [false true] (body-effect-case write volatile)))
   (for [kind 0 7] (unqualified-effect-call (cast i32 kind)))
@@ -1390,6 +1644,7 @@
     (for loaded [(: 4 i32) 10 13] (scalar-view stored loaded)))
   (for stored [(: 5 i32) 6 11 12]
     (for loaded [(: 5 i32) 6 11 12] (scalar-view stored loaded)))
+  (println "memory-area aliasing: footprint/decomposition oracles, 120 private/caller and 192 indexed native answers passed (original/forwarded/O3)")
   (println "pure-call forwarding: 28 direct/indirect/observed native cases (280 answers), 6 aggregate-result and 7 unqualified/malformed barriers pass")
   (println "mem2ssa: 52 contained-view policies / 2106 native answers, 2115 late-forward cases, observation ordering, 1254 scalar-view answers, 36 branch-forward cases and existing partition/barrier checks pass")
   0)
