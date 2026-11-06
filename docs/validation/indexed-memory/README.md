@@ -32,3 +32,20 @@ base/index/value spill scratch conflicts; differential native tests for both
 loads and stores, volatile accesses, SIMD, aliases and high pressure. Only then
 measure representative emitter and compiler paths. Full goal remains5x
 IR-to-machine-code speed and compiler runtime within10% of LLVM O3.
+
+## Integrated library continuation
+
+Persistent Plan now records index/scale, redirects memory base+index uses before
+liveness, and updates register constraints for the index. Existing retirement
+keeps shared/rooted address and shift definitions. Emission uses register-offset
+loads/stores, preserving volatile control; store index recipes using x17 are
+consumed into an effective address in x16 before a store value can reuse x17.
+Ordinary spill reloads remain owned by allocation/transfers and the register
+constraints, rather than hidden operand loads in the emitter.
+
+1040 new native cases:13 integer/FP/SIMD types x4 dynamic positive/negative
+indices x5 sharing/root/COPY/escape/mixed-width variants x2 scale modes. Exact
+bytes and untouched output sentinels checked. Forty volatile loads whose values
+are summed after a volatile constant store check pressure and reload behavior.
+Existing constant-address native suite remains. LLVM O1/debug/ASAN and Stogir
+O3/debug test hosts pass. Compiler integration and performance remain pending.
