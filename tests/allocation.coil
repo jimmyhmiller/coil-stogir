@@ -5,8 +5,83 @@
 (import "stogir.interval-queue" :as q)
 (import "coil.result" :use [Some None Ok Err])
 (import "stogir.frame" :as frame)
+(import "stogir.scan" :as scan)
 (import "coil.arraylist" :use [ArrayList])
-(import "coil.alloc" :use [malloc-allocator])
+(import "coil.alloc" :use [malloc-allocator Allocator])
+
+;;; Exact reference policy, independently recomputing every register limit.
+(defn reference-choice [(part a/Part)
+                            (availability (ArrayList i64))
+                            (position i64)
+                            (allowed u64)
+                            (source i32)
+                            (boundary-step i64)
+                            (extra-boundaries (slice i64))
+                            (allocator (dyn Allocator))] (-> scan/Choice)
+  (let [(mut limits) (ArrayList::new [i64] allocator)
+        (mut i) 0]
+    (while (< i (len availability))
+      (let [free (get availability i)
+            fixed (c/register-limit (.uses part) position (cast i32 i))
+            until (if (< free fixed) free fixed)
+            end (if (= (len (.ranges part)) 0) position
+                    (.end (get (.ranges part) (- (len (.ranges part)) 1))))]
+        ; A target may only lower general location changes at input boundaries.
+        ; Round interference limits before choosing a register, so an illegal
+        ; short assignment cannot win and later produce an unlowerable move.
+        ; Complete assignments need no transfer and keep their original bound.
+        (push! (mut limits)
+               (if (and (< until end) (not (a/extra-boundary? extra-boundaries until)))
+                   (- until (% until boundary-step)) until)))
+      (set! i (+ i 1)))
+    (let [end
+            (if (= (len (.ranges part)) 0)
+                position
+                (.end (get (.ranges part) (- (len (.ranges part)) 1))))
+          mask (& allowed (.allowed part))
+          required (c/required-at (.uses part) position)
+          direct
+            (a/preferred-choice limits
+                              position
+                              end
+                              mask
+                              required
+                              (.preferred part))
+          from-source
+            (if (>= (.register direct) 0)
+                direct
+                (a/preferred-choice limits position end mask required source))
+          choice
+            (if (>= (.register from-source) 0)
+                from-source
+                (scan/choose-free limits position mask required))]
+      (free! (mut limits))
+      choice)))
+
+
+(defn reusable-limits-check [] (-> void)
+  (let [allocator (malloc-allocator)
+        (mut part) (a/create 1 allocator)
+        (mut availability) (ArrayList::new [i64] allocator)
+        (mut limits) (ArrayList::new [i64] allocator)]
+    (r/add! (mut (.ranges part)) 0 100)
+    (c/add! (mut (.uses part)) 12 2 2)
+    (c/add! (mut (.uses part)) 52 2 5)
+    (for size [(: 0 i64) 1 64 3 72 2 32 0 65]
+      (clear! (mut availability))
+      (for [i 0 size] (push! (mut availability) (+ 3 (* i 7))))
+      (for position [(: 0 i64) 3 11 12 13 51 52 99 100]
+        (for preferred [(: -1 i32) 0 2 5 63 64]
+          (set! (.preferred part) preferred)
+          (for step [(: 1 i64) 2 4]
+            (let [expected (reference-choice part availability position
+                              0xFFFFFFFFFFFFFFFF 1 step [(: 3 i64) 12 51] allocator)
+                  actual (a/free-decision-with-limits! part availability position
+                              0xFFFFFFFFFFFFFFFF 1 step [(: 3 i64) 12 51] (mut limits))]
+              (assert (= (.register expected) (.register actual)))
+              (assert (= (.until expected) (.until actual)))
+              (assert (= (len limits) size)))))))
+    (free! (mut limits)) (free! (mut availability)) (a/release! (mut part))))
 
 (defn preference-check [] (-> void)
   (let [allocator (malloc-allocator)
@@ -154,6 +229,7 @@
     failures))
 
 (defn main [] (-> i64)
+  (reusable-limits-check)
   (preference-check)
   (let [allocator (malloc-allocator)
         (mut parent) (a/create 7 allocator)
