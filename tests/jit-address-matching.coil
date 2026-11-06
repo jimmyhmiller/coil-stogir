@@ -215,7 +215,40 @@
     (g/release! (mut graph))
     failures))
 
+;;; Independent expected address geometry; selection never rewrites the graph.
+(defn indexed-selection-cases [] (-> void)
+  (let [(mut graph) (g/create (malloc-allocator))
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        base (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        index (require (b/emit! (mut graph) 71 5 [start (: 1 i32) 0]))]
+    (for width [(: 1 i32) 2 4 8 16]
+      (for amount [(: 0 i32) 1 2 3 4 5 63 64]
+        (let [literal (require (b/scalar-constant! (mut graph) 5 (cast u64 amount) 8))
+              shifted (require (b/emit! (mut graph) 49 5 [index literal]))
+              sum (require (b/emit! (mut graph) 26 6 [base shifted]))
+              copied (require (b/emit! (mut graph) 68 6 [sum (: 0 i32)]))
+              before (len (.instructions graph))
+              expected (case width 1 (: 0 i32) 2 1 4 2 8 3 16 4 -1)]
+          (match (address/select-indexed graph sum width)
+            (None [] (panic "indexed address not recognized"))
+            (Some [chosen]
+              (assert (= (.base chosen) base))
+              (assert (= (.index chosen) (if (= amount expected) index shifted)))
+              (assert (= (.shift chosen) (if (= amount expected) expected 0)))))
+          (match (address/select-indexed graph copied width)
+            (Some [_] (panic "COPY barrier bypassed")) (None [] 0))
+          (assert (= before (len (.instructions graph)))))))
+    (let [sum (require (b/emit! (mut graph) 26 6 [base index]))]
+      (for width [(: -1 i32) 0 3 32]
+        (match (address/select-indexed graph sum width)
+          (Some [_] (panic "invalid indexed width accepted")) (None [] 0)))
+      (for ref [(: -2147483648 i32) 0 2147483647]
+        (match (address/select-indexed graph ref 8)
+          (Some [_] (panic "missing indexed address accepted")) (None [] 0))))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (indexed-selection-cases)
   (assert (= (check 5 16 0 1) 0))
   (literal-kinds)
   (let [(mut failures) (invalid-references)]
