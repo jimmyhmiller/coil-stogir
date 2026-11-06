@@ -1615,3 +1615,7 @@ Independent implementation optimization of the existing linear-scan decision pol
 ## Scalar leaf register effects
 
 Independent closed instruction-effect analysis in a64/leaf-effects.coil, using existing encoder recipes and independent clang assembly validation. Unknown forms/control/metadata decline. This is not an ABI/private-binding certificate and does not relax caller clobbers. Sources and evidence: validation/leaf-register-effects. Original upstream credit remains in NOTICE.
+
+## Owned private leaf contexts
+
+Independent a64/private-leaf.coil ownership and private-publication layer. It derives effects from closed emitted-byte analysis, retains the whole ordinary caller setup GP bank and preserves explicit private image bindings. It does not yet alter normal caller allocation. Central validation: validation/private-leaf-context. Original dstogov/ir credit and license remain in NOTICE.

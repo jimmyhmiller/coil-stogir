@@ -1,0 +1,111 @@
+(module stogir.tests.private-leaf)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.image" :as image)
+(import "stogir.bytes" :as bytes)
+(import "stogir.text-data" :as text-data)
+(import "stogir.jit.darwin" :as jit)
+(import "stogir.aot.macho" :as macho)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(answer (Result i32 (slice u8)))] (-> i32)
+  (match answer (Ok [value] value) (Err [message] (panic "{}" message))))
+
+(defn declines [(source image/Image) (symbol i32) (size i64) (signature (slice u8))]
+  (-> bool)
+  (match (private/create source symbol size signature (malloc-allocator))
+    (None [] true)
+    (Some [leaf] (let [(mut leaf) leaf] (private/release! (mut leaf)) false))))
+
+(defn mask-check [(leaf private/Frozen)] (-> void)
+  (for signature [(: [(: 0 u8) 5 1 5] (slice u8)) [64 5 1 5]]
+    (match (private/call-mask leaf "private_leaf_body" signature)
+      (None [] (panic "matching owned signature declined"))
+      (Some [mask] (assert (= mask 0x11FF)))))
+  (match (private/call-mask leaf "other_leaf" [(: 0 u8) 5 1 5])
+    (None [] 0) (Some [_] (panic "wrong name accepted")))
+  (match (private/call-mask leaf "private_leaf_body" [(: 0 u8) 5 1 11])
+    (None [] 0) (Some [_] (panic "wrong signature accepted"))))
+
+(defn main [] (-> i32)
+  (let [a (malloc-allocator) signature [(: 0 u8) 5 1 5]
+        (mut source-signature) (ArrayList::new [u8] a)
+        (mut source) (image/create a)]
+    (for byte signature (push! (mut source-signature) byte))
+    (bytes/append32! (mut (.text source)) 0xD503201F)
+    (for word [(: 0x9100040C u32) 0xAA0C03E0 0xD65F03C0]
+      (bytes/append32! (mut (.text source)) word))
+    (let [symbol (require (image/local-symbol! (mut source) "private_leaf_body" 1 4))
+          (mut leaf) (match (private/create source symbol 12 (slice source-signature) a)
+                       (None [] (panic "valid private leaf declined")) (Some [leaf] leaf))]
+      (mask-check leaf)
+      (assert (declines source -1 12 signature))
+      (assert (declines source 100 12 signature))
+      (assert (declines source symbol 0 signature))
+      (assert (declines source symbol 8 signature))
+      (assert (declines source symbol 16 signature))
+      (assert (declines source symbol 12 [(: 0 u8) 5 3 5]))
+      (assert (declines source symbol 12 (: [] (slice u8))))
+      (assert (declines source symbol 12 [(: 0 u8)]))
+      (assert (declines source symbol 12 [(: 1 u8) 5 1 5]))
+      (set! (.global? (elem (mut (.symbols source)) 0)) true)
+      (assert (declines source symbol 12 signature))
+      (set! (.global? (elem (mut (.symbols source)) 0)) false)
+      (set! (.section (elem (mut (.symbols source)) 0)) 0)
+      (assert (declines source symbol 12 signature))
+      (set! (.section (elem (mut (.symbols source)) 0)) 1)
+      ; ABS64 beginning before the body still overlaps its first instruction.
+      (assert (image/relocate! (mut source)
+        (image/Relocation :section 1 :offset 0 :kind 1 :symbol symbol :addend 0)))
+      (assert (declines source symbol 12 signature))
+      (clear! (mut (.relocations source)))
+      (push! (mut (.text-data source)) (text-data/Range :offset 4 :length 4 :kind 4))
+      (assert (declines source symbol 12 signature))
+      (clear! (mut (.text-data source)))
+      ; The snapshot remains independent after the caller mutates and frees its source.
+      (assert (bytes/patch32! (mut (.text source)) 4 0xFFFFFFFF))
+      (set! (mut source-signature) 3 (: 11 u8))
+      (free! (mut source-signature))
+      (image/release! (mut source))
+      (mask-check leaf)
+      (let [(mut output) (image/create a)]
+        (require (image/symbol! (mut output) "_private_leaf_entry" 1 0))
+        ; Keep x9 live across the private call. Its preservation is justified by
+        ; the exact leaf write set, while x0..x8 remain in the setup bank.
+        (for word [(: 0xD10043FF u32) 0xF90003FE 0xD2802469 0x94000000
+                   0xF94003FE 0x910043FF 0x8B090000 0xD65F03C0]
+          (bytes/append32! (mut (.text output)) word))
+        (let [callee (require (private/append-to! leaf (mut output)))]
+          (assert (not (.global? (get (.symbols output) (cast i64 callee)))))
+          (assert (image/relocate! (mut output)
+            (image/Relocation :section 1 :offset 12 :kind 2 :symbol callee :addend 0))))
+        (match (image/symbol! (mut output) "private_leaf_body" 1 32)
+          (Err [_] 0) (Ok [_] (panic "private definition rebound globally")))
+        (match (private/append-to! leaf (mut output))
+          (Err [_] 0) (Ok [_] (panic "duplicate body rebound")))
+        (private/release! (mut leaf))
+        (match (private/call-mask leaf "private_leaf_body" signature)
+          (None [] 0) (Some [_] (panic "released leaf still usable")))
+        ; Published bytes outlive the snapshot and are the bytes used by both paths.
+        (match (jit/map-image output a)
+          (Err [message] (panic "JIT: {}" message))
+          (Ok [mapped]
+            (let [(mut mapped) mapped
+                  f (p/cast (fnptr (cc/C) [u64] u64) (.base (.memory mapped)))]
+              (for x [(: 0 u64) 1 19 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
+                (assert (= (call-ptr f x) (+ (+ x 1) 0x123))))
+              (jit/release-image! (mut mapped)))))
+        (match (macho/image-object output a)
+          (Err [message] (panic "AOT: {}" message))
+          (Ok [object]
+            (let [(mut object) object]
+              (match (fs/write-file a "build/private-leaf.o" (slice object))
+                (Err [_] (panic "cannot write AOT object")) (Ok [_] 0))
+              (free! (mut object)))))
+        (image/release! (mut output))))
+    (println "private snapshot, ABI bank, private publication, JIT and AOT emission pass")
+    0))

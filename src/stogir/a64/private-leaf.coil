@@ -1,0 +1,125 @@
+;;; Owned private leaf bytes and signature, without mutable image aliases.
+(module stogir.a64.private-leaf)
+(export Frozen create release! call-mask append-to!)
+(import "stogir.a64.leaf-effects" :as effects)
+(import "stogir.a64.registers" :as registers)
+(import "stogir.image" :as image)
+(import "stogir.text-data" :as text-data)
+(import "stogir.prototype-bytes" :as prototype)
+(import "stogir.bytes" :as bytes)
+(import "coil.slice" :use [subslice])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :as alloc :use [Allocator])
+(import "coil.primitive" :as p)
+(import "coil.result" :use [Option Some None Result Ok Err])
+
+;;; Single ownership, like the inline registry. Do not copy ownership, mutate
+;;; concurrently, or retain borrowed views/handles after release.
+(defstruct Frozen [(state (ptr u8))])
+(defstruct State [(a (dyn Allocator)) (name (ArrayList u8))
+                  (prototype (ArrayList u8)) (text (ArrayList u8)) (writes u64)])
+
+(defn same? [(a (slice u8)) (b (slice u8)) (abi? bool)] (-> bool)
+  (let [(mut equal) (= (len a) (len b)) (mut i) 0]
+    (while (and equal (< i (len a)))
+      (let [mask (if (and abi? (= i 0)) (: 31 u8) (: 255 u8))]
+        (unless (= (& (get a i) mask) (& (get b i) mask)) (set! equal false)))
+      (set! i (+ i 1)))
+    equal))
+
+(defn own [(name (slice u8)) (signature (slice u8)) (text (slice u8))
+            (writes u64) (a (dyn Allocator))] (-> Frozen)
+  (let [(mut owned-name) (ArrayList::new [u8] a)
+        (mut owned-signature) (ArrayList::new [u8] a)
+        (mut owned-text) (ArrayList::new [u8] a)]
+    (for byte name (push! (mut owned-name) byte))
+    (for byte signature (push! (mut owned-signature) byte))
+    (for byte text (push! (mut owned-text) byte))
+    (Frozen :state
+      (p/cast (ptr u8)
+        (alloc/box! a State (State :a a :name owned-name
+          :prototype owned-signature :text owned-text :writes writes))))))
+
+;;; The source symbol must already be a private text definition. The exact
+;;; range is supplied by emission metadata, never inferred from adjacent labels.
+;;; Relocations/data touching the body decline. Snapshot bytes are independently
+;;; decoded before ownership is established. This does not emit or bind a caller.
+(defn create [(source image/Image) (symbol i32) (size i64)
+               (signature (slice u8)) (a (dyn Allocator))] (-> (Option Frozen))
+  (if (or (< symbol 0) (>= (cast i64 symbol) (len (.symbols source)))
+          (not (image/valid-alignments? source)) (not (prototype/valid-bytes? signature))
+          (not (or (= (& (get signature 0) 15) 0) (= (& (get signature 0) 15) 9))))
+      (None)
+      (let [definition (get (.symbols source) (cast i64 symbol))
+            start (.offset definition) name-start (.name definition)
+            name-size (.length definition) (mut valid) true]
+        (when (or (.global? definition) (!= (.section definition) 1)
+                  (< start 0) (> start (len (.text source))) (!= (% start 4) 0)
+                  (<= size 0) (> size (- (len (.text source)) start))
+                  (< name-start 0) (> name-start (len (.names source)))
+                  (<= name-size 0) (> name-size (- (len (.names source)) name-start)))
+          (set! valid false))
+        (match (text-data/validate (.text-data source) (len (.text source)))
+          (Err [_] (set! valid false)) (Ok [_] 0))
+        (when valid
+          (for relocation (.relocations source)
+            (when (= (.section relocation) 1)
+              (let [width (if (= (.kind relocation) 1) 8 4)
+                    offset (.offset relocation)]
+                (if (or (< offset 0) (> offset (- (len (.text source)) width))
+                        (< (.kind relocation) 1) (> (.kind relocation) 4))
+                    (set! valid false)
+                    (when (and (< offset (+ start size)) (> (+ offset width) start))
+                      (set! valid false))))))
+          (for range (.text-data source)
+            (when (and (< (.offset range) (+ start size))
+                       (> (+ (.offset range) (.length range)) start))
+              (set! valid false))))
+        (if (not valid) (None)
+            (let [name (subslice (slice (.names source)) name-start (+ name-start name-size))
+                  text (subslice (slice (.text source)) start (+ start size))]
+              (for byte name (when (= byte 0) (set! valid false)))
+              (if (not valid) (None)
+                  (match (effects/text text)
+                    (None [] (None))
+                    (Some [writes] (Some (own name signature text writes a))))))))))
+
+(defn release! [(leaf (mut Frozen))] (-> void)
+  (when (!= (p/cast usize (.state leaf)) 0)
+    (let [s (p/cast (ptr State) (.state leaf)) a (.a s)]
+      (free! (mut (.name s))) (free! (mut (.prototype s))) (free! (mut (.text s)))
+      (alloc/destroy a s)
+      (set! (.state leaf) (p/cast (ptr u8) 0)))))
+
+;;; Only ordinary direct calls to this exact owned name/signature may use the
+;;; result. A target adapter must bind that call to append-to!'s private symbol,
+;;; or to an equivalent publication of these same owned bytes. No caller is
+;;; allowed to infer a binding from this mask. Tail/indirect/external calls keep
+;;; the full ABI mask. Semantic flags outside the low five ABI bits may differ.
+(defn call-mask [(leaf Frozen) (name (slice u8)) (signature (slice u8))]
+  (-> (Option u64))
+  (if (= (p/cast usize (.state leaf)) 0) (None)
+      (let [s (p/cast (ptr State) (.state leaf))]
+        (if (and (same? name (slice (.name s)) false)
+                 (prototype/valid-bytes? signature)
+                 (same? signature (slice (.prototype s)) true))
+            (Some (& (| (.writes s) (registers/call-setup-gpr-mask))
+                     (registers/caller-gpr-mask)))
+            (None)))))
+
+;;; Publish the snapshot itself, not the possibly changed source image. A local
+;;; definition cannot be rebound by a later global definition of the same name.
+(defn append-to! [(leaf Frozen) (output (mut image/Image))]
+  (-> (Result i32 (slice u8)))
+  (if (or (= (p/cast usize (.state leaf)) 0) (not (image/valid-alignments? output)))
+      (Err "released private leaf or invalid output image")
+      (let [s (p/cast (ptr State) (.state leaf)) size (len (.text s))
+            before (len (.text output)) pad (% (- 4 (% before 4)) 4)]
+        (if (> before (- (- 0x7FFFFFFFFFFFFFFF size) pad))
+            (Err "private leaf publication exceeds text range")
+            (match (image/local-symbol! (mut output) (slice (.name s)) 1 (+ before pad))
+              (Err [message] (Err message))
+              (Ok [symbol]
+                (for [i 0 pad] (push! (mut (.text output)) (: 0 u8)))
+                (if (bytes/append-slice! (mut (.text output)) (slice (.text s)))
+                    (Ok symbol) (Err "private leaf text append failed"))))))))
