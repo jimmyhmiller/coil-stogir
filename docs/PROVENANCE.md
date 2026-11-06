@@ -1598,3 +1598,7 @@ Affected-merge literal diamond reconsideration follows pinned ir_sccp.c's
 ir_iter_optimize_merge/ir_optimize_phi orchestration for the existing literal
 subset. Bulk and local paths share one collapse operation; arbitrary-value
 availability and MIN/MAX/ABS remain unimplemented. See validation/affected-merge-diamond.
+
+Diamond producer rewrites now notify existing users as pinned ir_optimize_phi
+notifies ir_iter_add_uses after conversion. This restores the affected-consumer
+restart contract without adding fold rules. See validation/diamond-user-notification.
