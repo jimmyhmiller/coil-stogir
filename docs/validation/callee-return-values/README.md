@@ -56,3 +56,19 @@ aggregate suite, module execution, projection pressure and20linked C executions
 pass again under debug/ASAN. No compiler performance claim until integrated.
 The frozen replay uses direct typed input literals; fixed arrays have no slice
 method in the preserved host. Inspection-only tracing is not production code.
+
+### Canonical return observations
+
+Only newly appended, unanchored exact-type COPY observations are resolved to
+backing SSA values; existing client roots are preserved. Original selected
+RETURN input ports are retained ahead of the private GP pieces. Constant
+locations, including symbolic constants reached through positive aliases, are
+materialized after simultaneous physical transfers, using the existing operand
+emitter. Void RETURN values remain invalid and are not made legal by lowering.
+
+Validation: aggregate suite LLVM O1 with debug checks and AddressSanitizer passes,
+including three rejected nonzero void-return inputs; ten native GP modes execute
+240 JIT answers and 160 scalar probes. Independently linked C callers pass 480
+answers across ordinary and ASAN harnesses (20 executables). Generated code is
+not ASAN-instrumented. Captured Graph.operand replay passes 117 getter/ABI cases
+and remains 228 bytes. These are correctness results, not a runtime speedup.
