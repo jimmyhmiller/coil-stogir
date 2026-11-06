@@ -1,0 +1,68 @@
+(defn inspect [(graph g/Graph) (entry i32) (roots (slice i32))] (-> void)
+ (let [a (malloc-allocator)]
+  (match (pipeline/prepare-native graph entry roots a)
+   (Err [e] (panic "{}" e))
+   (Ok [owned]
+    (let [(mut prepared) owned]
+     (match (matching/build graph (.schedule prepared) roots true a)
+      (Err [e] (panic "{}" e))
+      (Ok [owned-plan]
+       (let [(mut plan) owned-plan
+             (mut analysis) (live/analyze-matched graph (.blocks prepared) (.schedule prepared)
+                              (.order prepared) (.operands plan) a)
+             (mut intervals) (ranges/build-matched graph (.schedule prepared) analysis
+                              (.order prepared) (.operands plan) a)]
+        (match (constraints/build-matched graph (.schedule prepared) plan a)
+         (Err [e] (panic "{}" e))
+         (Ok [owned-req]
+          (let [(mut req) owned-req
+                (mut split-blocks) (split/build (.blocks prepared) (.schedule prepared)
+                                    (.idom prepared) (.depths prepared) a)]
+           (for block split-blocks
+             (println "split-block {} {} depth {} header {} idom {}" (.start block) (.end block)
+                      (.depth block) (.header block) (.idom block)))
+           (match (allocate/build-prepared-with-machine-private-splits intervals req graph (.schedule prepared)
+                     (.static-sizes plan) (.operands plan) (.blocks prepared) (.depths prepared) a
+                     (slice (.modes (.tails plan))) (private/no-context) (slice split-blocks))
+            (Err [e] (panic "{}" e))
+            (Ok [owned-allocation]
+             (let [(mut assigned) owned-allocation frame (.frame assigned)]
+              (let [(mut moves) (locations/contiguous-indexed (.parts assigned)
+                                                              (.locations assigned) a)
+                    (mut original) (ArrayList::new [locations/Transfer] a)
+                    (mut checked) (: 0 i64)]
+                (for move moves (push! (mut original) move))
+                (println "home-plan-changes {}" (homes/plan! graph (.schedule prepared) assigned plan (mut moves) a))
+                ; Phi transfers write a Phi's block-entry location. When that is
+                ; not its home, every original store into the home must remain.
+                (for range (.ranges (.schedule prepared))
+                  (for [k 0 (.count range)]
+                    (let [reference (get (.nodes (.schedule prepared)) (+ (.offset range) k))]
+                      (when (= (n/opcode (get (.instructions graph) (cast i64 reference))) 67)
+                        (let [parent (locations/owner (.parts assigned) (.locations assigned) reference)]
+                          (match (locations/lookup-indexed (.parts assigned) (.locations assigned)
+                                                           reference (* (.offset range) 2))
+                            (Err [message] (panic "{}" message))
+                            (Ok [entry]
+                              (when (= (.kind entry) 0)
+                                (for move original
+                                  (when (and (= (.parent move) parent) (= (.kind (.source move)) 0)
+                                             (= (.kind (.destination move)) 1))
+                                    (let [(mut kept) false]
+                                      (for planned moves
+                                        (when (and (= (.parent planned) parent) (= (.position planned) (.position move))
+                                                   (= (.kind (.source planned)) 0) (= (.kind (.destination planned)) 1)
+                                                   (= (.value (.destination planned)) (.value (.destination move))))
+                                          (set! kept true)))
+                                      (println "phi-entry-store parent {} phi {} position {} kept {}"
+                                               parent reference (.position move) kept)
+                                      (assert kept)
+                                      (set! checked (+ checked 1)))))))))))))
+                (println "phi-entry-stores-checked {}" checked)
+                (assert (> checked 0))
+                (free! (mut original)) (free! (mut moves)))
+              (allocate/release! (mut assigned)))))
+           (free! (mut split-blocks)) (constraints/release! (mut req)))))
+        (ranges/release! (mut intervals)) (live/release-analysis! (mut analysis))
+        (matching/release! (mut plan)))))
+     (pipeline/release! (mut prepared)))))))

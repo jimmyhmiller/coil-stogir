@@ -1,0 +1,116 @@
+(module stogir.tests.spill-home-phi-entry)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.a64.constants" :as constants)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+(defn word! [(text (mut (ArrayList u8))) (r (Result u32 (slice u8)))] (-> void)
+  (match r (Ok [word] (bytes/append32! (mut text) word)) (Err [e] (panic "{}" e))))
+
+;;; Returns x0 + 7 after destroying every ordinary caller GPR (x18 preserved).
+(defn clobber-target [] (-> (ArrayList u8))
+  (let [a (malloc-allocator) (mut text) (ArrayList::new [u8] a)]
+    (word! (mut text) (encode/add-sub-immediate true false false 0 0 7))
+    (for [r 1 18]
+      (require (constants/emit! (mut text) true (cast i32 r)
+                               (+ (: 0xFEDCBA9876540000 u64) (cast u64 r)))))
+    (word! (mut text) (encode/add-sub true true true 31 0 1))
+    (word! (mut text) (encode/ret 30))
+    text))
+
+;;; A Phi joins a computed register value and a literal, then lives across a
+;;; call under callee-saved pressure from values live across the whole body. Phi resolution writes the Phi's location
+;;; at merge entry; the spill home is only established if that entry location
+;;; is the home itself or the boundary store is retained.
+(defn check [(literal-first bool) (pressure i64)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        input (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        flag (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        bound (require (b/scalar-constant! (mut graph) 11 23 8))
+        (mut roots) (ArrayList::new [i32] a)
+        (mut values) (ArrayList::new [i32] a)]
+    (for [i 1 (+ pressure 1)]
+      (let [constant (require (b/scalar-constant! (mut graph) 11 (cast u64 i) 8))]
+        (push! (mut values) (require (b/emit! (mut graph) 26 11 [input constant])))))
+    ; Every pressure value is live before the branch and after the call.
+    (let [(mut early) zero
+          _ (for value values (set! early (require (b/emit! (mut graph) 26 11 [early value]))))
+          negative (require (b/emit! (mut graph) 16 1 [flag early]))
+          branch (require (b/emit! (mut graph) 116 0 [start negative]))
+          taken (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+          skipped (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+          small (require (b/emit! (mut graph) 18 1 [input bound]))
+          widened (require (b/emit! (mut graph) 34 11 [small]))
+          left (require (b/emit! (mut graph) 114 0 [taken]))
+          right (require (b/emit! (mut graph) 114 0 [skipped]))
+          join (if literal-first
+                   (require (b/emit! (mut graph) 112 0 [right left]))
+                   (require (b/emit! (mut graph) 112 0 [left right])))
+          merged (if literal-first
+                     (require (b/emit! (mut graph) 67 11 [join zero widened]))
+                     (require (b/emit! (mut graph) 67 11 [join widened zero])))]
+      (match (calls/create 0 11 [(: 11 u8)] a)
+        (Err [e] (panic "{}" e))
+        (Ok [owned]
+          (let [(mut signature) owned
+                call (require (calls/emit! (mut graph) signature join target [input] a))
+                (mut sum) call]
+            (calls/release! (mut signature))
+            ; The Phi's only use is last, so allocation prefers to spill it.
+            (for value values (set! sum (require (b/emit! (mut graph) 26 11 [sum value]))))
+            (set! sum (require (b/emit! (mut graph) 26 11 [sum merged])))
+            (let [ret (require (b/emit! (mut graph) 120 11 [call sum (: 0 i32)]))
+                  (mut target-code) (clobber-target)]
+              (push! (mut roots) ret)
+              (match (jit/map-text (slice target-code))
+                (Err [e] (panic "{}" e))
+                (Ok [owned-target]
+                  (let [(mut native-target) owned-target]
+                    (for level [(: 1 i32) 2 3]
+                      (match (compile/image-with-options graph start (slice roots) "_home_phi_entry"
+                               (options/Options :level level) a)
+                        (Err [e] (panic "{}" e))
+                        (Ok [owned-code]
+                          (let [(mut code) owned-code]
+                            (match (jit/map-image code a)
+                              (Err [e] (panic "{}" e))
+                              (Ok [owned-image]
+                                (let [(mut loaded) owned-image
+                                      f (p/cast (fnptr (cc/C) [u64 i64 i64] i64)
+                                                (.base (.memory loaded)))]
+                                  (for x [(: -100 i64) -1 0 1 7 23 24 100]
+                                    (for flag-value [(: -5 i64) -1 0 1 9]
+                                      (let [early (+ (* pressure x) (/ (* pressure (+ pressure 1)) 2))
+                                            phi (if (and (< flag-value early) (<= x 23)) 1 0)
+                                            expected (+ x 7 phi (* pressure x)
+                                                        (/ (* pressure (+ pressure 1)) 2))]
+                                        (assert (= (call-ptr f (p/cast u64 (.base native-target))
+                                                             x flag-value)
+                                                   expected)))))
+                                  (jit/release-image! (mut loaded)))))
+                            (image/release! (mut code))))))
+                    (jit/release! (mut native-target)))))
+              (free! (mut target-code)))))))
+    (free! (mut roots)) (free! (mut values)) (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (for pressure [(: 0 i64) 4 9 10 11 12 16 24]
+    (check false pressure)
+    (check true pressure))
+  0)
