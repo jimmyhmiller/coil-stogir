@@ -38,3 +38,35 @@ spilled definitions, Phi edges, aliases, scalar/FP/vector widths, unsafe frame
 introspection, external entries and failure cleanup need explicit validation.
 Existing homes only are a first stage; broader split/reload policy remains open.
 No production algorithm change or runtime claim in this checkpoint.
+
+## Implemented existing-home protocol
+
+New a64/spill-homes.coil certifies each existing private spill home's complete
+machine definitions and size. Definitions assigned registers write their home
+at the next even phase within the same block; spilled definitions already write
+that home. Ambiguous, missing, incompatible or rematerialized definitions retain
+the old transfers. All changing/coalesced definitions must be covered before any
+boundary store is removed. Unsafe frame/scope introspection, external entries and
+indirect/computed control retain the old function protocol. No new slots or frame
+layout mutation. Register-register/reload boundary behavior is unchanged.
+
+Normal JIT/AOT body paths normalize transfers before block aliasing/layout.
+New writebacks participate in existing typed simultaneous groups, preserving
+sources before following reloads clobber their registers. No-valued-terminator
+and no-next-block checks keep definition writebacks in their defining blocks.
+Read-only spill-home storage is private to the compiler; Phi edges and every
+newly defined coalesced value still establish their current value explicitly.
+
+Ten existing native suites and four ASAN suites pass (pressure, call pressure,
+Phi/call redefinition, FP, Phi/loops, switch/bulk/private calls and guards).
+New216-answer loop test uses24 invariants both before/after a call which destroys
+x1–x17 and NZCV, while returning x0+7; levels1/2/3 and explicit frame-address
+fallback pass native and ASAN. Frame-memory checks pass. Actual provider replay
+ASAN verifies all eight specific outer-definition writeback positions. A planner
+bypass negative control fails those assertions. This is not an old-source API
+compile failure. Static code/store counts and hashes are in results.json.
+
+Remaining upstream work is explicit: register-availability/per-use reload
+suppression, memory Phi handling and free/restart split categories. This stage
+keeps existing register/reload transfers and does not enable general odd reloads.
+Performance integration/measurement follows; no whole-runtime claim yet.

@@ -1,0 +1,109 @@
+(module stogir.tests.spill-home-loop)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.a64.constants" :as constants)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+(defn word! [(text (mut (ArrayList u8))) (r (Result u32 (slice u8)))] (-> void)
+  (match r (Ok [word] (bytes/append32! (mut text) word)) (Err [e] (panic "{}" e))))
+
+;;; Native ABI target preserves x0's answer while destroying all ordinary
+;;; caller GPRs, including reserved instruction scratch x16/x17. x18 is
+;;; the platform register and is deliberately preserved, as required by ABI.
+(defn clobber-target [] (-> (ArrayList u8))
+  (let [a (malloc-allocator) (mut text) (ArrayList::new [u8] a)]
+    (word! (mut text) (encode/add-sub-immediate true false false 0 0 7))
+    (for [r 1 18]
+      (require (constants/emit! (mut text) true (cast i32 r)
+                               (+ (: 0xFEDCBA9876540000 u64) (cast u64 r)))))
+    (word! (mut text) (encode/add-sub true true true 31 0 1))
+    (word! (mut text) (encode/ret 30))
+    text))
+
+(defn check [(introspect bool)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        input (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        limit (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        frame-root (if introspect (require (b/emit! (mut graph) 66 6 [])) 0)
+        (mut roots) (ArrayList::new [i32] a)
+        (mut values) (ArrayList::new [i32] a)]
+    (for [i 1 25]
+      (let [constant (require (b/scalar-constant! (mut graph) 11 (cast u64 i) 8))]
+        (push! (mut values) (require (b/emit! (mut graph) 26 11 [input constant])))))
+    (let [entry (require (b/emit! (mut graph) 114 0 [start]))
+          header (require (b/loop-begin! (mut graph) entry))
+          counter (require (b/loop-phi! (mut graph) header zero))
+          answer (require (b/loop-phi! (mut graph) header zero))
+          condition (require (b/emit! (mut graph) 16 1 [counter limit]))
+          branch (require (b/emit! (mut graph) 116 0 [header condition]))
+          body (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+          exit (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+          (mut sum) answer]
+      ; Uses on both sides of the call prevent active-eviction placement alone
+      ; from moving all home stores out of the loop.
+      (for value values (set! sum (require (b/emit! (mut graph) 26 11 [sum value]))))
+      (match (calls/create 0 11 [(: 11 u8)] a)
+        (Err [e] (panic "{}" e))
+        (Ok [owned]
+          (let [(mut signature) owned
+                call (require (calls/emit! (mut graph) signature body target [sum] a))]
+            (calls/release! (mut signature))
+            (set! sum call)
+            (for value values (set! sum (require (b/emit! (mut graph) 26 11 [sum value]))))
+            (let [next (require (b/emit! (mut graph) 26 11 [counter one]))
+                  back (require (b/emit! (mut graph) 115 0 [call]))
+                  ret (require (b/emit! (mut graph) 120 11 [exit answer (: 0 i32)]))
+                  (mut target-code) (clobber-target)]
+              (push! (mut roots) ret)
+              (when introspect (push! (mut roots) frame-root))
+              (require (b/patch! (mut graph) header 2 back))
+              (require (b/patch! (mut graph) counter 3 next))
+              (require (b/patch! (mut graph) answer 3 sum))
+              (match (jit/map-text (slice target-code))
+                (Err [e] (panic "{}" e))
+                (Ok [owned-target]
+                  (let [(mut native-target) owned-target]
+                    (for level [(: 1 i32) 2 3]
+                      (match (compile/image-with-options graph start (slice roots) "_home_loop"
+                               (options/Options :level level) a)
+                        (Err [e] (panic "{}" e))
+                        (Ok [owned-code]
+                          (let [(mut code) owned-code]
+                            (match (jit/map-image code a)
+                              (Err [e] (panic "{}" e))
+                              (Ok [owned-image]
+                                (let [(mut loaded) owned-image
+                                      f (p/cast (fnptr (cc/C) [u64 i64 i64] i64)
+                                                (.base (.memory loaded)))]
+                                  (for x [(: -100 i64) -1 0 1 7 100]
+                                    (for n [(: -1 i64) 0 1 2 7 17]
+                                      (let [expected (* (if (> n 0) n 0) (+ (* 48 x) 607))]
+                                        (assert (= (call-ptr f (p/cast u64 (.base native-target)) x n) expected)))))
+                                  (jit/release-image! (mut loaded)))))
+                            (image/release! (mut code))))))
+                    (jit/release! (mut native-target)))))
+              (free! (mut target-code)))))))
+    (free! (mut roots)) (free! (mut values)) (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (check false)
+  (check true)
+  (println "canonical spill homes: 216 loop answers survive caller GPR/NZCV clobbers, including frame fallback")
+  0)

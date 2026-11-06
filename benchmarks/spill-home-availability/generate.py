@@ -6,7 +6,7 @@ data=gzip.open(src, 'rt').read() if src.suffix=='.gz' else src.read_text()
 rows=[s.split()[1:] for s in data.splitlines() if s.startswith('stogir-snapshot ')]
 assert sum(r[0]=='begin' for r in rows)==1
 out=['(module inspect.spill-home-availability)']
-for mod,alias in [('locations','locations'),('split-position','split'),('a64.private-leaf','private'),('graph','g'),('node','n'),('strings','strings'),('pipeline','pipeline'),('uses','uses'),('opcode','op'),('sccp','sccp'),('sccp-rewrite','rewrite'),('a64.match','matching'),('a64.result-projections','projection'),('matched-uses','machine')]:
+for mod,alias in [('a64.spill-homes','homes'),('locations','locations'),('split-position','split'),('a64.private-leaf','private'),('graph','g'),('node','n'),('strings','strings'),('pipeline','pipeline'),('uses','uses'),('opcode','op'),('sccp','sccp'),('sccp-rewrite','rewrite'),('a64.match','matching'),('a64.result-projections','projection'),('matched-uses','machine')]:
  out.append(f'(import "stogir.{mod}" :as {alias})')
 out+=['(import "coil.arraylist" :use [ArrayList])','(import "coil.alloc" :use [malloc-allocator])','(import "coil.result" :use [Ok Err Some None])']
 for mod,alias in [('register-live','live'),('live-ranges','ranges'),('a64.constraints','constraints'),('a64.allocate','allocate'),('a64.function','function'),('a64.code','code')]:

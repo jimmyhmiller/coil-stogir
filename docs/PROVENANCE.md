@@ -1680,3 +1680,14 @@ proper masks. XOR all-ones uses an explicit unary restart, not an alias fact.
 Central validation/bit-literal-identities includes180 exact C-rule decisions,
 native/ASAN checks and actual constructor replay. Original source credit and
 license remain centralized in NOTICE/LICENSE.
+
+## Canonical homes for existing split spills
+
+Adapted the shared-home/definition-store contract from
+[dstogov/ir ir_ra.c assign_regs](https://github.com/dstogov/ir/blob/92171d0a4a36b0acf707f2dea7998de615dd4acd/ir_ra.c#L4380)
+and split-parent home assignment around4203. The independent two-phase planner
+certifies all changing/coalesced definitions before eliminating boundary stores,
+uses existing private slots and typed groups, and retains unsafe/incomplete
+cases. Per-use availability, memory Phi and new split categories remain separate.
+Validation/spill-home-availability retains actual graph/transfer records, native
+loop/caller-clobber checks and ASAN. Original credit/license remain in NOTICE/LICENSE.
