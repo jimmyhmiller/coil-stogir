@@ -23,3 +23,11 @@ duplicate target IDs and sealing before all bodies are published. It checks
 nonembedding of the callee in a caller image, exact binding identity and rejection
 after context release. This does not establish compiler adapter correctness or
 whole-compiler performance. Coil integration must supply those separate checks.
+
+Address-taking correction: an emitted FUNC constant with prototype zero is a
+valid untyped address, not a typed call declaration. Such references retain the
+published name binding without granting a reduced mask. `context-mask` still
+requires a validated actual CALL signature matching the owned leaf ABI. Explicit
+typed declarations continue to reject mismatches. The module test now covers an
+untyped ABS64 address reference; native/debug and LLVM/ASAN both pass. The existing
+private allocation/typed mismatch/aggregate suite also passes native O3/debug.
