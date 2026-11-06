@@ -1,0 +1,180 @@
+(module stogir.tests.adjacent-field-promotion)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.mem2ssa" :as mem)
+(import "stogir.verify" :as verify)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+
+(defn execute [(graph g/Graph) (start i32) (roots (slice i32))
+                (width i32) (mode i32) (level i32)] (-> void)
+  (let [a (malloc-allocator)]
+    (match (compile/image-with-options graph start roots "_adjacent_fields"
+             (options/Options :level level) a)
+      (Err [e] (panic "adjacent mode {} level {}: {}" mode level e))
+      (Ok [owned]
+        (let [(mut code) owned]
+          (match (jit/map-image code a)
+            (Err [e] (panic "{}" e))
+            (Ok [owned]
+              (let [(mut loaded) owned
+                    f (p/cast (fnptr (cc/C) [u64 u64 i64] u64) (.base (.memory loaded)))
+                    mask (- (<< (: 1 u64) (cast u64 (* width 8))) 1)]
+                (for x [(: 0 u64) 0x0123456789ABCDEF 0xFFFFFFFFFFFFFFFF]
+                  (for y [(: 0 u64) 0x8000000080008080 0xFFFFFFFFFFFFFFFF]
+                    (for count [(: 0 i64) 1 2 7]
+                      (let [lo (if (= mode 1) (if (!= count 0) (& x mask) 0)
+                                   (if (= mode 2)
+                                       (if (> count 0) (& (+ x (cast u64 (- count 1))) mask) 0)
+                                       (& x mask)))
+                            hi (if (= mode 1) (if (= count 0) (& y mask) 0)
+                                   (if (= mode 2)
+                                       (if (> count 0) (& (- y (cast u64 (- count 1))) mask) 0)
+                                       (& y mask)))
+                            packed (| lo (<< hi (cast u64 (* width 8))))
+                            expected (+ (+ packed (* lo 17)) (* hi 31))]
+                        (assert (= (f x y count) expected))))))
+                (jit/release-image! (mut loaded)))))
+          (image/release! (mut code)))))))
+
+(defn fixture [(ty i32) (mode i32) (reverse bool) (aliased bool)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        y (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        count (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        width (types/size ty 8)
+        extent (require (b/scalar-constant! (mut graph) 5 8 8))
+        offset (require (b/scalar-constant! (mut graph) 5 (cast u64 width) 8))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        zero-signed (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        seventeen (require (b/scalar-constant! (mut graph) 5 17 8))
+        thirty-one (require (b/scalar-constant! (mut graph) 5 31 8))
+        slot (require (b/stack-allocate! (mut graph) start extent 16))
+        wide (if aliased (require (b/emit! (mut graph) 68 6 [slot (: 0 i32)])) slot)
+        high (require (b/emit! (mut graph) 26 6 [slot offset]))
+        initialized (if (= mode 3) slot
+                        (require (b/emit! (mut graph) 93 0 [slot wide zero])))
+        (mut control) initialized (mut exit) (: 0 i32)
+        (mut header) (: 0 i32) (mut counter) (: 0 i32)
+        (mut left) x (mut right) y]
+    (when (= mode 2)
+      (let [entry (require (b/emit! (mut graph) 114 0 [initialized]))]
+        (set! header (require (b/loop-begin! (mut graph) entry)))
+        (set! counter (require (b/loop-phi! (mut graph) header zero-signed)))
+        (let [condition (require (b/emit! (mut graph) 16 1 [counter count]))
+              branch (require (b/emit! (mut graph) 116 0 [header condition]))
+              index (require (b/emit! (mut graph) 36 5 [counter]))]
+          (set! control (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)])))
+          (set! exit (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)])))
+          (set! left (require (b/emit! (mut graph) 26 5 [x index])))
+          (set! right (require (b/emit! (mut graph) 27 5 [y index]))))))
+    (let [lo (require (b/emit! (mut graph) 35 ty [left]))
+          hi (require (b/emit! (mut graph) 35 ty [right]))]
+      (if (= mode 1)
+          (let [branch (require (b/emit! (mut graph) 116 0 [control count]))
+                yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+                no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+                lo-store (require (b/emit! (mut graph) 93 0 [yes slot lo]))
+                hi-store (require (b/emit! (mut graph) 93 0 [no high hi]))
+                yes-end (require (b/emit! (mut graph) 114 0 [lo-store]))
+                no-end (require (b/emit! (mut graph) 114 0 [hi-store]))]
+            (set! control (require (b/emit! (mut graph) 112 0
+                                      (if reverse [no-end yes-end] [yes-end no-end])))))
+          (let [first (require (b/emit! (mut graph) 93 0
+                                  [control (if reverse high slot) (if reverse hi lo)]))
+                second (require (b/emit! (mut graph) 93 0
+                                  [first (if reverse slot high) (if reverse lo hi)]))]
+            (set! control second)))
+      (when (= mode 2)
+        (let [next (require (b/emit! (mut graph) 26 11 [counter one]))
+              back (require (b/emit! (mut graph) 115 0 [control]))]
+          (require (b/patch! (mut graph) header 2 back))
+          (require (b/patch! (mut graph) counter 3 next))
+          (set! control exit)))
+      (let [lo-read (require (b/emit! (mut graph) 91 ty [control slot]))
+            hi-read (require (b/emit! (mut graph) 91 ty [lo-read high]))
+            whole (require (b/emit! (mut graph) 91 5 [hi-read wide]))
+            lo-value (require (b/emit! (mut graph) 34 5 [lo-read]))
+            hi-value (require (b/emit! (mut graph) 34 5 [hi-read]))
+            lo-score (require (b/emit! (mut graph) 28 5 [lo-value seventeen]))
+            hi-score (require (b/emit! (mut graph) 28 5 [hi-value thirty-one]))
+            score (require (b/emit! (mut graph) 26 5 [lo-score hi-score]))
+            value (require (b/emit! (mut graph) 26 5 [whole score]))
+            ret (require (b/emit! (mut graph) 120 5 [whole value (: 0 i32)]))
+            (mut roots) (ArrayList::new [i32] a)
+            (mut optimized) (g/duplicate graph a)]
+        (for root [ret lo-read hi-read whole] (push! (mut roots) root))
+        (when (= mode 5) (push! (mut roots) slot))
+        (require (mem/promote-ordered! (mut optimized) (mut roots) (!= mode 4) a))
+        (assert (= (n/opcode (get (.instructions optimized) (cast i64 slot)))
+                   (if (< mode 3) (: 0 u8) (: 81 u8))))
+        (require (verify/native-input optimized start (slice roots)))
+        (unless (= mode 3)
+          (execute graph start [ret] width mode 1)
+          (for level [(: 1 i32) 3]
+            (execute optimized start (slice roots) width mode level)))
+        (g/release! (mut optimized)) (free! (mut roots))))
+    (g/release! (mut graph))))
+
+(defn fallback [(kind i32) (reverse bool)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        extent (require (b/scalar-constant! (mut graph) 5 16 8))
+        four (require (b/scalar-constant! (mut graph) 5 4 8))
+        eight (require (b/scalar-constant! (mut graph) 5 8 8))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        slot (require (b/stack-allocate! (mut graph) start extent 16))
+        middle (require (b/emit! (mut graph) 26 6 [slot four]))
+        high (require (b/emit! (mut graph) 26 6 [slot eight]))
+        first (require (b/emit! (mut graph) 93 0 [slot (if reverse high slot) zero]))
+        second (require (b/emit! (mut graph) 93 0 [first (if reverse slot high) zero]))
+        ; Equal widest views are ordered differently by changing these types.
+        ty (case kind 0 (: 5 i32) 1 12 2 6 13)
+        first-read (require (b/emit! (mut graph) 91 (if reverse 4 ty)
+                                    [second (if (or (= kind 0) (= kind 3)) middle slot)]))
+        second-read (require (b/emit! (mut graph) 91 (if reverse ty 4)
+                                     [first-read (if (and reverse (or (= kind 0) (= kind 3))) middle slot)]))
+        ret (require (b/emit! (mut graph) 120 5 [second-read zero (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)]
+    (for root [ret first-read second-read] (push! (mut roots) root))
+    (require (mem/promote-ordered! (mut graph) (mut roots) true a))
+    (assert (= (n/opcode (get (.instructions graph) (cast i64 slot))) 81))
+    (require (verify/native-input graph start (slice roots)))
+    (match (compile/image-with-options graph start (slice roots) "_retained_overlap"
+               (options/Options :level 1) a)
+      (Err [e] (panic "{}" e))
+      (Ok [owned]
+        (let [(mut code) owned]
+          (match (jit/map-image code a)
+            (Err [e] (panic "{}" e))
+            (Ok [owned]
+              (let [(mut loaded) owned
+                    f (p/cast (fnptr (cc/C) [] u64) (.base (.memory loaded)))]
+                (assert (= (f) 0))
+                (jit/release-image! (mut loaded)))))
+          (image/release! (mut code)))))
+    (free! (mut roots)) (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (for ty [(: 2 i32) 7 8 3 9 4 10]
+    (for mode [(: 0 i32) 1 2 3 4 5]
+      (for reverse [false true]
+        (for aliased [false true] (fixture ty mode reverse aliased)))))
+  (for kind [(: 0 i32) 1 2 3]
+    (for reverse [false true] (fallback kind reverse)))
+  (println "adjacent fields: 168 policies, 15120 native byte checks and 8 overlap/type fallback executions pass")
+  0)

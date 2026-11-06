@@ -1661,3 +1661,12 @@ rejects unequal-width stores. Coil preserves prior high bits through typed bit
 insertion, using its existing demand-driven Phi construction and conservative
 initialization/escape/observation policy. Validation: validation/partial-field-promotion.
 Original upstream credit and license remain centralized in NOTICE/LICENSE.
+
+## Contained integer field views
+
+Independent extension beyond pinned ir_mem2ssa_add_split_var's unequal-width
+restriction. Widest-first bounded type-size classification and typed byte-offset
+insertion/extraction preserve unchanged bytes and initialization across loops.
+Crossing/noninteger/escape/observation fallbacks remain conservative. Validation:
+validation/contained-field-promotion. Original dstogov/ir attribution and license
+remain centralized in NOTICE/LICENSE.
