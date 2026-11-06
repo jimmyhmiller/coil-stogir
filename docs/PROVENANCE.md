@@ -1554,3 +1554,9 @@ Direct GP return ports also attach advisory allocation preferences through
 owners are resolved before hinting. The first existing preference wins for a
 shared value; no simultaneous hard x0/x1 constraints are imposed. Complete typed
 parallel return copies remain responsible for every result port and all cycles.
+
+Protected return COPY roots cannot always coalesce into an existing Phi group.
+Advisory result hints now also walk at most16same-width GP COPY/BITCAST views
+back to the producer. They stop at Phis, arithmetic, width changes and register
+bank changes; setting the Phi/group preference itself is allowed. No value or
+constraint is rewritten, and existing preferences win for shared owners.

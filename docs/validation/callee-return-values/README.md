@@ -37,3 +37,22 @@ through existing allocation preferences, with first-hint-wins for shared owners.
 The full aggregate/probe/JIT/C matrix passes again, as do module execution,
 120projection pressure answers and static-stack under debug/ASAN. No native
 compiler performance result is claimed until measured. Identity stays one RET.
+
+## Producer preference propagation
+
+A lossless snapshot of the actual compiler-emitted Graph.operand reproduces the
+60instruction/240byte body. Its captured object was byte-identical to the timed
+6cff505d verifier object (SHA4a18afeb5d15b618449fc310e6831669c1f6b33bc0a6a04fde81fc2666559e32).
+Diagnostic allocation logs show the two root COPY preferences applied correctly,
+but preferred registers were occupied before the COPY births (positions193/195;
+limits192/194). The fix carries the advisory hints back through bounded full-word
+COPY/BITCAST views to the producers. It preserves Phi group identity and stops
+before crossing a Phi, arithmetic, width change or bank boundary.
+
+Captured-body replay now emits57instructions/228bytes, no FMOV swap and no SP
+traffic. It passes117native ABI/getter checks covering valid values, continuation
+header payloads, negative references and extreme invalid indices. The full
+aggregate suite, module execution, projection pressure and20linked C executions
+pass again under debug/ASAN. No compiler performance claim until integrated.
+The frozen replay uses direct typed input literals; fixed arrays have no slice
+method in the preserved host. Inspection-only tracing is not production code.
