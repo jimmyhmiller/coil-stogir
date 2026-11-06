@@ -28,3 +28,12 @@ installation now accepts only that placeholder before adding typed return uses.
 Allocator recognition also rejects a zero placeholder as an actual GP piece.
 Those failures were corrected before the passing results above. No compiler
 integration or performance result is claimed by this library checkpoint.
+
+## Advisory result preferences
+
+The first compiler experiment removed Graph.operand's SP traffic but left a
+three-move payload/tag swap. Direct return pieces now get advisory GP0/GP1 hints
+through existing allocation preferences, with first-hint-wins for shared owners.
+The full aggregate/probe/JIT/C matrix passes again, as do module execution,
+120projection pressure answers and static-stack under debug/ASAN. No native
+compiler performance result is claimed until measured. Identity stays one RET.
