@@ -49,3 +49,19 @@ bytes and untouched output sentinels checked. Forty volatile loads whose values
 are summed after a volatile constant store check pressure and reload behavior.
 Existing constant-address native suite remains. LLVM O1/debug/ASAN and Stogir
 O3/debug test hosts pass. Compiler integration and performance remain pending.
+
+## Retired shifted-tile edge correction
+
+First compiler integration2a33d42d quick passed but live-emission executable hit
+BUS: a MUL-by-power-of-two value used as a selected memory base was omitted.
+A word BITCAST chain deferred retirement of its ADD until after shifted-ADD
+fusion. Retirement then decremented the original MUL edge a second time rather
+than the already-substituted shifted tile inputs. Retiring rule50/51 now removes
+its actual selected input edges, exactly matching machine-use construction.
+No address-shape blacklist or disabled optimization is used.
+
+Added commuted MUL/ADD/BITCAST shape extends native matrix to1560cases, plus
+assertions that selected memory machine inputs are not omitted. New regression
+fails with old95e3a4d (ASAN BUS), passes with corrected accounting under
+LLVM/debug/ASAN and native Stogir/debug hosts. Compiler rebuild/live-emission
+recheck pending. Raw before/after evidence retained here.
