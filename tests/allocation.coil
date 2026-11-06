@@ -175,44 +175,40 @@
     failures))
 
 (defn eviction-check [] (-> i64)
-  (let [allocator (malloc-allocator)
-        (mut failures) 0
-        (mut parts) (ArrayList::new [a/Part] allocator)
-        (mut heap) (ArrayList::new [q/Item] allocator)
-        (mut layout) (frame/create allocator)
-        (mut initial) (a/create 15 allocator)]
-    (r/add! (mut (.ranges initial)) 0 30)
-    (c/add! (mut (.uses initial)) 10 1 -1)
-    (set! (.register initial) 3)
-    (push! (mut parts) initial)
-    (match (a/evict! (mut parts) (mut heap) 0 5 (mut layout) 8 8 allocator)
-      (Err [_] (set! failures (+ failures 1)))
-      (Ok [_] 0))
-    (when (!= (len parts) 3) (set! failures (+ failures 1)))
-    (when (= (len parts) 3)
-      (let [prefix (at parts 0)
-            spilled (at parts 1)
-            resumed (at parts 2)]
-        (when (!= (.register prefix) 3) (set! failures (+ failures 1)))
-        (when (!= (.end (get (.ranges prefix) 0)) 5)
-          (set! failures (+ failures 1)))
-        (when (!= (.start (get (.ranges spilled) 0)) 5)
-          (set! failures (+ failures 1)))
-        (when (!= (.end (get (.ranges spilled) 0)) 10)
-          (set! failures (+ failures 1)))
-        (when (!= (.spill-slot spilled) (.spill-slot resumed))
-          (set! failures (+ failures 1)))))
-    (match (q/take! (mut heap))
-      (None [] (set! failures (+ failures 1)))
-      (Some [item]
-            (when (!= (.position item) 10) (set! failures (+ failures 1)))))
-    (let [(mut i) 0]
-      (while (< i (len parts))
-        (a/release! (elem (mut parts) i))
-        (set! i (+ i 1))))
-    (free! (mut parts))
-    (free! (mut heap))
-    (frame/release! (mut layout))
+  (let [allocator (malloc-allocator) (mut failures) 0]
+    ; No prior use spills the entire owner prefix. Every earlier operand kind,
+    ; including a memory-allowed use, preserves the old assigned prefix.
+    (for prior-kind [(: -1 i32) 0 1 2]
+      (let [(mut parts) (ArrayList::new [a/Part] allocator)
+            (mut heap) (ArrayList::new [q/Item] allocator)
+            (mut layout) (frame/create allocator)
+            (mut initial) (a/create 15 allocator)]
+        (r/add! (mut (.ranges initial)) 0 30)
+        (c/add! (mut (.uses initial)) 10 1 -1)
+        (when (>= prior-kind 0)
+          (c/add! (mut (.uses initial)) 2 prior-kind (if (= prior-kind 2) 3 -1)))
+        (set! (.register initial) 3)
+        (push! (mut parts) initial)
+        (match (a/evict! (mut parts) (mut heap) 0 5 (mut layout) 8 8 allocator)
+          (Err [_] (set! failures (+ failures 1))) (Ok [_] 0))
+        (let [expected (if (< prior-kind 0) 2 3)]
+          (when (!= (len parts) expected) (set! failures (+ failures 1)))
+          (when (= (len parts) expected)
+            (let [spilled (at parts (if (< prior-kind 0) 0 1))
+                  resumed (at parts (- expected 1))]
+              (when (!= (.register spilled) -1) (set! failures (+ failures 1)))
+              (when (!= (.start (get (.ranges spilled) 0)) (if (< prior-kind 0) 0 5))
+                (set! failures (+ failures 1)))
+              (when (!= (.end (get (.ranges spilled) 0)) 10) (set! failures (+ failures 1)))
+              (when (!= (.spill-slot spilled) (.spill-slot resumed)) (set! failures (+ failures 1)))
+              (when (>= prior-kind 0)
+                (assert (= (.register (at parts 0)) 3))
+                (assert (= (.end (get (.ranges (at parts 0)) 0)) 5))))))
+        (match (q/take! (mut heap))
+          (None [] (set! failures (+ failures 1)))
+          (Some [item] (when (!= (.position item) 10) (set! failures (+ failures 1)))))
+        (for [i 0 (len parts)] (a/release! (elem (mut parts) i)))
+        (free! (mut parts)) (free! (mut heap)) (frame/release! (mut layout))))
     failures))
 
 (defn pressure-check [] (-> i64)

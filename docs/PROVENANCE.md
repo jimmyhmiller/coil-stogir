@@ -1623,3 +1623,12 @@ Independent a64/private-leaf.coil ownership and private-publication layer. It de
 ## Private leaf call allocation
 
 Independent frozen private-call context and AArch64 clobber selection, with complete setup GP bank and full fallback for indirect/unknown/tail calls. Closed emitted-byte summaries drive target reservations without changing IR or linear-scan policy. The self-contained image entry binds calls to the owned private bytes before publishing. Whole-module Coil integration remains separate to preserve single body/function-address identity. Validation and qualified diagnostic timings: validation/private-call-allocation. Original dstogov/ir credit remains in NOTICE.
+
+## Unused assigned prefix during eviction
+
+Adapted the no-prior-use active-owner eviction rule from dstogov/ir ir_ra.c
+`ir_allocate_blocked_reg`, pinned92171d0a4a36b0acf707f2dea7998de615dd4acd.
+Spill the whole assigned child when it has no earlier operand use; preserve a
+used prefix. The independent indexed event/state implementations retain their
+existing contracts. Actual frontend replay and validation are centralized in
+validation/frontend-provider-transfers. Original license and credit remain in NOTICE.
