@@ -220,6 +220,21 @@
     (spill-homes/plan! graph scheduled assigned matched (mut moves) allocator)
     moves))
 
+(defstruct HomePlan [(moves (ArrayList locations/Transfer)) (established (ArrayList i64))])
+
+(defn assigned-home-view [(assigned allocate/Assigned) (established (slice i64))]
+  (-> allocate/Assigned)
+  (let [(mut view) assigned]
+    (set! (.established-homes view) established) view))
+
+(defn resolved-home-plan [(graph g/Graph) (scheduled schedule/Schedule)
+                          (assigned allocate/Assigned) (matched matching/Plan)
+                          (allocator (dyn Allocator))] (-> HomePlan)
+  (let [(mut moves) (split-moves graph scheduled assigned matched allocator)
+        (mut established) (ArrayList::new [i64] allocator)]
+    (spill-homes/plan-certified! graph scheduled assigned matched (mut moves) (mut established) allocator)
+    (HomePlan :moves moves :established established)))
+
 (defn body-matched [(graph g/Graph)
                     (scheduled schedule/Schedule)
                     (assigned allocate/Assigned)
@@ -228,13 +243,15 @@
                     (matched matching/Plan)
                     (allocator (dyn Allocator))]
   (-> (Result code/Buffer (slice u8)))
-  (let [(mut moves)
-          (resolved-split-moves graph scheduled assigned matched allocator)
+  (let [(mut resolution)
+          (resolved-home-plan graph scheduled assigned matched allocator)
+        moves (.moves resolution)
+        resolved (assigned-home-view assigned (slice (.established resolution)))
         (mut physical) (layout/identity graph scheduled allocator)
         result
           (body-ordered graph
                         scheduled
-                        assigned
+                        resolved
                         analysis
                         requirements
                         matched
@@ -242,7 +259,8 @@
                         moves
                         allocator)]
     (layout/release! (mut physical))
-    (free! (mut moves))
+    (free! (mut (.moves resolution)))
+    (free! (mut (.established resolution)))
     result))
 
 ;;; Allocation positions are fixed before constructing physical block layout.
@@ -278,10 +296,12 @@
                    (matched matching/Plan)
                    (allocator (dyn Allocator))]
   (-> (Result code/Buffer (slice u8)))
-  (let [(mut moves)
-          (resolved-split-moves graph (.schedule prepared) assigned matched allocator)
+  (let [(mut resolution)
+          (resolved-home-plan graph (.schedule prepared) assigned matched allocator)
+        moves (.moves resolution)
+        resolved (assigned-home-view assigned (slice (.established resolution)))
         result
-          (match (empty-blocks graph prepared assigned analysis moves allocator)
+          (match (empty-blocks graph prepared resolved analysis moves allocator)
             (Err [message] (Err [code/Buffer (slice u8)] message))
             (Ok [candidates]
                 (let [(mut empty) candidates
@@ -290,7 +310,7 @@
                       emitted
                         (body-ordered graph
                                       (.schedule prepared)
-                                      assigned
+                                      resolved
                                       analysis
                                       requirements
                                       matched
@@ -300,7 +320,8 @@
                   (layout/release! (mut physical))
                   (free! (mut empty))
                   emitted)))]
-    (free! (mut moves))
+    (free! (mut (.moves resolution)))
+    (free! (mut (.established resolution)))
     result))
 
 ;;; Match upstream's structural start/END-only candidate, then account for all
@@ -1477,6 +1498,7 @@
       (Ok [moves]
           (let [(mut owned) moves
                 (mut error) ""]
+            (spill-homes/omit-established-stores! (mut owned) (.established-homes assigned))
             (match (edges/phis-indexed graph
                                        scheduled
                                        (.parts assigned)

@@ -1691,3 +1691,6 @@ uses existing private slots and typed groups, and retains unsafe/incomplete
 cases. Per-use availability, memory Phi and new split categories remain separate.
 Validation/spill-home-availability retains actual graph/transfer records, native
 loop/caller-clobber checks and ASAN. Original credit/license remain in NOTICE/LICENSE.
+
+
+Complete existing-home edge resolution follows the shared spilled-parent home model in pinned dstogov/ir ir_ra.c assign_regs/needs_spill_reload (https://github.com/dstogov/ir/blob/92171d0a4a36b0acf707f2dea7998de615dd4acd/ir_ra.c); see centralized LICENSE/NOTICE for original credit. Independent two-phase adaptation: the complete-definition certificate now suppresses ordinary same-parent CFG edge stores to that exact home as well as contiguous boundary stores. Phi transfers retain original behavior. An emission-only borrowed certificate is owned by the transfer plan, visible to empty-block/layout and edge lowering, and released after lowering. This completes a missing part of the previous home experiment; it does not establish full upstream per-use reload/phase parity.
