@@ -1,0 +1,106 @@
+(module stogir.tests.memory-countdown)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.memory-countdown" :as countdown)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.uses" :as uses)
+(import "stogir.a64.compile" :as native)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn need [(x (Result i32 (slice u8)))] (-> i32)
+ (match x (Ok [r] r) (Err [e] (panic "{}" e))))
+
+(defn execute [(graph g/Graph) (start i32) (roots (slice i32)) (ty i32) (a (dyn Allocator))]
+ (-> void)
+ (match (native/text graph start roots a)
+  (Err [e] (panic "{}" e))
+  (Ok [text]
+   (let [(mut bytes) text]
+    (match (jit/map-text (slice bytes))
+     (Err [e] (panic "{}" e))
+     (Ok [mapped]
+      (let [(mut image) mapped f (p/cast (fnptr (cc/C) [(ptr u64)] u64) (.base image))
+            width (types/scalar-size ty 8)
+            mask (if (= width 8) (: 0 u64)
+                     (<< (: 0xFFFFFFFFFFFFFFFF u64) (cast u64 (* width 8))))]
+       (for [i 0 256]
+        (let [high (& (: 0xFEDCBA9876543200 u64) mask)
+              (mut value) (| high (cast u64 i))]
+         (assert (= (call-ptr f (p/cast (ptr u64) (mut value))) 0))
+         (assert (= value high))))
+       ; This mapping is RX, with eight zero bytes. A zero-trip store faults.
+       (match (jit/map-text [(: 0 u8) 0 0 0 0 0 0 0])
+        (Err [e] (panic "{}" e))
+        (Ok [read-only]
+         (let [(mut zero-page) read-only]
+          (assert (= (call-ptr f (p/cast (ptr u64) (.base zero-page))) 0))
+          (jit/release! (mut zero-page)))))
+       (jit/release! (mut image)))))
+    (free! (mut bytes))))))
+
+;;; Positive modes: direct, equal-width signedness views/duplicate address,
+;;; inverted predicate, swapped merge slots. Other modes violate a proof guard.
+(defn check [(ty i32) (mode i32)] (-> void)
+ (let [a (malloc-allocator) (mut graph) (g/create a)
+       start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+       address (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+       entry (need (b/emit! (mut graph) 114 0 [start]))
+       header (need (b/loop-begin! (mut graph) entry))
+       read (need (b/emit! (mut graph) (if (= mode 2) 92 91) ty [header address]))
+       counter-ty (if (= mode 1) (if (< ty 8) (+ ty 6) (- ty 6)) ty)
+       counter (if (= mode 1) (need (b/emit! (mut graph) 36 counter-ty [read])) read)
+       zero (need (b/scalar-constant! (mut graph) counter-ty 0 8))
+       one (need (b/scalar-constant! (mut graph) counter-ty (if (= mode 5) 2 1) 8))
+       cmp (need (b/emit! (mut graph) (if (= mode 9) 15 14) 1 [counter zero]))
+       branch (need (b/emit! (mut graph) 116 0 [read cmp]))
+       inside (need (b/emit! (mut graph) (if (= mode 9) 107 108) 0 [branch (: 0 i32)]))
+       outside (need (b/emit! (mut graph) (if (= mode 9) 108 107) 0 [branch (: 0 i32)]))
+       step (need (b/emit! (mut graph) 27 counter-ty [counter one]))
+       offset (need (b/scalar-constant! (mut graph) 5 (if (= mode 4) 8 0) 8))
+       store-address (if (or (= mode 1) (= mode 4))
+                       (need (b/emit! (mut graph) 26 6 [address offset])) address)
+       before-store (if (= mode 6)
+                      (need (b/emit! (mut graph) 92 ty [inside address])) inside)
+       store (need (b/emit! (mut graph) (if (= mode 3) 94 93) 0 [before-store store-address step]))
+       back (need (b/emit! (mut graph) 115 0 [store]))
+       final (need (b/emit! (mut graph) 91 ty [outside address]))
+       ret (need (b/emit! (mut graph) 120 ty [final final (: 0 i32)]))
+       eligible? (or (= mode 0) (= mode 1) (>= mode 8))
+       protected-root (case mode 8 read 11 entry 12 outside 13 header 14 store (: 0 i32))
+       blocked? (or (= mode 8) (= mode 11) (= mode 13) (= mode 14))]
+  (need (b/patch! (mut graph) header 2 back))
+  (when (= mode 7)
+   (let [extra (need (b/emit! (mut graph) 26 counter-ty [counter one]))]
+    (need (b/patch! (mut graph) ret 2 extra))))
+  (when (= mode 10)
+   (need (b/patch! (mut graph) header 1 back))
+   (need (b/patch! (mut graph) header 2 entry)))
+  (let [(mut edges) (uses/build graph a)]
+   (match (countdown/select graph edges header 8)
+    (Some [_] (assert eligible?)) (None [] (assert (not eligible?))))
+   (uses/release! (mut edges)))
+  (when (and eligible? (not blocked?)) (execute graph start [ret back] ty a))
+  (when eligible?
+   (match (sccp/optimize graph 8 (if (> protected-root 0) [ret back protected-root] [ret back]) a)
+    (Err [e] (panic "{}" e))
+    (Ok [value]
+     (let [(mut optimized) value
+           load-node (get (.instructions (.graph optimized)) (cast i64 read))]
+      (if blocked? (assert (= (.op1 load-node) header))
+          (do (assert (!= (.op1 load-node) header))
+              (execute (.graph optimized) start (slice (.roots optimized)) ty a)))
+      (rewrite/release! (mut optimized))))))
+  (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+ (for ty [(: 2 i32) 8 3 9 4 10 5 11]
+  (for [mode 0 15] (check ty (cast i32 mode))))
+ (println "memory countdown: 20480 native answers, upper bytes, readonly zero trips and guards passed")
+ 0)

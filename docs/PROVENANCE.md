@@ -1567,3 +1567,11 @@ control/def-use rewrites. Pinned ir_sccp.c's induction-variable optimization was
 consulted, but this finite-loop rule is not claimed as its port. Scope/proof and
 source-captured replay are in validation/finite-countdown. Generic destructors
 and memory-carried counters remain unchanged.
+
+Guarded memory-carried unit-countdown elimination in memory-countdown.coil is
+an independent extension of the finite-counter proof. It reuses the pinned-
+upstream-inspired address-alias decomposition and existing incremental control/
+use-list machinery. It preserves the initial read and zero-trip no-write path;
+volatile/atomic accesses and hard COPY barriers decline. Detailed proof, root
+protection, native semantic tests and actual allocator replay are documented in
+validation/memory-countdown. This is not an upstream loop-elimination port.
