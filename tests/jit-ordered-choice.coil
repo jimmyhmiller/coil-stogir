@@ -1,0 +1,207 @@
+(module stogir.tests.jit-ordered-choice)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.a64.match" :as matching)
+(import "stogir.a64.select" :as select)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.code" :as code)
+(import "stogir.jit.darwin" :as jit)
+(import "stogir.types" :as types)
+(import "stogir.opcode" :as op)
+(import "stogir.boolean-diamond" :as diamond)
+(import "stogir.uses" :as uses)
+(import "stogir.bitqueue" :as q)
+(import "stogir.node" :as n)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err Some None])
+(defn need [T] [(value (Result T (slice u8)))] (-> T)
+ (match value (Ok [x] x) (Err [e] (panic "{}" e))))
+(defn truth [(opcode i32) (width i32) (a u64) (b u64)] (-> bool)
+ (let [name (op/name opcode)
+       sa (if (= width 4) (cast i64 (cast i32 a)) (cast i64 a))
+       sb (if (= width 4) (cast i64 (cast i32 b)) (cast i64 b))]
+  (cond (= name "LT") (< sa sb) (= name "LE") (<= sa sb)
+        (= name "GT") (> sa sb) (= name "GE") (>= sa sb)
+        (= name "ULT") (< a b) (= name "ULE") (<= a b)
+        (= name "UGT") (> a b) (= name "UGE") (>= a b)
+        :else (panic "unexpected comparison"))))
+(defn exercise [(graph g/Graph) (start i32) (roots (slice i32))
+                (ty i32) (opcode i32) (swap bool) (chosen i32) (a i32) (b i32)
+                (cmp i32) (keep-comparison? bool) (fuse bool) (literal-mode i32)] (-> i64)
+ (let [alc (malloc-allocator)]
+  (let [(mut prepared) (need (pipeline/prepare-native graph start roots alc))
+        (mut plan) (need (matching/build graph (.schedule prepared) roots fuse alc))
+        tile (get (.tiles plan) (cast i64 chosen))
+        name (op/name opcode)
+        less? (or (= name "LT") (= name "LE") (= name "ULT") (= name "ULE"))
+        minimum? (!= less? swap)
+        range (get (.ranges (.operands plan)) (cast i64 chosen))
+        (mut emitted) (need (compile/generate-matched graph prepared plan alc))
+        width (types/scalar-size ty 8) (mut answers) (: 0 i64)]
+   (when fuse
+    (assert (= (.rule tile) (cast i32 (+ (if minimum? 34 36) (if (< opcode 20) 1 0)))))
+    (assert (= (.wide tile) (= width 8)))
+    (assert (= (.count range) 2))
+    (assert (= (get (.inputs (.operands plan)) (.offset range)) a))
+    (assert (= (get (.inputs (.operands plan)) (+ (.offset range) 1)) b))
+    (assert (= (get (.omitted (.operands plan)) (cast i64 cmp)) (not keep-comparison?)))
+   )
+   (assert (= (len (.references emitted)) 0))
+   (let [(mut image) (need (jit/map-text (slice (.text emitted))))
+         f (p/cast (fnptr (cc/C) [u64 u64] u64) (.base image))
+         values [(: 0 u64) 1 2 7 0x7FFFFFFF 0x80000000 0xFFFFFFFF
+                 0x100000000 0x7FFFFFFFFFFFFFFF 0x8000000000000000 0xFFFFFFFFFFFFFFFF]]
+    (for x values (for y values
+     (let [mask (if (= width 4) (: 0xFFFFFFFF u64) 0xFFFFFFFFFFFFFFFF)
+           a (if (= literal-mode 1)
+                 (if (= width 4) (: 0x80000000 u64) 0x8000000000000000) (& x mask))
+           b (if (= literal-mode 2) mask (& y mask)) yes (if swap b a) no (if swap a b)
+           expected (if (truth opcode (cast i32 width) a b) yes no)]
+      (let [actual (call-ptr f x y)]
+       (when (!= actual expected)
+        (println "choice mismatch ty={} op={} swap={} fuse={} shape={} keep={} x={} y={} got={} want={}"
+         ty opcode swap fuse (n/opcode (get (.instructions graph) (cast i64 chosen)))
+         keep-comparison? x y actual expected))
+       (assert (= actual expected)))
+      (set! answers (+ answers 1)))))
+    (jit/release! (mut image)))
+   (code/release! (mut emitted)) (matching/release! (mut plan))
+   (pipeline/release! (mut prepared)) answers)
+ ))
+
+(defn check [(ty i32) (opcode i32) (swap bool) (mode i32) (literal-mode i32)] (-> i64)
+ (let [alc (malloc-allocator) (mut graph) (g/create alc)
+       start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+       x (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+       y (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+       width (types/scalar-size ty 8)
+       a (if (= literal-mode 1)
+             (need (b/scalar-constant! (mut graph) ty
+                 (if (= width 4) (: 0x80000000 u64) 0x8000000000000000) 8))
+             (if (= ty 5) x (need (b/emit! (mut graph) (if (= width 4) 35 36) ty [x]))))
+       b (if (= literal-mode 2)
+             (need (b/scalar-constant! (mut graph) ty
+                 (if (= width 4) (: 0xFFFFFFFF u64) 0xFFFFFFFFFFFFFFFF) 8))
+             (if (= ty 5) y (need (b/emit! (mut graph) (if (= width 4) 35 36) ty [y]))))
+       cmp (need (b/emit! (mut graph) opcode 1 [a b]))
+       chosen (need (b/emit! (mut graph) 60 ty [cmp (if swap b a) (if swap a b)]))
+       result (if (= ty 5) chosen
+                  (need (b/emit! (mut graph) (if (= width 4) 34 36) 5 [chosen])))
+       ret (need (b/emit! (mut graph) 120 5 [start result (: 0 i32)]))
+       (mut roots) (ArrayList::new [i32] alc)
+       (mut answers) (: 0 i64)]
+  (push! (mut roots) ret)
+  (when (!= (& mode 1) 0) (push! (mut roots) cmp))
+  (when (!= (& mode 2) 0)
+   (push! (mut roots) (need (b/emit! (mut graph) 68 1 [cmp (: 1 i32)]))))
+  (when (= mode 4)
+   (push! (mut roots) (need (b/emit! (mut graph) 60 ty [cmp (if swap a b) (if swap b a)]))))
+  (for fuse [false true]
+   (set! answers (+ answers (exercise graph start (slice roots) ty opcode swap chosen a b cmp
+                            (!= (& mode 3) 0) fuse literal-mode))))
+  (free! (mut roots)) (g/release! (mut graph)) answers))
+(defn exact-uses? [(graph g/Graph) (actual uses/Uses)] (-> bool)
+ (let [(mut expected) (uses/build graph (malloc-allocator)) (mut good) true]
+  (for [r 1 (len (.instructions graph))]
+   (let [want (get (.ranges expected) r) got (get (.ranges actual) r)]
+    (unless (= (.count want) (.count got)) (set! good false))
+    (for [i (.offset want) (+ (.offset want) (.count want))]
+     (let [edge (get (.edges expected) i) (mut seen) 0]
+      (for [j (.offset got) (+ (.offset got) (.count got))]
+       (let [other (get (.edges actual) j)]
+        (when (and (= (.user edge) (.user other)) (= (.operand edge) (.operand other)))
+         (set! seen (+ seen 1)))))
+      (unless (= seen 1) (set! good false))))))
+  (uses/release! (mut expected)) good))
+(defn check-diamond [(ty i32) (opcode i32) (swap bool) (reverse? bool) (mode i32) (literal-mode i32)] (-> i64)
+ (let [alc (malloc-allocator) (mut graph) (g/create alc)
+       start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+       x (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+       y (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+       width (types/scalar-size ty 8)
+       a (if (= literal-mode 1)
+             (need (b/scalar-constant! (mut graph) ty
+                 (if (= width 4) (: 0x80000000 u64) 0x8000000000000000) 8))
+             (if (= ty 5) x (need (b/emit! (mut graph) (if (= width 4) 35 36) ty [x]))))
+       b (if (= literal-mode 2)
+             (need (b/scalar-constant! (mut graph) ty
+                 (if (= width 4) (: 0xFFFFFFFF u64) 0xFFFFFFFFFFFFFFFF) 8))
+             (if (= ty 5) y (need (b/emit! (mut graph) (if (= width 4) 35 36) ty [y]))))
+       cmp (need (b/emit! (mut graph) opcode 1 [a b]))
+       branch (need (b/emit! (mut graph) 116 0 [start cmp]))
+       yes (need (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+       no (need (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+       end1 (need (b/emit! (mut graph) 114 0 [yes]))
+       end2 (need (b/emit! (mut graph) 114 0 [no]))
+       merge (need (b/emit! (mut graph) 112 0 [(if reverse? end2 end1) (if reverse? end1 end2)]))
+       first (if swap b a) second (if swap a b)
+       chosen (need (b/emit! (mut graph) 67 ty
+                       [merge (if reverse? second first) (if reverse? first second)]))
+       result (if (= ty 5) chosen (need (b/emit! (mut graph) (if (= width 4) 34 36) 5 [chosen])))
+       ret (need (b/emit! (mut graph) 120 5 [merge result (: 0 i32)]))
+       (mut roots) (ArrayList::new [i32] alc)
+       (mut lists) (uses/build graph alc)
+       (mut queue) (q/create (len (.instructions graph)) alc)
+       (mut answers) (: 0 i64)]
+  (push! (mut roots) ret)
+  (case mode
+    1 (push! (mut roots) cmp) 2 (push! (mut roots) chosen)
+    3 (push! (mut roots) merge) 4 (push! (mut roots) branch)
+    5 (push! (mut roots) end1) 6 (push! (mut roots) yes)
+    7 (do (push! (mut roots) end1) (push! (mut roots) end2)) 0)
+  (set! answers (+ answers (exercise graph start (slice roots) ty opcode swap chosen a b cmp
+                            (= mode 1) false literal-mode)))
+  (assert (= (need (diamond/rewrite! (mut graph) (mut roots) (mut lists) (mut queue) 8 alc)) 1))
+  (assert (= (n/opcode (get (.instructions graph) (cast i64 chosen))) 60))
+  (assert (exact-uses? graph lists))
+  (need (rewrite/validate graph 8 alc))
+  (for root roots (assert (!= (n/opcode (get (.instructions graph) (cast i64 root))) 0)))
+  (set! answers (+ answers (exercise graph start (slice roots) ty opcode swap chosen a b cmp
+                            (= mode 1) true literal-mode)))
+  (q/release! (mut queue)) (uses/release! (mut lists))
+  (free! (mut roots)) (g/release! (mut graph)) answers))
+(defn decline-cases [] (-> void)
+ (for ty [(: 2 i32) 3 4 5 6 7 8 9 10 11 12 13]
+  (let [alc (malloc-allocator) (mut graph) (g/create alc)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        a (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        b (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 1]))
+        c (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 2]))]
+   (for opcode [(: 14 i32) 15 16]
+    (let [cmp (need (b/emit! (mut graph) opcode 1 [a b]))
+          choice (need (b/emit! (mut graph) 60 ty [cmp a c]))]
+     ; A third identity never satisfies the exact-comparand proof.
+     (match (select/ordered-choice graph choice)
+      (None [] 0) (Some [_] (panic "unrelated arm selected")))
+     (when (or (< opcode 16) (not (types/integer? ty))
+               (< (types/scalar-size ty 8) 4))
+      (let [exact (need (b/emit! (mut graph) 60 ty [cmp a b]))]
+       (match (select/ordered-choice graph exact)
+        (None [] 0) (Some [_] (panic "unsupported choice selected")))))))
+   (g/release! (mut graph))))
+ (let [alc (malloc-allocator) (mut graph) (g/create alc)
+       start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+       rload (need (b/emit! (mut graph) 89 5 [start (: 0 i32) 0]))
+       b (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+       cmp (need (b/emit! (mut graph) 16 1 [rload b]))
+       choice (need (b/emit! (mut graph) 60 5 [cmp rload b]))]
+  (match (select/ordered-choice graph choice)
+   (None [] 0) (Some [_] (panic "RLOAD comparison moved")))
+  (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+ (decline-cases)
+ (let [(mut answers) (: 0 i64)]
+  (for literal-mode [(: 0 i32) 1 2]
+   (for ty [(: 4 i32) 5 6 10 11]
+    (for [opcode 16 24] (for swap [false true]
+     (for [mode 0 5]
+      (set! answers (+ answers (check ty (cast i32 opcode) swap (cast i32 mode) literal-mode))))
+     (for reverse? [false true] (for [mode 0 8]
+      (set! answers (+ answers (check-diamond ty (cast i32 opcode) swap reverse? (cast i32 mode) literal-mode)))))))))
+  (println "ordered choice: {} original/selected native answers" answers)) 0)

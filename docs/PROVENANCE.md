@@ -1602,3 +1602,8 @@ availability and MIN/MAX/ABS remain unimplemented. See validation/affected-merge
 Diamond producer rewrites now notify existing users as pinned ir_optimize_phi
 notifies ir_iter_add_uses after conversion. This restores the affected-consumer
 restart contract without adding fold rules. See validation/diamond-user-notification.
+
+
+## Exact comparison choices
+
+The exact operand-identity diamond pattern follows dstogov/ir ir_sccp.c MIN/MAX handling at pinned92171d0a4a36b0acf707f2dea7998de615dd4acd. Coil retains COND in the generic graph so signed comparison semantics survive canonical unsigned CIR word types, then reuses the existing AArch64 signed/unsigned MIN/MAX CMP/CSEL recipes. No arbitrary-value availability or floating MIN/MAX transformation is implied. Validation is centralized under docs/validation/compare-choice-minmax; original license/credit remains in NOTICE.
