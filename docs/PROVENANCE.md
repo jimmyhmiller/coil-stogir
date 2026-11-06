@@ -1583,3 +1583,8 @@ prototype/optional/local-storage checks remain unchanged; no unchecked public
 Graph API is introduced. The signed instruction-reference domain is explicitly
 checked once, matching Graph.append's existing limit. Proof/differential/error
 and performance evidence are in validation/structure-proven-operands.
+
+Integer verifier current-header operand reads are an independent implementation
+improvement in verify.coil, using the existing successful structural-validation
+precondition. Referenced cells and type/width/guard checks remain checked.
+See validation/integer-operand-fields for exact diagnostic and ASAN evidence.
