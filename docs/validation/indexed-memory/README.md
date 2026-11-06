@@ -79,3 +79,11 @@ Ordinary unshifted indices remain legal. The existing geometry oracle now also
 asserts non-natural scales decline; mixed-width sharing keeps its address when
 needed.1560native variants plus volatile pressure pass LLVM/debug/ASAN.
 Compiler performance for this follow-up remains pending.
+
+Refined compiler bb21d63f candidate build/quick45.4s/live-emission and current
+candidate native address suite pass. Paired actual CIR emitter CPU762.5935→
+746.449ms (2.12%), LLVM340.4485ms; object2706144→2697868bytes. AVec neutral,
+verifier0.79% gain. Same-source before55d4a5ff, four generation/eight rotating
+runtime samples after warmup, no task builds/tests overlap, all source/SDK
+identities recorded. Full evidence in Coil docs/benchmarks/indexed-memory-natural.
+Keep isolated: no whole-bootstrap acceptance or fullFAST/install/push claim.
