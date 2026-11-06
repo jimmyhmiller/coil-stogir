@@ -1,6 +1,6 @@
 ;;; Standalone AArch64 compilation entry point over the library IR.
 (module stogir.a64.compile)
-(export validate generate generate-matched text image object vector-image image-with-options object-with-options image-with-private)
+(export validate generate generate-matched text image object vector-image image-with-options object-with-options image-with-private image-for-private-module)
 (import "stogir.graph" :as g)
 (import "stogir.options" :as options)
 (import "stogir.loop-vectorize" :as vectorize)
@@ -225,7 +225,7 @@
              (entry i32)
              (roots (slice i32))
              (symbol (slice u8))
-             (allocator (dyn Allocator)) (context private/Context)]
+             (allocator (dyn Allocator)) (context private/Context) (embed bool)]
   (-> (Result code/Image (slice u8)))
   (match (generate-private graph entry roots allocator context)
     (Err [msg] (Err msg))
@@ -239,7 +239,7 @@
             (Err [message] (Err message))
             (Ok [compiled]
               (let [(mut compiled) compiled]
-                (match (private/bind-image! context (mut compiled))
+                (match (if embed (private/bind-image! context (mut compiled)) (Ok [i32 (slice u8)] 0))
                   (Err [message] (code/release! (mut compiled)) (Err message))
                   (Ok [_] (Ok compiled))))))))))
 
@@ -263,16 +263,16 @@
                     (entry i32)
                     (roots (slice i32))
                     (symbol (slice u8))
-                    (allocator (dyn Allocator)) (context private/Context)]
+                    (allocator (dyn Allocator)) (context private/Context) (embed bool)]
   (-> (Result code/Image (slice u8)))
   (match (vectorize/optimize graph entry roots 2 allocator)
     (Err [message] (Err message))
     (Ok [candidate]
         (match candidate
-          (None [] (image-private graph entry roots symbol allocator context))
+          (None [] (image-private graph entry roots symbol allocator context embed))
           (Some [working]
                 (let [(mut working) working
-                      output (image-private working entry roots symbol allocator context)]
+                      output (image-private working entry roots symbol allocator context embed)]
                   (g/release! (mut working))
                   output))))))
 
@@ -282,12 +282,12 @@
 ;;; implementation exists. Missing promotion/control rules remain documented.
 ;;; Keep the working graph alive through finish!: Buffer references are not an
 ;;; owned image and must never escape after the optimized graph is released.
-(defn image-with-private [(graph g/Graph)
+(defn image-with-private-impl [(graph g/Graph)
                           (entry i32)
                           (roots (slice i32))
                           (symbol (slice u8))
                           (configuration options/Options)
-                          (allocator (dyn Allocator)) (context private/Context)]
+                          (allocator (dyn Allocator)) (context private/Context) (embed bool)]
   (-> (Result code/Image (slice u8)))
   (match (options/validate configuration)
     (Err [message] (Err message))
@@ -295,7 +295,7 @@
         (if (= level 0)
             (Err "AArch64 O0 pipeline is not implemented")
             (if (= level 1)
-                (image-private graph entry roots symbol allocator context)
+                (image-private graph entry roots symbol allocator context embed)
                 (if (!= entry 1)
                     (Err "SCCP requires START at reference one")
                     (match (sccp/optimize-memory graph 8 roots true allocator)
@@ -308,12 +308,12 @@
                                                     entry
                                                     (slice (.roots optimized))
                                                     symbol
-                                                    allocator context)
+                                                    allocator context embed)
                                       (image-private (.graph optimized)
                                              entry
                                              (slice (.roots optimized))
                                              symbol
-                                             allocator context))]
+                                             allocator context embed))]
                             (rewrite/release! (mut optimized))
                             output)))))))))
 
@@ -348,11 +348,31 @@
   (generate-matched-private graph owned matched a (private/no-context)))
 (defn image [(graph g/Graph) (entry i32) (roots (slice i32)) (symbol (slice u8))
              (a (dyn Allocator))] (-> (Result code/Image (slice u8)))
-  (image-private graph entry roots symbol a (private/no-context)))
+  (image-private graph entry roots symbol a (private/no-context) true))
 (defn vector-image [(graph g/Graph) (entry i32) (roots (slice i32)) (symbol (slice u8))
                     (a (dyn Allocator))] (-> (Result code/Image (slice u8)))
-  (vector-image-private graph entry roots symbol a (private/no-context)))
+  (vector-image-private graph entry roots symbol a (private/no-context) true))
 (defn image-with-options [(graph g/Graph) (entry i32) (roots (slice i32))
                           (symbol (slice u8)) (configuration options/Options)
                           (a (dyn Allocator))] (-> (Result code/Image (slice u8)))
   (image-with-private graph entry roots symbol configuration a (private/no-context)))
+
+;;; Self-contained images own a private instance of every referenced leaf.
+(defn image-with-private [(graph g/Graph) (entry i32) (roots (slice i32))
+                          (symbol (slice u8)) (configuration options/Options)
+                          (a (dyn Allocator)) (context private/Context)]
+  (-> (Result code/Image (slice u8)))
+  (image-with-private-impl graph entry roots symbol configuration a context true))
+
+;;; A target transport must bind the returned undefined declarations to binding()
+;;; from this exact sealed publication. It may not resolve them externally or
+;;; emit the private bodies again. The adapter verifies publication bytes/binding
+;;; metadata and preserves symbol IDs through its final AOT/JIT image assembly.
+(defn image-for-private-module [(graph g/Graph) (entry i32) (roots (slice i32))
+                                (symbol (slice u8)) (configuration options/Options)
+                                (a (dyn Allocator)) (context private/Context)
+                                (publication private/Publication) (scope usize)]
+  (-> (Result code/Image (slice u8)))
+  (if (not (private/module-valid? context publication scope))
+      (Err "private module publication is not valid for this target")
+      (image-with-private-impl graph entry roots symbol configuration a context false)))

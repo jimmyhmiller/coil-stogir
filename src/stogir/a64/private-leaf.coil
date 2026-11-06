@@ -1,6 +1,6 @@
 ;;; Owned private leaf bytes and signature, without mutable image aliases.
 (module stogir.a64.private-leaf)
-(export Frozen create release! call-mask append-to! Context active? no-context context-create context-release! register! freeze! context-mask validate-references bind-image!)
+(export Frozen create release! call-mask append-to! Context active? no-context context-create context-release! register! register-as! freeze! context-mask validate-references bind-image! Publication no-publication confirm-publication! seal-module! module-valid? binding verify-publication)
 (import "stogir.a64.leaf-effects" :as effects)
 (import "stogir.a64.registers" :as registers)
 (import "stogir.a64.code" :as code)
@@ -136,7 +136,8 @@
 (defstruct Context [(state (ptr u8))])
 (defstruct ContextState [(a (dyn Allocator)) (frozen bool)
                         (leaves (ArrayList Frozen)) (next (ArrayList i32))
-                        (heads (HashMap u64 i32))])
+                        (heads (HashMap u64 i32)) (targets (ArrayList i64))
+                        (scope usize) (sealed bool)])
 
 (defn active? [(context Context)] (-> bool) (!= (p/cast usize (.state context)) 0))
 
@@ -146,7 +147,8 @@
   (Context :state (p/cast (ptr u8)
     (alloc/box! a ContextState (ContextState :a a :frozen false
       :leaves (ArrayList::new [Frozen] a) :next (ArrayList::new [i32] a)
-      :heads (HashMap::new-scalar [u64 i32] a))))))
+      :heads (HashMap::new-scalar [u64 i32] a)
+      :targets (ArrayList::new [i64] a) :scope 0 :sealed false)))))
 
 (defn find-leaf [(s (ptr ContextState)) (name (slice u8))] (-> i32)
   (let [(mut i) (match (get (.heads s) (image/hash-name name))
@@ -164,41 +166,58 @@
     (let [s (p/cast (ptr ContextState) (.state context)) a (.a s)]
       (for [i 0 (len (.leaves s))] (release! (elem (mut (.leaves s)) i)))
       (free! (mut (.leaves s))) (free! (mut (.next s))) (free! (mut (.heads s)))
+      (free! (mut (.targets s)))
       (alloc/destroy a s)
       (set! (.state context) (p/cast (ptr u8) 0)))))
 
-(defn duplicate-source? [(s (ptr ContextState)) (source image/Image) (id i32)] (-> bool)
-  (if (or (< id 0) (>= (cast i64 id) (len (.symbols source)))) false
+(defn source-name [(source image/Image) (id i32)] (-> (Option (slice u8)))
+  (if (or (< id 0) (>= (cast i64 id) (len (.symbols source)))) (None)
       (let [symbol (get (.symbols source) (cast i64 id))
             offset (.name symbol) size (.length symbol)]
-        (and (>= offset 0) (> size 0) (<= offset (len (.names source)))
-             (<= size (- (len (.names source)) offset))
-             (>= (find-leaf s (subslice (slice (.names source)) offset (+ offset size))) 0)))))
+        (if (and (>= offset 0) (> size 0) (<= offset (len (.names source)))
+                 (<= size (- (len (.names source)) offset)))
+            (Some (subslice (slice (.names source)) offset (+ offset size))) (None)))))
 
-;;; Unsupported bodies decline normally. Duplicate names and registration after
-;;; freeze are errors; published code can never be replaced through this API.
-(defn register! [(context (mut Context)) (source image/Image) (symbol i32)
-                  (size i64) (signature (slice u8))] (-> (Result bool (slice u8)))
-  (if (= (p/cast usize (.state context)) 0) (Err "private context is released")
+;;; Naming a module-owned binding separately from the temporary image's entry
+;;; label does not alter its bytes or ABI. The target adapter must publish that
+;;; exact body once at the original private symbol before sealing the context.
+(defn register-as! [(context (mut Context)) (name (slice u8)) (source image/Image)
+                     (symbol i32) (size i64) (signature (slice u8))]
+  (-> (Result bool (slice u8)))
+  (if (not (active? context)) (Err "private context is released")
       (let [s (p/cast (ptr ContextState) (.state context))]
-        (if (.frozen s) (Err "private context is frozen")
-            (if (duplicate-source? s source symbol) (Err "duplicate private leaf name")
+        (cond
+          (.frozen s) (Err "private context is frozen")
+          (not (symbols/valid-name? name)) (Err "invalid private binding name")
+          (>= (find-leaf s name) 0) (Err "duplicate private leaf name")
+          :else
             (match (create source symbol size signature (.a s))
               (None [] (Ok false))
               (Some [leaf]
                 (let [(mut leaf) leaf body (p/cast (ptr State) (.state leaf))
-                      name (slice (.name body)) hash (image/hash-name name)]
-                  (if (>= (find-leaf s name) 0)
-                      (do (release! (mut leaf)) (Err "duplicate private leaf name"))
-                      (let [head (match (get (.heads s) hash)
-                                    (None [] (: -1 i32)) (Some [i] i))
-                            index (len (.leaves s))]
-                        (if (> index 2147483647)
-                            (do (release! (mut leaf)) (Err "private leaf index space exhausted"))
-                            (do (push! (mut (.next s)) head)
-                                (push! (mut (.leaves s)) leaf)
-                                (set! (mut (.heads s)) hash (cast i32 index))
-                                (Ok true)))))))))))))
+                      hash (image/hash-name name)
+                      head (match (get (.heads s) hash) (None [] (: -1 i32)) (Some [i] i))
+                      index (len (.leaves s))]
+                  (if (> index 2147483647)
+                      (do (release! (mut leaf)) (Err "private leaf index space exhausted"))
+                      (do
+                        (unless (same? name (slice (.name body)) false)
+                          (clear! (mut (.name body)))
+                          (for byte name (push! (mut (.name body)) byte)))
+                        (push! (mut (.next s)) head)
+                        (push! (mut (.targets s)) (: -1 i64))
+                        (push! (mut (.leaves s)) leaf)
+                        (set! (mut (.heads s)) hash (cast i32 index))
+                        (Ok true))))))))))
+
+(defn register! [(context (mut Context)) (source image/Image) (symbol i32)
+                  (size i64) (signature (slice u8))] (-> (Result bool (slice u8)))
+  (if (not (active? context)) (Err "private context is released")
+      (if (.frozen (p/cast (ptr ContextState) (.state context)))
+          (Err "private context is frozen")
+          (match (source-name source symbol)
+            (None [] (Ok false))
+            (Some [name] (register-as! (mut context) name source symbol size signature))))))
 
 (defn freeze! [(context (mut Context))] (-> void)
   (when (!= (p/cast usize (.state context)) 0)
@@ -302,3 +321,65 @@
                         (Err [message] (set! error message))
                         (Ok [_] (set! count (+ count 1))))))))
               (if (= error "") (Ok count) (Err error)))))))
+
+;;; Borrowed publication token; its owning context must remain alive. A transport
+;;; supplies actual symbol metadata and emitted bytes, never a validation flag.
+(defstruct Publication [(owner (ptr u8)) (scope usize)])
+(defn no-publication [] (-> Publication)
+  (Publication :owner (p/cast (ptr u8) 0) :scope 0))
+
+(defn confirm-publication! [(context (mut Context)) (scope usize) (name (slice u8))
+                            (symbol i64) (binding u8) (text (slice u8))]
+  (-> (Result bool (slice u8)))
+  (if (not (active? context)) (Err "private context is released")
+      (let [s (p/cast (ptr ContextState) (.state context)) index (find-leaf s name)]
+        (cond
+          (.frozen s) (Err "private context is frozen")
+          (or (= scope 0) (< symbol 0) (> symbol 4294967295) (!= binding 0))
+            (Err "private publication requires a local symbol and target scope")
+          (and (!= (.scope s) 0) (!= (.scope s) scope))
+            (Err "private publication target scope changed")
+          (< index 0) (Ok false)
+          :else
+            (let [leaf (get (.leaves s) (cast i64 index))
+                  body (p/cast (ptr State) (.state leaf))
+                  (mut used) false]
+              (for target (.targets s) (when (= target symbol) (set! used true)))
+              (cond
+                used (Err "private symbol already published")
+                (>= (get (.targets s) (cast i64 index)) 0) (Err "private body already published")
+                (not (same? text (slice (.text body)) false)) (Err "published private bytes differ")
+                :else (do (set! (.scope s) scope)
+                          (set! (mut (.targets s)) (cast i64 index) symbol)
+                          (Ok true))))))))
+
+(defn seal-module! [(context (mut Context)) (scope usize)] (-> (Option Publication))
+  (if (or (not (active? context)) (= scope 0)) (None)
+      (let [s (p/cast (ptr ContextState) (.state context))
+            (mut valid) (or (= (.scope s) 0) (= (.scope s) scope))]
+        (for target (.targets s) (when (< target 0) (set! valid false)))
+        (if (not valid) (None)
+            (do (set! (.scope s) scope) (set! (.frozen s) true) (set! (.sealed s) true)
+                (Some (Publication :owner (.state context) :scope scope)))))))
+
+(defn module-valid? [(context Context) (publication Publication) (scope usize)] (-> bool)
+  (and (active? context) (!= scope 0)
+       (= (p/cast usize (.state context)) (p/cast usize (.owner publication)))
+       (= scope (.scope publication))
+       (let [s (p/cast (ptr ContextState) (.state context))]
+         (and (.frozen s) (.sealed s) (= scope (.scope s))))))
+
+(defn binding [(context Context) (publication Publication) (scope usize) (name (slice u8))]
+  (-> (Option i64))
+  (if (not (module-valid? context publication scope)) (None)
+      (let [s (p/cast (ptr ContextState) (.state context)) index (find-leaf s name)]
+        (if (< index 0) (None) (Some (get (.targets s) (cast i64 index)))))))
+
+(defn verify-publication [(context Context) (publication Publication) (scope usize)
+                           (name (slice u8)) (symbol i64) (kind u8) (text (slice u8))]
+  (-> bool)
+  (if (or (!= kind 0) (not (module-valid? context publication scope))) false
+      (let [s (p/cast (ptr ContextState) (.state context)) index (find-leaf s name)]
+        (and (>= index 0) (= symbol (get (.targets s) (cast i64 index)))
+             (let [body (p/cast (ptr State) (.state (get (.leaves s) (cast i64 index))))]
+               (same? text (slice (.text body)) false))))))
