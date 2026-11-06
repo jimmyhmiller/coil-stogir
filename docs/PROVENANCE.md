@@ -1619,3 +1619,7 @@ Independent closed instruction-effect analysis in a64/leaf-effects.coil, using e
 ## Owned private leaf contexts
 
 Independent a64/private-leaf.coil ownership and private-publication layer. It derives effects from closed emitted-byte analysis, retains the whole ordinary caller setup GP bank and preserves explicit private image bindings. It does not yet alter normal caller allocation. Central validation: validation/private-leaf-context. Original dstogov/ir credit and license remain in NOTICE.
+
+## Private leaf call allocation
+
+Independent frozen private-call context and AArch64 clobber selection, with complete setup GP bank and full fallback for indirect/unknown/tail calls. Closed emitted-byte summaries drive target reservations without changing IR or linear-scan policy. The self-contained image entry binds calls to the owned private bytes before publishing. Whole-module Coil integration remains separate to preserve single body/function-address identity. Validation and qualified diagnostic timings: validation/private-call-allocation. Original dstogov/ir credit remains in NOTICE.

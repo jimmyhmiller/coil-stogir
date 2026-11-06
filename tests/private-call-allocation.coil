@@ -1,0 +1,263 @@
+(module stogir.tests.private-call-allocation)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.call-results" :as results)
+(import "stogir.symbols" :as symbols)
+(import "stogir.strings" :as strings)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.bytes" :as bytes)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.allocation" :as allocation)
+(import "stogir.live-ranges" :as live-ranges)
+(import "stogir.a64.call-abi" :as abi)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "stogir.aot.macho" :as macho)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.fs" :as fs)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(answer (Result i32 (slice u8)))] (-> i32)
+  (match answer (Err [message] (panic "{}" message)) (Ok [value] value)))
+(defn word! [(text (mut (ArrayList u8))) (answer (Result u32 (slice u8)))] (-> void)
+  (match answer (Err [message] (panic "{}" message))
+    (Ok [word] (bytes/append32! (mut text) word))))
+
+(defn run-image [(source image/Image) (path (slice u8))] (-> void)
+  (let [a (malloc-allocator)]
+    (match (jit/map-image source a)
+      (Err [message] (panic "map: {}" message))
+      (Ok [mapped]
+        (let [(mut mapped) mapped
+              f (p/cast (fnptr (cc/C) [(ptr u64) u64] u64) (.base (.memory mapped)))
+              (mut cells) (ArrayList::new [u64] a)]
+          (for [i 0 32] (push! (mut cells) (: 0 u64)))
+          (for input [(: 0 u64) 1 19 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
+            (for [i 0 12]
+              (set! (mut cells) i (+ (* input 37) (cast u64 (* i 13))))
+              (set! (mut cells) (+ i 16) (: 0 u64)))
+            (assert (= (call-ptr f (.data cells) input) (+ input 1)))
+            (for [i 0 12] (assert (= (get cells i) (get cells (+ i 16))))))
+          (free! (mut cells)) (jit/release-image! (mut mapped)))))
+    (match (macho/image-object source a)
+      (Err [message] (panic "AOT: {}" message))
+      (Ok [object]
+        (let [(mut object) object]
+          (match (fs/write-file a path (slice object))
+            (Err [_] (panic "write object failed")) (Ok [_] 0))
+          (free! (mut object)))))))
+
+(defn reservation-check [(context private/Context) (graph g/Graph)
+                          (start i32) (ret i32) (call i32) (expected u64)] (-> void)
+  (let [a (malloc-allocator)]
+    (match (pipeline/prepare-native graph start [ret] a)
+      (Err [message] (panic "prepare: {}" message))
+      (Ok [prepared]
+        (let [(mut prepared) prepared (mut modes) (ArrayList::new [i32] a)
+              (mut parts) (ArrayList::new [allocation/Part] a)]
+          (for [i 0 (len (.instructions graph))] (push! (mut modes) (: 0 i32)))
+          (for mode [(: 0 i32) 1 2]
+            (set! (mut modes) (cast i64 call) mode)
+            ; Empty virtual ranges are sufficient to inspect physical reservations.
+            (for floating? [false true]
+            (let [(mut ranges) (ArrayList::new [live-ranges/Value] a)
+                  count (abi/reserve-with-context! (mut parts) graph (.schedule prepared)
+                            floating? ranges [] (slice modes) context a)
+                  (mut mask) (: 0 u64)]
+              (assert (= count 1))
+              (for part parts (set! mask (| mask (<< (: 1 u64) (cast u64 (.register part))))))
+              (assert (= mask (| (if (= mode 0) (& expected 0xFFFE) (: 0xFFFE u64))
+                                 (if floating? (: 0x3FFF00FF00000000 u64) (: 0 u64)))))
+              (for [i 0 (len parts)] (allocation/release! (elem (mut parts) i)))
+              (clear! (mut parts)) (free! (mut ranges)))))
+          (free! (mut parts)) (free! (mut modes))
+          (pipeline/release! (mut prepared)))))))
+
+(defn check [(extra i32)] (-> void)
+  (let [a (malloc-allocator) (mut source) (image/create a)
+        (mut context) (private/context-create a)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        address (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        input (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        (mut values) (ArrayList::new [i32] a) (mut control) start]
+    (word! (mut (.text source)) (encode/add-sub-immediate true false false 0 0 1))
+    (for [reg 1 9] (word! (mut (.text source)) (encode/move-wide true 2 (cast i32 reg) (+ 500 (cast i32 reg)) 0)))
+    (when (>= extra 0) (word! (mut (.text source)) (encode/move-wide true 2 extra 999 0)))
+    (word! (mut (.text source)) (encode/ret 30))
+    (let [symbol (require (image/local-symbol! (mut source) "pressure_leaf" 1 0))]
+      (match (private/register! (mut context) source symbol (len (.text source)) [(: 0 u8) 5 1 5])
+        (Err [message] (panic "register: {}" message)) (Ok [accepted] (assert accepted)))
+      (match (private/register! (mut context) source symbol (len (.text source)) [(: 0 u8) 5 1 5])
+        (Err [_] 0) (Ok [_] (panic "duplicate private name accepted")))
+      (assert (bytes/patch32! (mut (.text source)) 0 0xFFFFFFFF))
+      (match (private/register! (mut context) source symbol (len (.text source)) [(: 0 u8) 5 1 5])
+        (Err [message] (assert (= message "duplicate private leaf name")))
+        (Ok [_] (panic "unsupported duplicate bypassed name guard")))
+      (assert (bytes/patch32! (mut (.text source)) 0 0x91000400)))
+    (for [i 0 12]
+      (let [offset (require (b/scalar-constant! (mut graph) 5 (cast u64 (* i 8)) 8))
+            pointer (require (b/emit! (mut graph) 26 6 [address offset]))
+            load (require (b/emit! (mut graph) 91 5 [control pointer]))]
+        (push! (mut values) load) (set! control load)))
+    (let [target (require (symbols/function! (mut graph) "pressure_leaf" 0))
+          (mut prototype) (match (calls/create 0 5 [(: 5 u8)] a)
+                            (Err [message] (panic "{}" message)) (Ok [prototype] prototype))
+          call (require (calls/emit! (mut graph) prototype control target [input] a))]
+      (match (private/context-mask context graph call)
+        (None [] 0) (Some [_] (panic "unfrozen context used")))
+      (private/freeze! (mut context))
+      (match (private/register! (mut context) source 0 (len (.text source)) [(: 0 u8) 5 1 5])
+        (Err [_] 0) (Ok [_] (panic "registration after freeze accepted")))
+      (image/release! (mut source))
+      (let [expected (| (: 0x1FF u64) (if (< extra 0) (: 0 u64) (<< (: 1 u64) (cast u64 extra))))]
+        (match (private/context-mask context graph call)
+          (None [] (panic "private call proof missing"))
+          (Some [mask] (assert (= mask expected))))
+        (set! control call)
+        (for [i 0 12]
+          (let [offset (require (b/scalar-constant! (mut graph) 5 (cast u64 (* (+ i 16) 8)) 8))
+                destination (require (b/emit! (mut graph) 26 6 [address offset]))]
+            (set! control (require (b/emit! (mut graph) 93 0 [control destination (get values i)])))))
+        (let [ret (require (b/emit! (mut graph) 120 5 [control call (: 0 i32)]))]
+          (reservation-check context graph start ret call expected)
+          (let [original (.op2 (get (.instructions graph) (cast i64 call)))
+                original-node (match (g/lookup graph original)
+                                (None [] (panic "original callee missing")) (Some [node] node))
+                unknown (require (symbols/function! (mut graph) "external_pressure_leaf"
+                                   (cast i32 (n/auxiliary original-node))))]
+            (assert (g/set-operand! (mut graph) call 2 address))
+            (match (private/context-mask context graph call)
+              (None [] 0) (Some [_] (panic "indirect call specialized")))
+            (reservation-check context graph start ret call 0xFFFF)
+            (assert (g/set-operand! (mut graph) call 2 unknown))
+            (match (private/context-mask context graph call)
+              (None [] 0) (Some [_] (panic "unknown direct call specialized")))
+            (reservation-check context graph start ret call 0xFFFF)
+            (match (compile/image-with-private graph start [ret] "_private_pressure_entry"
+                     (options/Options :level 3) a context)
+              (Err [message] (panic "external fallback: {}" message))
+              (Ok [output]
+                (let [(mut output) output
+                      id (match (image/find-symbol output "external_pressure_leaf")
+                           (None [] (panic "external declaration lost")) (Some [id] id))
+                      symbol (get (.symbols output) (cast i64 id))]
+                  (assert (.global? symbol)) (assert (= (.section symbol) 0))
+                  (image/release! (mut output)))))
+            (let [(mut mismatch) (match (calls/create 9 5 [(: 5 u8)] a)
+                                  (Err [message] (panic "{}" message)) (Ok [p] p))
+                  (mut encoded) (calls/encode mismatch a)
+                  id (match (strings/intern! (mut (.strings graph)) (slice encoded))
+                       (None [] (panic "prototype intern failed")) (Some [id] id))
+                  target (require (symbols/function! (mut graph) "pressure_leaf" id))]
+              (assert (g/set-operand! (mut graph) call 2 target))
+              (match (private/context-mask context graph call)
+                (None [] 0) (Some [_] (panic "mismatched ABI specialized")))
+              (match (compile/image-with-private graph start [ret] "_private_pressure_entry"
+                       (options/Options :level 3) a context)
+                (Err [message] (assert (= message "private function ABI prototype mismatch")))
+                (Ok [output] (let [(mut output) output] (image/release! (mut output)))
+                             (panic "mismatched private ABI emitted")))
+              (free! (mut encoded)) (calls/release! (mut mismatch)))
+            (assert (g/set-operand! (mut graph) call 2 original)))
+          (for optimized [false true]
+            (let [(mut output)
+                    (match (if optimized
+                             (compile/image-with-private graph start [ret] "_private_pressure_entry"
+                               (options/Options :level 3) a context)
+                             (compile/image-with-options graph start [ret] "_private_pressure_entry"
+                               (options/Options :level 3) a))
+                      (Err [message] (panic "compile: {}" message)) (Ok [output] output))]
+              (unless optimized (require (private/bind-image! context (mut output))))
+              (let [callee (match (image/find-symbol output "pressure_leaf")
+                             (None [] (panic "private binding missing")) (Some [i] i))
+                    symbol (get (.symbols output) (cast i64 callee))]
+                (assert (not (.global? symbol)))
+                (println "private call extra{} optimized{}: caller text {} bytes" extra optimized (.offset symbol)))
+              (run-image output
+                (if optimized
+                    (match extra (-1 "build/private-pressure-after-none.o")
+                      (9 "build/private-pressure-after9.o") (12 "build/private-pressure-after12.o")
+                      (_ "build/private-pressure-after15.o"))
+                    (match extra (-1 "build/private-pressure-before-none.o")
+                      (9 "build/private-pressure-before9.o") (12 "build/private-pressure-before12.o")
+                      (_ "build/private-pressure-before15.o"))))
+              (image/release! (mut output))))))
+      (calls/release! (mut prototype)))
+    (free! (mut values)) (private/context-release! (mut context))
+    (g/release! (mut graph))))
+
+(defn result-check [(level i32) (indirect? bool)] (-> void)
+  (let [a (malloc-allocator) (mut source) (image/create a)
+        (mut context) (private/context-create a)
+        (mut graph) (g/create a)
+        (mut prototype) (match (calls/create-result 0 [(: 6 u8) 5] []
+                           (if indirect? (results/indirect) (results/pieces 5 2)) a)
+                          (Err [message] (panic "{}" message)) (Ok [p] p))
+        (mut signature) (calls/encode prototype a)]
+    (bytes/append32! (mut (.text source)) (if indirect? (: 0xF9000100 u32) (: 0x91000401 u32)))
+    (bytes/append32! (mut (.text source)) 0xD65F03C0)
+    (let [symbol (require (image/local-symbol! (mut source) "sret_leaf" 1 0))]
+      (match (private/register! (mut context) source symbol 8 (slice signature))
+        (Err [message] (panic "{}" message)) (Ok [accepted] (assert accepted))))
+    (image/release! (mut source)) (free! (mut signature))
+    (private/freeze! (mut context))
+    (let [start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+          destination (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+          input (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+          target (require (symbols/function! (mut graph) "sret_leaf" 0))
+          call (require (calls/emit! (mut graph) prototype start target [destination input] a))
+          loaded (require (b/emit! (mut graph) 91 5 [call destination]))
+          second (if indirect? loaded
+                     (let [eight (require (b/scalar-constant! (mut graph) 5 8 8))
+                           pointer (require (b/emit! (mut graph) 26 6 [destination eight]))]
+                       (require (b/emit! (mut graph) 91 5 [loaded pointer]))))
+          value (if indirect? loaded (require (b/emit! (mut graph) 48 5 [loaded second])))
+          ret (require (b/emit! (mut graph) 120 5 [second value (: 0 i32)]))]
+      (match (private/context-mask context graph call)
+        (None [] (panic "indirect result proof missing"))
+        (Some [mask] (assert (= mask 0x1FF))))
+      (match (compile/image-with-private graph start [ret]
+               (if indirect? "_private_sret_entry" "_private_pieces_entry")
+               (options/Options :level level) a context)
+        (Err [message] (panic "sret compile: {}" message))
+        (Ok [output]
+          (let [(mut output) output]
+            (match (jit/map-image output a)
+              (Err [message] (panic "sret JIT: {}" message))
+              (Ok [mapped]
+                (let [(mut mapped) mapped (mut cells) (ArrayList::new [u64] a)
+                      f (p/cast (fnptr (cc/C) [(ptr u64) u64] u64) (.base (.memory mapped)))]
+                  (push! (mut cells) (: 0 u64)) (push! (mut cells) (: 0 u64))
+                  (for input [(: 0 u64) 1 19 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
+                    (assert (= (call-ptr f (.data cells) input)
+                               (if indirect? input (^ input (+ input 1)))))
+                    (assert (= (get cells 0) input))
+                    (unless indirect? (assert (= (get cells 1) (+ input 1)))))
+                  (free! (mut cells)) (jit/release-image! (mut mapped)))))
+            (match (macho/image-object output a)
+              (Err [message] (panic "sret AOT: {}" message))
+              (Ok [object]
+                (let [(mut object) object]
+                  (match (fs/write-file a (if indirect? "build/private-sret.o" "build/private-pieces.o") (slice object))
+                    (Err [_] (panic "sret write failed")) (Ok [_] 0))
+                  (free! (mut object)))))
+            (image/release! (mut output))))))
+    (calls/release! (mut prototype)) (g/release! (mut graph))
+    (private/context-release! (mut context))
+    (println "private aggregate result indirect{} level{} pass" indirect? level)))
+
+(defn main [] (-> i32)
+  (for extra [(: -1 i32) 9 12 15] (check extra))
+  (for level [(: 1 i32) 2 3]
+    (result-check level false) (result-check level true))
+  (println "private allocation, tail fallback, binding and pressure execution pass")
+  0)
