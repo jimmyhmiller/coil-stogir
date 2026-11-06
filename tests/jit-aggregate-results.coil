@@ -1,5 +1,8 @@
 (module stogir.tests.jit-aggregate-results)
 (import "stogir.graph" :as g)
+(import "stogir.a64.return-values" :as return-values)
+(import "stogir.verify" :as verify)
+(import "stogir.node" :as node)
 (import "stogir.builder" :as b)
 (import "stogir.calls" :as calls)
 (import "stogir.symbols" :as symbols)
@@ -12,7 +15,7 @@
 (import "coil.primitive" :as primitive)
 (import "coil.cc" :as cc)
 (import "coil.fs" :as fs)
-(import "coil.result" :use [Result Ok Err])
+(import "coil.result" :use [Result Ok Err Some None])
 
 (defn bits-f32 [(bits u32)] (-> f32)
   (let [p (primitive/alloc-stack u32)]
@@ -2080,7 +2083,155 @@
     (g/release! (mut graph))
     failures))
 
+;;; Validate private return-memory to SSA independently of machine selection.
+;;; The scalar probe consumes both promoted pieces, preserving branch/loop and
+;;; foreign-memory effects. Incomplete/escaped/observed/unsupported places stay.
+(defn return-preparation [(mode i32)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        place (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        y (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        other (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 3]))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        one (require (b/scalar-constant! (mut graph) 5 1 8))
+        three (require (b/scalar-constant! (mut graph) 5 3 8))
+        seven (require (b/scalar-constant! (mut graph) 5 7 8))
+        upper (address! (mut graph) place 8)
+        spec (cond (= mode 6) (results/indirect)
+                   (= mode 7) (results/pieces 12 2)
+                   :else (results/pieces 5 (if (= mode 12) 1 2)))
+        (mut extra-ret) (: 0 i32)
+        (mut control) start]
+    (match (calls/create-result 9 [(: 6 u8) 5 5 6] [] spec a)
+      (Err [e] (panic "{}" e))
+      (Ok [prototype]
+        (let [(mut prototype) prototype]
+          (require (calls/function! (mut graph) prototype a))
+          (calls/release! (mut prototype)))))
+    (when (= mode 11)
+      (let [size (require (b/scalar-constant! (mut graph) 5 16 8))]
+        (set! control (require (b/stack-allocate! (mut graph) control size 16)))))
+    (if (or (= mode 1) (= mode 13))
+        (let [condition (require (b/emit! (mut graph) 14 1 [x zero]))
+              split (require (b/emit! (mut graph) 116 0 [start condition]))
+              yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+              no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+              added (require (b/emit! (mut graph) 26 5 [x three]))
+              flipped (require (b/emit! (mut graph) 48 5 [y seven]))
+              s0 (require (b/emit! (mut graph) 93 0 [yes place added]))
+              s1 (require (b/emit! (mut graph) 93 0 [s0 upper flipped]))
+              t0 (require (b/emit! (mut graph) 93 0 [no place y]))
+              t1 (require (b/emit! (mut graph) 93 0 [t0 upper x]))
+              e0 (if (= mode 13) (require (b/emit! (mut graph) 120 0 [s1 (: 0 i32) 0]))
+                     (require (b/emit! (mut graph) 114 0 [s1])))
+              e1 (if (= mode 13) (require (b/emit! (mut graph) 120 0 [t1 (: 0 i32) 0]))
+                     (require (b/emit! (mut graph) 114 0 [t1])))]
+          (if (= mode 13) (do (set! extra-ret e0) (set! control e1))
+              (set! control (require (b/emit! (mut graph) 112 0 [e0 e1])))))
+        (let [low (if (= mode 8) (require (b/conversion! (mut graph) 35 4 8 x))
+                      (if (= mode 7) (require (b/conversion! (mut graph) 36 12 8 x)) x))
+              high (if (= mode 4) (require (b/conversion! (mut graph) 36 5 8 place))
+                       (if (= mode 7) (require (b/conversion! (mut graph) 36 12 8 y)) y))]
+          (set! control (require (b/emit! (mut graph) 93 0 [control place low])))
+          (unless (or (= mode 3) (= mode 12))
+            (set! control (require (b/emit! (mut graph) 93 0 [control upper high]))))))
+    (when (= mode 2)
+      (let [entry (require (b/emit! (mut graph) 114 0 [control]))
+            head (require (b/loop-begin! (mut graph) entry))
+            index (require (b/loop-phi! (mut graph) head zero))
+            limit (require (b/emit! (mut graph) 47 5 [x seven]))
+            condition (require (b/emit! (mut graph) 20 1 [index limit]))
+            split (require (b/emit! (mut graph) 116 0 [head condition]))
+            yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+            no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+            old (require (b/emit! (mut graph) 91 5 [yes place]))
+            added (require (b/emit! (mut graph) 26 5 [old y]))
+            s0 (require (b/emit! (mut graph) 93 0 [old place added]))
+            s1 (require (b/emit! (mut graph) 93 0 [s0 upper index]))
+            next (require (b/emit! (mut graph) 26 5 [index one]))
+            back (require (b/emit! (mut graph) 115 0 [s1]))]
+        (require (b/patch! (mut graph) head 2 back))
+        (require (b/patch! (mut graph) index 3 next))
+        (set! control no)))
+    (when (= mode 9)
+      (set! control (require (b/emit! (mut graph) 93 0 [control other x]))))
+    (let [ret (if (= mode 13) control (require (b/emit! (mut graph) 120 0 [control (: 0 i32) 0])))
+          (mut roots) (ArrayList::new [i32] a)
+          (mut original) (g/create a)]
+      (push! (mut roots) ret)
+      (when (> extra-ret 0) (push! (mut roots) extra-ret))
+      (when (= mode 10) (push! (mut roots) (require (b/frame-address! (mut graph)))))
+      (when (= mode 5) (push! (mut roots) place))
+      (g/release! (mut original)) (set! original (g/duplicate graph a))
+      (match (return-values/prepare graph start (slice roots) a)
+        (Err [e] (panic "return preparation mode {}: {}" mode e))
+        (Ok [answer]
+          (match answer
+            (None [] (assert (and (>= mode 3) (<= mode 11) (!= mode 9))))
+            (Some [owned]
+              (let [(mut lowered) owned]
+                (assert (or (< mode 3) (= mode 9) (= mode 12) (= mode 13)))
+                (assert (= (len (.returns lowered)) (if (= mode 13) 2 1)))
+                (assert (= (node/opcode (get (.instructions (.graph lowered)) (cast i64 place))) 0))
+                (require (verify/native-input (.graph lowered) start (slice (.roots lowered))))
+                ; Probe the promoted words through the ordinary scalar ABI.
+                (set! (.function-prototype (.graph lowered)) 0)
+                (match (calls/create 9 5 [(: 5 u8) 5 6] a)
+                  (Err [e] (panic "{}" e))
+                  (Ok [prototype]
+                    (let [(mut prototype) prototype]
+                      (require (calls/function! (mut (.graph lowered)) prototype a))
+                      (calls/release! (mut prototype)))))
+                (for i (range 1 (len (.instructions (.graph lowered))))
+                  (let [n (get (.instructions (.graph lowered)) i)]
+                    (when (= (node/opcode n) 71)
+                      (assert (g/set-operand! (mut (.graph lowered)) (cast i32 i) 3 (- (.op3 n) 1))))))
+                (for item (.returns lowered)
+                  (let [n (get (.instructions (.graph lowered)) (cast i64 (.reference item)))
+                        seventeen (require (b/scalar-constant! (mut (.graph lowered)) 5 17 8))
+                        weighted (require (b/emit! (mut (.graph lowered)) 28 5 [(.low item) seventeen]))
+                        checksum (if (= (.high item) 0) weighted
+                                     (require (b/emit! (mut (.graph lowered)) 48 5 [weighted (.high item)])))]
+                    (assert (g/rewrite-inputs! (mut (.graph lowered)) (.reference item) 120 5
+                                               [(.op1 n) checksum (: 0 i32)]))))
+                (match (compile/image (.graph lowered) start (slice (.roots lowered)) "_return_probe" a)
+                  (Err [e] (panic "return probe mode {}: {}" mode e))
+                  (Ok [image]
+                    (let [(mut image) image]
+                      (match (jit/map-image image a)
+                        (Err [e] (panic "{}" e))
+                        (Ok [loaded]
+                          (let [(mut loaded) loaded
+                                f (primitive/cast (fnptr (cc/C) [u64 u64 (ptr u64)] u64) (.base (.memory loaded)))
+                                memory (primitive/alloc-stack u64)]
+                            (for xv [(: 0 u64) 1 3 8]
+                              (for yv [(: 0 u64) 7 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
+                                (let [trips (& xv 7)
+                                      low (if (or (= mode 1) (= mode 13)) (if (= xv 0) (+ xv 3) yv)
+                                              (if (= mode 2) (+ xv (* trips yv)) xv))
+                                      high (if (= mode 12) (: 0 u64)
+                                               (if (or (= mode 1) (= mode 13)) (if (= xv 0) (^ yv 7) xv)
+                                                   (if (= mode 2) (if (= trips 0) yv (- trips 1)) yv)))]
+                                  (set! memory 222)
+                                  (assert (= (f xv yv memory) (^ (* low 17) high)))
+                                  (assert (= (load memory) (if (= mode 9) xv (: 222 u64)))))))
+                            (jit/release-image! (mut loaded)))))
+                      (image/release! (mut image)))))
+                (return-values/release! (mut lowered)))))))
+      ; Transaction never mutates the source, including its former PARAM0.
+      (assert (= (len (.instructions graph)) (len (.instructions original))))
+      (for i (range 0 (len (.instructions graph)))
+        (let [lhs (get (.instructions graph) i) rhs (get (.instructions original) i)]
+          (assert (= (.header lhs) (.header rhs)))
+          (assert (= (.op1 lhs) (.op1 rhs)))
+          (assert (= (.op2 lhs) (.op2 rhs)))
+          (assert (= (.op3 lhs) (.op3 rhs)))))
+      (free! (mut roots)) (g/release! (mut original)))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (for mode [(: 0 i32) 1 2 3 4 5 6 7 8 9 10 11 12 13] (return-preparation mode))
   (let [(mut failures) 0
         (mut id) (: 0 i32)]
     (while (< id 16)
