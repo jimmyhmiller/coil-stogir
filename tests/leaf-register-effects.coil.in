@@ -1,0 +1,83 @@
+(module stogir.tests.leaf-register-effects)
+(import "stogir.a64.leaf-effects" :as effects)
+(import "stogir.a64.code" :as code)
+(import "stogir.bytes" :as bytes)
+(import "stogir.text-data" :as text-data)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Option Some None])
+
+(defn none? [(value (Option u64))] (-> bool)
+  (match value (None [] true) (Some [_] false)))
+(defn some? [(value (Option u64))] (-> bool) (not (none? value)))
+
+(defn check [(word u32) (expected u64) (accept bool)] (-> void)
+  (match (effects/instruction word)
+    (None [] (assert (not accept)))
+    (Some [actual] (assert accept) (assert (= actual expected))))
+  (when accept
+    (let [(mut body) (code/create (malloc-allocator))]
+      (bytes/append32! (mut (.text body)) word)
+      (bytes/append32! (mut (.text body)) 0xD65F03C0)
+      (match (effects/buffer body)
+        (None [] (panic "accepted instruction {} lost leaf summary" word))
+        (Some [actual] (assert (= actual expected))))
+      (code/release! (mut body)))))
+
+(defn control-check [] (-> void)
+  (let [(mut body) (code/create (malloc-allocator))]
+    (assert (none? (effects/buffer body)))
+    (bytes/append32! (mut (.text body)) 0x14000002)
+    (bytes/append32! (mut (.text body)) 0xD503201F)
+    (bytes/append32! (mut (.text body)) 0xD65F03C0)
+    (match (effects/buffer body)
+      (None [] (panic "local forward branch declined"))
+      (Some [mask] (assert (= mask 0))))
+    ; Backward branch is local; the unreachable RET is still checked.
+    (assert (bytes/patch32! (mut (.text body)) 4 0x17FFFFFF))
+    (assert (some? (effects/buffer body)))
+    ; A branch to exactly the end is external and must decline.
+    (assert (bytes/patch32! (mut (.text body)) 0 0x14000003))
+    (assert (none? (effects/buffer body)))
+    (assert (bytes/patch32! (mut (.text body)) 0 0x17FFFFFF))
+    (assert (none? (effects/buffer body)))
+    ; BL and indirect transfers are not ordinary local branches.
+    (for word [(: 0x94000000 u32) 0xD63F0000 0xD61F0000 0xD65F0000
+               0xD4000001 0xD4200000 0xD69F03E0 0x00000000 0xFFFFFFFF]
+      (assert (bytes/patch32! (mut (.text body)) 0 word))
+      (assert (none? (effects/buffer body))))
+    (assert (bytes/patch32! (mut (.text body)) 0 0x54000040))
+    (assert (some? (effects/buffer body)))
+    (assert (bytes/patch32! (mut (.text body)) 0 0x34000040))
+    (assert (some? (effects/buffer body)))
+    (assert (bytes/patch32! (mut (.text body)) 0 0x36000040))
+    (assert (some? (effects/buffer body)))
+    (assert (bytes/patch32! (mut (.text body)) 0 0xD503201F))
+    (assert (bytes/patch32! (mut (.text body)) 8 0xD503201F))
+    (assert (none? (effects/buffer body)))
+    (assert (bytes/patch32! (mut (.text body)) 8 0xD65F03C0))
+    (push! (mut (.references body)) (code/Reference :offset 0 :kind 3 :target -1))
+    (assert (none? (effects/buffer body)))
+    (clear! (mut (.references body)))
+    (push! (mut (.text-data body)) (text-data/Range :offset 0 :length 4 :kind 1))
+    (assert (none? (effects/buffer body)))
+    (clear! (mut (.text-data body)))
+    (for alignment [(: 0 i64) 1 2 3 12]
+      (set! (.alignment body) alignment)
+      (assert (none? (effects/buffer body))))
+    (set! (.alignment body) 4)
+    (push! (mut (.text body)) (: 0 u8))
+    (assert (none? (effects/buffer body)))
+    (code/release! (mut body))))
+
+(defn main [] (-> i32)
+  ; ASSEMBLED-CASES
+  ; Reserved and unmodeled adjacent encodings must not inherit an effect.
+  (for word [(: 0x32800000 u32) 0x52C00000 0x13400000 0x93200000
+             0x13800000 0x0BC00000 0x0B008000 0x0A008000
+             0x1200FC00 0x12400000 0xF9800000 0xF8400C00
+             0xF8400400 0xFC400000 0x1A800800 0x54000010]
+    (assert (none? (effects/instruction word))))
+  (control-check)
+  (println "leaf instruction effects and control checks passed")
+  0)

@@ -1611,3 +1611,7 @@ The exact operand-identity diamond pattern follows dstogov/ir ir_sccp.c MIN/MAX 
 ## Class-only free register decisions
 
 Independent implementation optimization of the existing linear-scan decision policy: visit only admissible physical registers instead of materializing a complete limit vector inside the solver. Upstream hint and longest-availability choices are preserved. The complete-limit public API is unchanged. See validation/class-register-choice.
+
+## Scalar leaf register effects
+
+Independent closed instruction-effect analysis in a64/leaf-effects.coil, using existing encoder recipes and independent clang assembly validation. Unknown forms/control/metadata decline. This is not an ABI/private-binding certificate and does not relax caller clobbers. Sources and evidence: validation/leaf-register-effects. Original upstream credit remains in NOTICE.
