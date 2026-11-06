@@ -1,0 +1,93 @@
+(module stogir.tests.finite-countdown)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.finite-countdown" :as countdown)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.uses" :as uses)
+(import "stogir.a64.compile" :as native)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn need [(x (Result i32 (slice u8)))] (-> i32)
+ (match x (Ok [r] r) (Err [e] (panic "{}" e))))
+
+;;; Modes: decrement2 is not universally terminating; LT/extra Phi/effect/body
+;;; observer violate the proof. Both EQ/NE and swapped merge slots are covered.
+(defn check [(ty i32) (mode i32)] (-> void)
+ (let [a (malloc-allocator) (mut graph) (g/create a)
+       start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+       initial (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+       entry (need (b/emit! (mut graph) 114 0 [start]))
+       header (need (b/loop-begin! (mut graph) entry))
+       zero (need (b/scalar-constant! (mut graph) ty 0 8))
+       one (need (b/scalar-constant! (mut graph) ty (if (= mode 2) 2 1)
+                   8))
+       counter (need (b/loop-phi! (mut graph) header initial))
+       predicate (need (b/emit! (mut graph) (case mode 1 (: 15 i32) 3 16 14) 1 [counter zero]))
+       branch (need (b/emit! (mut graph) 116 0 [header predicate]))
+       inside (need (b/emit! (mut graph) (if (= mode 1) 107 108) 0 [branch (: 0 i32)]))
+       outside (need (b/emit! (mut graph) (if (= mode 1) 108 107) 0 [branch (: 0 i32)]))
+       step (need (b/emit! (mut graph) 27 ty [counter one]))
+       back (need (b/emit! (mut graph) 115 0 [inside]))
+       ret (need (b/emit! (mut graph) 120 ty [outside counter (: 0 i32)]))
+       eligible? (or (= mode 0) (= mode 1) (= mode 6) (= mode 7))]
+  (need (b/patch! (mut graph) header 2 back))
+  (need (b/patch! (mut graph) counter 3 step))
+  (when (= mode 4)
+   (let [extra (need (b/loop-phi! (mut graph) header zero))]
+    (need (b/patch! (mut graph) extra 3 one))))
+  (when (= mode 5)
+   ; A volatile read is an effect even when its result is unused.
+   (let [pointer (need (b/emit! (mut graph) 71 6 [start (: 1 i32) 0]))
+         load (need (b/emit! (mut graph) 92 ty [inside pointer]))]
+    (need (b/patch! (mut graph) back 1 load))))
+  (when (= mode 8)
+   (let [escaped (need (b/emit! (mut graph) 26 ty [counter one]))]
+    (need (b/patch! (mut graph) ret 2 escaped))))
+  (when (= mode 6)
+   (need (b/patch! (mut graph) header 1 back))
+   (need (b/patch! (mut graph) header 2 entry))
+   (need (b/patch! (mut graph) counter 2 step))
+   (need (b/patch! (mut graph) counter 3 initial)))
+  (let [(mut edges) (uses/build graph a)]
+   (match (countdown/select graph edges header)
+    (Some [_] (assert eligible?)) (None [] (assert (not eligible?))))
+   (uses/release! (mut edges)))
+  (when (and eligible? (!= mode 7)) (execute graph start [ret back] a))
+  (when eligible?
+   (match (sccp/optimize graph 8 (if (= mode 7) [ret back counter] [ret back]) a)
+    (Err [e] (panic "{}" e))
+    (Ok [value]
+     (let [(mut optimized) value]
+      (if (= mode 7)
+          (assert (or (= (n/opcode (get (.instructions (.graph optimized)) (cast i64 header))) 113)
+                      (= (n/opcode (get (.instructions (.graph optimized)) (cast i64 header))) 112)))
+          (assert (= (n/opcode (get (.instructions (.graph optimized)) (cast i64 header))) 0)))
+      (unless (= mode 7) (execute (.graph optimized) start (slice (.roots optimized)) a))
+      (rewrite/release! (mut optimized))))))
+  (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+ (for ty [(: 2 i32) 8 3 9 4 10 5 11]
+  (for [mode 0 9] (check ty (cast i32 mode))))
+ (println "finite countdown: shape guards and 12288 baseline/optimized native answers passed")
+ 0)
+
+(defn execute [(graph g/Graph) (start i32) (roots (slice i32)) (a (dyn Allocator))] (-> void)
+      (match (native/text graph start roots a)
+       (Err [e] (panic "{}" e))
+       (Ok [text]
+        (let [(mut bytes) text]
+         (match (jit/map-text (slice bytes))
+          (Err [e] (panic "{}" e))
+          (Ok [mapped]
+           (let [(mut image) mapped f (p/cast (fnptr (cc/C) [u64] u64) (.base image))]
+            (for [i 0 256] (assert (= (call-ptr f (cast u64 i)) 0)))
+            (jit/release! (mut image)))))
+         (free! (mut bytes)))))
+)

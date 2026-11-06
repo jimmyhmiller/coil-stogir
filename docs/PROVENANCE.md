@@ -1560,3 +1560,10 @@ Advisory result hints now also walk at most16same-width GP COPY/BITCAST views
 back to the producer. They stop at Phis, arithmetic, width changes and register
 bank changes; setting the Phi/group preference itself is allowed. No value or
 constraint is rewritten, and existing preferences win for shared owners.
+
+Finite register-carried unit-countdown elimination is an independent extension
+in finite-countdown.coil, using the existing iterative optimizer and checked
+control/def-use rewrites. Pinned ir_sccp.c's induction-variable optimization was
+consulted, but this finite-loop rule is not claimed as its port. Scope/proof and
+source-captured replay are in validation/finite-countdown. Generic destructors
+and memory-carried counters remain unchanged.
