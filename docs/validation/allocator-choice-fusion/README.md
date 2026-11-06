@@ -10,7 +10,7 @@ optimization, not a policy port. Pinned upstream92171d0 ir_ra.c uses free-until
 bounds and highest-free choice, but has a caller-saved tie preference our old
 lower-ID policy does not encode explicitly; this experiment does not change it.
 
-116,640 reference-policy cases (9sizes×9positions×6preferences×8masks×6sources×3steps)
+69,984 reference-policy cases (9sizes×9positions×6preferences×8masks×6sources×3steps)
 compare register, until and every scratch element. Existing spill/split/hint/
 allocation suites also execute. Native O3/debug and LLVM O1/debug/ASAN PASS.
 Reference policy still uses original independent register-limit and choose-free.
