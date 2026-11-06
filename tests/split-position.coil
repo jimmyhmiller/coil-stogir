@@ -1,0 +1,67 @@
+(module stogir.tests.split-position)
+(import "stogir.split-position" :as split)
+(import "stogir.allocation" :as allocation)
+(import "stogir.constraints" :as constraints)
+(import "stogir.interval-queue" :as queue)
+(import "stogir.frame" :as frame)
+(import "coil.result" :use [Ok Err Some None])
+(import "stogir.interval" :as interval)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+
+;;; Expected hashes come from the pinned C functions compiled with ASAN by
+;;; benchmarks/frontend-provider-transfers/split-oracle.py, not this selector.
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        blocks [(split/Block :start 0 :end 10 :depth 0 :header -1 :idom 0)
+                (split/Block :start 10 :end 20 :depth 1 :header 1 :idom 0)
+                (split/Block :start 20 :end 30 :depth 1 :header 1 :idom 1)
+                (split/Block :start 30 :end 40 :depth 2 :header 3 :idom 2)
+                (split/Block :start 40 :end 50 :depth 2 :header 3 :idom 3)
+                (split/Block :start 50 :end 60 :depth 1 :header 1 :idom 3)
+                (split/Block :start 60 :end 70 :depth 0 :header -1 :idom 1)]
+        expected [(: 2826821165420839426 u64) 750317765207533338
+                  16827928891838896694 988317436578341075]
+        (mut count) 0]
+    (for [shape 0 4]
+      (let [(mut ranges) (ArrayList::new [interval/Range] a)
+            (mut hash) (: 1469598103934665603 u64)]
+        (case shape
+          0 (interval/add! (mut ranges) 0 70)
+          1 (do (interval/add! (mut ranges) 0 20) (interval/add! (mut ranges) 25 70))
+          2 (do (interval/add! (mut ranges) 0 45) (interval/add! (mut ranges) 46 70))
+          (do (interval/add! (mut ranges) 0 10) (interval/add! (mut ranges) 15 35)
+              (interval/add! (mut ranges) 40 70)))
+        (for [lo 0 70]
+          (for [hi lo 70]
+            (for [prefer 0 2]
+              (let [selected (split/choose blocks ranges lo hi (= prefer 1))]
+                (assert (and (>= selected lo) (<= selected hi)))
+                (set! hash (* (^ hash (cast u64 selected)) 1099511628211))
+                (set! count (+ count 1))))))
+        (assert (= hash (get expected shape)))
+        (free! (mut ranges))))
+    (for kind [(: 0 i32) 1 2]
+      (let [(mut parts) (ArrayList::new [allocation/Part] a)
+            (mut work) (ArrayList::new [queue/Item] a)
+            (mut area) (frame/create a) (mut part) (allocation/create 7 a)]
+        (interval/add! (mut (.ranges part)) 12 70)
+        (constraints/add! (mut (.uses part)) 28 kind (if (= kind 2) 3 -1))
+        (constraints/add! (mut (.uses part)) 55 1 -1)
+        (set! (.register part) 3)
+        (let [cut (allocation/active-eviction-cut part 45 blocks)]
+          (assert (= cut 29))
+          (push! (mut parts) part)
+          (match (allocation/evict! (mut parts) (mut work) 0 cut (mut area) 8 8 a)
+            (Err [e] (panic "{}" e)) (Ok [_] 0))
+          (assert (= (len parts) 3))
+          (assert (= (.end (get (.ranges (at parts 0)) 0)) 29))
+          (assert (= (.start (get (.ranges (at parts 1)) 0)) 29))
+          (match (queue/take! (mut work))
+            (None [] (panic "resume missing"))
+            (Some [item] (assert (= (.position item) 55)) (assert (>= (.position item) 45)))))
+        (for [i 0 (len parts)] (allocation/release! (elem (mut parts) i)))
+        (free! (mut parts)) (free! (mut work)) (frame/release! (mut area))))
+    (assert (= count 19880))
+    (println "pinned C split-position answers: {} pass" count))
+  0)

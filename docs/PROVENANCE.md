@@ -1632,3 +1632,13 @@ Spill the whole assigned child when it has no earlier operand use; preserve a
 used prefix. The independent indexed event/state implementations retain their
 existing contracts. Actual frontend replay and validation are centralized in
 validation/frontend-provider-transfers. Original license and credit remain in NOTICE.
+
+## Loop-aware active-owner splitting
+
+Adapted `ir_find_optimal_split_position` and its hole/block helpers from
+[dstogov/ir ir_ra.c at92171d0](https://github.com/dstogov/ir/blob/92171d0a4a36b0acf707f2dea7998de615dd4acd/ir_ra.c#L2595).
+The independent C oracle retains the exact pinned functions with position macros
+adapted to Coil's two-phase schedule. Native metadata reuses existing dominance
+and loop analyses; active eviction preserves past operands and legal stores.
+Free/reload split categories and complete irreducible classification remain open.
+Validation: validation/loop-aware-active-split. Original MIT credit is in NOTICE/LICENSE.
