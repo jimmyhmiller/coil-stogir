@@ -1642,3 +1642,13 @@ adapted to Coil's two-phase schedule. Native metadata reuses existing dominance
 and loop analyses; active eviction preserves past operands and legal stores.
 Free/reload split categories and complete irreducible classification remain open.
 Validation: validation/loop-aware-active-split. Original MIT credit is in NOTICE/LICENSE.
+
+## Iterative control cleanup boundary
+
+The affected-worklist fixed point follows the cleanup intent of
+[dstogov/ir ir_iter_opt and ir_iter_cleanup](https://github.com/dstogov/ir/blob/92171d0a4a36b0acf707f2dea7998de615dd4acd/ir_sccp.c#L4155).
+The Coil implementation independently retains explicit observation roots and
+checks reachability after each control-changing drain before memory replacement.
+Prune/boundary notifications are drained with control folding enabled; it does
+not repeat SCCP analysis. Real compiler graph regression: validation/boolean-operand-shape.
+Original source credit and MIT license remain centralized in NOTICE/LICENSE.
