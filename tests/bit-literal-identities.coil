@@ -1,0 +1,96 @@
+(module stogir.tests.bit-literal-identities)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.sccp-fold" :as fold)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+
+(defn fixture [(ty i32) (opcode i32) (literal u64) (reverse bool)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        width (if (= ty 1) 1 (* 8 (types/size ty 8)))
+        full (if (= width 64) (: 0xFFFFFFFFFFFFFFFF u64)
+                 (- (<< (: 1 u64) (cast u64 width)) 1))
+        input (if (= ty 1)
+                  (require (b/emit! (mut graph) 15 1 [x zero]))
+                  (if (= ty 5) x
+                      (require (b/emit! (mut graph) (if (= width 64) 36 35) ty [x]))))
+        constant (require (b/scalar-constant! (mut graph) ty literal 8))
+        operation (require (b/emit! (mut graph) opcode ty
+                                   (if reverse [constant input] [input constant])))
+        value (if (= ty 5) operation
+                  (require (b/emit! (mut graph) (if (= width 64) 36 34) 5 [operation])))
+        ret (require (b/emit! (mut graph) 120 5 [start value (: 0 i32)]))]
+    (match (fold/evaluate-current graph operation 8)
+      (Err [e] (panic "{}" e))
+      (Ok [decision]
+        (println "BIT {} {} {} {} {} {} {}" ty opcode literal reverse (.kind decision)
+                 (if (= (.source decision) input) 11
+                     (if (= (.source decision) constant) -2 0))
+                 (if (= (.kind decision) 4) (cast i32 (n/opcode (.constant decision))) 0))
+        (if (or (= literal 0) (= literal full))
+            (if (and (= opcode 48) (= literal full) (!= literal 0))
+                (do (assert (= (.kind decision) 4))
+                    (assert (= (n/opcode (.constant decision)) 45))
+                    (assert (= (.source decision) input)))
+                (do (assert (= (.kind decision) 2))
+                    (assert (= (.source decision)
+                       (if (or (and (= opcode 47) (= literal 0))
+                               (and (= opcode 46) (= literal full))) constant input)))))
+            (assert (= (.kind decision) 3)))))
+    (for level [(: 1 i32) 3]
+      (match (compile/image-with-options graph start [ret] "_bit_literal"
+               (options/Options :level level) a)
+        (Err [e] (panic "literal ty {} op {}: {}" ty opcode e))
+        (Ok [owned]
+          (let [(mut code) owned]
+            (match (jit/map-image code a)
+              (Err [e] (panic "{}" e))
+              (Ok [owned]
+                (let [(mut loaded) owned
+                      f (p/cast (fnptr (cc/C) [u64] u64) (.base (.memory loaded)))]
+                  (for raw [(: 0 u64) 1 2 127 128 255 32768 65535 0x80000000
+                            0x0123456789ABCDEF 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
+                    (let [input (if (= ty 1) (if (= raw 0) (: 0 u64) (: 1 u64)) (& raw full))
+                          expected (& (case opcode 46 (| input literal) 47 (& input literal)
+                                                       (^ input literal)) full)]
+                      (assert (= (f raw) expected))))
+                  (jit/release-image! (mut loaded)))))
+            (image/release! (mut code))))))
+    (g/release! (mut graph))))
+
+(defn rejected [] (-> void)
+  (for opcode [(: 46 i32) 47 48]
+    (for test [(: 0 i32) 1 2 3]
+      (let [ty (if (= test 0) (: 6 i32) 5)
+            input (n/make 71 (cast u8 ty) 0 1 0 0)
+            literal (if (= test 1)
+                        (n/constant 74 (cast u8 ty) 0 0)
+                        (n/constant (cast u8 ty) (cast u8 (if (= test 2) 4 ty)) 0 0))]
+        (match (fold/bit-literal opcode ty 1 input -1 literal (if (= test 3) (: 16 i32) 8))
+          (None [] 0) (Some [_] (panic "invalid literal bypass accepted: opcode {} test {}" opcode test)))))))
+
+(defn main [] (-> i64)
+  (for ty [(: 1 i32) 2 3 4 5 7 8 9 10 11]
+    (let [width (if (= ty 1) 1 (* 8 (types/size ty 8)))
+          full (if (= width 64) (: 0xFFFFFFFFFFFFFFFF u64)
+                   (- (<< (: 1 u64) (cast u64 width)) 1))]
+      (for opcode [(: 46 i32) 47 48]
+        (for literal [(: 0 u64) full (& (: 0xA5 u64) full)]
+          (for reverse [false true] (fixture ty opcode literal reverse))))))
+  (rejected)
+  (println "bit literals: 180 decision cases and 4320 native O1/O3 results pass")
+  0)

@@ -1670,3 +1670,13 @@ insertion/extraction preserve unchanged bytes and initialization across loops.
 Crossing/noninteger/escape/observation fallbacks remain conservative. Validation:
 validation/contained-field-promotion. Original dstogov/ir attribution and license
 remain centralized in NOTICE/LICENSE.
+
+## Bitwise literal identities and restart
+
+Adapted AND/OR/XOR(_, C_*) from
+[dstogov/ir ir_fold.h at92171d0](https://github.com/dstogov/ir/blob/92171d0a4a36b0acf707f2dea7998de615dd4acd/ir_fold.h#L2878).
+Exact numeric/type guards preserve symbolic references; BOOL/CHAR cases use their
+proper masks. XOR all-ones uses an explicit unary restart, not an alias fact.
+Central validation/bit-literal-identities includes180 exact C-rule decisions,
+native/ASAN checks and actual constructor replay. Original source credit and
+license remain centralized in NOTICE/LICENSE.
