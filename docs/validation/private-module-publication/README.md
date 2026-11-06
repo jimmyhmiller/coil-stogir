@@ -31,3 +31,23 @@ requires a validated actual CALL signature matching the owned leaf ABI. Explicit
 typed declarations continue to reject mismatches. The module test now covers an
 untyped ABS64 address reference; native/debug and LLVM/ASAN both pass. The existing
 private allocation/typed mismatch/aggregate suite also passes native O3/debug.
+
+### Scalar ABI equivalence
+
+The real Coil emitter fixture exposed declarations using unsigned32 (type4)
+for definitions using signed32 (type10): graph.lookup, strings.lookup and
+ graph.operand. Exact serialized type equality rejected these despite identical
+AArch64 argument representation. Comparison now checks ABI shape: signed and
+unsigned 32/64-bit scalars are equivalent; calling-convention/variadic flags,
+parameter count, groups (first/count/alignment) and aggregate result kind/count
+remain exact. Narrow integers, pointers and FP remain distinct. Semantic proof
+flags above the low five ABI bits remain irrelevant.
+
+The 11×11 scalar signature matrix checks narrow signedness, width, GP/FP and
+pointer distinctions, plus explicit calling-convention rejection. Native O3/debug
+and LLVM O1/debug/ASAN module tests pass. This compares signatures only; machine
+body certification remains the independent closed effects decoder.
+
+Reference: [Apple ARM64 ABI](https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms),
+which requires caller-side extension for integer arguments smaller than32 bits.
+This is an ABI compatibility comparison, not a source type coercion.
