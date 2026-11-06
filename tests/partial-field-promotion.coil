@@ -1,0 +1,143 @@
+(module stogir.tests.partial-field-promotion)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.mem2ssa" :as mem)
+(import "stogir.verify" :as verify)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+
+(defn execute [(graph g/Graph) (start i32) (roots (slice i32))
+                (width i32) (canonical-width i32) (mode i32) (level i32)] (-> void)
+  (let [a (malloc-allocator)]
+    (match (compile/image-with-options graph start roots "_partial_fields"
+             (options/Options :level level) a)
+      (Err [e] (panic "partial fields mode {} level {}: {}" mode level e))
+      (Ok [owned]
+        (let [(mut code) owned]
+          (match (jit/map-image code a)
+            (Err [e] (panic "{}" e))
+            (Ok [owned]
+              (let [(mut loaded) owned
+                    f (p/cast (fnptr (cc/C) [u64 u64 i64] u64)
+                              (.base (.memory loaded)))
+                    shift (if (= mode 7) (: 8 u64) (: 0 u64))
+                    mask (<< (- (<< (: 1 u64) (cast u64 (* width 8))) 1) shift)
+                    full-mask (if (= canonical-width 8) (: 0xFFFFFFFFFFFFFFFF u64)
+                                  (- (<< (: 1 u64) (cast u64 (* canonical-width 8))) 1))]
+                (for x [(: 0 u64) 0x0123456789ABCDEF 0xFFFFFFFFFFFFFFFF]
+                  (for y [(: 0 u64) 0x8000000080008080 0xFFFFFFFFFFFFFFFF]
+                    (for count [(: 0 i64) 1 2 7]
+                      (let [writes (if (= mode 2) (> count 0)
+                                       (if (= mode 1) (!= count 0) true))
+                            last (if (and (= mode 2) writes)
+                                     (+ y (cast u64 (- count 1))) y)
+                            expected (if writes
+                                         (| (& x (^ mask 0xFFFFFFFFFFFFFFFF))
+                                            (& (<< last shift) mask)) x)]
+                        (assert (= (f x y count) (& expected full-mask)))))))
+                (jit/release-image! (mut loaded)))))
+          (image/release! (mut code)))))))
+
+;;; Modes: straight, join, loop, uninitialized predecessor, unspecified byte
+;;; order, observed address, volatile access, displaced overlapping field.
+(defn fixture [(ty i32) (canonical i32) (mode i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        y (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        count (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        eight (require (b/scalar-constant! (mut graph) 5 8 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        slot (require (b/stack-allocate! (mut graph) start eight 16))
+        pointer (if (= mode 7)
+                    (require (b/emit! (mut graph) 26 6 [slot one])) slot)
+        initial (if (= canonical 5) x
+                    (require (b/emit! (mut graph)
+                       (if (= (types/size canonical 8) 8) 36 35) canonical [x])))
+        full (if (or (= mode 3) (= mode 8)) slot
+                 (require (b/emit! (mut graph) 93 0 [slot slot initial])))
+        (mut control) full
+        (mut input) y
+        (mut header) (: 0 i32)
+        (mut counter) (: 0 i32)
+        (mut exit) (: 0 i32)]
+    (when (or (= mode 2) (= mode 8))
+      (let [entry (require (b/emit! (mut graph) 114 0 [full]))]
+        (set! header (require (b/loop-begin! (mut graph) entry)))
+        (set! counter (require (b/loop-phi! (mut graph) header zero)))
+        (let [condition (require (b/emit! (mut graph) 16 1 [counter count]))
+              branch (require (b/emit! (mut graph) 116 0 [header condition]))]
+          (set! control (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)])))
+          (set! exit (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))))
+        (set! input (require (b/emit! (mut graph) 26 5 [y
+                          (require (b/emit! (mut graph) 36 5 [counter]))])))))
+    (when (or (= mode 1) (= mode 3))
+      (let [branch (require (b/emit! (mut graph) 116 0 [full count]))]
+        (set! control (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)])))
+        (set! exit (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)])))))
+    ; Only one incoming path initializes the high bytes in mode3.
+    (when (= mode 3)
+      (set! control (require (b/emit! (mut graph) 93 0 [control slot initial]))))
+    (let [small (require (b/emit! (mut graph) 35 ty [input]))
+          stored (require (b/emit! (mut graph) (if (= mode 6) 94 93) 0
+                                         [control pointer small]))]
+      (set! control stored)
+      (when (or (= mode 2) (= mode 8))
+        (let [next (require (b/emit! (mut graph) 26 11 [counter one]))
+              back (require (b/emit! (mut graph) 115 0 [stored]))]
+          (b/patch! (mut graph) header 2 back)
+          (b/patch! (mut graph) counter 3 next)
+          (set! control exit)))
+      (when (or (= mode 1) (= mode 3))
+        (let [yes (require (b/emit! (mut graph) 114 0 [stored]))
+              no (require (b/emit! (mut graph) 114 0 [exit]))]
+          (set! control (require (b/emit! (mut graph) 112 0 [no yes])))))
+      (let [read (require (b/emit! (mut graph) 91 canonical [control slot]))
+            value (if (= canonical 5) read
+                      (require (b/emit! (mut graph)
+                        (if (= (types/size canonical 8) 8) 36 34) 5 [read])))
+            ret (require (b/emit! (mut graph) 120 5 [read value (: 0 i32)]))
+            (mut roots) (ArrayList::new [i32] a)
+            (mut optimized) (g/duplicate graph a)
+            width (types/size ty 8)
+            promoted (and (< mode 3))]
+        (push! (mut roots) ret)
+        (push! (mut roots) read)
+        (when (= mode 5) (push! (mut roots) slot))
+        (require (mem/promote-ordered! (mut optimized) (mut roots) (!= mode 4) a))
+        (assert (= (n/opcode (get (.instructions optimized) (cast i64 slot)))
+                   (if promoted (: 0 u8) (: 81 u8))))
+        ; Failed promotion must leave a valid graph, including provisional
+        ; loop/join expressions which have just been discarded.
+        (require (verify/native-input optimized start (slice roots)))
+        ; Uninitialized storage is deliberately never executed.
+        (unless (or (= mode 3) (= mode 8))
+          (execute graph start [ret] width (types/size canonical 8) mode 1)
+          (for level [(: 1 i32) 3]
+            (execute optimized start (slice roots) width (types/size canonical 8) mode level)))
+        (g/release! (mut optimized))
+        (free! (mut roots))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (for ty [(: 2 i32) 7 8 3 9 4 10]
+    (for canonical [(: 3 i32) 9 4 10 5 11]
+      (when (< (types/size ty 8) (types/size canonical 8))
+        (for mode [(: 0 i32) 1 2 3 4 5 6 7 8]
+          (fixture ty canonical mode)))))
+  (println "partial fields: 270 promotion/fallback cases and 22680 native byte-preservation answers pass")
+  0)

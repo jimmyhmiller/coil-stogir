@@ -1652,3 +1652,12 @@ checks reachability after each control-changing drain before memory replacement.
 Prune/boundary notifications are drained with control folding enabled; it does
 not repeat SCCP analysis. Real compiler graph regression: validation/boolean-operand-shape.
 Original source credit and MIT license remain centralized in NOTICE/LICENSE.
+
+## Partial integer field stores
+
+Independent extension to same-start little-endian field promotion. Pinned
+[ir_mem2ssa_add_split_var](https://github.com/dstogov/ir/blob/92171d0a4a36b0acf707f2dea7998de615dd4acd/ir_mem2ssa.c#L574)
+rejects unequal-width stores. Coil preserves prior high bits through typed bit
+insertion, using its existing demand-driven Phi construction and conservative
+initialization/escape/observation policy. Validation: validation/partial-field-promotion.
+Original upstream credit and license remain centralized in NOTICE/LICENSE.
