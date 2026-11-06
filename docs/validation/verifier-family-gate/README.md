@@ -16,3 +16,14 @@ Native O3 suites verify, checked, atomics, terminal, switch, stack, locals and
 conversion all pass. Broader differential/malformed coverage, ASAN, repeat
 measurement and integrated compiler checks remain required before promotion.
 Not installed or pushed.
+
+## Differential validation
+
+71,050 raw-graph cases: opcode0..144 (includes invalid opcodes), scalar types
+0..13, arities0..6 and five operand patterns (value, control, zero, maximum
+positive and minimum negative reference). Same raw-storage ASAN caller invokes
+baseline/native-debug, changed/native-debug and changed/LLVM-ASAN kernels.
+Every result count and diagnostic byte agrees; no sanitizer findings. These
+synthetic cases complement, rather than replace, the valid family fixtures.
+
+Repeat paired run: Stogir446.6195→438.9305ms (-1.72%); LLVM202.598→193.006ms (-4.73%). Repeat builds completed before timings. Integration remains pending.
