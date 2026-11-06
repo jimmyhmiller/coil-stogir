@@ -65,3 +65,17 @@ assertions that selected memory machine inputs are not omitted. New regression
 fails with old95e3a4d (ASAN BUS), passes with corrected accounting under
 LLVM/debug/ASAN and native Stogir/debug hosts. Compiler rebuild/live-emission
 recheck pending. Raw before/after evidence retained here.
+
+## Arithmetic-tile cost follow-up
+
+Initial paired compiler measurements are neutral (actual emitter757.4105 vs
+757.112ms) and AVec slightly regresses. Its disassembly shows commuted MUL-by8
+selected as base instead of scaled index, and a shared16-byte stride forced
+into an8-byte memory access as an extra LSL. Reuse existing word arithmetic
+rules38..40 to recognize both SHL and MUL-by-power-of-two. Commute a shifted
+operand into the index field. Select only natural-scale LSL tiles; otherwise
+retain the existing shifted ADD rather than force an extra standalone shift.
+Ordinary unshifted indices remain legal. The existing geometry oracle now also
+asserts non-natural scales decline; mixed-width sharing keeps its address when
+needed.1560native variants plus volatile pressure pass LLVM/debug/ASAN.
+Compiler performance for this follow-up remains pending.
