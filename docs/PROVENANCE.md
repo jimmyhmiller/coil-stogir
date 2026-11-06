@@ -1575,3 +1575,11 @@ use-list machinery. It preserves the initial read and zero-trip no-write path;
 volatile/atomic accesses and hard COPY barriers decline. Detailed proof, root
 protection, native semantic tests and actual allocator replay are documented in
 validation/memory-countdown. This is not an upstream loop-elimination port.
+
+Structural verification now consumes instruction operand words directly only
+after complete per-node extent/count/continuation checks. This uses pinned
+ir.h's four-word cell layout, as Graph.operand does. Referenced-node membership,
+prototype/optional/local-storage checks remain unchanged; no unchecked public
+Graph API is introduced. The signed instruction-reference domain is explicitly
+checked once, matching Graph.append's existing limit. Proof/differential/error
+and performance evidence are in validation/structure-proven-operands.
