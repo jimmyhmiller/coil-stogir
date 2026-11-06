@@ -1593,3 +1593,8 @@ Identity-only iterative Phi cleanup is an independent extension in iter-fold.coi
 and sccp-rewrite.coil's existing seed walk. Pinned ir_sccp.c also skips iterative
 PHI folding; this is not its port. Exact reference identity, self-edge handling,
 root preservation and native validation: validation/iterative-phi-identity.
+
+Affected-merge literal diamond reconsideration follows pinned ir_sccp.c's
+ir_iter_optimize_merge/ir_optimize_phi orchestration for the existing literal
+subset. Bulk and local paths share one collapse operation; arbitrary-value
+availability and MIN/MAX/ABS remain unimplemented. See validation/affected-merge-diamond.

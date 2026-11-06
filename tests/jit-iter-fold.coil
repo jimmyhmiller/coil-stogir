@@ -13,6 +13,7 @@
 (import "stogir.sccp-fold" :as fold-bridge)
 (import "coil.arraylist" :use [ArrayList])
 (import "stogir.iter-fold" :as iter)
+(import "stogir.boolean-diamond" :as diamond)
 (import "stogir.iter-control" :as control)
 (import "stogir.sccp-rewrite" :as rewrite)
 (import "stogir.uses" :as uses)
@@ -1439,7 +1440,68 @@
    (uses/release! (mut lists)))
   (g/release! (mut graph))))
 
+(defn affected-diamond-case [(observation i32) (reverse? bool)] (-> void)
+ (let [a (malloc-allocator) (mut graph) (g/create a)
+       start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+       condition (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+       x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+       split (require (b/emit! (mut graph) 116 0 [start condition]))
+       yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+       no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+       end1 (require (b/emit! (mut graph) 114 0 [yes]))
+       end2 (require (b/emit! (mut graph) 114 0 [no]))
+       merge (if reverse? (require (b/emit! (mut graph) 112 0 [end2 end1]))
+                         (require (b/emit! (mut graph) 112 0 [end1 end2])))
+       first (require (b/scalar-constant! (mut graph) 11 42 8))
+       second (require (b/scalar-constant! (mut graph) 11 7 8))
+       choice (if reverse? (require (b/emit! (mut graph) 67 11 [merge second first]))
+                          (require (b/emit! (mut graph) 67 11 [merge first second])))
+       extra (require (b/emit! (mut graph) 67 11 [merge x x]))
+       sum (require (b/emit! (mut graph) 26 11 [choice extra]))
+       ret (require (b/emit! (mut graph) 120 11 [merge sum (: 0 i32)]))
+       (mut roots) (ArrayList::new [i32] a)
+       (mut lists) (uses/build graph a)
+       (mut queue) (q/create (len (.instructions graph)) a)
+       (mut protected) (bits/create (len (.instructions graph)) a)]
+  (push! (mut roots) ret)
+  (case observation
+   1 (push! (mut roots) extra) 2 (push! (mut roots) choice)
+   3 (push! (mut roots) merge) 4 (push! (mut roots) split)
+   5 (push! (mut roots) end1) 6 (push! (mut roots) yes)
+   7 (do (push! (mut roots) end1) (push! (mut roots) end2)) 0)
+  (for root roots (bits/add! (mut protected) (cast i64 root)))
+  (assert (= (diamond/candidate graph lists merge) 0))
+  (for [stage 0 2]
+   (when (= stage 1)
+    ; Only the changed Phi is seeded: detaching it must wake its MERGE.
+    (q/add! (mut queue) (cast i64 extra))
+    (require (iter/run-rooted! (mut graph) (mut roots) (mut lists) (mut queue) (mut protected) 8 a))
+    (assert (!= (n/opcode (get (.instructions graph) (cast i64 split))) 116))
+    (assert (= (n/opcode (get (.instructions graph) (cast i64 choice))) 60))
+    (assert (= (check-uses graph lists) 0))
+    (require (rewrite/validate graph 8 a))
+    (for root roots
+     (assert (!= (n/opcode (get (.instructions graph) (cast i64 root))) 0))
+     (assert (bits/contains? protected (cast i64 root)))))
+   (match (compile/image graph start (slice roots) "_affected_diamond" a)
+    (Err [e] (panic "{}" e))
+    (Ok [value] (let [(mut code) value]
+     (match (jit/map-image code a)
+      (Err [e] (panic "{}" e))
+      (Ok [value] (let [(mut loaded) value
+        f (p/cast (fnptr (cc/C) [u64 i64] i64) (.base (.memory loaded)))]
+       (for c [(: 0 u64) 1 18446744073709551615]
+        (for x [(: -100 i64) 0 100]
+         (assert (= (f c x) (+ x (if (= c 0) 7 42))))))
+       (jit/release-image! (mut loaded)))))
+     (image/release! (mut code))))))
+  (bits/release! (mut protected)) (q/release! (mut queue))
+  (uses/release! (mut lists)) (free! (mut roots)) (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (for [observation 0 8]
+    (affected-diamond-case (cast i32 observation) false)
+    (affected-diamond-case (cast i32 observation) true))
   (loop-phi-identity-case false) (loop-phi-identity-case true)
   (for [ty 1 14] (for [mode 0 7]
     (phi-identity-case (cast i32 ty) (cast i32 mode) false)
