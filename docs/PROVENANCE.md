@@ -1607,3 +1607,7 @@ restart contract without adding fold rules. See validation/diamond-user-notifica
 ## Exact comparison choices
 
 The exact operand-identity diamond pattern follows dstogov/ir ir_sccp.c MIN/MAX handling at pinned92171d0a4a36b0acf707f2dea7998de615dd4acd. Coil retains COND in the generic graph so signed comparison semantics survive canonical unsigned CIR word types, then reuses the existing AArch64 signed/unsigned MIN/MAX CMP/CSEL recipes. No arbitrary-value availability or floating MIN/MAX transformation is implied. Validation is centralized under docs/validation/compare-choice-minmax; original license/credit remains in NOTICE.
+
+## Class-only free register decisions
+
+Independent implementation optimization of the existing linear-scan decision policy: visit only admissible physical registers instead of materializing a complete limit vector inside the solver. Upstream hint and longest-availability choices are preserved. The complete-limit public API is unchanged. See validation/class-register-choice.
