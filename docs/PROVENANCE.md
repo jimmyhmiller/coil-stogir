@@ -1588,3 +1588,8 @@ Integer verifier current-header operand reads are an independent implementation
 improvement in verify.coil, using the existing successful structural-validation
 precondition. Referenced cells and type/width/guard checks remain checked.
 See validation/integer-operand-fields for exact diagnostic and ASAN evidence.
+
+Identity-only iterative Phi cleanup is an independent extension in iter-fold.coil
+and sccp-rewrite.coil's existing seed walk. Pinned ir_sccp.c also skips iterative
+PHI folding; this is not its port. Exact reference identity, self-edge handling,
+root preservation and native validation: validation/iterative-phi-identity.
