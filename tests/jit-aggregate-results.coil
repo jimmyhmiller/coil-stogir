@@ -7,10 +7,11 @@
 (import "stogir.calls" :as calls)
 (import "stogir.symbols" :as symbols)
 (import "stogir.image" :as image)
+(import "stogir.aot.macho" :as macho)
 (import "stogir.call-results" :as results)
 (import "stogir.a64.compile" :as compile)
 (import "stogir.jit.darwin" :as jit)
-(import "coil.alloc" :use [malloc-allocator])
+(import "coil.alloc" :use [malloc-allocator Allocator])
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.primitive" :as primitive)
 (import "coil.cc" :as cc)
@@ -2083,6 +2084,71 @@
     (g/release! (mut graph))
     failures))
 
+(extern return-llabs :as "llabs" :cc (cc/C) [i64] (-> i64))
+(defn return-symbol-address [] (-> u64)
+  (primitive/cast u64 (primitive/cast (ptr u8)
+    (: (fnptr-of return-llabs) (fnptr (cc/C) [i64] i64)))))
+(defn map-return-image [(code image/Image) (a (dyn Allocator))]
+  (-> (Result jit/Loaded (slice u8)))
+  (let [(mut resolved) (ArrayList::new [u64] a)
+        (mut present) (ArrayList::new [bool] a)]
+    (for symbol (.symbols code)
+      (let [external (= (.section symbol) 0)]
+        (when external (assert (image/same-name? code symbol "_llabs")))
+        (push! (mut resolved) (if external (return-symbol-address) (: 0 u64)))
+        (push! (mut present) external)))
+    (let [answer (jit/map-image-resolved code (slice resolved) (slice present) a)]
+      (free! (mut resolved)) (free! (mut present)) answer)))
+
+(defn prepared-low [(mode i32) (x u64) (y u64)] (-> u64)
+  (cond (= mode 16) (: 1 u64) (= mode 17) (return-symbol-address)
+        (or (= mode 1) (= mode 13)) (if (= x 0) (+ x 3) y)
+        (= mode 2) (+ x (* (& x 7) y)) :else x))
+(defn prepared-high [(mode i32) (x u64) (y u64)] (-> u64)
+  (cond (= mode 12) (: 0 u64) (= mode 14) x (= mode 15) (: 7 u64)
+        (or (= mode 1) (= mode 13)) (if (= x 0) (^ y 7) x)
+        (= mode 2) (if (= (& x 7) 0) y (- (& x 7) 1)) :else y))
+
+;;; Exercise the original aggregate prototype through native GP result registers.
+(defn execute-prepared-return [(graph g/Graph) (entry i32) (roots (slice i32))
+                                (mode i32)] (-> void)
+  (let [a (malloc-allocator)]
+    (match (compile/image graph entry roots "_callee_return_values" a)
+      (Err [e] (panic "native return mode {}: {}" mode e))
+      (Ok [owned]
+        (let [(mut code) owned]
+          (when (= mode 0) (assert (<= (len (.text code)) 16)))
+          (match (macho/image-object code a)
+            (Err [e] (panic "{}" e))
+            (Ok [object]
+              (let [(mut object) object
+                    path (case mode 0 "/tmp/callee-return-0.o" 1 "/tmp/callee-return-1.o"
+                                    2 "/tmp/callee-return-2.o" 9 "/tmp/callee-return-9.o"
+                                    12 "/tmp/callee-return-12.o" 13 "/tmp/callee-return-13.o"
+                                    14 "/tmp/callee-return-14.o" 15 "/tmp/callee-return-15.o"
+                                    16 "/tmp/callee-return-16.o" "/tmp/callee-return-17.o")]
+                (match (fs/write-file a path (slice object))
+                  (Err [e] (panic "{}" e)) (Ok [_] 0))
+                (free! (mut object)))))
+          (match (map-return-image code a)
+            (Err [e] (panic "{}" e))
+            (Ok [owned]
+              (let [(mut loaded) owned memory (primitive/alloc-stack u64)]
+                (for x [(: 0 u64) 1 3 8 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
+                  (for y [(: 0 u64) 7 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
+                    (set! memory 222)
+                    (if (= mode 12)
+                        (let [f (primitive/cast (fnptr (cc/C) [u64 u64 (ptr u64)] R0) (.base (.memory loaded)))
+                              result (call-ptr f x y memory)]
+                          (assert (= (.a result) (prepared-low mode x y))))
+                        (let [f (primitive/cast (fnptr (cc/C) [u64 u64 (ptr u64)] R1) (.base (.memory loaded)))
+                              result (call-ptr f x y memory)]
+                          (assert (= (.a result) (prepared-low mode x y)))
+                          (assert (= (.b result) (prepared-high mode x y)))))
+                    (assert (= (load memory) (if (= mode 9) x (: 222 u64))))))
+                (jit/release-image! (mut loaded)))))
+          (image/release! (mut code)))))))
+
 ;;; Validate private return-memory to SSA independently of machine selection.
 ;;; The scalar probe consumes both promoted pieces, preserving branch/loop and
 ;;; foreign-memory effects. Incomplete/escaped/observed/unsupported places stay.
@@ -2129,10 +2195,15 @@
                      (require (b/emit! (mut graph) 114 0 [t1])))]
           (if (= mode 13) (do (set! extra-ret e0) (set! control e1))
               (set! control (require (b/emit! (mut graph) 112 0 [e0 e1])))))
-        (let [low (if (= mode 8) (require (b/conversion! (mut graph) 35 4 8 x))
-                      (if (= mode 7) (require (b/conversion! (mut graph) 36 12 8 x)) x))
+        (let [low (cond (= mode 16) one
+                         (= mode 17) (require (b/conversion! (mut graph) 36 5 8
+                             (require (symbols/function! (mut graph) "_llabs" 0))))
+                         (= mode 8) (require (b/conversion! (mut graph) 35 4 8 x))
+                         (= mode 7) (require (b/conversion! (mut graph) 36 12 8 x))
+                         :else x)
               high (if (= mode 4) (require (b/conversion! (mut graph) 36 5 8 place))
-                       (if (= mode 7) (require (b/conversion! (mut graph) 36 12 8 y)) y))]
+                       (if (= mode 7) (require (b/conversion! (mut graph) 36 12 8 y))
+                           (if (= mode 14) x (if (= mode 15) seven y))))]
           (set! control (require (b/emit! (mut graph) 93 0 [control place low])))
           (unless (or (= mode 3) (= mode 12))
             (set! control (require (b/emit! (mut graph) 93 0 [control upper high]))))))
@@ -2164,6 +2235,8 @@
       (when (= mode 10) (push! (mut roots) (require (b/frame-address! (mut graph)))))
       (when (= mode 5) (push! (mut roots) place))
       (g/release! (mut original)) (set! original (g/duplicate graph a))
+      (when (or (< mode 3) (= mode 9) (>= mode 12))
+        (execute-prepared-return graph start (slice roots) mode))
       (match (return-values/prepare graph start (slice roots) a)
         (Err [e] (panic "return preparation mode {}: {}" mode e))
         (Ok [answer]
@@ -2171,7 +2244,7 @@
             (None [] (assert (and (>= mode 3) (<= mode 11) (!= mode 9))))
             (Some [owned]
               (let [(mut lowered) owned]
-                (assert (or (< mode 3) (= mode 9) (= mode 12) (= mode 13)))
+                (assert (or (< mode 3) (= mode 9) (>= mode 12)))
                 (assert (= (len (.returns lowered)) (if (= mode 13) 2 1)))
                 (assert (= (node/opcode (get (.instructions (.graph lowered)) (cast i64 place))) 0))
                 (require (verify/native-input (.graph lowered) start (slice (.roots lowered))))
@@ -2199,7 +2272,7 @@
                   (Err [e] (panic "return probe mode {}: {}" mode e))
                   (Ok [image]
                     (let [(mut image) image]
-                      (match (jit/map-image image a)
+                      (match (map-return-image image a)
                         (Err [e] (panic "{}" e))
                         (Ok [loaded]
                           (let [(mut loaded) loaded
@@ -2207,12 +2280,8 @@
                                 memory (primitive/alloc-stack u64)]
                             (for xv [(: 0 u64) 1 3 8]
                               (for yv [(: 0 u64) 7 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
-                                (let [trips (& xv 7)
-                                      low (if (or (= mode 1) (= mode 13)) (if (= xv 0) (+ xv 3) yv)
-                                              (if (= mode 2) (+ xv (* trips yv)) xv))
-                                      high (if (= mode 12) (: 0 u64)
-                                               (if (or (= mode 1) (= mode 13)) (if (= xv 0) (^ yv 7) xv)
-                                                   (if (= mode 2) (if (= trips 0) yv (- trips 1)) yv)))]
+                                (let [low (prepared-low mode xv yv)
+                                      high (prepared-high mode xv yv)]
                                   (set! memory 222)
                                   (assert (= (f xv yv memory) (^ (* low 17) high)))
                                   (assert (= (load memory) (if (= mode 9) xv (: 222 u64)))))))
@@ -2231,7 +2300,7 @@
     (g/release! (mut graph))))
 
 (defn main [] (-> i64)
-  (for mode [(: 0 i32) 1 2 3 4 5 6 7 8 9 10 11 12 13] (return-preparation mode))
+  (for mode [(: 0 i32) 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17] (return-preparation mode))
   (let [(mut failures) 0
         (mut id) (: 0 i32)]
     (while (< id 16)
