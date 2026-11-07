@@ -1,0 +1,86 @@
+(module stogir.tests.switch-verify-oracle)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.uses" :as uses)
+(import "stogir.switch" :as switch)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [r] r) (Err [message] (panic "{}" message))))
+
+;;; The original verifier: one complete use index, then collect per SWITCH.
+(defn oracle [(graph g/Graph) (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (let [(mut indexed) (uses/build graph allocator)
+        (mut count) (: 0 i32)
+        (mut error) ""
+        (mut r) (: 1 i64)]
+    (while (and (= error "") (< r (len (.instructions graph))))
+      (when (= (n/opcode (get (.instructions graph) r)) 117)
+        (match (switch/collect graph (cast i32 r) indexed allocator)
+          (Err [message] (set! error message))
+          (Ok [dispatch]
+              (let [(mut owned) dispatch]
+                (free! (mut (.cases owned)))
+                (set! count (+ count 1))))))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    (uses/release! (mut indexed))
+    (if (= error "") (Ok count) (Err error))))
+
+(defn append! [(graph (mut g/Graph)) (opcode u8) (ty u8) (inputs (slice i32))] (-> i32)
+  (match (g/append-inputs! (mut graph) opcode ty inputs)
+    (Some [r] r)
+    (None [] (panic "append failed"))))
+
+;;; Raw construction bypasses builder checks so every verifier failure is
+;;; reachable. Modes: 0 valid pair of switches; 1 a non-case user of the first
+;;; SWITCH; 2 missing default; 3 duplicate default; 4 overlapping ranges in the
+;;; second SWITCH; 5 a case key whose type differs from the selector;
+;;; 6 no SWITCH at all; 7 valid single switch with many cases.
+(defn fixture [(mode i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        selector (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        four (require (b/scalar-constant! (mut graph) 11 4 8))
+        nine (require (b/scalar-constant! (mut graph) 11 9 8))]
+    (when (!= mode 6)
+      (let [first (append! (mut graph) 117 0 [start selector])
+            v1 (append! (mut graph) 109 0 [first one 0])
+            r1 (append! (mut graph) 110 0 [first four nine])]
+        (when (!= mode 2) (append! (mut graph) 111 0 [first 0]))
+        (when (= mode 3) (append! (mut graph) 111 0 [first 0]))
+        (when (= mode 1) (append! (mut graph) 106 0 [first 0]))
+        (when (= mode 7)
+          (for k [(: 20 u64) 21 22 23 24 25 26 27]
+            (append! (mut graph) 109 0 [first (require (b/scalar-constant! (mut graph) 11 k 8)) 0])))
+        (let [second (append! (mut graph) 117 0 [v1 selector])]
+          (append! (mut graph) 109 0 [second nine 0])
+          (append! (mut graph) 110 0 [second one four])
+          (when (= mode 4) (append! (mut graph) 110 0 [second four nine]))
+          (append! (mut graph) 111 0 [second 0])
+          (when (= mode 5)
+            (append! (mut graph) 109 0 [second (require (b/scalar-constant! (mut graph) 5 30 8)) 0])))))
+    (let [expected (oracle graph a)
+          actual (switch/verify graph a)
+          invalid (and (>= mode 1) (<= mode 5))]
+      (match expected
+        (Ok [_] (assert (not invalid)))
+        (Err [_] (assert invalid)))
+      (match expected
+        (Ok [count]
+            (match actual
+              (Ok [got] (assert (= got count)))
+              (Err [message] (panic "new verifier rejected a graph the oracle accepted: {}" message))))
+        (Err [message]
+            (match actual
+              (Ok [_] (panic "new verifier accepted a graph the oracle rejected: {}" message))
+              (Err [got] (assert (= got message)))))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (for mode [(: 0 i32) 1 2 3 4 5 6 7] (fixture mode))
+  (println "switch verification matches the complete use-index oracle")
+  0)
