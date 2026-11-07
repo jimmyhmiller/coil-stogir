@@ -3,6 +3,7 @@
 (import "stogir.graph" :as g)
 (import "stogir.node" :as n)
 (import "stogir.types" :as types)
+(import "stogir.symbols" :as symbols)
 (import "stogir.allocation" :as a)
 (import "stogir.locations" :as loc)
 (import "stogir.a64.value" :as value)
@@ -44,6 +45,19 @@
                                                   (types/short-vector? ty 8))
                                               (Ok (types/size ty 8))
                                               (Err "unsupported memory value type"))))))))))))))
+
+;;; An all-zero scalar of at most eight bytes stores from WZR/XZR. Floating
+;;; +0.0 has the same bit pattern, so the integer store writes identical bytes.
+(defn zero-constant? [(graph g/Graph) (parts loc/View) (value i32)] (-> bool)
+  (let [constant (loc/constant-reference parts value)]
+    (and (< constant 0)
+         (match (g/lookup graph constant)
+           (None [] false)
+           (Some [node]
+                 (and (symbols/numeric? node)
+                      (= (n/opcode node) (n/type-id node))
+                      (types/valid-scalar? (cast i32 (n/type-id node)))
+                      (= (n/constant-bits node) 0)))))))
 
 ;;; Displacement encodable by the scaled or unscaled immediate access forms.
 (defn direct-displacement? [(offset i64) (width i32)] (-> bool)
@@ -135,15 +149,17 @@
                         (set! reg (cast i32 (.value destination)))
                         (set! error
                               "load result requires register of its class"))))
-              (match (value/register-with-locations! (mut temporary)
-                                                     graph
-                                                     parts
-                                                     (.op3 node)
-                                                     position
-                                                     17
-                                                     63)
-                (Err [message] (set! error message))
-                (Ok [r] (set! reg r))))
+              (if (and (<= width 8) (zero-constant? graph parts (.op3 node)))
+                  (set! reg 31)
+                  (match (value/register-with-locations! (mut temporary)
+                                                         graph
+                                                         parts
+                                                         (.op3 node)
+                                                         position
+                                                         17
+                                                         63)
+                    (Err [message] (set! error message))
+                    (Ok [r] (set! reg r)))))
           (when (= error "")
             (match (if (>= index-reg 0)
                        (encode/register-offset-memory load?
