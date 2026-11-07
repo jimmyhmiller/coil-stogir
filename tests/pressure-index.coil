@@ -451,6 +451,47 @@
     (frame/release! (mut area))
     failures))
 
+;;; With positions advancing, first-advanced answers exactly as first, both
+;;; for registers whose reservations are disjoint (the cursor path) and for
+;;; registers with overlaps (the general path).
+(defn check-advanced [(seed i64)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut input) (ArrayList::new [reserved/Reservation] allocator)
+        (mut failures) 0
+        (mut cursor) (: 0 i64)]
+    (for [i 0 40]
+      (let [register (cast i32 (% i 4))
+            gap (% (+ (* i 13) seed) 5)
+            length (+ 1 (% (+ (* i 7) seed) 6))
+            start (if (= register 3) (% (+ (* i 11) seed) 50) (+ cursor gap))]
+        (when (!= register 3) (set! cursor (+ start length)))
+        (push! (mut input)
+               (reserved/Reservation
+                 :start start :end (+ start length) :register register
+                 :owner (cast i32 i)))))
+    (match (reserved/create 40 4 (slice input) allocator)
+      (Err [message] (panic "{}" message))
+      (Ok [built]
+          (let [(mut index) built]
+            (for [position 0 260]
+              (reserved/advance! (mut index) position)
+              (for [register 0 4]
+                (for width [(: 1 i64) 3 9 40]
+                  (for minimum [(: 0 i64) position (+ position 2)]
+                    (for exclude [(: -1 i32) (cast i32 (% (+ position seed) 40))]
+                      (let [begin (+ position (% (* register 3) 4))
+                            expected (reserved/first index (cast i32 register) minimum
+                                                     begin (+ begin width) exclude)
+                            actual (reserved/first-advanced index (cast i32 register) minimum
+                                                            begin (+ begin width) exclude)]
+                        (when (!= expected actual)
+                          (println "advanced seed={} position={} reg={} {}/{}"
+                                   seed position register expected actual)
+                          (set! failures (+ failures 1)))))))))
+            (reserved/release! (mut index)))))
+    (free! (mut input))
+    failures))
+
 (defn main [] (-> i64)
   (let [allocator (malloc-allocator)
         (mut events) (f/empty allocator)
@@ -461,6 +502,7 @@
     (f/release! (mut events))
     (reserved/release! (mut physical)))
   (let [(mut failures) (+ (tracked-splits) (+ (assigned-mutations true) (assigned-mutations false)))]
+    (for [seed 0 8] (set! failures (+ failures (check-advanced seed))))
     (for registers [(: 1 i32) 4 16 64]
       (for [seed 0 16]
         (set! failures (+ failures (check-assigned seed registers false)))
