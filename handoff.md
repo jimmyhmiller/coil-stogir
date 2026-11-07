@@ -2,6 +2,24 @@
 
 Updated November 7, 2026. **Both goals are still unmet.** This document describes where things stand and the plan for meeting them. Earlier session logs are in git history (this file at `171fa16` and before) and in the `coil-stogir` pad.
 
+## November 7 afternoon session (in progress)
+
+Library `feature/branch-fusion` is now at `73ed968` (plus earlier commits listed below); Coil `stogir/branch-fusion` at `60af4293` vendors it through `5b9fe69`-era work (later library commits are not yet vendored). Nothing installed or pushed.
+
+**Status (matched measurements, same source):** runtime **1.36–1.40×** LLVM by cycles (64.4B vs 46.0B min, from 1.48×); generation **~8.0–8.2 s** in the candidate (from ~8.7 s; goal ≤ ~7.3 s). Every change below keeps the full library suite green (except the two pre-existing failures); output-preserving generation changes were checked to emit byte-identical objects.
+
+**Profiling correction (important).** `pcprof` uses ITIMER_PROF, whose signals macOS delivers on kernel exit, so ~70% of its samples land on page-faulting stores and memmove into fresh pages. Earlier per-instruction conclusions from it (including "memmove is the gap" and "one load in verify.structure") are unreliable. Use `/usr/bin/sample` (call trees) or the new unbiased PC sampler `tsprof` (Coil `build/s8/tsprof.c`: a helper thread suspends the target thread every 200 µs and reads PC/LR). With it, memmove time is about equal between hosts.
+
+**Model of the runtime gap.** Cycles ≈ shared memory stall + instructions ÷ sustained IPC, on both P-cores and E-cores (E-core ratio is the same 1.49×). The gap is dynamic instruction count (Stogir ~256B vs LLVM ~152B now) plus taken branches. Remaining gap by unbiased role samples: loads, compares, register-allocator reloads/moves (~27% of the gap), prologue/epilogue (no shrink-wrapping), extensions.
+
+**Runtime commits this afternoon:** frame slots addressed directly (`2260fe6`); zero stores from XZR (`b80fef5`); narrow truth tests without UXTB (`8845aaf`); ZEXT/SEXT as register views with 64-bit signed loads and LDPSW (`8791284`, `bbd9683`, `<I32 ZEXT>`); pairing-NOP compaction (`a910c2b`); return tails through forwarded empty blocks (`f69a393`); small test blocks emitted in place at ENDs, i.e. loop rotation (`8928a88`, −2.1% cycles); BUILTIN-MOVE copy forwarding (`37a0d6c`, neutral).
+
+**Generation commits:** SWITCH verification without a use index (`66982a1`, `73ed968`); graph compaction before SCCP/backend (`b43c441`, `e8ef92d`, byte-identical, −3%); early-exit pressure scans (`5b9fe69`); content-hash validation proofs (`b24ba1d`, user-approved: skip re-validation only when a 128-bit digest proves the graph identical to one that passed); index loops instead of slice iterators (`6221e7c`, `c571547`); adapter skips template SCCP for adapted graphs over 1.5× the inline budget (Coil, byte-identical, −2%).
+
+**Rejected/measured:** inline budget 1024 (−1% cycles, +18.5% generation); skipping SCCP's final validation when cleanup changed nothing (almost never applies); TRUNC coalescing (neutral, kept).
+
+**Next ideas, ranked:** spill splitting around rare calls in loops (e.g. closure-subprogram-scoped reloads six values per iteration); shrink-wrapping prologues; IR-level integer narrowing (i32 counters as U64 containers + TRUNC/SEXT); constant hoisting out of loops; signed div/rem by powers of two with known-nonnegative dividends; for generation, a monotone-cursor reservation query in register pressure and sharing use lists across backend stages.
+
 ## The goals
 
 For the whole Coil compiler bootstrap:
