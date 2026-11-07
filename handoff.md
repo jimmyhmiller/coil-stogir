@@ -1,235 +1,214 @@
 # Coil Stogir performance handoff
 
-Updated November 6, 2026. The performance goal is **paused and unmet**. This document describes the state at the pause; it does not resume development or benchmarking.
+Updated November 7, 2026. **Both goals are still unmet.** This document describes where things stand and the plan for meeting them. Earlier session logs are in git history (this file at `171fa16` and before) and in the `coil-stogir` pad.
 
-## Goal and current evidence
+## The goals
 
 For the whole Coil compiler bootstrap:
 
-- IR-to-machine-code generation must be at least **5× faster than LLVM O3**. The user explicitly excluded frontend time from this compile-time target.
-- The resulting Stogir-built compiler must run within **10% of the LLVM-O3-built compiler**.
-- Preserve correctness, JIT and AOT, and the pinned upstream architecture. Small benchmarks are diagnostic tools, not substitutes for the whole-compiler goal.
+1. **Generation:** Stogir IR-to-machine generation at least **5× faster than LLVM O3**. It is measured in the fixed LLVM-built candidate while it emits the compiler; frontend time is excluded.
+2. **Runtime:** the Stogir-built compiler runs within **10% of the LLVM-O3-built compiler** doing the same work (each emits the current compiler with Stogir O3).
 
-Latest **completed**, matched whole-bootstrap diagnostic:
+Correctness, JIT and AOT, and the pinned upstream architecture must be preserved. Do not disable verification, remove checks, special-case workloads, overwrite the global compiler, or run `build full` or comprehensive workflows while iterating.
 
-| Measurement | LLVM O3 | Stogir O3 | Required Stogir |
+## Where things stand
+
+Two full bootstraps at Coil `5c751f13` (results in Coil `docs/benchmarks/branch-fusion/bootstrap-run-{1,2}.json`). Every generated host reproduces the exact seed Stogir object.
+
+| Measure | Run 1 | Run 2 | Goal |
 |---|---:|---:|---:|
-| IR-to-machine generation | 37.110109 s | 10.925092 s | ≤7.422022 s |
-| Generated compiler runtime, wall | 17.157830 s | 28.315133 s | ≤18.873613 s |
+| Generation, Stogir / LLVM | 9.64 / 36.96 s (**3.83×**) | 8.73 / 36.55 s (**4.19×**) | ≥ 5× (≤ ~7.3 s) |
+| Runtime cycles, Stogir / LLVM | 74.26B / 50.15B (**1.48×**) | 73.92B / 50.97B (**1.45×**) | ≤ 1.10× (≤ ~56B) |
+| Runtime wall | 22.51 / 15.13 s | 23.02 / 15.53 s | |
 
-That is **3.396778× faster generation and 1.650275× runtime**. At that checkpoint we need approximately **32.1% less generation time and 33.3% less runtime**. These are single diagnostic runs, not repeated acceptance medians.
+History: 1.65× runtime and 3.40× generation at `68ced91e`; 1.56× and 3.39× at the start of November 7. About **24% fewer runtime cycles** and **20% less generation time** are still needed.
 
-Source/candidate: Coil `68ced91e`; whole evidence: `131d3115`. Results are in the Coil worktree at `docs/benchmarks/contained-fields-and-bit-identities/bootstrap/results.json`.
+The workload moves. Generation improvements in the library also make the compiler being run cheaper, for both hosts. During this session the remaining runtime work got relatively harder for Stogir (1.43× → 1.46×) while absolute cycles fell. Always compare the two hosts on the same source.
 
-**Important interpretation:** generation compares one fixed host emitting the compiler with each target backend. Runtime compares the resulting native compiler executables doing the **same work**: each emits the current compiler using Stogir O3. It does not compare an LLVM host doing LLVM optimization against a Stogir host doing a different backend's work.
+## Where everything is
 
-## Where to work
+All paths are under `/Users/jimmyhmiller/Documents/Code/projects`. Everything is committed; **nothing is installed or pushed.**
 
-All paths below are under `/Users/jimmyhmiller/Documents/Code`.
-
-| Item | Path / checkpoint |
+| Item | Location |
 |---|---|
-| Standalone library repository | `projects/coil-stogir` |
-| Coil repository | `projects/coil` |
-| Pinned upstream reference | `open-source/ir`, commit `92171d0a4a36b0acf707f2dea7998de615dd4acd` |
-| Latest library implementation | `projects/coil-stogir/.worktrees/spill-home-edges`, commit `4e068bc` |
-| Latest Coil integration | `projects/coil/.worktrees/stogir-spill-home-edges`, source/candidate `a831fb94` |
-| Latest component evidence / pause report | Same Coil worktree, commits `5daecd7e` / `be78c1d8` |
-| Retained comparison baseline | `projects/coil/.worktrees/stogir-contained-field-promotion`, evidence HEAD `131d3115`, candidate built from `68ced91e` |
-| Fixed standalone test compiler | `projects/coil/.worktrees/stogir-allocator-choice-fusion/build/bin/coil-candidate` |
-| Candidate build seed | `projects/coil/.worktrees/stogir-static-entry-allocations/build/bin/coil-candidate` |
-| Common emitter caller object | `projects/coil/.worktrees/stogir-class-register-choice/build/class-choice-comparison/emitter/runner.o` |
+| Coil integration | `coil/.worktrees/stogir-branch-fusion`, branch `stogir/branch-fusion` (on `stogir/copy-forwarding`) |
+| Stogir library | `coil-stogir/.worktrees/branch-fusion`, branch `feature/branch-fusion` at `342ffb7` (on `feature/guard-trip-first` `03d2b10`); vendored unchanged into Coil `src/compiler/stogir/stogir/` |
+| Candidate build seed | `build/seed-bin/coil` in the Coil worktree (symlink to the `stogir-static-entry-allocations` candidate) |
+| Fixed library test compiler | `coil/.worktrees/stogir-allocator-choice-fusion/build/bin/coil-candidate` |
+| Measurement tools | Coil `docs/benchmarks/branch-fusion/tools/` (see its README) |
+| Profilers | Coil `docs/benchmarks/cir-copy-forwarding/tools/` (`pcprof`, `memprof`) |
+| Scratch knobs (not for merging) | `coil/.worktrees/stogir-budget2` (`scratch/inline-budget-2`: layout cutoff), `stogir-bulk-limit` (`scratch/bulk-limit`: inliner rejection reasons), `stogir-inline-budget` (`experiment/stogir-inline-budget`: inline budget and LLVM pipeline knobs), `stogir-genbase` (detached base used for one generation A/B; safe to remove) |
 
-Do not assume either repository's main checkout contains the latest experiment. The named worktrees and their committed evidence are the checkpoints. Latest experimental worktrees were clean at the pause. These experiments are **committed, not globally installed, and not pushed**.
+Validation at the current heads:
+- The full library suite (342 tests) passes except `jit-parameter-specialize` and `private-leaf`, which also fail on `03d2b10`, before this work.
+- The `aot-*-link` tests need link flags from earlier JIT tests; `aot-switch-link` was run by hand and passes.
+- Quick FAST passes and the whole bootstrap reproduces the seed object.
+- **Full FAST has not been run;** it is required before pushing.
 
-Recorded binary identities: latest Coil candidate SHA-256 `aa49a61a577946e3c95541f7ceceaaecd2c0ddf0e0b424dbec7085e272e3e27b`; standalone test compiler SHA-256 `69773cb09fe6ef00fd91aca8a6580d9d1b967db1f980fd314a1350af48547ed3`. Check identities before relying on an existing binary; a worktree's current HEAD alone does not identify its previously built candidate.
+Commits made on November 7:
+- Library: `3860588`, `ca6be1e`, `5766b5c`, `ea4453e`, `c7d8a4a`, `dee6e58`, `342ffb7`.
+- Coil: `33622239`, `079a8d80`, `c76981cd`, `803d81a0`, `c702d2e2`, `49e738fb`, `f16d787b`, `5c751f13`, `d550c17c`.
 
-Local navigation: [latest component/pause report](../coil/.worktrees/stogir-spill-home-edges/docs/benchmarks/spill-home-edges/README.md), [completed whole results](../coil/.worktrees/stogir-spill-home-edges/docs/benchmarks/contained-fields-and-bit-identities/bootstrap/results.json), [historical broad profile](../coil/.worktrees/stogir-spill-home-edges/docs/benchmarks/verified-operands-bootstrap/profile/summary.json), [latest standalone validation](.worktrees/spill-home-edges/docs/validation/spill-home-edges/README.md). These links depend on the local worktrees remaining present.
+## How to measure (read this first)
 
-The root library checkout has user-owned, untracked `docs/benchmarks/results/`. **Do not modify, stage or delete that directory.** Stage named files rather than using `git add .`.
+- **Runtime changes need matched hosts.** A backend change also changes the work each generated host does, so `native-stogir` bootstrap rows from two candidates are not comparable. Build both hosts from the same source with the old and the new candidate (`mkhost.sh`), then alternate them (`ab.py`); it checks that the outputs are identical.
+- **Generation changes:** `genab.py ROOT N base=OLD new=NEW` alternates candidates on the same source, compares IR-codegen time and reports whether the emitted objects are identical. An identical object means a pure generation change.
+- **Compare cycles, not retired instructions.** Apple cores fuse compare-and-branch and decode 8 wide. Cutting 2–5% of instructions (CBZ fusion, Boolean folds) moved cycles by 0–2%. Every large runtime win this session removed *taken branches* with almost no instruction change.
+- Host load on this machine is often 10–50 (other sessions, `rustc`). Use at least three alternating rounds and compare minimum and median. Single bootstrap runs vary by about 5%.
+- `bootstrap.py --stogir-only` skips the LLVM rows for faster correctness checks. The official numbers need the full run.
+- Profiles: `/usr/bin/sample PID 30 1 -file F`, with the PID of the process you launched (`cmd & P=$!`), then `incl.py` and `children.py` for inclusive shares. PC sampling (`pcprof`) gives self time only, and LLVM's inlining moves samples into callers, so per-function cross-backend comparisons can mislead.
+- Per-event hardware counters are not available headless: `kperf` needs root, and `xctrace` CPU Counters fails to connect to DTServiceHub. Cache-miss and branch-miss data would settle several open questions (below) if they can be collected interactively.
 
-Create new worktrees under each project's ignored `.worktrees`. Develop and validate on this Mac; use `computer.jimmyhmiller.com` over SSH only for specifically Linux-required work. Preserve centralized upstream credit in LICENSE/NOTICE/PROVENANCE; do not add SPDX headers throughout the source and tests.
+## What we know
 
-Project Pads: `coil-stogir/index`, `coil-stogir/paused-wrap-up`, `coil-stogir/current-goal-status`, and `coil-stogir/spill-home-edges-development`. The Coil index also links the paused report. Report confirmed external Coil bugs in `coil-bugs`, following its instructions; do not silently work around them.
+**Runtime.**
+- With inlining off on both sides, LLVM takes 119.5B cycles and Stogir 185.0B. LLVM still inlines `alwaysinline` trait wrappers, so this overstates Stogir's per-body gap, but per-body code quality matters at least as much as inlining.
+- Raising Stogir's inline budget does not help: 1024 gave +19% generation with no cycle gain, 2048 gave +51%. Inlined code is not cleaned up. In a replay of `verify.structure`, full inlining raised instructions 31.3B → 37.3B with no cycle change.
+- Inliner gate, whole compile: 129,585 calls to registered templates, 60,975 inlined. Rejections: exhausted per-caller budget (dominant), never-inline targets, callees containing indirect calls (about 30K checks; for example the `KeyOps` eq/hash function-pointer wrappers and allocator `dyn` calls), and callees larger than the remaining budget.
+- Copies: about 93M `memmove` calls / 11.2 GB, against LLVM's 58M / 7.1 GB. LLVM expands copies up to about 256 bytes inline (with q-register `ldp`/`stp`) and its interposer counts miss those, so the true LLVM copy volume is unknown.
+  - The clearest missing optimization is a field read of a by-value struct through `get`, such as `(.name (get list i))` on a 176-byte struct: Stogir 88.3M cycles against LLVM's 40.7M in an isolated benchmark.
+  - Raising the inline-copy cap to 256 bytes gives 54.7M there, but a global cap is neutral to worse on the whole compiler, because real copies (for example `box-expr` into the heap) get slower.
+- The largest single function gap is `stogir.verify.structure`: 5–9× in context against 2.3× in a warm isolated replay. Most of its samples sit on one load in the outer loop. It is unexplained without hardware counters; cold memory, register pressure and limited memory-level parallelism are the suspects. The loop uses all ten callee-saved registers and still spills about 26 times, and both arms of inlined `contains?`/`borrow-node` are computed before the branch (early placement).
+- The remaining unconditional branches (static count, current host):
+  - 107K, against LLVM's 44K;
+  - about 68K follow PHI moves, which is partly unavoidable;
+  - 61K are backward;
+  - 11K are dead `b` after `brk`;
+  - jumps into jumps are down from 29.7K to 53.
+- Register allocator choice barely matters for LLVM (basic instead of greedy costs it 2.6%), and the prologue/epilogue share of samples is under 1%.
 
-## What the latest change actually does
+**Generation** (call-tree profile of the candidate emitting the compiler; shares of the whole emit run, of which generation is about 55%):
+- Image pipeline about 25%: register allocation 7.9% (`allocation.pressure-state-into!` is 43% of that), CFG and schedule preparation 5.4%, emission 3.2%.
+- SCCP 13.4%, of which `sccp-rewrite.validate` is 6.4%.
+- Module finish 10.9%; template preparation 7.4%; inline expansion 7.1%; `mem2ssa` 4.1% (`cfg.build` is 22% of that); copy forwarding 4% before this session's fix.
+- Verification as a whole is about 12% of generation.
+- SCCP is not exactly idempotent: a second run on its own output changes the emitted object. Skipping it nevertheless had no runtime cost.
 
-The latest work completes part of the shared spill-home protocol. Definitions can establish a private parent's home, making later stores of the same value redundant. Earlier experiments removed contiguous split-boundary stores but **left ordinary CFG edge stores intact**. The provider's mismatch paths still stored those values and then reloaded them.
+## What changed on November 7 (matched A/B results)
 
-`a64/spill-homes.coil` now supplies a certificate only when all relevant machine definitions, coalesced values, widths and private frame slots can be established. Resolution owns that certificate; the emission view borrows it until resolution is released. Empty-block/layout checks and actual edge lowering see the same view.
+| Change | Effect |
+|---|---|
+| Boolean integer-view folds and IF/COND condition canonicalization; CBZ/CBNZ; STP/LDP frame saves (lib `3860588`) | Instructions −2.1%, cycles within noise |
+| Scalar `def` reads become constants on the CIR path (Coil `079a8d80`) | With the above: instructions −5.6%, cycles about −2% |
+| Direct switch dispatch, no stubs on empty edges (lib `ca6be1e`) | Cycles −3.4% minimum, −5.1% median |
+| PHI-only blocks count as empty (lib `ca6be1e`) | Cycles −3.5% minimum |
+| Taken-edge moves at IF projection entry (lib `5766b5c`) | Cycles −1.2% minimum, −1.8% median |
+| In-place return at return tails (lib `5766b5c`) | Cycles −1.7% minimum, −1.9% median |
+| LDP/STP pairing of adjacent accesses (lib `ea4453e`) | Cycles −1.2% minimum, −0.5% median |
+| Owned SCCP; skip the image's entry SCCP on graphs that are already SCCP output (lib `c7d8a4a`, Coil `49e738fb`) | Generation −7.5%; runtime unchanged |
+| Reuse the vectorizer's CFG/schedule preparation (lib `dee6e58`) | Generation −3.5%, identical objects |
+| Bulk array initialization (Coil `5c751f13`, lib `342ffb7`) | Generation −2.9% (copy forwarding), instructions −2.1% more (library) |
 
-Only **ordinary same-parent register-to-that-exact-home stores** are suppressed. Phi moves and literals are added afterward and retain their behavior: they can establish a new incoming value. Reloads are unchanged. Frame/scope introspection, external/computed entry and incomplete-definition cases retain the original fallback.
+**Measured and rejected; do not repeat without a new idea:**
+- Bigger inline budgets.
+- A global 256- or 512-byte inline-copy cap.
+- Expanding only copies into local stack slots: 55% slower on the field-read benchmark.
+- If-converting cheap pure diamonds into COND: cycles +0.7–2.3%. Branches here are well predicted and COND lowering is expensive.
+- Switch fallthrough for the case laid out next: neutral.
+- Branchless DEF/REF test in the verify loop.
+- Bottom-up layout for functions over 257 blocks: neutral.
+- The CIR-level inliner from the previous session (`d25c60b8`).
 
-Actual provider body, with exact agreement between standalone graph replay and Coil object:
+## Plan to meet the goals
 
-- Baseline: 1,464 bytes, SHA-256 `97dcf1a1c7350db51fb2fd7a688a85a0f380f2487565dcd42180d9a4fa9c505d`.
-- Complete home/edge protocol: 1,324 bytes, SHA-256 `fb1e094e38633bfe2d4e840267236516c25b28eaeebe3293b10fcb42508ffb9e`.
+The two goals pull against each other: most runtime work adds generation work. Budget each runtime change against its generation cost with `genab.py`, and fund it with algorithmic generation savings.
 
-Latest component results, eight alternating CPU samples after excluded warmup:
+### Runtime: about 24% of cycles to find
 
-| Workload | Retained Stogir | New Stogir | LLVM before | LLVM after |
-|---|---:|---:|---:|---:|
-| Actual provider | 99.8375 ms | 89.9860 ms | 51.0495 ms | 51.1475 ms |
-| Actual emitter | 621.7595 ms | 618.3710 ms | 356.2935 ms | 354.6925 ms |
+Ranked by expected value given the evidence above. Estimates are uncertain; measure each with matched hosts.
 
-The provider improved **9.87%**. Emitter performance is effectively neutral, with similar movement in its LLVM control. Both LLVM object pairs are identical; expected execution results pass. Host activity qualifies the timings. This has **not yet demonstrated a whole-compiler improvement**.
+1. **Copy elimination after inlining (scalar replacement of aggregates).** This is the biggest known gap shape and the main thing LLVM has that Stogir lacks.
+   - **Mechanism.** Keep fixed-size copies as a graph-level operation until after inlining and SCCP, instead of lowering them to `memmove` or 8-byte pairs when the adapter builds the graph. Load forwarding and dead-store elimination can then read through a copy and delete the temporary, and the copies that survive are lowered late: inline `ldp`/`stp` (q registers) up to about 256 bytes, `memmove` above.
+   - **Work involved.** A new opcode carried through verify, use lists, scheduling, alias/effect analysis, inliner eligibility and lowering.
+   - **Expected size.** The `get`-field benchmark suggests large local wins; whole-compiler value is unmeasured.
+2. **More taken-branch removal in layout and emission.** This lever has worked five times.
+   - **Candidates.**
+     - Pick the fallthrough predecessor of a merge by edge weight or loop depth.
+     - Tail-duplicate small merge blocks beyond return tails.
+     - Rotate every loop shape so the back edge is a conditional branch.
+     - Keep dead `b` after `brk` out of hot code.
+   - **First step.** Classify the 61K backward branches in hot functions.
+3. **Register pressure from early placement.** Sink pure values computed before a branch but used in only one arm into that arm (late placement after inlining). In `borrow-node`/`contains?` the negative-index path is computed on the positive path. This should reduce spills in hot loops such as `verify.structure`.
+4. **Inliner eligibility, not budget.** About 30K rejections are callees with indirect calls. Constant function pointers, such as `KeyOps` hash/eq loaded from a known table, could become direct calls before eligibility is decided, which also makes them inlinable.
+5. **Smaller items**, each likely 0.5–2%:
+   - fuse COND's comparison into `cmp`+`csel` (x86 upstream has `COND_CMP_INT`);
+   - fold a Var-static cell's address (three dependent loads become one);
+   - address module-local symbols directly in AOT (`adrp`+`add` instead of loading an address slot);
+   - hoist or rematerialize loop-invariant constants instead of rebuilding `movz`/`movk` every iteration;
+   - drop redundant extensions (`sxtb` after `ldrsb`, `ubfx #0, #32` chains).
+6. **Get hardware counters for `verify.structure` and the top ten hot functions** (cache and branch misses) if root or interactive Instruments is possible. That would tell whether the in-context 5–9× is memory behavior or code shape.
 
-Evidence: Coil `docs/benchmarks/spill-home-edges/README.md`, per-component `results.json`, generation transcripts, process snapshots and compressed disassembly. Standalone correctness evidence: library worktree `docs/validation/spill-home-edges/`.
+### Generation: about 20% of time to find
 
-## How I have been testing
+1. **Cheaper verification without checking less** (about 12% of generation).
+   - `integer-operations-target-structured` and `structure`: per-operand helper calls and repeated classification.
+   - `switch/verify`: rebuilds a full use index per graph when any SWITCH exists.
+   - `calls/verify`: repeated full scans.
+   - Same checks, same independence; just faster.
+2. **Register allocation pressure queries** (about 6% of generation). `pressure-state-into!` loops over every register and every range of the interval with reserved-range lookups. Maintain free-until and next-use incrementally, as upstream's linear scan does with its active and inactive sets.
+3. **Stop rebuilding analyses on unchanged graphs.**
+   - `cfg.build` inside `mem2ssa` when the CFG is known.
+   - `uses/build` in `inspect-verified-site`, once per call site.
+   - `uses/build` in SCCP `finish!` and the verifiers.
+   - The use and CFG facts are often available from the previous pass.
+4. **Remaining whole-graph copies.**
+   - `sccp-rewrite` duplicates its input only to diff old against new in `seed-iteration!`; record changed references during the rewrite instead.
+   - `own-definition!` copies each template into module memory. Optimize directly into the module allocator or move ownership.
+5. **Fewer full SCCP runs.**
+   - Templates run SCCP in preparation and again in module finish after expansion; callers run it before inlining.
+   - The image's entry SCCP is now skipped for clean graphs. Extend that to multi-return templates, which need canonicalization that preserves the fixpoint, and to callers with no expansion.
 
-### 1. Keep the implementation and emitter under test separate
+**On reusing validation results.** About half of validation re-checks a graph that was already checked, so reusing the result is tempting, but the two main cases differ:
+- **The inliner's caller check** really is redundant today: SCCP validated that exact graph and only the root list changes afterwards. But the library's contract says only its own internal path may vouch for that, and a later change that edits the graph in between would silently leave it unchecked. Estimated saving about 2–4% of generation.
+- **The post-rewrite check inside SCCP** is *not* redundant: the final check sees the graph only after the iterative folder has changed it. Skipping it would lose detection and localization of rewrite bugs.
 
-Use a fixed compiler to compile standalone library tests, so changing the library does not silently change the compiler that builds the test. Run from the library experiment's worktree, whose `Coil.toml` resolves its own `src`.
+Recommendation: keep validation as it is and pursue item 1 first.
+
+### Before calling anything done
+
+Repeated full bootstraps (same source, controlled load) must meet both targets, with every host reproducing the seed object. Then run full FAST, live emission and the full library suite including the `aot-*-link` tests. Install and push only after that, deliberately, and report committed, installed and pushed states separately.
+
+## Reference: testing workflow
+
+### Library changes
+
+Develop in the library worktree and test with the fixed test compiler, so changing the library never changes the compiler that builds its tests:
 
 ```sh
 STOGIR_TEST_COIL=/Users/jimmyhmiller/Documents/Code/projects/coil/.worktrees/stogir-allocator-choice-fusion/build/bin/coil-candidate
-cd /Users/jimmyhmiller/Documents/Code/projects/coil-stogir/.worktrees/spill-home-edges
-
-COIL_LIBRARY_STATE=0 "$STOGIR_TEST_COIL" run tests/spill-home-loop.coil \
-  --backend stogir -O3 --no-debug --debug-checks
-
-COIL_LIBRARY_STATE=0 "$STOGIR_TEST_COIL" run tests/spill-home-loop.coil \
-  --backend llvm -O1 --no-debug --debug-checks --sanitize=address
+cd /Users/jimmyhmiller/Documents/Code/projects/coil-stogir/.worktrees/branch-fusion
+COIL_LIBRARY_STATE=0 "$STOGIR_TEST_COIL" run tests/jit-branch.coil --backend stogir -O3 --no-debug --debug-checks
+# whole suite (about 25 minutes, 6 in parallel):
+.../coil/.worktrees/stogir-branch-fusion/docs/benchmarks/branch-fusion/tools/libtests.sh $PWD /path/to/out
 ```
 
-The sanitizer flag is `--sanitize=address`. Debug checks stay enabled in correctness runs. Performance measurements use their documented O3/no-debug configuration instead.
+- **Don't edit library source while the suite runs;** it compiles each test from the live tree.
+- New behavior gets a test that fails on the previous library. Check this by copying the test into a scratch copy of the previous library's `src`.
 
-The expanded spill-home test checks **432 native answers across O1/O2/O3**, including 24 invariants used before and after a call, a native target that destroys caller GPRs/NZCV, alternating call/bypass paths with Phi joins, and frame-address fallback. It also passes ASAN.
+### Real-graph replays
 
-Additional native suites used here: `jit-pressure`, `jit-call-pressure`, `jit-phi-call-redefinition`, `jit-floating-pressure`, `jit-phi`, `jit-loop`, `jit-switch-pressure`, `jit-bulk-pressure`, `private-call-allocation`, `jit-loop-guard`, and `frame-memory`. Four ASAN suites passed: the expanded home loop, Phi-call redefinition, floating pressure and loop behavior. Tests check semantics and ABI behavior; static instruction counts alone do not establish correctness or speed.
+`COIL_TPDE_STATS=1 COIL_TPDE_SERIAL=1 COIL_STOGIR_GRAPH=<function> <candidate> build <file>` prints a lossless `stogir-snapshot` of one function's graph. The `benchmarks/*/generate.py` scripts turn a snapshot into a replay program (see `benchmarks/phi-home-entry`). `emit-obj` does not print snapshots; use `build`.
 
-Before editing Coil, read `coil guide`. For damaged delimiters use `coil balance --write` and inspect the changes; do not run a formatter over unrelated code.
+### Integrating into Coil
 
-### 2. Reduce real compiler graphs and compare actual emitted code
-
-The provider replay is generated from a lossless captured graph, rather than a hand-written approximation:
+1. Copy changed library files into Coil `src/compiler/stogir/stogir/` (they must stay identical: `diff -rq`).
+2. Append a provenance paragraph to `src/compiler/stogir/README.md`; never replace it.
+3. Rebuild the candidate after every source change, README included: the toolchain stamp covers it, and `bootstrap.py` asserts it.
 
 ```sh
-python3 benchmarks/spill-home-availability/generate.py
-COIL_LIBRARY_STATE=0 "$STOGIR_TEST_COIL" run \
-  build/spill-home-availability/replay.coil \
-  --backend stogir -O3 --no-debug --debug-checks
+cd /Users/jimmyhmiller/Documents/Code/projects/coil/.worktrees/stogir-branch-fusion
+PATH="$PWD/build/seed-bin:$PATH" COIL_LIBRARY_STATE=0 python3 scripts/dev.py build candidate
+COIL_LIBRARY_STATE=0 python3 scripts/dev.py test fast --compiler build/bin/coil-candidate --quick
+python3 docs/benchmarks/private-call-module/bootstrap.py --compiler build/bin/coil-candidate --output build/<fresh-dir> [--stogir-only]
 ```
 
-The generator defaults to the compressed snapshot in `docs/validation/spill-home-availability/snapshot.txt.gz`. Its inspection tail records definitions, owners, ranges, transfers, loop depths, frame layout and machine bytes. The latest version asserts eight definition-writeback positions and the 1,324-byte body. The ASAN replay emits the same body. A temporary edge-certificate bypass failed the real body assertion with exit 134; the source was restored afterward. The failure was not an API/build error.
+A candidate builds in about 15 seconds and a Stogir-only bootstrap takes about 70 seconds. Every generated host must reproduce the exact seed object. The bootstrap must run from the worktree root with `COIL_*` cleared, which the script does.
 
-For architecture-sensitive decisions, extract the pinned upstream C rule and compare decisions. Example: the separate split-child ranking experiment matched **625 native ranking decisions** from an unchanged C fragment compiled with UBSAN. That proves the tested ranking rule, not the whole allocator. Inputs that would overflow signed C scoring were excluded explicitly; no upstream reachable bug was established.
+### Repository rules
 
-### 3. Integrate into Coil, then build one candidate
-
-Vendor source under `src/compiler/stogir/stogir/`. Preserve Coil's existing vendor provenance and append the new commit/qualification; do not replace its provenance file wholesale. Freeze **all** compiler/stdlib source, including vendored validation docs, before building or timing: the toolchain SDK digest includes those files.
-
-The latest worktree already has `build/seed-bin/coil` pointing to the fixed build seed listed above:
-
-```sh
-cd /Users/jimmyhmiller/Documents/Code/projects/coil/.worktrees/stogir-spill-home-edges
-PATH="$PWD/build/seed-bin:$PATH" COIL_LIBRARY_STATE=0 \
-  python3 scripts/dev.py build candidate
-
-COIL_LIBRARY_STATE=0 python3 scripts/dev.py test fast \
-  --compiler build/bin/coil-candidate --quick
-COIL_LIBRARY_STATE=0 python3 scripts/tests/stogir-live-emission.py \
-  build/bin/coil-candidate
-```
-
-Latest build and live-emission/prebuilt retention checks passed. Quick passed in **79.1 seconds**, over its 60-second target under host activity. Read the report, not merely the outer script's exit code. Full FAST with the required normal environment remains required before pushing compiler changes. Do not run `build full` or comprehensive/release workflows while iterating, and do not overwrite the global compiler with experiments.
-
-### 4. Measure small real workloads with fixed opaque callers
-
-Only start these after builds, tests and profiles are terminal. Run the two measurements serially:
-
-```sh
-STOGIR_BASELINE=/Users/jimmyhmiller/Documents/Code/projects/coil/.worktrees/stogir-contained-field-promotion/build/bin/coil-candidate
-STOGIR_CALLER=/Users/jimmyhmiller/Documents/Code/projects/coil/.worktrees/stogir-class-register-choice/build/class-choice-comparison/emitter/runner.o
-
-python3 docs/benchmarks/frontend-providers/measure.py \
-  --compiler "$PWD/build/bin/coil-candidate" \
-  --baseline "$STOGIR_BASELINE" --output build/handoff-provider-run
-
-python3 docs/benchmarks/private-call-module/measure.py \
-  --candidate "$PWD/build/bin/coil-candidate" \
-  --baseline "$STOGIR_BASELINE" --caller-object "$STOGIR_CALLER" \
-  --output build/handoff-emitter-run
-```
-
-Use fresh output directories. Scripts disable library state, request serial native codegen and record phase telemetry. Each compiles the **same current source** with old/new Stogir and LLVM controls, verifies execution, excludes a warmup, then takes eight samples with alternating forward/reverse order.
-
-- Provider: 256 modules, 8 facades, 20,000 queries alternating present/missing names. The C caller owns opaque inputs; construction/destruction are outside its process-CPU kernel timer. The independently computed expected count is 100,000.
-- Emitter: `docs/benchmarks/class-register-choice/emitter/kernel.coil`, linked to one unchanged opaque caller object. Its runtime metric is child-process CPU time, including process overhead; it is not the provider's internal timer. Exact answers are compared across variants. That differential agreement is not an independent correctness proof, so keep the semantic library tests too.
-- Each script takes **one generation sample** per variant. Those samples are diagnostic, not reliable compile-speed medians.
-
-Record compiler/fixture/caller/object hashes, source/SDK identity and host process inventories before/after. Verify LLVM control object pairs really are identical. Compare paired current-source results; never claim an improvement by comparing LLVM numbers from different source checkpoints. Preserve raw samples and disassembly. A smaller body can still be slower.
-
-### 5. Periodically test the whole compiler
-
-After useful small evidence, with frozen source and no overlapping jobs:
-
-```sh
-python3 docs/benchmarks/private-call-module/bootstrap.py \
-  --compiler "$PWD/build/bin/coil-candidate" \
-  --baseline "$STOGIR_BASELINE" \
-  --output build/handoff-whole-bootstrap
-```
-
-The driver serially emits Stogir and LLVM compiler objects using the fixed candidate, plus a same-source previous-Stogir object. It links each into a **private** toolchain prefix. Each generated compiler then emits the same current main program using Stogir O3. All outputs must reproduce the exact seed Stogir object. It records wall/CPU/RSS, generation phase sums, compiler/object/SDK hashes and host activity. This is a diagnostic, not final acceptance: repeat matched runs under controlled load for acceptance.
-
-The paused run lives in `build/spill-edges-bootstrap`. Only seed-Stogir completed: 10.962724 s generation / 19.391906 s whole emit. LLVM was interrupted. Partial progress/pause records are committed under `docs/benchmarks/spill-home-edges/paused-bootstrap/`. **There is no new complete comparison.** Do not use the partial LLVM object or partial row as a result.
-
-The driver's `--resume` reads `results.json`, not `progress.json`. Do not blindly pass `--resume` to this interrupted run: a safe resume needs explicit checkpoint/artifact verification or a fresh output directory. No benchmark process was left running at the pause. Poll exact live process/session handles; an observation timeout is not termination.
-
-## Where I think the largest runtime gains are
-
-These are priorities, not promised speedups.
-
-1. **Complete register/spill availability and CFG resolution.** This has the strongest recent concrete evidence: applying the home proof to ordinary edges gained 9.87% on a real provider. Remaining work includes per-use/predecessor reload availability and spilled-Phi handling. Current code still reloads and reconciles locations without upstream's complete availability model. Inspect the actual hot paths; do not add another store-placement cost heuristic.
-2. **Improve the generated code for broad compiler hot paths, especially graph verification, emission and aggregate/access loops.** The current emitter is about 1.74× LLVM in the component run. Historical profiles show substantial verification, repeated use-list/operand work, memory copying, resolver/provider work and allocation APIs. Existing aggregate promotion, private-call effects, checked field reads, operand-read proofs and bounded inlining have already addressed parts of this. Re-profile and inspect current native bodies before extending them; do not repeat an already-completed optimization or raise inline budgets blindly.
-3. **Finish the phase/use contract before further split-placement changes.** Upstream has LOAD/USE/DEF/SAVE positions. We currently have two phases, and a use at an interval split belongs to a different side than it does in upstream's inside-range split. General odd reloads are intentionally rejected. Remaining free-assignment/reload-restart split categories need correct transfer lowering and ownership, not simply earlier numeric cuts.
-
-Do not equate upstream parity with guaranteed target performance. The implementation still needs measured machine-quality improvements on the whole compiler. Avoid workload-specific names, special cases, unchecked access or disabling verification to obtain a benchmark result.
-
-## Biggest compile-time costs: evidence and limits
-
-There are two different questions: time spent running the generated compiler, and the fixed host's IR-to-machine generation cost. A generated-compiler profile helps identify runtime gaps, but it is **not** an exact decomposition of the current 10.925092-second generation measurement.
-
-The most useful saved broader profile is Coil `docs/benchmarks/verified-operands-bootstrap/profile/summary.json` (source `ca35b006`, evidence `9c946167`). It predates several later fixes. Both native compiler hosts were separately profiled while compiling the same program; their output objects matched the seed. Stogir worker had 21,159 samples; LLVM worker 12,088. Main-thread join waits were excluded.
-
-| Inclusive family, share of sampled worker | Stogir-built host | LLVM-built host |
-|---|---:|---:|
-| Native per-function compilation/emission | 31.7% | 31.9% |
-| Graph verification | 12.8% | 8.7% |
-| Allocation APIs / scratch-related calls | 7.6% | 8.1% |
-| Use-list construction | 4.2% | 5.7% |
-| Register allocation | 4.9% | 4.4% |
-| Module preparation | 8.5% | 8.0% |
-
-Module finalization was visible at 9.6% in the Stogir host; its missing LLVM family label is not zero cost. `sccp.optimize-memory` was also a large inclusive stack: 5,056 / 21,159 Stogir samples and 2,520 / 12,088 LLVM samples. It nests within compilation; **do not add these percentages together**. Inlining changes symbol visibility, so leaf-name counts are not direct cross-backend speed ratios.
-
-My compile-time priority is therefore **broad optimization/graph processing and module preparation/finalization**, followed by repeated verification, use reconstruction and memory traffic. Fresh profiles should distinguish unavoidable semantic work from repeated graph copies, redundant scans and analysis rebuilding. Keep proof and diagnostic equivalence when reusing validated facts; do not remove checks.
-
-Register-pressure queries were a serious older bottleneck and already received fixed-use events, physical reservation indexing, assigned-interval indexing and reusable scratch. An isolated emitter once showed roughly 24% allocation samples, but a later whole-bootstrap profile showed only about 4.6–4.9%. **Do not keep tuning the allocator based on the old synthetic percentage.** Likewise, old linear location lookup and repeated opcode classification profiles describe costs that have already been partly addressed.
-
-The exact current pass-by-pass split of the 10.925092-second generation budget has not been freshly measured after the latest fixes. That is a measurement task still open, not a reason to invent percentages. The latest edge change established no generation gain: single provider samples 0.964939→0.972538 s; emitter 2.674535→2.675337 s.
-
-For profiling, use a separate untimed run and the actual linked native compiler hosts. Saved helpers/raw samples are under `verified-operands-bootstrap/profile/`; an older reproducible example is `return-allocation-bootstrap/profile-profile.py`. Inspect/adapt their expected SDK/result paths before running. Do not profile alongside timing runs, count main-thread `__ulock_wait` as optimizer CPU, or optimize sampled telemetry `write` calls as application work. Fresh host activity invalidated earlier generation comparisons; preserve those exclusions.
-
-## Failed and neutral experiments worth knowing about
-
-| Experiment | Result | State |
-|---|---|---|
-| Uniform homes without ordinary-edge suppression | Provider +14.4% runtime | Rejected, isolated; library `3509fb3`, Coil evidence `89628a89` |
-| Loop-depth-costed homes, still without edge suppression | Provider +3.9% runtime | Rejected, isolated; library `418a6cd`, Coil evidence `58baec22` |
-| Split-child blocked-register scoring | Provider/emitter neutral; noisy generation samples discarded | Isolated; library `e316eac`, Coil evidence `38cfc365`; **not included** in latest home-edge branch |
-| Contained fields / literal identities | Emitter component −2.63%, whole runtime essentially unchanged | Included in retained baseline; demonstrates why micro gains need whole checks |
-
-The latest edge fix explains a missing piece of the previous policies, but does not invalidate their measured regressions. Do not merge every experimental branch together or promote neutral work as a performance gain. Preserve central attribution and the exact pinned upstream reference when porting rules.
-
-## Recommended next steps when the user resumes
-
-1. Finish a fresh or safely verified resumed whole comparison for `a831fb94`. Check exact output equality from every generated host before interpreting speed.
-2. Obtain a fresh, separate profile of the current fixed emitter and generated hosts. Use it to rank runtime and generation work independently.
-3. Continue reload availability / memory-Phi resolution against reduced real graphs, preserving parallel copies, frame ownership, ABI clobbers and fallbacks. Complete the phase/use adaptation before enabling remaining split categories.
-4. After each change: native/ASAN semantics, actual emitted-body inspection, paired small measurements, then whole diagnostics only when warranted. Reject regressions promptly.
-5. Only claim completion after repeated whole-bootstrap results meet both original targets and required validation passes. Deliberately integrate/install/push afterward; report committed, installed and pushed states separately.
-
-The goal remains paused. No performance target was redefined or marked complete in preparing this handoff.
+- The root library checkout has user-owned, untracked `docs/benchmarks/results/`: do not modify, stage or delete it. Stage named files.
+- New worktrees go under each project's ignored `.worktrees`.
+- Keep central upstream credit in LICENSE, NOTICE and PROVENANCE; no SPDX headers.
+- Stubs must fail loudly.
+- Report confirmed Coil bugs in the `coil-bugs` pad.
+- Commit on non-default branches only.
