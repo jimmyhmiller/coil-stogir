@@ -1,0 +1,125 @@
+(module stogir.tests.copy-forward)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.node" :as n)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "stogir.options" :as options)
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [x] x) (Err [e] (panic "{}" e))))
+
+(defn move :cc (cc/C) [(destination (ptr u8)) (source (ptr u8)) (count u64)] (-> (ptr u8))
+  (let [(mut i) (: 0 u64)]
+    (while (< i count)
+      (store! (p/cast (ptr u8) (+ (p/cast u64 destination) i))
+              (load (p/cast (ptr u8) (+ (p/cast u64 source) i))))
+      (set! i (+ i 1))))
+  destination)
+
+(defn observe :cc (cc/C) [(address (ptr u64))] (-> u64)
+  (load address))
+
+(defn count-opcode [(graph g/Graph) (opcode u8)] (-> i64)
+  (let [(mut found) (: 0 i64)
+        (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (when (= (n/opcode (get (.instructions graph) r)) opcode) (set! found (+ found 1)))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    found))
+
+;;; mode 0: two reads of a 192-byte move destination read the source; the move
+;;;         and its private destination's data traffic disappear.
+;;; mode 1: a store to the source after the move must not be bypassed.
+;;; mode 2: the destination escapes to another call; nothing changes.
+;;; mode 3: a move of a move reads the original source; both moves are removed.
+(defn fixture [(mode i32)] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        mover (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        observer (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        source (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        size (require (b/scalar-constant! (mut graph) 5 192 8))
+        eight (require (b/scalar-constant! (mut graph) 5 8 8))
+        hundred (require (b/scalar-constant! (mut graph) 5 160 8))
+        nine (require (b/scalar-constant! (mut graph) 5 9 8))
+        slot (require (b/frame-object! (mut graph) start size 16))
+        other (require (b/frame-object! (mut graph) slot size 16))]
+    (match (calls/create-builtin-move 0 a)
+      (Err [e] (panic "{}" e))
+      (Ok [proto]
+          (let [(mut proto) proto
+                moved (require (calls/emit! (mut graph) proto other mover [slot source size] a))
+                second (if (= mode 3)
+                           (require (calls/emit! (mut graph) proto moved mover [other slot size] a))
+                           moved)
+                read-base (if (= mode 3) other slot)
+                field (require (b/emit! (mut graph) 26 6 [read-base eight]))
+                tail (require (b/emit! (mut graph) 26 6 [read-base hundred]))
+                source-field (require (b/emit! (mut graph) 26 6 [source eight]))
+                clobbered (if (= mode 1)
+                              (require (b/emit! (mut graph) 93 0 [second source-field nine]))
+                              second)
+                escaped (if (= mode 2)
+                            (match (calls/create 0 5 [(: 6 u8)] a)
+                              (Err [e] (panic "{}" e))
+                              (Ok [plain]
+                                  (let [(mut plain) plain
+                                        r (require (calls/emit! (mut graph) plain clobbered observer [slot] a))]
+                                    (calls/release! (mut plain))
+                                    r)))
+                            clobbered)
+                first (require (b/emit! (mut graph) 91 5 [escaped field]))
+                last (require (b/emit! (mut graph) 91 5 [first tail]))
+                sum (require (b/emit! (mut graph) 26 5 [first last]))
+                ret (require (b/emit! (mut graph) 120 5 [last sum (: 0 i32)]))]
+            (calls/release! (mut proto))
+            (match (sccp/optimize-memory graph 8 [ret] true a)
+              (Err [e] (panic "{}" e))
+              (Ok [optimized]
+                  (let [(mut optimized) optimized
+                        calls (count-opcode (.graph optimized) 79)]
+                    (cond (= mode 0) (assert (= calls 0))
+                          (= mode 1) (assert (= calls 1))
+                          (= mode 2) (assert (= calls 2))
+                          :else (assert (= calls 0)))
+                    (rewrite/release! (mut optimized)))))
+            (for level [(: 1 i32) 3]
+            (match (compile/image-with-options graph start [ret] "_copy_forward"
+                                               (options/Options :level level) a)
+              (Err [e] (panic "{}" e))
+              (Ok [code]
+                  (let [(mut code) code]
+                    (match (jit/map-image code a)
+                      (Err [e] (panic "{}" e))
+                      (Ok [mapped]
+                          (let [(mut mapped) mapped
+                                f (p/cast (fnptr (cc/C) [u64 u64 (ptr u64)] u64) (.base (.memory mapped)))
+                                mover-address (p/cast u64 (p/cast (ptr u8) (fnptr-of move)))
+                                observer-address (p/cast u64 (p/cast (ptr u8) (fnptr-of observe)))
+                                (mut buffer) (ArrayList::new [u64] a)]
+                            (for [i 0 24] (push! (mut buffer) (+ (cast u64 i) 100)))
+                            (let [result (f mover-address observer-address (.data buffer))]
+                              ; Fields at 8 and 160 are words 1 and 20. Mode 1's store
+                              ; follows the move, so the destination keeps the old word.
+                              (assert (= result (: 221 u64)))
+                              (assert (= (get buffer 1) (if (= mode 1) (: 9 u64) 101))))
+                            (free! (mut buffer))
+                            (jit/release-image! (mut mapped)))))
+                    (image/release! (mut code)))))))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (for mode [(: 0 i32) 1 2 3] (fixture mode))
+  (println "loads read through private builtin moves; clobbered and escaping cases are kept")
+  0)
