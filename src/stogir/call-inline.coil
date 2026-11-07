@@ -4,7 +4,7 @@
 (module stogir.call-inline)
 (import "stogir.fill" :as fill)
 
-(export Callee Site SiteProof inspect-verified-site optimize optimize-sites optimize-sites-if-changed Registry RegisteredSite specialization-count optimize-registered-specialized-if-changed registry-create registry-release! register! prioritize-registered-sites optimize-registered-prioritized-if-changed optimize-registered-if-changed)
+(export Callee Site SiteProof inspect-verified-site optimize optimize-sites optimize-sites-if-changed Registry RegisteredSite specialization-count optimize-registered-specialized-if-changed optimize-registered-specialized-proven registry-create registry-release! register! prioritize-registered-sites optimize-registered-prioritized-if-changed optimize-registered-if-changed)
 
 (import "stogir.graph" :as g)
 (import "stogir.cfg" :as cfg)
@@ -1056,7 +1056,8 @@
     (for condition (.conditions source) (push! (mut conditions) condition))
     (specialize/Specialized
       :body (rewrite/Rewritten :graph graph :roots roots
-                               :changes (.changes (.body source)) :iteration (q/create 0 a))
+                               :changes (.changes (.body source)) :iteration (q/create 0 a)
+                               :proof 0)
       :conditions conditions :pointer-bytes (.pointer-bytes source))))
 
 (defn register! [(registry (mut Registry)) (target Callee)]
@@ -1197,6 +1198,17 @@
                                       (budget i32) (entry i32)
                                       (a (dyn Allocator))]
   (-> (Result (Option rewrite/Rewritten) (slice u8)))
+  (optimize-registered-verified registry source roots sites budget entry false a))
+
+;;; caller-verified: the source's content digest equals the proof recorded when
+;;; exactly this content passed rewrite/validate (see content-hash).
+(defn optimize-registered-verified [(registry Registry)
+                                      (source g/Graph)
+                                      (roots (slice i32))
+                                      (sites (slice RegisteredSite))
+                                      (budget i32) (entry i32) (caller-verified bool)
+                                      (a (dyn Allocator))]
+  (-> (Result (Option rewrite/Rewritten) (slice u8)))
   (if (= (p/cast u64 (.state registry)) 0)
       (Err "inline registry is released")
       (let [state (p/cast (ptr RegistryState) (.state registry))
@@ -1228,7 +1240,7 @@
                                          (slice resolved)
                                          (.pointer-bytes state)
                                          budget
-                                         true (slice costs) entry false
+                                         true (slice costs) entry caller-verified
                                          a))]
           (free! (mut resolved)) (free! (mut costs))
           result))))
@@ -1496,7 +1508,8 @@
                                 :graph graph
                                 :roots observed
                                 :changes changes
-                                :iteration queue))))))))))
+                                :iteration queue
+                                :proof (rewrite/content-hash graph pointer-bytes)))))))))))
 
 (defn optimize-sites-if-changed [(source g/Graph) (roots (slice i32))
                                  (sites (slice Site)) (pointer-bytes i32)
@@ -1525,7 +1538,8 @@
                         :graph (g/duplicate source a)
                         :roots observed
                         :changes 0
-                        :iteration (q/create (len (.instructions source)) a)))))))))
+                        :iteration (q/create (len (.instructions source)) a)
+                        :proof 0))))))))
 
 ;;; Transactional single-site convenience API.
 (defn optimize [(source g/Graph)
@@ -1666,10 +1680,24 @@
                 (entry i32) (roots (slice i32)) (sites (slice RegisteredSite))
                 (budget i32) (a (dyn Allocator))]
   (-> (Result (Option rewrite/Rewritten) (slice u8)))
+  (optimize-registered-specialized-proven registry source entry roots sites budget 0 a))
+
+;;; As above. A nonzero proof is a rewrite/Rewritten proof for a graph the caller
+;;; has not edited since: when source still has that digest, its validation is
+;;; not repeated. Every other check (sites, budget, callees) still runs.
+(defn optimize-registered-specialized-proven [(registry Registry) (source g/Graph)
+                (entry i32) (roots (slice i32)) (sites (slice RegisteredSite))
+                (budget i32) (proof u128) (a (dyn Allocator))]
+  (-> (Result (Option rewrite/Rewritten) (slice u8)))
+  (let [verified (and (!= proof 0)
+                      (!= (p/cast u64 (.state registry)) 0)
+                      (= (rewrite/content-hash source
+                                               (.pointer-bytes (p/cast (ptr RegistryState) (.state registry))))
+                         proof))]
   (if (<= entry 0) (Err "invalid priority entry")
       (if (or (<= budget 0) (> budget 16384))
-          (optimize-registered-core registry source roots sites budget entry a)
-          (match (optimize-registered-core registry source roots sites 0 entry a)
+          (optimize-registered-verified registry source roots sites budget entry verified a)
+          (match (optimize-registered-verified registry source roots sites 0 entry verified a)
             (Err [message] (Err message))
             (Ok [validated]
               (match validated
@@ -1706,4 +1734,4 @@
                           (optimize-sites-core source roots (slice resolved) (.pointer-bytes state)
                                                budget true (slice costs) entry true a))]
                       (free! (mut resolved)) (free! (mut costs))
-                      result)))))))))
+                      result))))))))))

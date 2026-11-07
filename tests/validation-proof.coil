@@ -1,0 +1,48 @@
+(module stogir.tests.validation-proof)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [x] x) (Err [e] (panic "{}" e))))
+
+;;; A proof is the digest of exactly the content that passed validation: an
+;;; exact copy shares it, any edit changes it, and a stale proof never lets an
+;;; invalid graph skip SCCP's input validation.
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        three (require (b/scalar-constant! (mut graph) 11 3 8))
+        sum (require (b/emit! (mut graph) 26 11 [x three]))
+        ret (require (b/emit! (mut graph) 120 11 [start sum (: 0 i32)]))]
+    (match (sccp/optimize graph 8 [ret] a)
+      (Err [e] (panic "{}" e))
+      (Ok [optimized]
+          (let [(mut optimized) optimized
+                proof (.proof optimized)]
+            (assert (!= proof 0))
+            (assert (= (rewrite/content-hash (.graph optimized) 8) proof))
+            (assert (!= (rewrite/content-hash (.graph optimized) 4) proof))
+            (let [(mut copy) (g/duplicate (.graph optimized) a)]
+              (assert (= (rewrite/content-hash copy 8) proof))
+              ; A dangling operand is invalid; the stale proof must not vouch.
+              (assert (g/set-operand! (mut copy) sum 1 100000))
+              (match (sccp/optimize copy 8 [ret] a)
+                (Ok [wrong] (let [(mut wrong) wrong] (rewrite/release! (mut wrong)))
+                       (panic "validation accepted a dangling operand"))
+                (Err [_] 0))
+              (assert (!= (rewrite/content-hash copy 8) proof))
+              (match (sccp/optimize-proven copy 8 [ret] proof a)
+                (Ok [wrong] (let [(mut wrong) wrong] (rewrite/release! (mut wrong)))
+                       (panic "a stale proof validated an edited graph"))
+                (Err [_] 0))
+              (g/release! (mut copy)))
+            (rewrite/release! (mut optimized)))))
+    (g/release! (mut graph))
+    (println "validation proofs name exactly the validated content")
+    0))
