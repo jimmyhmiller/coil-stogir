@@ -1,0 +1,97 @@
+(module stogir.tests.jit-optimized-entry)
+;;; optimize-memory-owned! yields the same graph as optimize-memory on a copy,
+;;; and an image of SCCP output built with image-with-options-optimized (which
+;;; skips the entry SCCP) computes what the full pipeline computes.
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+;;; f(x) stores x*3 to a stack slot, reloads it and returns it plus one.
+(defn build [] (-> g/Graph)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        three (require (b/scalar-constant! (mut graph) 11 3 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        size (require (b/scalar-constant! (mut graph) 5 8 8))
+        slot (require (b/stack-allocate! (mut graph) start size 16))
+        product (require (b/emit! (mut graph) 28 11 [x three]))
+        stored (require (b/emit! (mut graph) 93 0 [slot slot product]))
+        loaded (require (b/emit! (mut graph) 91 11 [stored slot]))
+        sum (require (b/emit! (mut graph) 26 11 [loaded one]))
+        ret (require (b/emit! (mut graph) 120 11 [loaded sum (: 0 i32)]))]
+    graph))
+
+(defn run [(code image/Image)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut failures) 0]
+    (match (jit/map-image code a)
+      (Err [e] (panic "{}" e))
+      (Ok [mapped]
+          (let [(mut loaded) mapped
+                f (p/cast (fnptr (cc/C) [i64] i64) (.base (.memory loaded)))]
+            (for x [(: -5 i64) 0 7 1000000]
+              (when (!= (f x) (+ (* x 3) 1)) (set! failures (+ failures 1))))
+            (jit/release-image! (mut loaded)))))
+    failures))
+
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut failures) 0
+        (mut source) (build)
+        ret (- (len (.instructions source)) 1)]
+    ; Owned and borrowed optimization agree cell for cell.
+    (let [(mut copy) (g/duplicate source a)]
+      (match (sccp/optimize-memory source 8 [(cast i32 ret)] true a)
+        (Err [e] (panic "{}" e))
+        (Ok [borrowed]
+            (let [(mut borrowed) borrowed]
+              (match (sccp/optimize-memory-owned! copy 8 [(cast i32 ret)] true a)
+                (Err [e] (panic "{}" e))
+                (Ok [owned]
+                    (let [(mut owned) owned
+                          left (.graph borrowed)
+                          right (.graph owned)]
+                      (when (or (!= (len (.instructions left)) (len (.instructions right)))
+                                (!= (len (.roots borrowed)) (len (.roots owned))))
+                        (set! failures (+ failures 1)))
+                      (when (= failures 0)
+                        (for [i 0 (len (.instructions left))]
+                          (when (!= (.header (get (.instructions left) i))
+                                    (.header (get (.instructions right) i)))
+                            (set! failures (+ failures 1)))))
+                      ; The optimized entry on SCCP output matches the full pipeline.
+                      (for level [(: 2 i32) 3]
+                        (match (compile/image-with-options-optimized left 1 (slice (.roots borrowed))
+                                 "_optimized_entry" (options/Options :level level) a)
+                          (Err [e] (panic "{}" e))
+                          (Ok [value]
+                              (let [(mut code) value]
+                                (set! failures (+ failures (run code)))
+                                (image/release! (mut code)))))
+                        (match (compile/image-with-options source 1 [(cast i32 ret)]
+                                 "_full_pipeline" (options/Options :level level) a)
+                          (Err [e] (panic "{}" e))
+                          (Ok [value]
+                              (let [(mut code) value]
+                                (set! failures (+ failures (run code)))
+                                (image/release! (mut code))))))
+                      (rewrite/release! (mut owned)))))
+              (rewrite/release! (mut borrowed))))))
+    (g/release! (mut source))
+    (println "optimized image entry: {} failures" failures)
+    (if (= failures 0) 0 1)))
