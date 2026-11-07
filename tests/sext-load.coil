@@ -1,0 +1,74 @@
+(module stogir.tests.sext-load)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [x] x) (Err [e] (panic "{}" e))))
+
+(defn word [(text (slice u8)) (i i64)] (-> u32)
+  (| (cast u32 (get text i))
+     (<< (cast u32 (get text (+ i 1))) 8)
+     (<< (cast u32 (get text (+ i 2))) 16)
+     (<< (cast u32 (get text (+ i 3))) 24)))
+
+;;; SXTW Xd, Wn and SXTB/SXTH to X (SBFM X with immr 0).
+(defn sign-extend? [(w u32)] (-> bool)
+  (or (= (& w (: 0xFFFFFC00 u32)) (: 0x93407C00 u32))
+      (= (& w (: 0xFFFFFC00 u32)) (: 0x93401C00 u32))
+      (= (& w (: 0xFFFFFC00 u32)) (: 0x93403C00 u32))))
+
+;;; Signed loads of each narrow width, each sign-extended to I64, summed.
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        base (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        four (require (b/scalar-constant! (mut graph) 5 4 8))
+        six (require (b/scalar-constant! (mut graph) 5 6 8))
+        word-address (require (b/emit! (mut graph) 26 6 [base four]))
+        byte-address (require (b/emit! (mut graph) 26 6 [base six]))
+        w (require (b/emit! (mut graph) 91 10 [start base]))
+        h (require (b/emit! (mut graph) 91 9 [w word-address]))
+        c (require (b/emit! (mut graph) 91 8 [h byte-address]))
+        ww (require (b/emit! (mut graph) 33 11 [w]))
+        hh (require (b/emit! (mut graph) 33 11 [h]))
+        cc (require (b/emit! (mut graph) 33 11 [c]))
+        sum (require (b/emit! (mut graph) 26 11 [ww hh]))
+        sum (require (b/emit! (mut graph) 26 11 [sum cc]))
+        ret (require (b/emit! (mut graph) 120 11 [c sum (: 0 i32)]))]
+    (for level [(: 1 i32) 3]
+      (match (compile/image-with-options graph start [ret] "_sext_load"
+                                         (options/Options :level level) a)
+        (Err [e] (panic "{}" e))
+        (Ok [code]
+            (let [(mut code) code
+                  text (slice (.text code))]
+              (for [i 0 (/ (len text) 4)] (assert (not (sign-extend? (word text (* i 4))))))
+              (match (jit/map-image code a)
+                (Err [e] (panic "{}" e))
+                (Ok [mapped]
+                    (let [(mut mapped) mapped
+                          f (p/cast (fnptr (cc/C) [(ptr u8)] i64) (.base (.memory mapped)))
+                          (mut bytes) (ArrayList::new [u8] a)]
+                      ; i32 -3 at 0, i16 -2 at 4, i8 -1 at 6.
+                      (for x [(: 0xFD u8) 0xFF 0xFF 0xFF 0xFE 0xFF 0xFF 0x00]
+                        (push! (mut bytes) x))
+                      (assert (= (f (.data bytes)) -6))
+                      (set! (mut bytes) 0 0x05) (set! (mut bytes) 1 0) (set! (mut bytes) 2 0) (set! (mut bytes) 3 0x80)
+                      (set! (mut bytes) 4 0x07) (set! (mut bytes) 5 0) (set! (mut bytes) 6 0x7F)
+                      (assert (= (f (.data bytes)) (+ (- 0 2147483643) 7 127)))
+                      (free! (mut bytes))
+                      (jit/release-image! (mut mapped)))))
+              (image/release! (mut code))))))
+    (g/release! (mut graph))
+    (println "signed loads sign-extend to 64 bits; SEXT of them is a copy")
+    0))
