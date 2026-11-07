@@ -1,0 +1,173 @@
+(module stogir.tests.jit-boolean-folds)
+;;; Integer views of Booleans, as Coil lowers bool values, fold back to their
+;;; predicates: EQ/NE(COND(c, 0/1, 1/0), 0), a PHI of such views tested against
+;;; zero, and IF/COND conditions through NOT and Boolean NE/EQ-zero tests.
+;;; Each shape is checked structurally after SCCP and by native execution.
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn count-op [(graph g/Graph) (opcode u8) (ty u8)] (-> i64)
+  (let [(mut found) 0 (mut r) 1]
+    (while (< r (len (.instructions graph)))
+      (let [node (get (.instructions graph) r)]
+        (when (and (= (n/opcode node) opcode) (= (n/type-id node) ty))
+          (set! found (+ found 1)))
+        (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4)))))
+    found))
+
+;;; NE/EQ of a COND of literals keeps only the Boolean predicate.
+(defn compare-of-choice? [(graph g/Graph)] (-> bool)
+  (let [(mut found) false (mut r) 1]
+    (while (< r (len (.instructions graph)))
+      (let [node (get (.instructions graph) r)
+            opcode (n/opcode node)]
+        (when (and (or (= opcode 14) (= opcode 15)) (> (.op1 node) 0)
+                   (= (n/opcode (get (.instructions graph) (cast i64 (.op1 node)))) 60))
+          (set! found true))
+        (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4)))))
+    found))
+
+(defn image-of [(graph g/Graph) (roots (slice i32)) (name (slice u8))] (-> image/Image)
+  (match (compile/image graph 1 roots name (malloc-allocator))
+    (Err [e] (panic "{}" e))
+    (Ok [code] code)))
+
+(defn optimized [(graph g/Graph) (roots (slice i32))] (-> rewrite/Rewritten)
+  (match (sccp/optimize-memory graph 8 roots true (malloc-allocator))
+    (Err [e] (panic "{}" e))
+    (Ok [result] result)))
+
+;;; f(x) = ((x == 0 ? 0 : 1) != 0) ? 10 : 20, the shape of Coil's `!=`.
+(defn negated-choice [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut failures) 0
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        one (require (b/scalar-constant! (mut graph) 5 1 8))
+        ten (require (b/scalar-constant! (mut graph) 5 10 8))
+        twenty (require (b/scalar-constant! (mut graph) 5 20 8))
+        equal (require (b/emit! (mut graph) 14 1 [x zero]))
+        view (require (b/emit! (mut graph) 60 5 [equal zero one]))
+        test (require (b/emit! (mut graph) 15 1 [view zero]))
+        result (require (b/emit! (mut graph) 60 5 [test ten twenty]))
+        ret (require (b/emit! (mut graph) 120 5 [start result (: 0 i32)]))]
+    (let [(mut out) (optimized graph [ret])]
+      (when (compare-of-choice? (.graph out)) (set! failures (+ failures 1)))
+      (let [(mut code) (image-of (.graph out) (slice (.roots out)) "_negated_choice")]
+        (match (jit/map-image code a)
+          (Err [e] (panic "{}" e))
+          (Ok [value]
+              (let [(mut loaded) value
+                    f (p/cast (fnptr (cc/C) [u64] u64) (.base (.memory loaded)))]
+                (for v [(: 0 u64) 1 2 18446744073709551615]
+                  (when (!= (f v) (if (!= v 0) 10 20)) (set! failures (+ failures 1))))
+                (jit/release-image! (mut loaded)))))
+        (image/release! (mut code)))
+      (rewrite/release! (mut out)))
+    (g/release! (mut graph))
+    failures))
+
+;;; f(p, q) = (p != 0 && q != 0) ? 7 : 9, with the `and` as a PHI of an
+;;; integer Boolean view and a literal false: it becomes a Boolean PHI.
+(defn conjunction [(swap? bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut failures) 0
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p0 (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        q0 (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        one (require (b/scalar-constant! (mut graph) 5 1 8))
+        seven (require (b/scalar-constant! (mut graph) 5 7 8))
+        nine (require (b/scalar-constant! (mut graph) 5 9 8))
+        first (require (b/emit! (mut graph) 15 1 [p0 zero]))
+        split (require (b/emit! (mut graph) 116 0 [start first]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        end1 (require (b/emit! (mut graph) 114 0 [yes]))
+        end2 (require (b/emit! (mut graph) 114 0 [no]))
+        merge (if swap?
+                  (require (b/emit! (mut graph) 112 0 [end2 end1]))
+                  (require (b/emit! (mut graph) 112 0 [end1 end2])))
+        second (require (b/emit! (mut graph) 14 1 [q0 zero]))
+        view (require (b/emit! (mut graph) 60 5 [second zero one]))
+        both (if swap?
+                 (require (b/emit! (mut graph) 67 5 [merge zero view]))
+                 (require (b/emit! (mut graph) 67 5 [merge view zero])))
+        test (require (b/emit! (mut graph) 15 1 [both zero]))
+        result (require (b/emit! (mut graph) 60 5 [test seven nine]))
+        ret (require (b/emit! (mut graph) 120 5 [merge result (: 0 i32)]))]
+    (let [(mut out) (optimized graph [ret])]
+      (when (or (compare-of-choice? (.graph out))
+                (!= (count-op (.graph out) 67 1) 1)
+                (!= (count-op (.graph out) 67 5) 0))
+        (set! failures (+ failures 1)))
+      (let [(mut code) (image-of (.graph out) (slice (.roots out)) "_conjunction")]
+        (match (jit/map-image code a)
+          (Err [e] (panic "{}" e))
+          (Ok [value]
+              (let [(mut loaded) value
+                    f (p/cast (fnptr (cc/C) [u64 u64] u64) (.base (.memory loaded)))]
+                (for v [(: 0 u64) 1 18446744073709551615]
+                  (for w [(: 0 u64) 3 18446744073709551615]
+                    (when (!= (f v w) (if (and (!= v 0) (!= w 0)) 7 9))
+                      (set! failures (+ failures 1)))))
+                (jit/release-image! (mut loaded)))))
+        (image/release! (mut code)))
+      (rewrite/release! (mut out)))
+    (g/release! (mut graph))
+    failures))
+
+;;; IF(NOT(EQ(x, 0))) branches on the comparison with exchanged successors.
+(defn negated-branch [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut failures) 0
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        one (require (b/scalar-constant! (mut graph) 5 1 8))
+        two (require (b/scalar-constant! (mut graph) 5 2 8))
+        equal (require (b/emit! (mut graph) 14 1 [x zero]))
+        inverse (require (b/emit! (mut graph) 45 1 [equal]))
+        split (require (b/emit! (mut graph) 116 0 [start inverse]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        ret1 (require (b/emit! (mut graph) 120 5 [yes one (: 0 i32)]))
+        ret2 (require (b/emit! (mut graph) 120 5 [no two ret1]))]
+    (let [(mut out) (optimized graph [ret1 ret2])]
+      (when (> (count-op (.graph out) 45 1) 0) (set! failures (+ failures 1)))
+      (let [(mut code) (image-of (.graph out) (slice (.roots out)) "_negated_branch")]
+        (match (jit/map-image code a)
+          (Err [e] (panic "{}" e))
+          (Ok [value]
+              (let [(mut loaded) value
+                    f (p/cast (fnptr (cc/C) [u64] u64) (.base (.memory loaded)))]
+                (for v [(: 0 u64) 1 18446744073709551615]
+                  (when (!= (f v) (if (!= v 0) 1 2)) (set! failures (+ failures 1))))
+                (jit/release-image! (mut loaded)))))
+        (image/release! (mut code)))
+      (rewrite/release! (mut out)))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures (+ (negated-choice) (conjunction false) (conjunction true) (negated-branch))]
+    (println "native Boolean view folds: {} failures" failures)
+    (if (= failures 0) 0 1)))
