@@ -1,0 +1,78 @@
+(module stogir.tests.forwarded-return-tail)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [x] x) (Err [e] (panic "{}" e))))
+
+(defn word [(text (slice u8)) (i i64)] (-> u32)
+  (| (cast u32 (get text i))
+     (<< (cast u32 (get text (+ i 1))) 8)
+     (<< (cast u32 (get text (+ i 2))) 16)
+     (<< (cast u32 (get text (+ i 3))) 24)))
+
+;;; Two nested diamonds: the inner merge holds only a PHI and an END, so it is
+;;; an empty block forwarded to the return block. Every path returns in place;
+;;; no unconditional branch targets a RET.
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        p (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        ten (require (b/scalar-constant! (mut graph) 11 10 8))
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))
+        outer (require (b/emit! (mut graph) 16 1 [x zero]))
+        split (require (b/emit! (mut graph) 116 0 [start outer]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        inner (require (b/emit! (mut graph) 16 1 [x ten]))
+        split2 (require (b/emit! (mut graph) 116 0 [no inner]))
+        yes2 (require (b/emit! (mut graph) 107 0 [split2 (: 0 i32)]))
+        no2 (require (b/emit! (mut graph) 108 0 [split2 (: 0 i32)]))
+        loaded (require (b/emit! (mut graph) 91 11 [yes2 p]))
+        e1 (require (b/emit! (mut graph) 114 0 [loaded]))
+        e2 (require (b/emit! (mut graph) 114 0 [no2]))
+        m1 (require (b/emit! (mut graph) 112 0 [e1 e2]))
+        phi1 (require (b/emit! (mut graph) 67 11 [m1 loaded seven]))
+        e3 (require (b/emit! (mut graph) 114 0 [m1]))
+        e4 (require (b/emit! (mut graph) 114 0 [yes]))
+        m2 (require (b/emit! (mut graph) 112 0 [e3 e4]))
+        phi2 (require (b/emit! (mut graph) 67 11 [m2 phi1 zero]))
+        ret (require (b/emit! (mut graph) 120 11 [m2 phi2 (: 0 i32)]))]
+    (match (compile/image-with-options graph start [ret] "_forwarded_tail"
+                                       (options/Options :level 1) a)
+      (Err [e] (panic "{}" e))
+      (Ok [code]
+          (let [(mut code) code
+                text (slice (.text code))
+                words (/ (len text) 4)]
+            (for [i 0 words]
+              (let [w (word text (* i 4))]
+                (when (= (& w (: 0xFC000000 u32)) (: 0x14000000 u32))
+                  (let [target (+ i (cast i64 (>> (cast i32 (<< w 6)) 6)))]
+                    (assert (!= (word text (* target 4)) (: 0xD65F03C0 u32)))))))
+            (match (jit/map-image code a)
+              (Err [e] (panic "{}" e))
+              (Ok [mapped]
+                  (let [(mut mapped) mapped
+                        f (p/cast (fnptr (cc/C) [i64 (ptr i64)] i64) (.base (.memory mapped)))
+                        cell (p/alloc-stack i64)]
+                    (store! cell 42)
+                    (assert (= (f -1 cell) 0))
+                    (assert (= (f 3 cell) 42))
+                    (assert (= (f 30 cell) 7))
+                    (jit/release-image! (mut mapped)))))
+            (image/release! (mut code)))))
+    (g/release! (mut graph))
+    (println "forwarded empty blocks reach return tails in place")
+    0))
