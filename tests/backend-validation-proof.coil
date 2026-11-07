@@ -1,0 +1,87 @@
+(module stogir.tests.backend-validation-proof)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [x] x) (Err [e] (panic "{}" e))))
+
+(defn text-of [(r (Result image/Image (slice u8))) (a (dyn Allocator))] (-> (ArrayList u8))
+  (match r
+    (Err [e] (panic "{}" e))
+    (Ok [code]
+        (let [(mut code) code
+              (mut copy) (ArrayList::new [u8] a)]
+          (for byte (.text code) (push! (mut copy) byte))
+          (image/release! (mut code))
+          copy))))
+
+(defn same? [(x (ArrayList u8)) (y (ArrayList u8))] (-> bool)
+  (and (= (len x) (len y))
+       (let [(mut equal) true]
+         (for [i 0 (len x)] (when (!= (get x i) (get y i)) (set! equal false)))
+         equal)))
+
+;;; Code generation from an optimizer-proven graph (with a merge, so the
+;;; vectorizer prepares it) matches generation that checks everything. A
+;;; stale proof on an edited, invalid graph is rejected by the full checks.
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        raw (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        which (require (b/emit! (mut graph) 71 1 [start (: 0 i32) 1]))
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))
+        split (require (b/emit! (mut graph) 116 0 [start which]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        added (require (b/emit! (mut graph) 26 11 [raw seven]))
+        left (require (b/emit! (mut graph) 114 0 [yes]))
+        right (require (b/emit! (mut graph) 114 0 [no]))
+        merge (require (b/emit! (mut graph) 112 0 [left right]))
+        phi (require (b/emit! (mut graph) 67 11 [merge added raw]))
+        ret (require (b/emit! (mut graph) 120 11 [merge phi (: 0 i32)]))
+        level (options/Options :level 3)]
+    (match (sccp/optimize-memory graph 8 [ret] true a)
+      (Err [e] (panic "{}" e))
+      (Ok [optimized]
+          (let [(mut optimized) optimized
+                proof (.proof optimized)
+                roots (slice (.roots optimized))]
+            (assert (!= proof 0))
+            (let [(mut checked)
+                    (text-of (compile/image-with-options-optimized (.graph optimized) start roots
+                                                                   "_proof" level a) a)
+                  (mut proven)
+                    (text-of (compile/image-with-options-proven (.graph optimized) start roots
+                                                                "_proof" level a proof) a)
+                  (mut wrong)
+                    (text-of (compile/image-with-options-proven (.graph optimized) start roots
+                                                                "_proof" level a (+ proof 1)) a)]
+              (assert (> (len checked) 0))
+              (assert (same? checked proven))
+              (assert (same? checked wrong))
+              (free! (mut checked))
+              (free! (mut proven))
+              (free! (mut wrong)))
+            (let [(mut copy) (g/duplicate (.graph optimized) a)
+                  target (get roots 0)]
+              ; Any graph edit changes the content hash; a dangling operand is
+              ; invalid and must be reported although the old proof is given.
+              (assert (g/set-operand! (mut copy) target 2 100000))
+              (match (compile/image-with-options-proven copy start roots "_proof" level a proof)
+                (Ok [code] (let [(mut code) code] (image/release! (mut code)))
+                       (panic "a stale proof let an edited graph skip verification"))
+                (Err [_] 0))
+              (g/release! (mut copy)))
+            (rewrite/release! (mut optimized)))))
+    (g/release! (mut graph))
+    (println "backend generation from proven graphs matches full checking")
+    0))
