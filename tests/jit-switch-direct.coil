@@ -1,0 +1,86 @@
+(module stogir.tests.jit-switch-direct)
+;;; A small switch whose edges carry no moves dispatches straight to its
+;;; targets: no stub of a lone B, so no B lands on another B, and a full-width
+;;; unsigned selector is compared in its own register instead of copied to x16.
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn word [(text (ArrayList u8)) (at i64)] (-> u32)
+  (| (cast u32 (get text at))
+     (<< (cast u32 (get text (+ at 1))) 8)
+     (<< (cast u32 (get text (+ at 2))) 16)
+     (<< (cast u32 (get text (+ at 3))) 24)))
+
+(defn branch? [(w u32)] (-> bool) (= (& w (: 0xFC000000 u32)) (: 0x14000000 u32)))
+
+;;; Byte offset of a B's target; imm26 is a signed word count.
+(defn target [(w u32) (at i64)] (-> i64)
+  (let [imm (cast i64 (& w (: 0x03FFFFFF u32)))
+        signed (if (>= imm 33554432) (- imm 67108864) imm)]
+    (+ at (* signed 4))))
+
+(defn check [(cases i32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut failures) 0
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        selector (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        split (require (b/switch! (mut graph) start selector))
+        (mut roots) (ArrayList::new [i32] a)
+        (mut previous) (: 0 i32)]
+    (for [k 0 (cast i64 cases)]
+      (let [key (require (b/scalar-constant! (mut graph) 5 (cast u64 (* k 3)) 8))
+            arm (require (b/case-value! (mut graph) split key))
+            value (require (b/scalar-constant! (mut graph) 5 (cast u64 (+ 10 k)) 8))
+            ret (require (b/emit! (mut graph) 120 5 [arm value previous]))]
+        (set! previous ret)
+        (push! (mut roots) ret)))
+    (let [fallback (require (b/case-default! (mut graph) split))
+          value (require (b/scalar-constant! (mut graph) 5 99 8))
+          ret (require (b/emit! (mut graph) 120 5 [fallback value previous]))]
+      (push! (mut roots) ret))
+    (match (compile/image graph start (slice roots) "_switch_direct" a)
+      (Err [e] (panic "{}" e))
+      (Ok [value]
+          (let [(mut code) value
+                text (.text code)]
+            (let [(mut at) (: 0 i64)]
+              (while (< (+ at 3) (len text))
+                (let [w (word text at)]
+                  (when (= w (: 0xD340FC10 u32)) (set! failures (+ failures 1)))
+                  (when (branch? w)
+                    (let [to (target w at)]
+                      (when (and (>= to 0) (< (+ to 3) (len text)) (branch? (word text to)))
+                        (set! failures (+ failures 1))))))
+                (set! at (+ at 4))))
+            (match (jit/map-image code a)
+              (Err [e] (panic "{}" e))
+              (Ok [mapped]
+                  (let [(mut loaded) mapped
+                        f (p/cast (fnptr (cc/C) [u64] u64) (.base (.memory loaded)))]
+                    (for x [(: 0 u64) 1 2 3 4 5 6 7 9 18446744073709551615]
+                      (let [expected (if (and (= (% x 3) 0) (< (/ x 3) (cast u64 cases)))
+                                         (+ 10 (/ x 3))
+                                         99)]
+                        (when (!= (f x) expected) (set! failures (+ failures 1)))))
+                    (jit/release-image! (mut loaded)))))
+            (image/release! (mut code)))))
+    (free! (mut roots))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures (+ (check 1) (check 2) (check 3) (check 5))]
+    (println "direct switch dispatch: {} failures" failures)
+    (if (= failures 0) 0 1)))
