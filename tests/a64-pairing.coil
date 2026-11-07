@@ -15,6 +15,55 @@
 (defn str [(rt u32) (rn u32) (slot u32)] (-> u32) (| (: 0xF9000000 u32) (<< slot 10) (<< rn 5) rt))
 (defn ldrw [(rt u32) (rn u32) (slot u32)] (-> u32) (| (: 0xB9400000 u32) (<< slot 10) (<< rn 5) rt))
 
+;;; Pairing in the middle of a function, then compaction: STR x9,[sp]; LDR;LDR
+;;; pair; B to a label after them; a relocated word; a switch-style table whose
+;;; base is a Relative. Every record moves down by the four removed bytes, and a
+;;; pair inside a table's 16-byte ADR window keeps its NOP.
+(defn compaction [] (-> i64)
+  (let [a (malloc-allocator)
+        nop (: 0xD503201F u32)
+        (mut output) (code/create a)
+        (mut labels) (ArrayList::new [i64] a)
+        (mut branches) (ArrayList::new [f/Branch] a)
+        (mut relatives) (ArrayList::new [f/Relative] a)
+        (mut removed) (ArrayList::new [i64] a)
+        (mut failures) 0]
+    (b/append32! (mut (.text output)) (ldr 1 0 1))   ; 0
+    (b/append32! (mut (.text output)) (ldr 2 0 2))   ; 4: paired away
+    (push! (mut branches) (f/Branch :offset 8 :label 0 :condition -1 :link false))
+    (b/append32! (mut (.text output)) 0)             ; 8: branch to label 0
+    (push! (mut (.references output)) (code/Reference :offset 12 :kind 4 :target -1))
+    (b/append32! (mut (.text output)) (: 0x94000000 u32)) ; 12: relocated BL
+    (b/append32! (mut (.text output)) (str 3 4 1))   ; 16
+    (b/append32! (mut (.text output)) (str 5 4 2))   ; 20: inside ADR window, kept
+    (b/append32! (mut (.text output)) (: 0xD61F0200 u32)) ; 24
+    (b/append32! (mut (.text output)) (: 0xD61F0200 u32)) ; 28
+    (push! (mut relatives) (f/Relative :offset 32 :base 32 :label 0))
+    (push! (mut (.text-data output)) (data/Range :offset 32 :length 4 :kind 4))
+    (b/append32! (mut (.text output)) 0)             ; 32: table word
+    (push! (mut labels) 36)
+    (b/append32! (mut (.text output)) (: 0xD65F03C0 u32)) ; 36: RET, label 0
+    (f/pair-adjacent! (mut output) labels (mut removed))
+    (when (!= (len removed) 2) (set! failures (+ failures 1)))
+    (match (f/compact-removed! (mut output) (mut labels) (mut branches) (mut relatives) removed)
+      (Err [message] (println "{}" message) (set! failures (+ failures 1)))
+      (Ok [count] (when (!= count 1) (set! failures (+ failures 1)))))
+    (when (or (!= (len (.text output)) 36)
+              (!= (get labels 0) 32)
+              (!= (.offset (get branches 0)) 4)
+              (!= (.offset (get (.references output) 0)) 8)
+              (!= (.offset (get relatives 0)) 28)
+              (!= (.base (get relatives 0)) 28)
+              (!= (.offset (get (.text-data output) 0)) 28)
+              (!= (read/read32 (.text output) 0) (: 0xA9408801 u32))
+              (!= (read/read32 (.text output) 12) (: 0xA9009483 u32))
+              (!= (read/read32 (.text output) 16) nop)
+              (!= (read/read32 (.text output) 32) (: 0xD65F03C0 u32)))
+      (set! failures (+ failures 1)))
+    (code/release! (mut output))
+    (free! (mut labels)) (free! (mut branches)) (free! (mut relatives)) (free! (mut removed))
+    failures))
+
 ;;; Runs the pass over two words; returns 1 if the result differs from expected.
 (defn check [(first u32) (second u32) (label-second bool) (relocated bool) (inline bool)
              (expected-first u32) (expected-second u32)] (-> i64)
@@ -30,7 +79,11 @@
       (push! (mut (.references output)) (code/Reference :offset 0 :kind 4 :target -1)))
     (when inline
       (push! (mut (.text-data output)) (data/Range :offset 4 :length 4 :kind 4)))
-    (f/pair-adjacent! (mut output) labels)
+    (let [(mut removed) (ArrayList::new [i64] a)]
+      (f/pair-adjacent! (mut output) labels (mut removed))
+      (when (!= (len removed) (if (= expected-second (: 0xD503201F u32)) 1 0))
+        (set! failures 1))
+      (free! (mut removed)))
     (when (or (!= (read/read32 (.text output) 0) expected-first)
               (!= (read/read32 (.text output) 4) expected-second))
       (set! failures 1))
@@ -57,6 +110,7 @@
              (check (str 1 0 1) (str 2 0 3) false false false (str 1 0 1) (str 2 0 3))
              (check (str 1 0 1) (str 2 1 2) false false false (str 1 0 1) (str 2 1 2))
              (check (ldr 1 0 1) (ldrw 2 0 2) false false false (ldr 1 0 1) (ldrw 2 0 2))
-             (check (str 1 0 64) (str 2 0 65) false false false (str 1 0 64) (str 2 0 65)))]
+             (check (str 1 0 64) (str 2 0 65) false false false (str 1 0 64) (str 2 0 65))
+             (compaction))]
     (println "AArch64 load/store pairing: {} failures" failures)
     (if (= failures 0) 0 1)))
