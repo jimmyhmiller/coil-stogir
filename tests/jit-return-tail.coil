@@ -1,0 +1,105 @@
+(module stogir.tests.jit-return-tail)
+;;; An END whose successor is a return tail (start, PHIs, RETURN, no moves)
+;;; returns in place: no unconditional B reaches a RET without an intervening
+;;; branch, and every path still returns its own PHI input.
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn word [(text (ArrayList u8)) (at i64)] (-> u32)
+  (| (cast u32 (get text at))
+     (<< (cast u32 (get text (+ at 1))) 8)
+     (<< (cast u32 (get text (+ at 2))) 16)
+     (<< (cast u32 (get text (+ at 3))) 24)))
+
+(defn branch? [(w u32)] (-> bool) (= (& w (: 0xFC000000 u32)) (: 0x14000000 u32)))
+
+;;; B, BL, B.cond, CBZ/CBNZ, TBZ/TBNZ, RET and BR end a straight-line run.
+(defn control? [(w u32)] (-> bool)
+  (or (= (& w (: 0x7C000000 u32)) (: 0x14000000 u32))
+      (= (& w (: 0xFF000010 u32)) (: 0x54000000 u32))
+      (= (& w (: 0x7E000000 u32)) (: 0x34000000 u32))
+      (= (& w (: 0x7E000000 u32)) (: 0x36000000 u32))
+      (= (& w (: 0xFFFFFC1F u32)) (: 0xD65F0000 u32))
+      (= (& w (: 0xFFFFFC1F u32)) (: 0xD61F0000 u32))))
+
+(defn ret? [(w u32)] (-> bool) (= (& w (: 0xFFFFFC1F u32)) (: 0xD65F0000 u32)))
+
+(defn target [(w u32) (at i64)] (-> i64)
+  (let [imm (cast i64 (& w (: 0x03FFFFFF u32)))
+        signed (if (>= imm 33554432) (- imm 67108864) imm)]
+    (+ at (* signed 4))))
+
+;;; f(x, y) = x > y ? x * 3 + y : x - y * 5, merged into one RETURN block.
+(defn check [(swap? bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut failures) 0
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        y (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        three (require (b/scalar-constant! (mut graph) 11 3 8))
+        five (require (b/scalar-constant! (mut graph) 11 5 8))
+        greater (require (b/emit! (mut graph) 19 1 [x y]))
+        split (require (b/emit! (mut graph) 116 0 [start greater]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        end1 (require (b/emit! (mut graph) 114 0 [yes]))
+        end2 (require (b/emit! (mut graph) 114 0 [no]))
+        merge (if swap?
+                  (require (b/emit! (mut graph) 112 0 [end2 end1]))
+                  (require (b/emit! (mut graph) 112 0 [end1 end2])))
+        scaled (require (b/emit! (mut graph) 28 11 [x three]))
+        first (require (b/emit! (mut graph) 26 11 [scaled y]))
+        weighted (require (b/emit! (mut graph) 28 11 [y five]))
+        second (require (b/emit! (mut graph) 27 11 [x weighted]))
+        phi (if swap?
+                (require (b/emit! (mut graph) 67 11 [merge second first]))
+                (require (b/emit! (mut graph) 67 11 [merge first second])))
+        ret (require (b/emit! (mut graph) 120 11 [merge phi (: 0 i32)]))]
+    (match (compile/image graph start [ret] "_return_tail" a)
+      (Err [e] (panic "{}" e))
+      (Ok [value]
+          (let [(mut code) value
+                text (.text code)]
+            (let [(mut at) (: 0 i64)]
+              (while (< (+ at 3) (len text))
+                (let [w (word text at)]
+                  (when (branch? w)
+                    (let [(mut k) (target w at)
+                          (mut steps) 0]
+                      (while (and (>= k 0) (< (+ k 3) (len text)) (< steps 8)
+                                  (not (control? (word text k))))
+                        (set! k (+ k 4))
+                        (set! steps (+ steps 1)))
+                      (when (and (>= k 0) (< (+ k 3) (len text)) (ret? (word text k)))
+                        (set! failures (+ failures 1))))))
+                (set! at (+ at 4))))
+            (match (jit/map-image code a)
+              (Err [e] (panic "{}" e))
+              (Ok [mapped]
+                  (let [(mut loaded) mapped
+                        f (p/cast (fnptr (cc/C) [i64 i64] i64) (.base (.memory loaded)))]
+                    (for u [(: -7 i64) 0 3 11]
+                      (for v [(: -2 i64) 0 3 9]
+                        (when (!= (f u v) (if (> u v) (+ (* u 3) v) (- u (* v 5))))
+                          (set! failures (+ failures 1)))))
+                    (jit/release-image! (mut loaded)))))
+            (image/release! (mut code)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures (+ (check false) (check true))]
+    (println "return tails: {} failures" failures)
+    (if (= failures 0) 0 1)))
