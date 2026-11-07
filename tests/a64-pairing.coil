@@ -1,0 +1,62 @@
+(module stogir.tests.a64-pairing)
+;;; Adjacent same-base LDR/STR at consecutive scaled slots become LDP/STP plus
+;;; NOP. Labels on the second word, relocations, inline data, a load whose
+;;; first destination is the base or equals the second, gaps, mixed widths and
+;;; out-of-range offsets keep both words.
+(import "stogir.a64.fixups" :as f)
+(import "stogir.a64.code" :as code)
+(import "stogir.text-data" :as data)
+(import "stogir.bytes" :as b)
+(import "stogir.relocate" :as read)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+
+(defn ldr [(rt u32) (rn u32) (slot u32)] (-> u32) (| (: 0xF9400000 u32) (<< slot 10) (<< rn 5) rt))
+(defn str [(rt u32) (rn u32) (slot u32)] (-> u32) (| (: 0xF9000000 u32) (<< slot 10) (<< rn 5) rt))
+(defn ldrw [(rt u32) (rn u32) (slot u32)] (-> u32) (| (: 0xB9400000 u32) (<< slot 10) (<< rn 5) rt))
+
+;;; Runs the pass over two words; returns 1 if the result differs from expected.
+(defn check [(first u32) (second u32) (label-second bool) (relocated bool) (inline bool)
+             (expected-first u32) (expected-second u32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut output) (code/create a)
+        (mut labels) (ArrayList::new [i64] a)
+        (mut failures) 0]
+    (b/append32! (mut (.text output)) first)
+    (b/append32! (mut (.text output)) second)
+    (push! (mut labels) 0)
+    (when label-second (push! (mut labels) 4))
+    (when relocated
+      (push! (mut (.references output)) (code/Reference :offset 0 :kind 4 :target -1)))
+    (when inline
+      (push! (mut (.text-data output)) (data/Range :offset 4 :length 4 :kind 4)))
+    (f/pair-adjacent! (mut output) labels)
+    (when (or (!= (read/read32 (.text output) 0) expected-first)
+              (!= (read/read32 (.text output) 4) expected-second))
+      (set! failures 1))
+    (code/release! (mut output))
+    (free! (mut labels))
+    failures))
+
+(defn main [] (-> i64)
+  (let [nop (: 0xD503201F u32)
+        failures
+          (+ ; STR x1,[x0,#8]; STR x2,[x0,#16] -> STP x1,x2,[x0,#8]
+             (check (str 1 0 1) (str 2 0 2) false false false (: 0xA9008801 u32) nop)
+             ; LDR x3,[sp,#16]; LDR x4,[sp,#24] -> LDP x3,x4,[sp,#16]
+             (check (ldr 3 31 2) (ldr 4 31 3) false false false (: 0xA94113E3 u32) nop)
+             ; 32-bit LDR w5,[x6,#4]; LDR w7,[x6,#8] -> LDP w5,w7,[x6,#4]
+             (check (ldrw 5 6 1) (ldrw 7 6 2) false false false (: 0x29409CC5 u32) nop)
+             ; Second load may overwrite the base: LDP x1,x0,[x0]
+             (check (ldr 1 0 0) (ldr 0 0 1) false false false (: 0xA9400001 u32) nop)
+             (check (str 1 0 1) (str 2 0 2) true false false (str 1 0 1) (str 2 0 2))
+             (check (str 1 0 1) (str 2 0 2) false true false (str 1 0 1) (str 2 0 2))
+             (check (str 1 0 1) (str 2 0 2) false false true (str 1 0 1) (str 2 0 2))
+             (check (ldr 0 0 1) (ldr 2 0 2) false false false (ldr 0 0 1) (ldr 2 0 2))
+             (check (ldr 3 0 1) (ldr 3 0 2) false false false (ldr 3 0 1) (ldr 3 0 2))
+             (check (str 1 0 1) (str 2 0 3) false false false (str 1 0 1) (str 2 0 3))
+             (check (str 1 0 1) (str 2 1 2) false false false (str 1 0 1) (str 2 1 2))
+             (check (ldr 1 0 1) (ldrw 2 0 2) false false false (ldr 1 0 1) (ldrw 2 0 2))
+             (check (str 1 0 64) (str 2 0 65) false false false (str 1 0 64) (str 2 0 65)))]
+    (println "AArch64 load/store pairing: {} failures" failures)
+    (if (= failures 0) 0 1)))
