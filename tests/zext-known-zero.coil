@@ -73,8 +73,48 @@
             (image/release! (mut code)))))
     (g/release! (mut graph))))
 
+;;; An I32 W-form ADD merged with a negative I32 constant: both clear the upper
+;;; word, so ZEXT to U64 is a register view and keeps the 32-bit pattern.
+(defn signed-word [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        raw (require (b/emit! (mut graph) 71 10 [start (: 0 i32) 0]))
+        which (require (b/emit! (mut graph) 71 1 [start (: 0 i32) 1]))
+        seven (require (b/scalar-constant! (mut graph) 10 7 8))
+        minus (require (b/scalar-constant! (mut graph) 10 0xFFFFFFFE 8))
+        split (require (b/emit! (mut graph) 116 0 [start which]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        added (require (b/emit! (mut graph) 26 10 [raw seven]))
+        left (require (b/emit! (mut graph) 114 0 [yes]))
+        right (require (b/emit! (mut graph) 114 0 [no]))
+        merge (require (b/emit! (mut graph) 112 0 [left right]))
+        phi (require (b/emit! (mut graph) 67 10 [merge added minus]))
+        widened (require (b/emit! (mut graph) 34 5 [phi]))
+        ret (require (b/emit! (mut graph) 120 5 [merge widened (: 0 i32)]))]
+    (match (compile/image-with-options graph start [ret] "_zext_i32"
+                                       (options/Options :level 1) a)
+      (Err [e] (panic "{}" e))
+      (Ok [code]
+          (let [(mut code) code
+                text (slice (.text code))]
+            (for [i 0 (/ (len text) 4)] (assert (not (zero-extend? (word text (* i 4))))))
+            (match (jit/map-image code a)
+              (Err [e] (panic "{}" e))
+              (Ok [mapped]
+                  (let [(mut mapped) mapped
+                        f (p/cast (fnptr (cc/C) [u64 bool] u64) (.base (.memory mapped)))]
+                    (assert (= (f 0xFFFFFFFFFFFFFFFB true) 2))
+                    (assert (= (f 0x123400000005 true) 12))
+                    (assert (= (f 5 false) 0xFFFFFFFE))
+                    (jit/release-image! (mut mapped)))))
+            (image/release! (mut code)))))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
   (fixture false)
   (fixture true)
+  (signed-word)
   (println "ZEXT of known zero-extended merges is a register view")
   0)
