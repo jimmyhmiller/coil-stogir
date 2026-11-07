@@ -1,0 +1,60 @@
+(module stogir.tests.trunc-view-coalesce)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [x] x) (Err [e] (panic "{}" e))))
+
+(defn word [(text (slice u8)) (i i64)] (-> u32)
+  (| (cast u32 (get text i))
+     (<< (cast u32 (get text (+ i 1))) 8)
+     (<< (cast u32 (get text (+ i 2))) 16)
+     (<< (cast u32 (get text (+ i 3))) 24)))
+
+;;; A W-register move: unshifted 32-bit ORR with WZR as either source.
+(defn word-move? [(w u32)] (-> bool)
+  (and (= (& w (: 0xFF20FC00 u32)) (: 0x2A000000 u32))
+       (or (= (& (>> w 16) (: 31 u32)) (: 31 u32))
+           (= (& (>> w 5) (: 31 u32)) (: 31 u32)))))
+
+;;; A 64-to-32-bit TRUNC whose source stays live shares the source register:
+;;; SEXT and the other use read it without a W move in between.
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        three (require (b/scalar-constant! (mut graph) 5 3 8))
+        bumped (require (b/emit! (mut graph) 26 5 [x three]))
+        low (require (b/emit! (mut graph) 35 10 [bumped]))
+        widened (require (b/emit! (mut graph) 33 5 [low]))
+        sum (require (b/emit! (mut graph) 26 5 [bumped widened]))
+        ret (require (b/emit! (mut graph) 120 5 [start sum (: 0 i32)]))]
+    (match (compile/image-with-options graph start [ret] "_trunc_view"
+                                       (options/Options :level 1) a)
+      (Err [e] (panic "{}" e))
+      (Ok [code]
+          (let [(mut code) code
+                text (slice (.text code))]
+            (for [i 0 (/ (len text) 4)] (assert (not (word-move? (word text (* i 4))))))
+            (match (jit/map-image code a)
+              (Err [e] (panic "{}" e))
+              (Ok [mapped]
+                  (let [(mut mapped) mapped
+                        f (p/cast (fnptr (cc/C) [u64] u64) (.base (.memory mapped)))]
+                    (assert (= (f 5) 16))
+                    ; 0x1_7FFF_FFFE + 3: the low word 0x80000001 sign-extends.
+                    (assert (= (f 0x17FFFFFFE) (+ (: 0x180000001 u64) (: 0xFFFFFFFF80000001 u64))))
+                    (jit/release-image! (mut mapped)))))
+            (image/release! (mut code)))))
+    (g/release! (mut graph))
+    (println "64-to-32-bit TRUNC shares its live source register")
+    0))
