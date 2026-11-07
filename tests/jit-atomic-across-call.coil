@@ -1,0 +1,96 @@
+(module stogir.tests.jit-atomic-across-call)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.a64.constants" :as constants)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+(defn word! [(text (mut (ArrayList u8))) (r (Result u32 (slice u8)))] (-> void)
+  (match r (Ok [word] (bytes/append32! (mut text) word)) (Err [e] (panic "{}" e))))
+
+;;; Returns x0 + 7 after destroying every ordinary caller GPR (x18 preserved).
+(defn clobber-target [] (-> (ArrayList u8))
+  (let [a (malloc-allocator) (mut text) (ArrayList::new [u8] a)]
+    (word! (mut text) (encode/add-sub-immediate true false false 0 0 7))
+    (for [r 1 18]
+      (require (constants/emit! (mut text) true (cast i32 r)
+                               (+ (: 0xFEDCBA9876540000 u64) (cast u64 r)))))
+    (word! (mut text) (encode/add-sub true true true 31 0 1))
+    (word! (mut text) (encode/ret 30))
+    text))
+
+;;; An atomic's result lives across a call, so allocation gives it a
+;;; callee-saved register: RMW add (kind 0), compare-exchange (1), load (2).
+(defn check [(kind i64)] (-> i64)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        pointer (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        value (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        atomic (require (case kind
+                          0 (b/emit! (mut graph) 128 5 [start pointer value 0])
+                          1 (b/emit! (mut graph) 129 5 [start pointer zero value])
+                          (b/emit! (mut graph) 126 5 [start pointer])))
+        (mut roots) (ArrayList::new [i32] a)
+        (mut failures) 0]
+    (match (calls/create 0 5 [(: 5 u8)] a)
+      (Err [e] (panic "{}" e))
+      (Ok [owned]
+        (let [(mut signature) owned
+              call (require (calls/emit! (mut graph) signature atomic target [zero] a))
+              sum (require (b/emit! (mut graph) 26 5 [atomic call]))
+              ret (require (b/emit! (mut graph) 120 5 [call sum (: 0 i32)]))
+              (mut target-code) (clobber-target)]
+          (calls/release! (mut signature))
+          (push! (mut roots) ret)
+          (match (jit/map-text (slice target-code))
+            (Err [e] (panic "{}" e))
+            (Ok [owned-target]
+              (let [(mut native-target) owned-target]
+                (for level [(: 1 i32) 2 3]
+                  (match (compile/image-with-options graph start (slice roots) "_atomic_call"
+                           (options/Options :level level) a)
+                    (Err [e] (println "kind {} level {}: {}" kind level e) (set! failures (+ failures 1)))
+                    (Ok [owned-code]
+                      (let [(mut code) owned-code]
+                        (match (jit/map-image code a)
+                          (Err [e] (panic "{}" e))
+                          (Ok [owned-image]
+                            (let [(mut loaded) owned-image
+                                  f (p/cast (fnptr (cc/C) [u64 (ptr u64) u64] u64) (.base (.memory loaded)))
+                                  (mut cell) (: 0 u64)]
+                              (for [old 0 4]
+                                (for [x 0 3]
+                                  (set! cell (cast u64 (* old 5)))
+                                  (let [before cell
+                                        got (call-ptr f (p/cast u64 (.base native-target)) (mut cell) (cast u64 x))
+                                        after (case kind 0 (+ before (cast u64 x))
+                                                         1 (if (= before 0) (cast u64 x) before)
+                                                         before)]
+                                    (unless (and (= got (+ before 7)) (= cell after))
+                                      (println "kind {} level {} old {} x {}: got {} cell {}" kind level before x got cell)
+                                      (set! failures (+ failures 1))))))
+                              (jit/release-image! (mut loaded)))))
+                        (image/release! (mut code))))))
+                (jit/release! (mut native-target)))))
+          (free! (mut target-code)))))
+    (free! (mut roots)) (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures (+ (check 0) (check 1) (check 2))]
+    (println "atomic results across calls: {} failures" failures)
+    (if (= failures 0) 0 1)))
