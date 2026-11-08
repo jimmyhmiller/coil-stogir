@@ -1,0 +1,44 @@
+(module stogir.tests.zero-shift-emit)
+(import "stogir.a64.select" :as select)
+(import "stogir.a64.emit" :as emit)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+;;; Selection turns a multiply by one (a symbolic size that resolves to one)
+;;; into LSL #0. A zero-count immediate shift is its source: nothing when it
+;;; stays in place, otherwise one register move. A W result still zero-extends.
+(defn case [(rule i32) (wide bool) (rd i32) (rn i32) (expected (slice u32))] (-> i64)
+  (let [(mut out) (ArrayList::new [u8] (malloc-allocator))
+        tile (select/Tile :rule rule :wide wide :left 1 :right 0 :immediate 0)
+        (mut failures) 0]
+    (match (emit/single! (mut out) tile rd rn 0)
+      (Err [msg] (do (println "rule {} wide {}: {}" rule wide msg) (set! failures 1)))
+      (Ok [count]
+          (if (or (!= (cast i64 count) (* 4 (len expected))) (!= (len out) (* 4 (len expected))))
+              (do (println "rule {} wide {} rd {} rn {}: {} bytes" rule wide rd rn count)
+                  (set! failures 1))
+              (for [i 0 (len expected)]
+                (let [word (| (cast u32 (get out (* i 4)))
+                              (<< (cast u32 (get out (+ (* i 4) 1))) 8)
+                              (<< (cast u32 (get out (+ (* i 4) 2))) 16)
+                              (<< (cast u32 (get out (+ (* i 4) 3))) 24))]
+                  (when (!= word (get expected i))
+                    (println "rule {} wide {}: word {} != {}" rule wide word (get expected i))
+                    (set! failures 1)))))))
+    (free! (mut out))
+    failures))
+
+(defn main [] (-> i32)
+  (let [(mut failures) 0]
+    (for rule [(: 38 i32) 39 40]
+      ; X form in place: no instruction.
+      (set! failures (+ failures (case rule true 3 3 [])))
+      ; X form to another register: orr x2, xzr, x1.
+      (set! failures (+ failures (case rule true 2 1 [(: 0xAA0103E2 u32)])))
+      ; W form, even in place, keeps the zero extension: orr w3, wzr, w3.
+      (set! failures (+ failures (case rule false 3 3 [(: 0x2A0303E3 u32)])))
+      (set! failures (+ failures (case rule false 2 1 [(: 0x2A0103E2 u32)]))))
+    (println "zero-count shift emission: {} failures" failures)
+    (if (= failures 0) 0 1)))
