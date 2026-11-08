@@ -1,0 +1,67 @@
+(module stogir.tests.register-proven)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.call-inline" :as inlining)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+;;; A one-parameter leaf: x + 7. With BROKEN, the RETURN names a value that
+;;; is not of the declared result type, which validate rejects.
+(defn leaf [(broken bool)] (-> g/Graph)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))
+        sum (require (b/emit! (mut graph) 26 11 [x seven]))
+        flag (require (b/emit! (mut graph) 16 1 [x seven]))]
+    (match (calls/create 0 11 [(: 11 u8)] a)
+      (Err [message] (panic "{}" message))
+      (Ok [owned]
+          (let [(mut prototype) owned]
+            (require (calls/function! (mut graph) prototype a))
+            (calls/release! (mut prototype)))))
+    (require (b/emit! (mut graph) 120 11 [start sum (: 0 i32)]))
+    (when broken
+      ; Retype the returned value's producer as BOOL: a declared I64 result
+      ; returning a BOOL comparison is invalid.
+      (g/rewrite-inputs! (mut graph) sum 16 1 [x seven]))
+    graph))
+
+(defn outcome [(graph g/Graph) (proof u128)] (-> bool)
+  (let [a (malloc-allocator)
+        (mut registry) (inlining/registry-create 8 a)
+        ret (cast i32 (- (len (.instructions graph)) 1))
+        result (match (inlining/register-proven! (mut registry)
+                        (inlining/Callee :name "_leaf" :graph graph :entry 1
+                                         :roots [ret] :observed [ret] :never false)
+                        proof)
+                 (Err [_] false) (Ok [_] true))]
+    (inlining/registry-release! (mut registry))
+    result))
+
+;;; A digest recorded when the exact content passed validation replaces the
+;;; re-check; a missing or stale digest validates, so invalid graphs still fail.
+(defn main [] (-> i32)
+  (let [(mut good) (leaf false)
+        (mut bad) (leaf true)
+        good-proof (rewrite/content-hash good 8)
+        (mut failures) 0]
+    (match (rewrite/validate good 8 (malloc-allocator))
+      (Err [message] (do (println "valid leaf rejected: {}" message) (set! failures (+ failures 1))))
+      (Ok [_] 0))
+    (match (rewrite/validate bad 8 (malloc-allocator))
+      (Err [_] 0)
+      (Ok [_] (do (println "broken leaf validated") (set! failures (+ failures 1)))))
+    (unless (outcome good good-proof) (println "proven leaf rejected") (set! failures (+ failures 1)))
+    (unless (outcome good 0) (println "unproven valid leaf rejected") (set! failures (+ failures 1)))
+    (when (outcome bad 0) (println "broken leaf registered without proof") (set! failures (+ failures 1)))
+    (when (outcome bad good-proof) (println "broken leaf registered with a stale proof") (set! failures (+ failures 1)))
+    (g/release! (mut good)) (g/release! (mut bad))
+    (println "proven registration: {} failures" failures)
+    (if (= failures 0) 0 1)))
