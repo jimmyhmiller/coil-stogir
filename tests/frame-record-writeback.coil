@@ -1,0 +1,85 @@
+(module stogir.tests.frame-record-writeback)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+
+(defn word-at [(text (ArrayList u8)) (i i64)] (-> u32)
+  (| (cast u32 (get text (* i 4))) (<< (cast u32 (get text (+ (* i 4) 1))) 8)
+     (<< (cast u32 (get text (+ (* i 4) 2))) 16) (<< (cast u32 (get text (+ (* i 4) 3))) 24)))
+
+;;; f(target, x) = target(x) + 1 makes an ordinary call, so it keeps a frame
+;;; record. With no outgoing stack area the record sits at the bottom of the
+;;; frame: the prologue stores it with SP pre-decrement (stp x29, x30,
+;;; [sp, #-N]!) and the epilogue reloads it with post-increment (ldp x29, x30,
+;;; [sp], #N), folding both SP adjustments.
+(defn main [] (-> i32)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        one (require (b/scalar-constant! (mut graph) 5 1 8))
+        (mut failures) 0]
+    (match (calls/create 0 5 [(: 6 u8) 5] a)
+      (Err [e] (panic "{}" e))
+      (Ok [owned]
+          (let [(mut prototype) owned]
+            (require (calls/function! (mut graph) prototype a))
+            (calls/release! (mut prototype)))))
+    (match (calls/create 0 5 [(: 5 u8)] a)
+      (Err [e] (panic "{}" e))
+      (Ok [owned]
+          (let [(mut prototype) owned
+                call (require (calls/emit! (mut graph) prototype start target [x] a))
+                sum (require (b/emit! (mut graph) 26 5 [call one]))
+                ret (require (b/emit! (mut graph) 120 5 [call sum (: 0 i32)]))
+                (mut leaf) (ArrayList::new [u8] a)]
+            (calls/release! (mut prototype))
+            (match (encode/add-sub-immediate true false false 0 0 5)
+              (Err [e] (panic "{}" e)) (Ok [w] (bytes/append32! (mut leaf) w)))
+            (match (encode/ret 30) (Err [e] (panic "{}" e)) (Ok [w] (bytes/append32! (mut leaf) w)))
+            (match (jit/map-text (slice leaf))
+              (Err [e] (panic "{}" e))
+              (Ok [owned-leaf]
+                  (let [(mut native) owned-leaf]
+                    (match (compile/image-with-options graph start [ret] "_record_writeback"
+                             (options/Options :level 3) a)
+                      (Err [e] (panic "{}" e))
+                      (Ok [owned-code]
+                          (let [(mut code) owned-code
+                                (mut pre) false (mut post) false]
+                            (for [i 0 (/ (len (.text code)) 4)]
+                              (let [w (word-at (.text code) i)]
+                                ; stp/ldp x29, x30 with SP writeback, any offset.
+                                (when (= (& w 0xFFC07FFF) 0xA9807BFD) (set! pre true))
+                                (when (= (& w 0xFFC07FFF) 0xA8C07BFD) (set! post true))))
+                            (unless pre (println "no pre-indexed frame record store") (set! failures (+ failures 1)))
+                            (unless post (println "no post-indexed frame record reload") (set! failures (+ failures 1)))
+                            (match (jit/map-image code a)
+                              (Err [e] (panic "{}" e))
+                              (Ok [owned-image]
+                                  (let [(mut loaded) owned-image
+                                        f (p/cast (fnptr (cc/C) [u64 u64] u64) (.base (.memory loaded)))]
+                                    (for value [(: 0 u64) 1 99 0xFFFFFFFFFFFFFFF0]
+                                      (unless (= (call-ptr f (p/cast u64 (.base native)) value) (+ value 6))
+                                        (set! failures (+ failures 1))))
+                                    (jit/release-image! (mut loaded)))))
+                            (image/release! (mut code)))))
+                    (jit/release! (mut native)))))
+            (free! (mut leaf)))))
+    (g/release! (mut graph))
+    (println "frame record writeback: {} failures" failures)
+    (if (= failures 0) 0 1)))
