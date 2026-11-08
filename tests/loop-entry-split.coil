@@ -5,6 +5,8 @@
 (import "stogir.interval" :as r)
 (import "stogir.constraints" :as c)
 (import "stogir.frame" :as f)
+(import "stogir.interval-queue" :as queue)
+(import "stogir.fixed-uses" :as fixed)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.result" :use [Result Ok Err])
@@ -64,7 +66,100 @@
     (f/release! (mut layout))
     failures))
 
+;;; A value spilled before a loop whose next register use is inside the loop:
+;;; without loop blocks its register suffix starts at that use (a reload every
+;;; iteration); with them it starts at the loop header, reloaded once on entry.
+(defn reload-check [(with-loops bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut parts) (ArrayList::new [a/Part] allocator)
+        (mut value) (a/create 0 allocator)
+        (mut layout) (f/create allocator)
+        (mut work) (ArrayList::new [queue/Item] allocator)
+        (mut failures) 0
+        blocks [(split/Block :start 0 :end 10 :depth 0 :header -1 :idom 0)
+                (split/Block :start 10 :end 20 :depth 1 :header 1 :idom 0)
+                (split/Block :start 20 :end 40 :depth 1 :header 1 :idom 1)
+                (split/Block :start 40 :end 50 :depth 0 :header -1 :idom 1)]]
+    (r/add! (mut (.ranges value)) 2 48)
+    (c/add! (mut (.uses value)) 22 1 -1)
+    (c/add! (mut (.uses value)) 36 1 -1)
+    (c/add! (mut (.uses value)) 46 1 -1)
+    (push! (mut parts) value)
+    (match (a/spill-prefix-tracked! (mut parts) (mut work) 0 (mut layout) 8 8 allocator
+                                    (cast (ptr fixed/Index) 0)
+                                    (if with-loops blocks []) -1)
+      (Err [msg] (println "spill failed: {}" msg) (set! failures (+ failures 1)))
+      (Ok [_] 0))
+    (let [want (if with-loops 10 22)]
+      (unless (and (= (len parts) 2)
+                   (= (.start (get (.ranges (get parts 1)) 0)) want)
+                   (< (.register (get parts 0)) 0))
+        (println "loops {}: suffix starts at {} (want {})" with-loops
+                 (if (= (len parts) 2) (.start (get (.ranges (get parts 1)) 0)) -1) want)
+        (set! failures (+ failures 1))))
+    (let [(mut i) 0]
+      (while (< i (len parts))
+        (a/release! (elem (mut parts) i))
+        (set! i (+ i 1))))
+    (free! (mut parts)) (free! (mut work))
+    (f/release! (mut layout))
+    failures))
+
+;;; Register 2 survives the call at 30; registers 0 and 1 do not. A cold value
+;;; defined before the loop holds register 2 across the loop without using it;
+;;; a hot value is used in the loop before and after the call. With loop
+;;; eviction for register 2 the hot value keeps register 2 for the loop and the
+;;; cold one waits in its slot; without it the hot value cannot stay there.
+(defn evict-check [(evict bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut parts) (ArrayList::new [a/Part] allocator)
+        (mut cold) (a/create 0 allocator)
+        (mut hot) (a/create 1 allocator)
+        (mut layout) (f/create allocator)
+        (mut failures) 0
+        blocks [(split/Block :start 0 :end 10 :depth 0 :header -1 :idom 0)
+                (split/Block :start 10 :end 40 :depth 1 :header 1 :idom 0)
+                (split/Block :start 40 :end 50 :depth 0 :header -1 :idom 1)]]
+    (r/add! (mut (.ranges cold)) 1 48)
+    (c/add! (mut (.uses cold)) 1 2 2)
+    (c/add! (mut (.uses cold)) 46 1 -1)
+    (r/add! (mut (.ranges hot)) 12 38)
+    (c/add! (mut (.uses hot)) 12 1 -1)
+    (c/add! (mut (.uses hot)) 22 1 -1)
+    (c/add! (mut (.uses hot)) 36 1 -1)
+    (push! (mut parts) cold)
+    (push! (mut parts) hot)
+    (a/reserve! (mut parts) 0 30 31 allocator)
+    (a/reserve! (mut parts) 1 30 31 allocator)
+    (match (a/run-shaped-with-tuning! (mut parts) (mut layout) 3 0x7
+             [(a/SpillShape :size 8 :alignment 8) (a/SpillShape :size 8 :alignment 8)] [] blocks
+             (a/Tuning :late (a/no-late) :loop-reloads false :loop-evict-mask (if evict (: 4 u64) (: 0 u64)))
+             allocator)
+      (Err [msg] (do (println "allocation failed: {}" msg) (set! failures (+ failures 1))))
+      (Ok [_] 0))
+    (match (verify/verify parts 3 0x7)
+      (Err [msg] (do (println "allocation invalid: {}" msg) (set! failures (+ failures 1))))
+      (Ok [_] 0))
+    (let [before (register-at parts 1 22) after (register-at parts 1 36)
+          held (register-at parts 0 20)]
+      (if evict
+          (unless (and (= before 2) (= after 2) (< held 0))
+            (println "evict: hot {} / {}, cold {}" before after held)
+            (set! failures (+ failures 1)))
+          (when (and (= before 2) (= after 2))
+            (println "no evict: hot kept register 2 ({} / {})" before after)
+            (set! failures (+ failures 1)))))
+    (let [(mut i) 0]
+      (while (< i (len parts))
+        (a/release! (elem (mut parts) i))
+        (set! i (+ i 1))))
+    (free! (mut parts))
+    (f/release! (mut layout))
+    failures))
+
 (defn main [] (-> i32)
-  (let [failures (+ (loop-entry-check 36) (loop-entry-check 24))]
+  (let [failures (+ (loop-entry-check 36) (loop-entry-check 24)
+                    (reload-check false) (reload-check true)
+                    (evict-check false) (evict-check true))]
     (println "loop-entry split checks: {} failures" failures)
     (if (= failures 0) 0 1)))
