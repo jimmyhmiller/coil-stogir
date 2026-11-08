@@ -27,7 +27,10 @@
 ;;; 4 = an entry ALLOCA whose address only the slow path uses (store, reload,
 ;;; then call), so the fast path stays frameless;
 ;;; 5 = both paths END into a MERGE that only returns its PHI: a shared return
-;;; tail the fast path emits in place without the frame.
+;;; tail the fast path emits in place without the frame;
+;;; 6 = nested merges as slice equality lowers: the fast inner path reaches the
+;;; shared tail only through an inner MERGE that the call path also enters, so
+;;; it must build the frame on that edge and return through the epilogue.
 (defn model [(shape i32) (x i64)] (-> i64)
   (cond (= shape 0) (if (< x 100) (+ x 1) (+ (slow-model x) x))
         (= shape 1) (+ (if (< x 100) (+ x 1) (slow-model x)) x)
@@ -38,6 +41,7 @@
                         (+ (slow-model x) 1))
         (= shape 3) (cond (= x 0) 7 (= x 1) (+ (slow-model x) 5) :else (+ x 2))
         (= shape 5) (if (< x 100) (+ x 1) (slow-model x))
+        (= shape 6) (if (< x 100) (if (= x 7) 1 (slow-model x)) 0)
         :else (if (< x 100) (+ x 1) (+ (slow-model (+ x 4)) 1))))
 
 (defn slow-graph [(a (dyn Allocator))] (-> g/Graph)
@@ -122,6 +126,24 @@
                 (require (b/emit! (mut graph) 120 11 [fast plus (: 0 i32)]))
                 (require (b/emit! (mut graph) 120 11 [called sum (: 0 i32)]))
                 graph)
+            (= shape 6)
+              (let [seven (require (b/scalar-constant! (mut graph) 11 7 8))
+                    zero (require (b/scalar-constant! (mut graph) 11 0 8))
+                    same (require (b/emit! (mut graph) 14 1 [x seven]))
+                    inner (require (b/emit! (mut graph) 116 0 [fast same]))
+                    hit (require (b/emit! (mut graph) 107 0 [inner (: 0 i32)]))
+                    miss (require (b/emit! (mut graph) 108 0 [inner (: 0 i32)]))
+                    called (slow-call! (mut graph) miss x a)
+                    hit-end (require (b/emit! (mut graph) 114 0 [hit]))
+                    miss-end (require (b/emit! (mut graph) 114 0 [called]))
+                    joined (require (b/emit! (mut graph) 112 0 [hit-end miss-end]))
+                    partial (require (b/emit! (mut graph) 67 11 [joined one called]))
+                    joined-end (require (b/emit! (mut graph) 114 0 [joined]))
+                    slow-end (require (b/emit! (mut graph) 114 0 [slow]))
+                    outer (require (b/emit! (mut graph) 112 0 [joined-end slow-end]))
+                    value (require (b/emit! (mut graph) 67 11 [outer partial zero]))]
+                (require (b/emit! (mut graph) 120 11 [outer value (: 0 i32)]))
+                graph)
             (= shape 5)
               (let [plus (require (b/emit! (mut graph) 26 11 [x one]))
                     called (slow-call! (mut graph) slow x a)
@@ -192,6 +214,72 @@
                (<< (cast u32 (get text (+ offset 2))) 16)
                (<< (cast u32 (get text (+ offset 3))) 24))))))
 
+;;; Instruction word at byte offset OFFSET of TEXT.
+(defn word-at [(text (coil.arraylist.ArrayList u8)) (offset i64)] (-> u32)
+  (| (cast u32 (get text offset))
+     (<< (cast u32 (get text (+ offset 1))) 8)
+     (<< (cast u32 (get text (+ offset 2))) 16)
+     (<< (cast u32 (get text (+ offset 3))) 24)))
+
+(defn signed [(value u32) (bits u32)] (-> i64)
+  (let [shift (- (: 64 u32) bits)]
+    (>> (<< (cast i64 value) (cast i64 shift)) (cast i64 shift))))
+
+;;; Walks NAME's machine code from its entry along every branch, tracking
+;;; whether the frame is built (0 = entry state). Counts a RET with the frame,
+;;; a frame release or call without it, and joins reached in both states.
+;;; Indirect jumps and BRK end a path.
+(defn frame-faults [(source image/Image) (name (slice u8))] (-> i64)
+  (match (image/find-symbol source name)
+    (None [] (panic "missing symbol {}" name))
+    (Some [id]
+          (let [a (malloc-allocator)
+                base (.offset (get (.symbols source) (cast i64 id)))
+                text (.text source)
+                limit (len text)
+                (mut seen) (coil.arraylist.ArrayList::new [i8] a)
+                (mut work) (coil.arraylist.ArrayList::new [i64] a)
+                (mut faults) (: 0 i64)]
+            (for [i 0 limit] (push! (mut seen) (: -1 i8)))
+            (push! (mut work) (* base 2))
+            (while (> (len work) 0)
+              (let [item (get work (- (len work) 1))
+                    _ (pop! (mut work))
+                    (mut at) (/ item 2)
+                    (mut state) (% item 2)
+                    (mut going) true]
+                (while (and going (>= at 0) (< (+ at 3) limit))
+                  (let [previous (get seen at)]
+                    (if (>= previous 0)
+                        (do (when (!= (cast i64 previous) state) (set! faults (+ faults 1)))
+                            (set! going false))
+                        (let [w (word-at text at)]
+                          (set! (mut seen) at (cast i8 state))
+                          (cond
+                            (or (= (& w 0xFFC07FFF) 0xA9807BFD) (= (& w 0xFF8003FF) 0xD10003FF))
+                              (do (when (= state 1) (set! faults (+ faults 1))) (set! state 1)
+                                  (set! at (+ at 4)))
+                            (or (= (& w 0xFFC07FFF) 0xA8C07BFD) (= (& w 0xFF8003FF) 0x910003FF))
+                              (do (when (= state 0) (set! faults (+ faults 1))) (set! state 0)
+                                  (set! at (+ at 4)))
+                            (= w 0xD65F03C0)
+                              (do (when (= state 1) (set! faults (+ faults 1))) (set! going false))
+                            (or (= (& w 0xFC000000) 0x94000000) (= (& w 0xFFFFFC1F) 0xD63F0000))
+                              (do (when (= state 0) (set! faults (+ faults 1))) (set! at (+ at 4)))
+                            (or (= (& w 0xFFFFFC1F) 0xD61F0000) (= (& w 0xFFE0001F) 0xD4200000))
+                              (set! going false)
+                            (= (& w 0xFC000000) 0x14000000)
+                              (set! at (+ at (* 4 (signed (& w 0x3FFFFFF) 26))))
+                            (or (= (& w 0xFF000010) 0x54000000) (= (& w 0x7E000000) 0x34000000))
+                              (do (push! (mut work) (+ (* (+ at (* 4 (signed (& (>> w 5) 0x7FFFF) 19))) 2) state))
+                                  (set! at (+ at 4)))
+                            (= (& w 0x7E000000) 0x36000000)
+                              (do (push! (mut work) (+ (* (+ at (* 4 (signed (& (>> w 5) 0x3FFF) 14))) 2) state))
+                                  (set! at (+ at 4)))
+                            :else (set! at (+ at 4)))))))))
+            (free! (mut seen)) (free! (mut work))
+            faults))))
+
 ;;; STP x29, x30, [sp, #-n]! or SUB sp, sp, #n: the frame built at entry.
 (defn frame-entry? [(word u32)] (-> bool)
   (or (= (& word 0xFFC07FFF) 0xA9807BFD)
@@ -212,6 +300,10 @@
         (when (and shrink (!= shape 1) (frame-entry? word))
           (println "shape {}: shrink-wrapped entry still builds the frame (0x{:x})" shape word)
           (set! failures (+ failures 1)))
+        (let [faults (frame-faults code "_sw_entry")]
+          (when (> faults 0)
+            (println "shape {} shrink {}: {} frame-state faults" shape shrink faults)
+            (set! failures (+ failures faults))))
         (when (and (not shrink) (not (frame-entry? word)))
           (println "shape {}: reference entry has no frame (0x{:x})" shape word)
           (set! failures (+ failures 1)))
@@ -242,7 +334,7 @@
 
 (defn main [] (-> i32)
   (let [(mut failures) (: 0 i64)]
-    (for shape [(: 0 i32) 1 2 3 4 5]
+    (for shape [(: 0 i32) 1 2 3 4 5 6]
       (set! failures (+ failures (check-shape shape))))
     (println "shrink-wrap: {} failures" failures)
     (if (= failures 0) 0 1)))
