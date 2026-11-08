@@ -1,0 +1,169 @@
+(module stogir.tests.inline-hoist-frames)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.symbols" :as symbols)
+(import "stogir.stack" :as stack)
+(import "stogir.call-inline" :as inlining)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+;;; _hf_leaf(x): store 2x into a frame object, reload it, return it plus one.
+(defn leaf [(a (dyn Allocator))] (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        sixteen (require (b/scalar-constant! (mut graph) 5 16 8))
+        object (require (b/frame-object! (mut graph) start sixteen (: 8 i32)))
+        two (require (b/scalar-constant! (mut graph) 11 2 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        doubled (require (b/emit! (mut graph) 28 11 [x two]))
+        stored (require (b/emit! (mut graph) 93 0 [object object doubled]))
+        loaded (require (b/emit! (mut graph) 91 11 [stored object]))
+        plus (require (b/emit! (mut graph) 26 11 [loaded one]))
+        (mut signature) (match (calls/create 0 11 [(: 11 u8)] a)
+                          (Err [message] (panic "{}" message)) (Ok [s] s))]
+    (require (calls/function! (mut graph) signature a))
+    (calls/release! (mut signature))
+    (require (b/emit! (mut graph) 120 11 [loaded plus (: 0 i32)]))
+    graph))
+
+;;; caller(x): keeps x in its own frame object, then sums _hf_leaf(i) for
+;;; i in 0..x inside a loop. The result is x * x.
+(defn caller [(a (dyn Allocator))] (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        eight (require (b/scalar-constant! (mut graph) 5 8 8))
+        own (require (b/frame-object! (mut graph) start eight (: 8 i32)))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        kept (require (b/emit! (mut graph) 93 0 [own own x]))
+        limit (require (b/emit! (mut graph) 91 11 [kept own]))
+        enter (require (b/emit! (mut graph) 114 0 [limit]))
+        loop (require (b/loop-begin! (mut graph) enter))
+        index (require (b/loop-phi! (mut graph) loop zero))
+        sum (require (b/loop-phi! (mut graph) loop zero))
+        more (require (b/emit! (mut graph) 16 1 [index limit]))
+        test (require (b/emit! (mut graph) 116 0 [loop more]))
+        body (require (b/emit! (mut graph) 107 0 [test (: 0 i32)]))
+        done (require (b/emit! (mut graph) 108 0 [test (: 0 i32)]))
+        (mut signature) (match (calls/create 0 11 [(: 11 u8)] a)
+                          (Err [message] (panic "{}" message)) (Ok [s] s))
+        _ (require (calls/function! (mut graph) signature a))
+        target (require (symbols/function! (mut graph) "_hf_leaf" 0))
+        called (require (calls/emit! (mut graph) signature body target [index] a))
+        next-sum (require (b/emit! (mut graph) 26 11 [sum called]))
+        next-index (require (b/emit! (mut graph) 26 11 [index one]))
+        back (require (b/emit! (mut graph) 115 0 [called]))]
+    (calls/release! (mut signature))
+    (require (b/patch! (mut graph) loop 2 back))
+    (require (b/patch! (mut graph) index 3 next-index))
+    (require (b/patch! (mut graph) sum 3 next-sum))
+    (require (b/emit! (mut graph) 120 11 [done sum (: 0 i32)]))
+    graph))
+
+(defn find-call [(graph g/Graph)] (-> i32)
+  (let [(mut found) (: 0 i32) (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (when (= (n/opcode (get (.instructions graph) r)) 79) (set! found (cast i32 r)))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    found))
+
+(defn find-return [(graph g/Graph)] (-> i32)
+  (let [(mut found) (: 0 i32) (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (when (= (n/opcode (get (.instructions graph) r)) 120) (set! found (cast i32 r)))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    found))
+
+;;; Counts of [stack scopes, frame objects] in GRAPH.
+(defn stack-shape [(graph g/Graph)] (-> (array i64 2))
+  (let [(mut scopes) (: 0 i64) (mut objects) (: 0 i64) (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (let [node (get (.instructions graph) r)]
+        (when (or (= (n/opcode node) 83) (= (n/opcode node) 84)) (set! scopes (+ scopes 1)))
+        (when (stack/frame-object? node) (set! objects (+ objects 1))))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    [scopes objects]))
+
+(defn run [(graph g/Graph) (roots (slice i32)) (x i64) (a (dyn Allocator))] (-> i64)
+  (match (compile/image graph 1 roots "_hf_caller" a)
+    (Err [message] (panic "compile: {}" message))
+    (Ok [code]
+        (let [(mut code) code]
+          (match (link/compose [code] a)
+            (Err [message] (panic "compose: {}" message))
+            (Ok [module]
+                (let [(mut module) module]
+                  (match (jit/map-image (.image module) a)
+                    (Err [message] (panic "map: {}" message))
+                    (Ok [loaded]
+                        (let [(mut loaded) loaded
+                              index (match (image/find-symbol (.image module) "_hf_caller")
+                                      (Some [id] id) (None [] (panic "symbol")))
+                              function (primitive/cast (fnptr (cc/C) [i64] i64)
+                                         (primitive/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))
+                              result (function x)]
+                          (jit/release-image! (mut loaded))
+                          (link/release! (mut module))
+                          (image/release! (mut code))
+                          result))))))))))
+
+(defn main [] (-> i32)
+  (let [a (malloc-allocator) (mut failures) (: 0 i64)
+        (mut callee) (leaf a)
+        (mut graph) (caller a)
+        call (find-call graph)
+        ret (find-return graph)
+        callee-ret (find-return callee)]
+    (for hoist [false true]
+      (match (inlining/optimize-sites-policy graph [ret]
+               [(inlining/Site :reference call
+                  :target (inlining/Callee :name "_hf_leaf" :graph callee :entry 1
+                                           :roots [callee-ret] :observed [callee-ret]
+                                           :never false :always false))]
+               8
+               (inlining/Policy :budget 512 :small-cells 0 :small-anywhere false :small-leaf false
+                                :indirect-calls false :pair-result-calls false :honor-always false
+                                :hoist-frames hoist)
+               a)
+        (Err [message] (panic "inline: {}" message))
+        (Ok [inlined]
+            (let [(mut inlined) inlined
+                  shape (stack-shape (.graph inlined))]
+              (unless (= (.changes inlined) 1)
+                (println "hoist {}: {} changes" hoist (.changes inlined))
+                (set! failures (+ failures 1)))
+              (match (rewrite/validate (.graph inlined) 8 a)
+                (Err [message] (println "hoist {}: invalid graph: {}" hoist message)
+                               (set! failures (+ failures 1)))
+                (Ok [_] 0))
+              (if hoist
+                  (unless (and (= (get shape 0) 0) (= (get shape 1) 2))
+                    (println "hoist: {} scope nodes, {} frame objects" (get shape 0) (get shape 1))
+                    (set! failures (+ failures 1)))
+                  (unless (and (= (get shape 0) 2) (= (get shape 1) 1))
+                    (println "scoped: {} scope nodes, {} frame objects" (get shape 0) (get shape 1))
+                    (set! failures (+ failures 1))))
+              (for x [(: 0 i64) 1 2 5 10 37]
+                (let [got (run (.graph inlined) (slice (.roots inlined)) x a)]
+                  (unless (= got (* x x))
+                    (println "hoist {} x {}: got {} want {}" hoist x got (* x x))
+                    (set! failures (+ failures 1)))))
+              (rewrite/release! (mut inlined))))))
+    (g/release! (mut graph)) (g/release! (mut callee))
+    (println "inline hoist frames: {} failures" failures)
+    (if (= failures 0) 0 1)))
