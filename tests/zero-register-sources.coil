@@ -1,0 +1,73 @@
+(module stogir.tests.zero-register-sources)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.a64.select" :as select)
+(import "stogir.a64.emit" :as emit)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn word-at [(text (ArrayList u8)) (i i64)] (-> u32)
+  (| (cast u32 (get text (* i 4))) (<< (cast u32 (get text (+ (* i 4) 1))) 8)
+     (<< (cast u32 (get text (+ (* i 4) 2))) 16) (<< (cast u32 (get text (+ (* i 4) 3))) 24)))
+
+;;; Register-form sources may be XZR: SUB from zero is NEG, with no scratch.
+(defn encoding-check [] (-> i64)
+  (let [(mut out) (ArrayList::new [u8] (malloc-allocator))
+        (mut failures) 0]
+    (match (emit/single! (mut out) (select/Tile :rule 2 :wide true :left -1 :right 1 :immediate 0) 0 31 1)
+      (Err [message] (do (println "neg: {}" message) (set! failures (+ failures 1))))
+      (Ok [_] (unless (= (word-at out 0) 0xCB0103E0)
+                (println "neg word {}" (word-at out 0)) (set! failures (+ failures 1)))))
+    ; 31 stays illegal where it would mean SP or is not a source: immediate ADD.
+    (match (emit/single! (mut out) (select/Tile :rule 4 :wide true :left -1 :right 0 :immediate 1) 0 31 0)
+      (Err [_] 0)
+      (Ok [_] (do (println "immediate ADD accepted SP-encoded source") (set! failures (+ failures 1)))))
+    (free! (mut out))
+    failures))
+
+;;; A comparison materializes 0/1 with CSET; returning it as BOOL needs no
+;;; UBFX/UXTB re-extension. The answer stays exact for every input.
+(defn boolean-return-check [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        y (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        test (require (b/emit! (mut graph) 17 1 [x y]))
+        ret (require (b/emit! (mut graph) 120 1 [start test (: 0 i32)]))
+        (mut failures) 0]
+    (match (compile/text graph start [ret] a)
+      (Err [message] (do (println "compile: {}" message) (set! failures (+ failures 1))))
+      (Ok [text]
+          (let [(mut text) text]
+            (for [i 0 (/ (len text) 4)]
+              ; UBFM/SBFM with immr=0 (UBFX/UXTB/UXTH/SXTB #0) on any register.
+              (let [w (word-at text i)]
+                (when (or (= (& w 0xFFFFFC00) 0xD3401C00) (= (& w 0xFFFFFC00) 0x53001C00))
+                  (println "boolean result re-extended: {}" w) (set! failures (+ failures 1)))))
+            (match (jit/map-text (slice text))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [mapped]
+                  (let [(mut mapped) mapped
+                        f (p/cast (fnptr (cc/C) [i64 i64] u8) (.base mapped))]
+                    (for x [(: -9223372036854775808 i64) -1 0 1 9223372036854775807]
+                      (for y [(: -9223372036854775808 i64) -1 0 1 9223372036854775807]
+                        (unless (= (call-ptr f x y) (if (>= x y) (: 1 u8) 0))
+                          (set! failures (+ failures 1)))))
+                    (jit/release! (mut mapped)))))
+            (free! (mut text)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i32)
+  (let [failures (+ (encoding-check) (boolean-return-check))]
+    (println "zero-register sources and boolean returns: {} failures" failures)
+    (if (= failures 0) 0 1)))
