@@ -50,7 +50,7 @@
 ;;; Small-callee policy for a loop-scoped exemption of N cells.
 (defn small-loop [(budget i32) (cells i32) (anywhere bool)] (-> inlining/Policy)
   (inlining/Policy :budget budget :small-cells cells :small-anywhere anywhere
-                   :indirect-calls false :pair-result-calls false))
+                   :indirect-calls false :pair-result-calls false :honor-always false))
 
 ;;; A one-cell leaf called twice inside a loop and twice before it, with a
 ;;; caller budget of exactly one leaf. By default the budget admits one site,
@@ -98,7 +98,7 @@
     (require (b/patch! (mut caller) sum 3 hot2))
     (match (inlining/register! (mut registry)
              (inlining/Callee :name "_small_leaf" :graph leaf :entry start
-                              :roots [returned] :observed [returned] :never false))
+                              :roots [returned] :observed [returned] :never false :always false))
       (Err [message] (panic "register: {}" message))
       (Ok [handle]
           (let [sites [(inlining/RegisteredSite :reference cold1 :callee handle)
@@ -117,7 +117,31 @@
                                                            4 calls [false false false false])))
             (for policy [(inlining/default-policy 0) (small-loop 0 40 false) (small-loop 0 40 true)]
               (set! failures (+ failures (expansion-failures registry caller entry result sites
-                                                             policy 0 calls [true true true true])))))))
+                                                             policy 0 calls [true true true true]))))))
+      )
+    ; The same leaf marked :inline (Always): the default policy still charges
+    ; it, honor-always inlines every site with a nonzero budget.
+    (match (inlining/register! (mut registry)
+             (inlining/Callee :name "_small_leaf" :graph leaf :entry start
+                              :roots [returned] :observed [returned] :never false :always true))
+      (Err [message] (panic "register always: {}" message))
+      (Ok [handle]
+          (let [sites [(inlining/RegisteredSite :reference cold1 :callee handle)
+                       (inlining/RegisteredSite :reference cold2 :callee handle)
+                       (inlining/RegisteredSite :reference hot1 :callee handle)
+                       (inlining/RegisteredSite :reference hot2 :callee handle)]
+                calls [cold1 cold2 hot1 hot2]
+                honor (inlining/Policy :budget 1 :small-cells 0 :small-anywhere false
+                                       :indirect-calls false :pair-result-calls false
+                                       :honor-always true)]
+            (set! failures (+ failures (expansion-failures registry caller entry result sites
+                                                           (inlining/default-policy 1)
+                                                           1 calls [true true false true])))
+            (set! failures (+ failures (expansion-failures registry caller entry result sites
+                                                           honor 4 calls [false false false false])))
+            (set! failures (+ failures (expansion-failures registry caller entry result sites
+                                                           (inlining/with-budget honor 0)
+                                                           0 calls [true true true true]))))))
     (inlining/registry-release! (mut registry))
     (calls/release! (mut signature))
     (g/release! (mut caller)) (g/release! (mut leaf))
