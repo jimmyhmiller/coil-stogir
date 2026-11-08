@@ -1,0 +1,148 @@
+(module stogir.tests.spill-home-scope)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.a64.constants" :as constants)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+(defn word! [(text (mut (ArrayList u8))) (r (Result u32 (slice u8)))] (-> void)
+  (match r (Ok [word] (bytes/append32! (mut text) word)) (Err [e] (panic "{}" e))))
+
+;;; Native ABI target preserves x0's answer while destroying all ordinary
+;;; caller GPRs, including reserved instruction scratch x16/x17. x18 is
+;;; the platform register and is deliberately preserved, as required by ABI.
+(defn clobber-target [] (-> (ArrayList u8))
+  (let [a (malloc-allocator) (mut text) (ArrayList::new [u8] a)]
+    (word! (mut text) (encode/add-sub-immediate true false false 0 0 7))
+    (for [r 1 18]
+      (require (constants/emit! (mut text) true (cast i32 r)
+                               (+ (: 0xFEDCBA9876540000 u64) (cast u64 r)))))
+    (word! (mut text) (encode/add-sub true true true 31 0 1))
+    (word! (mut text) (encode/ret 30))
+    text))
+
+(defn frame-stores [(text (ArrayList u8))] (-> i64)
+  (let [(mut count) (: 0 i64)]
+    (for [i 0 (/ (len text) 4)]
+      (let [w (| (cast u32 (get text (* i 4))) (<< (cast u32 (get text (+ (* i 4) 1))) 8)
+                 (<< (cast u32 (get text (+ (* i 4) 2))) 16) (<< (cast u32 (get text (+ (* i 4) 3))) 24))
+            base (& (>> w 5) 31)
+            store (or (= (& w 0xFFC00000) 0xF9000000) (= (& w 0xFFC00000) 0xA9000000)
+                      (= (& w 0xFFE00C00) 0xF8000000))]
+        (when (and store (or (= base 29) (= base 31))) (set! count (+ count 1)))))
+    count))
+
+;;; Same loop as spill-home-loop, optionally inside a stack scope. Returns the
+;;; number of fixed-frame stores in the optimized image.
+(defn check [(introspect bool) (conditional bool) (scoped bool)] (-> i64)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        input (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        limit (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        frame-root (if introspect (require (b/emit! (mut graph) 66 6 [])) 0)
+        (mut roots) (ArrayList::new [i32] a)
+        (mut values) (ArrayList::new [i32] a)
+        (mut stores) (: 0 i64)
+        saved (if scoped (require (b/stack-save! (mut graph) start)) 0)]
+    (for [i 1 25]
+      (let [constant (require (b/scalar-constant! (mut graph) 11 (cast u64 i) 8))]
+        (push! (mut values) (require (b/emit! (mut graph) 26 11 [input constant])))))
+    (let [entry (require (b/emit! (mut graph) 114 0 [(if scoped saved start)]))
+          header (require (b/loop-begin! (mut graph) entry))
+          counter (require (b/loop-phi! (mut graph) header zero))
+          answer (require (b/loop-phi! (mut graph) header zero))
+          condition (require (b/emit! (mut graph) 16 1 [counter limit]))
+          branch (require (b/emit! (mut graph) 116 0 [header condition]))
+          body (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+          exit (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+          (mut sum) answer]
+      ; Uses on both sides of the call prevent active-eviction placement alone
+      ; from moving all home stores out of the loop.
+      (for value values (set! sum (require (b/emit! (mut graph) 26 11 [sum value]))))
+      (match (calls/create 0 11 [(: 11 u8)] a)
+        (Err [e] (panic "{}" e))
+        (Ok [owned]
+          (let [(mut signature) owned
+                parity (require (b/emit! (mut graph) 47 11 [counter one]))
+                even (require (b/emit! (mut graph) 14 1 [parity zero]))
+                select (if conditional (require (b/emit! (mut graph) 116 0 [body even])) 0)
+                call-body (if conditional (require (b/emit! (mut graph) 107 0 [select (: 0 i32)])) body)
+                skip-body (if conditional (require (b/emit! (mut graph) 108 0 [select (: 0 i32)])) 0)
+                call (require (calls/emit! (mut graph) signature call-body target [sum] a))
+                left (if conditional (require (b/emit! (mut graph) 114 0 [call])) 0)
+                right (if conditional (require (b/emit! (mut graph) 114 0 [skip-body])) 0)
+                join (if conditional (require (b/emit! (mut graph) 112 0 [left right])) call)
+                merged (if conditional (require (b/emit! (mut graph) 67 11 [join call sum])) call)]
+            (calls/release! (mut signature))
+            (set! sum merged)
+            (for value values (set! sum (require (b/emit! (mut graph) 26 11 [sum value]))))
+            (let [next (require (b/emit! (mut graph) 26 11 [counter one]))
+                  back (require (b/emit! (mut graph) 115 0 [join]))
+                  restore (if scoped (require (b/stack-restore! (mut graph) exit saved)) exit)
+                  ret (require (b/emit! (mut graph) 120 11 [restore answer (: 0 i32)]))
+                  (mut target-code) (clobber-target)]
+              (push! (mut roots) ret)
+              (when introspect (push! (mut roots) frame-root))
+              (require (b/patch! (mut graph) header 2 back))
+              (require (b/patch! (mut graph) counter 3 next))
+              (require (b/patch! (mut graph) answer 3 sum))
+              (match (jit/map-text (slice target-code))
+                (Err [e] (panic "{}" e))
+                (Ok [owned-target]
+                  (let [(mut native-target) owned-target]
+                    (for level [(: 1 i32) 2 3]
+                      (match (compile/image-with-options graph start (slice roots) "_home_loop"
+                               (options/Options :level level) a)
+                        (Err [e] (panic "{}" e))
+                        (Ok [owned-code]
+                          (let [(mut code) owned-code]
+                            (when (= level 3) (set! stores (frame-stores (.text code))))
+                            (match (jit/map-image code a)
+                              (Err [e] (panic "{}" e))
+                              (Ok [owned-image]
+                                (let [(mut loaded) owned-image
+                                      f (p/cast (fnptr (cc/C) [u64 i64 i64] i64)
+                                                (.base (.memory loaded)))]
+                                  (for x [(: -100 i64) -1 0 1 7 100]
+                                    (for n [(: -1 i64) 0 1 2 7 17]
+                                      (let [iterations (if (> n 0) n 0)
+                                            expected (+ (* iterations (+ (* 48 x) 600))
+                                                        (* (if conditional (/ (+ iterations 1) 2) iterations) 7))]
+                                        (assert (= (call-ptr f (p/cast u64 (.base native-target)) x n) expected)))))
+                                  (jit/release-image! (mut loaded)))))
+                            (image/release! (mut code))))))
+                    (jit/release! (mut native-target)))))
+              (free! (mut target-code)))))))
+    (free! (mut roots)) (free! (mut values)) (g/release! (mut graph))
+    stores))
+
+;;; A stack scope moves SP below the fixed frame but leaves spill homes in it,
+;;; so the canonical homes (one store at each definition, none at loop calls)
+;;; apply to scoped functions too. The scope's saved SP is one more value live
+;;; across the loop: at most its own home store and one more preserved pair.
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for introspect [false true]
+      (for conditional [false true]
+        (let [plain (check introspect conditional false)
+              scoped (check introspect conditional true)]
+          (when (and (not introspect) (> scoped (+ plain 2)))
+            (println "conditional {}: scoped frame stores {} > unscoped {}" conditional scoped plain)
+            (set! failures (+ failures 1))))))
+    (println "scoped spill homes: {} failures" failures)
+    (if (= failures 0) 0 1)))
