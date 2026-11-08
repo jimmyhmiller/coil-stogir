@@ -1,6 +1,7 @@
 (module stogir.tests.sext-load)
 (import "stogir.graph" :as g)
 (import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
 (import "stogir.options" :as options)
 (import "stogir.a64.compile" :as compile)
 (import "stogir.image" :as image)
@@ -26,8 +27,79 @@
       (= (& w (: 0xFFFFFC00 u32)) (: 0x93401C00 u32))
       (= (& w (: 0xFFFFFC00 u32)) (: 0x93403C00 u32))))
 
+;;; Clobbers every caller-saved register a caller could have kept a value in.
+(defn clobber :cc (cc/C) [(x i32)] (-> i64) (+ (cast i64 x) 7))
+
+;;; A signed I32 load is live across a call, so allocation moves or reloads it
+;;; as a 32-bit value before its SEXT. The SEXT must then extend explicitly: a
+;;; W move or 32-bit reload clears bits 32-63.
+(defn across-call [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        base (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        flag (require (b/emit! (mut graph) 71 1 [start (: 0 i32) 2]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        (mut chain) start
+        (mut held) (ArrayList::new [i32] a)
+        (mut types) (ArrayList::new [u8] a)
+        (mut arguments) (ArrayList::new [i32] a)]
+    ; Values live across the call occupy the callee-saved registers.
+    (for [i 0 12]
+      (let [k (require (b/scalar-constant! (mut graph) 5 (cast u64 (+ 8 (* i 8))) 8))
+            address (require (b/emit! (mut graph) 26 6 [base k]))]
+        (set! chain (require (b/emit! (mut graph) 91 11 [chain address])))
+        (push! (mut held) chain)))
+    (let [w (require (b/emit! (mut graph) 91 10 [chain base]))
+          split (require (b/emit! (mut graph) 116 0 [w flag]))
+          yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+          no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))]
+    (push! (mut types) 10)
+    (push! (mut arguments) w)
+    (match (calls/create 0 11 (slice types) a)
+      (Err [e] (panic "{}" e))
+      (Ok [prototype]
+          (let [(mut prototype) prototype
+                call (require (calls/emit! (mut graph) prototype yes target (slice arguments) a))
+                left (require (b/emit! (mut graph) 114 0 [call]))
+                right (require (b/emit! (mut graph) 114 0 [no]))
+                merge (require (b/emit! (mut graph) 112 0 [left right]))
+                called (require (b/emit! (mut graph) 67 11 [merge call zero]))
+                widened (require (b/emit! (mut graph) 33 11 [w]))
+                (mut result) (require (b/emit! (mut graph) 26 11 [called widened]))
+                _ (for h held (set! result (require (b/emit! (mut graph) 26 11 [result h]))))
+                ret (require (b/emit! (mut graph) 120 11 [merge result (: 0 i32)]))]
+            (for level [(: 1 i32) 3]
+              (match (compile/image-with-options graph start [ret] "_sext_call"
+                                                 (options/Options :level level) a)
+                (Err [e] (panic "{}" e))
+                (Ok [code]
+                    (let [(mut code) code]
+                      (match (jit/map-image code a)
+                        (Err [e] (panic "{}" e))
+                        (Ok [mapped]
+                            (let [(mut mapped) mapped
+                                  f (p/cast (fnptr (cc/C) [(ptr i32) (ptr u8) bool] i64)
+                                            (.base (.memory mapped)))
+                                  (mut cell) (ArrayList::new [i32] a)]
+                              (push! (mut cell) -5)
+                              (push! (mut cell) 0)
+                              (for [i 0 24] (push! (mut cell) 0))
+                              (assert (= (f (.data cell) (p/cast (ptr u8) (fnptr-of clobber)) true) -3))
+                              (assert (= (f (.data cell) (p/cast (ptr u8) (fnptr-of clobber)) false) -5))
+                              (free! (mut cell))
+                              (jit/release-image! (mut mapped)))))
+                      (image/release! (mut code))))))
+            (calls/release! (mut prototype))))))
+    (free! (mut types))
+    (free! (mut arguments))
+    (free! (mut held))
+    (g/release! (mut graph))))
+
 ;;; Signed loads of each narrow width, each sign-extended to I64, summed.
 (defn main [] (-> i64)
+  (across-call)
   (let [a (malloc-allocator)
         (mut graph) (g/create a)
         start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
