@@ -1,0 +1,248 @@
+(module stogir.tests.shrink-wrap)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.symbols" :as symbols)
+(import "stogir.options" :as options)
+(import "stogir.link" :as link)
+(import "stogir.image" :as image)
+(import "stogir.bytes" :as bytes)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn slow-model [(x i64)] (-> i64) (* x 3))
+
+;;; Shapes: 0 = fast RETURN in the region, slow RETURN after a call;
+;;; 1 = both paths END into a MERGE that needs the frame (END crossing);
+;;; 2 = a counted loop on the fast path, the call in the slow path;
+;;; 3 = SWITCH: case 0 and default return directly, case 1 calls;
+;;; 4 = an entry ALLOCA whose address only the slow path uses (store, reload,
+;;; then call), so the fast path stays frameless;
+;;; 5 = both paths END into a MERGE that only returns its PHI: a shared return
+;;; tail the fast path emits in place without the frame.
+(defn model [(shape i32) (x i64)] (-> i64)
+  (cond (= shape 0) (if (< x 100) (+ x 1) (+ (slow-model x) x))
+        (= shape 1) (+ (if (< x 100) (+ x 1) (slow-model x)) x)
+        (= shape 2) (if (< x 100)
+                        (let [(mut sum) (: 0 i64)]
+                          (for [i 0 x] (set! sum (+ sum i)))
+                          sum)
+                        (+ (slow-model x) 1))
+        (= shape 3) (cond (= x 0) 7 (= x 1) (+ (slow-model x) 5) :else (+ x 2))
+        (= shape 5) (if (< x 100) (+ x 1) (slow-model x))
+        :else (if (< x 100) (+ x 1) (+ (slow-model (+ x 4)) 1))))
+
+(defn slow-graph [(a (dyn Allocator))] (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        three (require (b/scalar-constant! (mut graph) 11 3 8))
+        product (require (b/emit! (mut graph) 28 11 [x three]))
+        (mut signature) (match (calls/create 0 11 [(: 11 u8)] a)
+                          (Err [message] (panic "{}" message)) (Ok [s] s))]
+    (require (calls/function! (mut graph) signature a))
+    (require (b/emit! (mut graph) 120 11 [start product (: 0 i32)]))
+    (calls/release! (mut signature))
+    graph))
+
+(defn slow-call! [(graph (mut g/Graph)) (control i32) (x i32) (a (dyn Allocator))] (-> i32)
+  (let [(mut signature) (match (calls/create 0 11 [(: 11 u8)] a)
+                          (Err [message] (panic "{}" message)) (Ok [s] s))
+        target (require (symbols/function! (mut graph) "_sw_slow" 0))
+        call (require (calls/emit! (mut graph) signature control target [x] a))]
+    (calls/release! (mut signature))
+    call))
+
+;;; Builds the entry graph for SHAPE; returns it with its START and roots.
+(defn entry-graph [(shape i32) (a (dyn Allocator))] (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        (mut signature) (match (calls/create 0 11 [(: 11 u8)] a)
+                          (Err [message] (panic "{}" message)) (Ok [s] s))]
+    (require (calls/function! (mut graph) signature a))
+    (calls/release! (mut signature))
+    (cond
+      (= shape 3)
+        (let [zero (require (b/scalar-constant! (mut graph) 11 0 8))
+              one (require (b/scalar-constant! (mut graph) 11 1 8))
+              two (require (b/scalar-constant! (mut graph) 11 2 8))
+              five (require (b/scalar-constant! (mut graph) 11 5 8))
+              seven (require (b/scalar-constant! (mut graph) 11 7 8))
+              dispatch (require (b/emit! (mut graph) 117 0 [start x]))
+              case0 (require (b/emit! (mut graph) 109 0 [dispatch zero (: 0 i32)]))
+              case1 (require (b/emit! (mut graph) 109 0 [dispatch one (: 0 i32)]))
+              other (require (b/emit! (mut graph) 111 0 [dispatch (: 0 i32)]))
+              called (slow-call! (mut graph) case1 x a)
+              plus5 (require (b/emit! (mut graph) 26 11 [called five]))
+              plus2 (require (b/emit! (mut graph) 26 11 [x two]))]
+          (require (b/emit! (mut graph) 120 11 [case0 seven (: 0 i32)]))
+          (require (b/emit! (mut graph) 120 11 [called plus5 (: 0 i32)]))
+          (require (b/emit! (mut graph) 120 11 [other plus2 (: 0 i32)]))
+          graph)
+      (= shape 4)
+        (let [sixteen (require (b/scalar-constant! (mut graph) 5 16 8))
+              object (require (b/frame-object! (mut graph) start sixteen (: 8 i32)))
+              hundred (require (b/scalar-constant! (mut graph) 11 100 8))
+              one (require (b/scalar-constant! (mut graph) 11 1 8))
+              four (require (b/scalar-constant! (mut graph) 11 4 8))
+              condition (require (b/emit! (mut graph) 16 1 [x hundred]))
+              split (require (b/emit! (mut graph) 116 0 [object condition]))
+              fast (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+              slow (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+              plus (require (b/emit! (mut graph) 26 11 [x one]))
+              shifted (require (b/emit! (mut graph) 26 11 [x four]))
+              stored (require (b/emit! (mut graph) 93 0 [slow object shifted]))
+              loaded (require (b/emit! (mut graph) 91 11 [stored object]))
+              called (slow-call! (mut graph) loaded loaded a)
+              total (require (b/emit! (mut graph) 26 11 [called one]))]
+          (require (b/emit! (mut graph) 120 11 [fast plus (: 0 i32)]))
+          (require (b/emit! (mut graph) 120 11 [called total (: 0 i32)]))
+          graph)
+      :else
+        (let [hundred (require (b/scalar-constant! (mut graph) 11 100 8))
+              one (require (b/scalar-constant! (mut graph) 11 1 8))
+              condition (require (b/emit! (mut graph) 16 1 [x hundred]))
+              split (require (b/emit! (mut graph) 116 0 [start condition]))
+              fast (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+              slow (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))]
+          (cond
+            (= shape 0)
+              (let [plus (require (b/emit! (mut graph) 26 11 [x one]))
+                    called (slow-call! (mut graph) slow x a)
+                    sum (require (b/emit! (mut graph) 26 11 [called x]))]
+                (require (b/emit! (mut graph) 120 11 [fast plus (: 0 i32)]))
+                (require (b/emit! (mut graph) 120 11 [called sum (: 0 i32)]))
+                graph)
+            (= shape 5)
+              (let [plus (require (b/emit! (mut graph) 26 11 [x one]))
+                    called (slow-call! (mut graph) slow x a)
+                    fast-end (require (b/emit! (mut graph) 114 0 [fast]))
+                    slow-end (require (b/emit! (mut graph) 114 0 [called]))
+                    join (require (b/emit! (mut graph) 112 0 [fast-end slow-end]))
+                    value (require (b/emit! (mut graph) 67 11 [join plus called]))]
+                (require (b/emit! (mut graph) 120 11 [join value (: 0 i32)]))
+                graph)
+            (= shape 1)
+              (let [plus (require (b/emit! (mut graph) 26 11 [x one]))
+                    called (slow-call! (mut graph) slow x a)
+                    fast-end (require (b/emit! (mut graph) 114 0 [fast]))
+                    slow-end (require (b/emit! (mut graph) 114 0 [called]))
+                    join (require (b/emit! (mut graph) 112 0 [fast-end slow-end]))
+                    value (require (b/emit! (mut graph) 67 11 [join plus called]))
+                    total (require (b/emit! (mut graph) 26 11 [value x]))]
+                (require (b/emit! (mut graph) 120 11 [join total (: 0 i32)]))
+                graph)
+            :else
+              (let [zero (require (b/scalar-constant! (mut graph) 11 0 8))
+                    enter (require (b/emit! (mut graph) 114 0 [fast]))
+                    loop (require (b/loop-begin! (mut graph) enter))
+                    index (require (b/loop-phi! (mut graph) loop zero))
+                    sum (require (b/loop-phi! (mut graph) loop zero))
+                    more (require (b/emit! (mut graph) 16 1 [index x]))
+                    test (require (b/emit! (mut graph) 116 0 [loop more]))
+                    body (require (b/emit! (mut graph) 107 0 [test (: 0 i32)]))
+                    done (require (b/emit! (mut graph) 108 0 [test (: 0 i32)]))
+                    next-sum (require (b/emit! (mut graph) 26 11 [sum index]))
+                    next-index (require (b/emit! (mut graph) 26 11 [index one]))
+                    back (require (b/emit! (mut graph) 115 0 [body]))
+                    called (slow-call! (mut graph) slow x a)
+                    plus (require (b/emit! (mut graph) 26 11 [called one]))]
+                (require (b/patch! (mut graph) loop 2 back))
+                (require (b/patch! (mut graph) index 3 next-index))
+                (require (b/patch! (mut graph) sum 3 next-sum))
+                (require (b/emit! (mut graph) 120 11 [done sum (: 0 i32)]))
+                (require (b/emit! (mut graph) 120 11 [called plus (: 0 i32)]))
+                graph))))))
+
+;;; RETURN references of GRAPH, in order.
+(defn returns [(graph g/Graph) (a (dyn Allocator))] (-> (coil.arraylist.ArrayList i32))
+  (let [(mut roots) (coil.arraylist.ArrayList::new [i32] a)
+        (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (when (= (cast i32 (& (.header (get (.instructions graph) r)) 255)) 120)
+        (push! (mut roots) (cast i32 r)))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    roots))
+
+(defn compiled [(graph g/Graph) (roots (slice i32)) (name (slice u8)) (shrink bool)
+                (a (dyn Allocator))] (-> image/Image)
+  (match (compile/image-with-private graph 1 roots name (options/Options :level 1) a
+                                     (private/with-shrink-wrap (private/no-context) shrink))
+    (Ok [code] code)
+    (Err [message] (panic "compile {}: {}" name message))))
+
+;;; First instruction word of NAME in IMAGE.
+(defn first-word [(source image/Image) (name (slice u8))] (-> u32)
+  (match (image/find-symbol source name)
+    (None [] (panic "missing symbol {}" name))
+    (Some [id]
+          (let [offset (.offset (get (.symbols source) (cast i64 id)))
+                text (.text source)]
+            (| (cast u32 (get text offset))
+               (<< (cast u32 (get text (+ offset 1))) 8)
+               (<< (cast u32 (get text (+ offset 2))) 16)
+               (<< (cast u32 (get text (+ offset 3))) 24))))))
+
+;;; STP x29, x30, [sp, #-n]! or SUB sp, sp, #n: the frame built at entry.
+(defn frame-entry? [(word u32)] (-> bool)
+  (or (= (& word 0xFFC07FFF) 0xA9807BFD)
+      (= (& word 0xFF8003FF) 0xD10003FF)))
+
+(defn check-shape [(shape i32)] (-> i64)
+  (let [a (malloc-allocator) (mut failures) (: 0 i64)
+        (mut slow) (slow-graph a)]
+    (for shrink [false true]
+      (let [(mut graph) (entry-graph shape a)
+            (mut roots) (returns graph a)
+            (mut code) (compiled graph (slice roots) "_sw_entry" shrink a)
+            (mut slow-roots) (returns slow a)
+            (mut leaf) (match (compile/image slow 1 (slice slow-roots) "_sw_slow" a)
+                         (Ok [c] c) (Err [message] (panic "slow: {}" message)))
+            word (first-word code "_sw_entry")]
+        ; Shapes 0, 2 and 3 have a RETURN reachable without the frame.
+        (when (and shrink (!= shape 1) (frame-entry? word))
+          (println "shape {}: shrink-wrapped entry still builds the frame (0x{:x})" shape word)
+          (set! failures (+ failures 1)))
+        (when (and (not shrink) (not (frame-entry? word)))
+          (println "shape {}: reference entry has no frame (0x{:x})" shape word)
+          (set! failures (+ failures 1)))
+        (match (link/compose [code leaf] a)
+          (Err [message] (panic "compose: {}" message))
+          (Ok [module]
+              (let [(mut module) module]
+                (match (jit/map-image (.image module) a)
+                  (Err [message] (panic "map: {}" message))
+                  (Ok [loaded]
+                      (let [(mut loaded) loaded
+                            index (match (image/find-symbol (.image module) "_sw_entry")
+                                    (Some [id] id) (None [] (panic "entry symbol")))
+                            function (primitive/cast (fnptr (cc/C) [i64] i64)
+                                       (primitive/cast (ptr u8)
+                                         (get (.addresses loaded) (cast i64 index))))]
+                        (for x [(: 0 i64) 1 2 5 99 100 101 1000 -7]
+                          (let [got (function x) want (model shape x)]
+                            (unless (= got want)
+                              (println "shape {} shrink {} x {}: got {} want {}" shape shrink x got want)
+                              (set! failures (+ failures 1)))))
+                        (jit/release-image! (mut loaded)))))
+                (link/release! (mut module)))))
+        (image/release! (mut code)) (image/release! (mut leaf))
+        (free! (mut roots)) (free! (mut slow-roots)) (g/release! (mut graph))))
+    (g/release! (mut slow))
+    failures))
+
+(defn main [] (-> i32)
+  (let [(mut failures) (: 0 i64)]
+    (for shape [(: 0 i32) 1 2 3 4 5]
+      (set! failures (+ failures (check-shape shape))))
+    (println "shrink-wrap: {} failures" failures)
+    (if (= failures 0) 0 1)))

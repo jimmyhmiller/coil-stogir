@@ -49,7 +49,10 @@
 
 ;;; Small-callee policy for a loop-scoped exemption of N cells.
 (defn small-loop [(budget i32) (cells i32) (anywhere bool)] (-> inlining/Policy)
-  (inlining/Policy :budget budget :small-cells cells :small-anywhere anywhere
+  (small-policy budget cells anywhere false))
+
+(defn small-policy [(budget i32) (cells i32) (anywhere bool) (leaf bool)] (-> inlining/Policy)
+  (inlining/Policy :budget budget :small-cells cells :small-anywhere anywhere :small-leaf leaf
                    :indirect-calls false :pair-result-calls false :honor-always false))
 
 ;;; A one-cell leaf called twice inside a loop and twice before it, with a
@@ -115,6 +118,10 @@
             (set! failures (+ failures (expansion-failures registry caller entry result sites
                                                            (small-loop 1 40 true)
                                                            4 calls [false false false false])))
+            ; A call-free callee keeps the exemption under small-leaf.
+            (set! failures (+ failures (expansion-failures registry caller entry result sites
+                                                           (small-policy 1 40 true true)
+                                                           4 calls [false false false false])))
             (for policy [(inlining/default-policy 0) (small-loop 0 40 false) (small-loop 0 40 true)]
               (set! failures (+ failures (expansion-failures registry caller entry result sites
                                                              policy 0 calls [true true true true]))))))
@@ -131,7 +138,7 @@
                        (inlining/RegisteredSite :reference hot1 :callee handle)
                        (inlining/RegisteredSite :reference hot2 :callee handle)]
                 calls [cold1 cold2 hot1 hot2]
-                honor (inlining/Policy :budget 1 :small-cells 0 :small-anywhere false
+                honor (inlining/Policy :budget 1 :small-cells 0 :small-anywhere false :small-leaf false
                                        :indirect-calls false :pair-result-calls false
                                        :honor-always true)]
             (set! failures (+ failures (expansion-failures registry caller entry result sites
@@ -142,6 +149,33 @@
             (set! failures (+ failures (expansion-failures registry caller entry result sites
                                                            (inlining/with-budget honor 0)
                                                            0 calls [true true true true]))))))
+    ; A small callee that itself calls _small_leaf: uncharged under the plain
+    ; exemption, but under small-leaf it is charged like any site, so a
+    ; one-cell budget admits only the first loop site, as with no exemption.
+    (let [(mut wrapper) (g/create a)
+          wstart (require (b/emit! (mut wrapper) 104 0 [(: 0 i32)]))
+          wparam (require (b/emit! (mut wrapper) 71 5 [wstart (: 0 i32) 0]))
+          wfunction (require (symbols/function! (mut wrapper) "_small_leaf" 0))
+          _ (require (calls/function! (mut wrapper) signature a))
+          wcall (require (calls/emit! (mut wrapper) signature wstart wfunction [wparam] a))
+          wreturned (require (b/emit! (mut wrapper) 120 5 [wcall wcall (: 0 i32)]))]
+      (match (inlining/register! (mut registry)
+               (inlining/Callee :name "_small_leaf" :graph wrapper :entry wstart
+                                :roots [wreturned] :observed [wreturned] :never false :always false))
+        (Err [message] (panic "register wrapper: {}" message))
+        (Ok [handle]
+            (let [sites [(inlining/RegisteredSite :reference cold1 :callee handle)
+                         (inlining/RegisteredSite :reference cold2 :callee handle)
+                         (inlining/RegisteredSite :reference hot1 :callee handle)
+                         (inlining/RegisteredSite :reference hot2 :callee handle)]
+                  calls [cold1 cold2 hot1 hot2]]
+              (set! failures (+ failures (expansion-failures registry caller entry result sites
+                                                             (small-policy 1 40 true false)
+                                                             4 calls [false false false false])))
+              (set! failures (+ failures (expansion-failures registry caller entry result sites
+                                                             (small-policy 1 40 true true)
+                                                             1 calls [true true false true]))))))
+      (g/release! (mut wrapper)))
     (inlining/registry-release! (mut registry))
     (calls/release! (mut signature))
     (g/release! (mut caller)) (g/release! (mut leaf))
