@@ -2,7 +2,21 @@
 
 Updated November 7, 2026. **Both goals are still unmet.** This document describes where things stand and the plan for meeting them. Earlier session logs are in git history (this file at `171fa16` and before) and in the `coil-stogir` pad.
 
-## November 7 afternoon session (in progress)
+## November 7 evening (latest)
+
+Library `feature/branch-fusion` at `4b4eda0`; Coil `stogir/branch-fusion` at `1c8c3100` vendors it (quick FAST passes; Stogir-only bootstrap reproduces the seed object). Nothing installed or pushed.
+
+**Status.** Full bootstrap (`bootstrap.py`, with LLVM rows) at `37f4a55`/`79cc79f1`: seed generation **Stogir 7.296 s vs LLVM 36.10 s = 4.95×** (goal 5×; need ≤ ~7.22 s). Runtime: matched hosts ~61.5B vs ~46B cycles (**~1.34×**); the bootstrap's native rows show 8.80 s vs 7.08 s generation work (1.24×). Goal ≤ 1.10×.
+
+**Generation commits (all byte-identical except where noted):** disjoint register reservations from an advancing cursor (`9fe1d77`, −1.7%); pressure scans limited to the value's class mask (`cffc350`); fixed-use event sort by register buckets + merge sort (`1d2814a`); structure verified once in schedule preparation (`41311d9`); SCCP proofs carried into code generation, with owned/image SCCP compacting before final validation so 98% of functions reach the backend with a matching proof (`1824cb9`; compacted templates change inline-budget outcomes, matched hosts same cycles and identical outputs); four-lane content hash (`37f4a55`).
+
+**Bug found and fixed (`4b4eda0`).** `bbd9683` emitted SEXT of a signed load as a 64-bit copy; after a W move of the I32 value (e.g. into a callee-saved register at a split), bits 32-63 were zero. Now the copy is used only in the value's original, unsplit allocation part. sext-load has a regression case. It surfaced through a CSE experiment that changed inlining in `graph.contains?`/`lookup`; found by hash-gated bisection over SCCP graphs and lldb.
+
+**Measured and rejected this evening:** Euler-interval dominance in GCM placement (no gain); single-decode `uses.build` (no gain); multiply by (2^k+1)·2^m as shift-adds, fused into ADD/SUB (neutral to slightly worse on Apple cores: shifted adds are not cheaper than `mul`); global CSE of pure nodes (9% of pure nodes were duplicates, but +0.7B instructions and +0.5B cycles, likely longer live ranges and changed inlining, and +1.5% generation).
+
+**Where the runtime gap is (unbiased `tsprof`, same source).** Functions present in both hosts take *fewer* samples under Stogir (0.89×); the gap is in functions LLVM inlined away (39K of 94K Stogir samples). Call overhead (prologue/epilogue/argument setup) is ~17% of the gap. Stack loads are the largest bucket (+24% of the gap). Of hot stack loads, the biggest class is reads of address-taken stack objects (5,972 samples), larger than spill reloads (3,636) or callee-saved restores (3,182). A clear instance: calls returning `Option`/`Result` in x0/x1 (call-results kind 1) store the pieces into a stack place and immediately reload them (`scratch.bump`). **Next step:** make kind-1 call result pieces SSA values followed by explicit stores to the place, so load forwarding and mem2ssa remove the round trip.
+
+## November 7 afternoon session (superseded by the evening section)
 
 Library `feature/branch-fusion` is now at `73ed968` (plus earlier commits listed below); Coil `stogir/branch-fusion` at `60af4293` vendors it through `5b9fe69`-era work (later library commits are not yet vendored). Nothing installed or pushed.
 
