@@ -1,0 +1,99 @@
+(module stogir.tests.nested-address)
+(import "stogir.graph" :as g)
+(import "stogir.a64.address" :as address)
+(import "stogir.builder" :as b)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+;;; word ADD of a constant, as Coil lowers a field address: BITCAST, ADD, BITCAST.
+(defn field! [(graph (mut g/Graph)) (base i32) (offset u64) (commute bool)] (-> i32)
+  (let [delta (require (b/scalar-constant! (mut graph) 5 offset 8))
+        word (require (b/emit! (mut graph) 36 5 [base]))
+        sum (require (b/emit! (mut graph) 26 5 (if commute [delta word] [word delta])))]
+    (require (b/emit! (mut graph) 36 6 [sum]))))
+
+;;; A nested field address ADD(ADD(p, C1), C2) selects [p, #C1+C2]; the walk
+;;; stops at the last level whose accumulated offset is still encodable.
+(defn selection-check [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        base (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        inner (field! (mut graph) base 8 false)
+        outer (field! (mut graph) inner 16 true)
+        deep (field! (mut graph) outer 32 false)
+        far (field! (mut graph) inner 32760 false)
+        (mut failures) 0]
+    (match (address/select graph outer 8)
+      (None [] (do (println "nested address not selected") (set! failures (+ failures 1))))
+      (Some [chosen]
+            (unless (and (= (.base chosen) base) (= (.offset chosen) 24))
+              (println "nested address base {} offset {}" (.base chosen) (.offset chosen))
+              (set! failures (+ failures 1)))))
+    (match (address/select graph deep 8)
+      (None [] (do (println "three-level address not selected") (set! failures (+ failures 1))))
+      (Some [chosen]
+            (unless (and (= (.base chosen) base) (= (.offset chosen) 56))
+              (println "three-level address base {} offset {}" (.base chosen) (.offset chosen))
+              (set! failures (+ failures 1)))))
+    ; 8 + 32760 is not an encodable 8-byte offset; keep the inner address as base.
+    (match (address/select graph far 8)
+      (None [] (do (println "far address not selected") (set! failures (+ failures 1))))
+      (Some [chosen]
+            (when (or (= (.base chosen) base) (!= (.offset chosen) 32760))
+              (println "far address base {} offset {}" (.base chosen) (.offset chosen))
+              (set! failures (+ failures 1)))))
+    (g/release! (mut graph))
+    failures))
+
+;;; Execute loads through nested addresses, one of whose inner addresses is
+;;; also used directly, so the shared inner ADD stays live while each load
+;;; folds its full offset.
+(defn execution-check [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        base (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        inner (field! (mut graph) base 8 false)
+        outer (field! (mut graph) inner 16 false)
+        other (field! (mut graph) inner 24 true)
+        first (require (b/emit! (mut graph) 91 5 [start outer]))
+        second (require (b/emit! (mut graph) 91 5 [first other]))
+        third (require (b/emit! (mut graph) 91 5 [second inner]))
+        sum (require (b/emit! (mut graph) 26 5 [first second]))
+        total (require (b/emit! (mut graph) 26 5 [sum third]))
+        ret (require (b/emit! (mut graph) 120 5 [third total (: 0 i32)]))
+        (mut failures) 0]
+    (match (compile/text graph start [ret] a)
+      (Err [message] (do (println "compile: {}" message) (set! failures (+ failures 1))))
+      (Ok [text]
+          (let [(mut text) text]
+            (match (jit/map-text (slice text))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [mapped]
+                  (let [(mut mapped) mapped
+                        f (p/cast (fnptr (cc/C) [(ptr u64)] u64) (.base mapped))
+                        (mut cells) (ArrayList::new [u64] a)]
+                    (for [i 0 8] (push! (mut cells) (+ (* (cast u64 i) 1000) 7)))
+                    ; inner = +8 (cell 1), outer = +24 (cell 3), other = +32 (cell 4)
+                    (unless (= (call-ptr f (.data cells)) (: 8021 u64))
+                      (println "nested loads returned {}" (call-ptr f (.data cells)))
+                      (set! failures (+ failures 1)))
+                    (free! (mut cells))
+                    (jit/release! (mut mapped)))))
+            (free! (mut text)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i32)
+  (let [failures (+ (selection-check) (execution-check))]
+    (println "nested address checks: {} failures" failures)
+    (if (= failures 0) 0 1)))
