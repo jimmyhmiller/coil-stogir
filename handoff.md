@@ -1,39 +1,36 @@
 # Coil Stogir performance handoff
 
-Updated November 8, 2026. **The generation goal is met in two consecutive bootstraps; the runtime goal is not.** This document describes where things stand and the plan for meeting them. Earlier session logs are in git history (this file at `171fa16` and before) and in the `coil-stogir` pad.
+Updated November 8, 2026. **The generation goal is met (5.09×, 5.25×, 5.31× in whole bootstraps); the runtime goal is not (~1.31×).** This document describes where things stand and the plan for meeting them. Earlier session logs are in git history (this file at `171fa16` and before) and in the `coil-stogir` pad.
 
 ## November 8 early morning (latest)
 
-Library `feature/branch-fusion` at `2883e06`; Coil `stogir/branch-fusion` at `9b181527` vendors it (quick FAST passes; every bootstrap host reproduces the seed object). Nothing installed or pushed. Full FAST has not been run.
+Library `feature/branch-fusion` at `4589058`; Coil `stogir/branch-fusion` at `892641a2` vendors it (quick FAST passes at every vendoring; every bootstrap host reproduces the seed object; full library suite at `b7d5d00` shows only the two pre-existing failures plus link-flag tests). Nothing installed or pushed. Full FAST has not been run.
 
-**Generation goal: met in two consecutive full bootstraps** at Coil `59e44c0e` (results in Coil `docs/benchmarks/branch-fusion/bootstrap-run-{3,4}.json`): Stogir 6.857 s vs LLVM 34.876 s (**5.09×**) and 6.851 s vs 35.965 s (**5.25×**). The margin is a few percent; any change that adds generation work must be paid for.
+**Generation goal: met.** Whole bootstraps (Coil `docs/benchmarks/branch-fusion/bootstrap-run-*.json`): `59e44c0e` 5.09× and 5.25×; `d1efe960` **5.31×** (6.734 s vs 35.751 s). One run at `d1efe960` under host load measured 4.54× (`bootstrap-run-5-loaded.json`, LLVM also slow); repeat any run taken at load above ~10. Margin is a few percent: anything that adds generation work must be paid for.
 
-**Runtime goal: not met.** Matched hosts about 58.5B vs 43.7B cycles (~1.34×); bootstrap native rows 18.66/14.12 s and 18.56/13.99 s wall (1.32×, 1.33×). Down from 1.39× at the start of this session (60.65B vs 43.67B at Coil `d7ba41ed`).
+**Runtime goal: not met.** Matched hosts ~57.3B vs ~43.7B cycles (~1.31×); bootstrap native rows 1.29–1.37× wall depending on load. From 1.39× (60.65B vs 43.67B) at the start of this session.
 
-**Runtime commits this session (matched hosts):**
-- `68d4d0c` a value whose free register ends at a call inside a loop splits at the loop entry (bounded by fixed-register uses only) instead of at the call, so it takes a preserved register for the whole loop: cycles −1.8% min / −2.4% median.
-- `40d3f6b` zero-count shifts (a multiply by a size resolving to one) emit as their source; no `lsr x, x, #0` before memcmp.
-- `c295be4` nested constant field offsets `ADD(ADD(p,C1),C2)` fold into one address. With Coil marking memcmp/bcmp/memchr/strlen/strcmp/strncmp calls PURE_FUNC: instructions −3.2%, cycles −1.5% min.
-- `8287af0` canonical spill homes also in functions with stack scopes: cycles −0.6/−0.8%.
-- `c5f9979` literal-zero sources read XZR; CSET booleans return without UBFX: instructions −0.2%, cycles neutral.
+**Runtime commits (matched hosts):**
+- `68d4d0c` loop-entry split for values crossing a call in a loop: cycles −1.8% min / −2.4% median.
+- `40d3f6b` zero-count shifts emit as source; `c295be4` nested constant field offsets fold into one address; Coil marks memcmp/bcmp/memchr/strlen/strcmp/strncmp PURE_FUNC: together instructions −3.2%, cycles −1.5% min.
+- `8287af0` spill homes in functions with stack scopes: cycles −0.6/−0.8%.
+- `c5f9979` XZR zero sources, CSET booleans returned unextended; `196a155` native tail jumps get no frame record (indirect target in a reserved x15); `b789424` frame record stored/reloaded with SP writeback. Each cuts instructions (−0.2% to −0.85%) with cycles within noise.
 
-**Generation commits (identical objects):** `ae86cab` range intersections start after the query position (−1.1/−1.4%); `fb7c6e9` inline callee registration skips re-validating proven content (the adapter passes each definition's digest; −1.4/−2.6%); `2883e06` graph/opcode accessors `:inline (Always)` (−1.3 to −2.5%).
+**Generation commits (identical objects unless noted):** `ae86cab` range intersection from the query position (−1.1/−1.4%); `fb7c6e9` `register-proven!` skips re-validating proven callee content (adapter passes each definition's digest; −1.4/−2.6%); `2883e06` and `ed893f6` graph/opcode/type accessors `:inline (Always)` (−1.3% to −2.5%, −0.5/−1.1%); `cb9d1c2` faster `uses/build` (−0.4/−1.0%); `765ca29` emission borrows the schedule's use lists (−0.2/−0.5%).
 
-**Measured and rejected (branches kept in the library):**
-- `experiment/extension-compare-on-fusion`: cherry-picked extension-comparison narrowing; neutral cycles, +1.2% generation.
-- `experiment/loop-memory`: load forwarding and header-load hoisting across natural loops that write no memory; −0.24% instructions, cycles neutral, +3.8% generation (CFG/dominators per function).
-- `experiment/indirect-inline`: inlining callees with indirect calls is neutral; also allowing register-pair call results costs +15% generation and +1.9% host instructions.
-- `experiment/small-callee-inline`: callees of ≤40 cells inline without charging the caller budget: **cycles −2.1/−2.5%, but generation +6.4%** (32 cells: −0.6/−1.6%, +4.3%; 24: −1.1/+0.4%, +2.1%). Revisit once generation has margin to spend; needs the adapter to clamp its per-definition budget at zero and two tests updated.
-- Inline budget 1024: −0.6% cycles, +19% generation (re-measured).
+**Reverted or rejected (library branches kept):**
+- Small-callee inlining at loop call sites (`b7d5d00`, reverted in `4589058`): **cycles −1.5% min / −2.6% median, instructions −1.8%, but generation +2.5%**, which put bootstraps at 5.01× and 4.89×. The unrestricted version (`experiment/small-callee-inline`) was −2.1/−2.5% cycles for +6.4% generation. Re-apply `b7d5d00` (and the adapter's budget clamp at zero) once generation has ~3% margin.
+- `experiment/extension-compare-on-fusion` (neutral, +1.2% gen); `experiment/loop-memory` (load forwarding/hoisting across no-write loops: −0.24% ins, +3.8% gen); `experiment/indirect-inline` (neutral; with pair results +15% gen); inline budget 1024 (−0.6% cycles, +19% gen); compaction micro-tuning (no effect).
+- Observation: instruction-count cuts alone rarely move cycles on these cores. Cycle wins came from the allocator (loop-entry splits, spill homes) and from fewer memory operations.
 
-**Where the runtime gap is now (unbiased profiles).** Gap by instruction role: non-stack loads +27%, frame setup/teardown +21%, register moves +15%, spill reloads +11%, compares +11%, extensions +7%. Frame code is 11.2% of Stogir samples vs 8.2% for LLVM; the top functions are allocator wrappers (`sized-alloc`, `sized-resize`, `sized-reallocate`, `sized-free`, `raw-alloc`, `ScratchArena$allocate`, `bump`), `sx-items`, `code-node-parts`, `sccp-phi.input`, `KeyOps$hash` and `Eq$slice<u8>$=` (94% of its time in frame code). By subsystem, `compiler.resolve` is the largest gap (13.5K vs 8.1K samples): AVec scans with string equality where LLVM keeps the AVec header in registers and removes bounds checks.
+**Where the runtime gap is now.** By role: non-stack loads +27% of the gap, frame code +21%, register moves +15%, spill reloads +11%, compares +11%, extensions +7%. Frame code is 11% of Stogir samples vs 8% for LLVM: allocator wrappers (`sized-alloc`, `sized-resize`, `sized-reallocate`, `sized-free`, `raw-alloc`, `ScratchArena$allocate`, `bump`), `sx-items`, `code-node-parts`, `sccp-phi.input`, `Eq$slice<u8>$=`. `compiler.resolve` is the largest subsystem gap (AVec scans with string compares).
 
 **Next, ranked:**
-1. Shrink-wrapping: emit the prologue on edges leaving a frame-free entry region (`Eq$slice` length mismatch, `push!` fast path, `sized-alloc` count 0). Needs the emitter to place prologue code on edges and frameless returns, and must not duplicate return tails across the boundary.
-2. Splitting around cold calls in the allocator, so fast paths stay in caller-saved registers (`bump` moves arena/request into x19/x20 only for its rare observer call) and PHI webs are not spilled by a cold path (`sx-items` stores its result to a frame slot twice on the fast path).
-3. Frameless indirect tail calls: `KeyOps$hash`/`eq` keep a frame record only because the tail-call sequence parks the target in x30; ~0.5%.
-4. Tail calls for register-pair (Option/Result) results: 3,428 call+epilogue sequences in tail position, 1.1% of samples.
-5. Buy back generation (e.g. sharing use lists between schedule preparation and emission) and then adopt small-callee inlining.
+1. Buy ~3% generation (candidates: per-callee caching of `eligible?`'s callee scan and `closed-control?`, which rescan the callee at every site; SCCP's input duplicate for diffing; cheaper `pressure-class-into!` reservation queries), then re-apply `b7d5d00`.
+2. Shrink-wrapping: prologue on edges leaving a frame-free entry region (`Eq$slice` length mismatch, `push!` fast path).
+3. Allocator: split around cold calls so fast paths stay in caller-saved registers (`bump`), and keep cold paths from spilling PHI webs used by fast paths (`sx-items` stores its result to a frame slot twice).
+4. Tail calls for register-pair (Option/Result) results: 3,428 call+epilogue sequences in tail position, ~1.1% of samples.
+5. Spill/reload placement in high-pressure loops (`resolve-use` reloads values it does not use inside its inner loop).
 
 ## November 7 evening (latest)
 
