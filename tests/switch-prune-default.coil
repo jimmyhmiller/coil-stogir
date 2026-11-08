@@ -1,0 +1,101 @@
+(module stogir.tests.switch-prune-default)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+;;; f(x) = 10 + 7 * case(x) for x in the cases; the default is UNREACHABLE.
+;;; Cases: 0, 1 (two-way) or 0, 1 and the range 5..9 (three-way).
+(defn dispatch [(three bool) (a (dyn Allocator))] (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        five (require (b/scalar-constant! (mut graph) 11 5 8))
+        nine (require (b/scalar-constant! (mut graph) 11 9 8))
+        r0 (require (b/scalar-constant! (mut graph) 11 10 8))
+        r1 (require (b/scalar-constant! (mut graph) 11 17 8))
+        r2 (require (b/scalar-constant! (mut graph) 11 24 8))
+        selector (require (b/emit! (mut graph) 117 0 [start x]))
+        case0 (require (b/emit! (mut graph) 109 0 [selector zero (: 0 i32)]))
+        case1 (require (b/emit! (mut graph) 109 0 [selector one (: 0 i32)]))
+        other (require (b/emit! (mut graph) 111 0 [selector (: 0 i32)]))
+        (mut signature) (match (calls/create 0 11 [(: 11 u8)] a)
+                          (Err [message] (panic "{}" message)) (Ok [s] s))]
+    (require (calls/function! (mut graph) signature a))
+    (calls/release! (mut signature))
+    (require (b/emit! (mut graph) 120 11 [case0 r0 (: 0 i32)]))
+    (require (b/emit! (mut graph) 120 11 [case1 r1 (: 0 i32)]))
+    (when three
+      (let [ranged (require (b/emit! (mut graph) 110 0 [selector five nine]))]
+        (require (b/emit! (mut graph) 120 11 [ranged r2 (: 0 i32)]))))
+    (require (b/emit! (mut graph) 121 0 [other (: 0 i32) (: 0 i32)]))
+    graph))
+
+(defn roots [(graph g/Graph) (a (dyn Allocator))] (-> (ArrayList i32))
+  (let [(mut out) (ArrayList::new [i32] a) (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (let [opcode (& (.header (get (.instructions graph) r)) 255)]
+        (when (or (= opcode 120) (= opcode 121)) (push! (mut out) (cast i32 r))))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    out))
+
+(defn check [(three bool)] (-> i64)
+  (let [a (malloc-allocator) (mut failures) (: 0 i64) (mut sizes) [(: 0 i64) 0]]
+    (for [mode 0 2]
+      (let [prune (= mode 1)
+            (mut graph) (dispatch three a)
+            (mut exits) (roots graph a)]
+        (match (compile/image-with-private graph 1 (slice exits) "_sp_entry" (options/Options :level 1) a
+                                           (private/with-prune-default (private/no-context) prune))
+          (Err [message] (panic "compile: {}" message))
+          (Ok [code]
+              (let [(mut code) code]
+                (set! (mut sizes) mode (len (.text code)))
+                (match (link/compose [code] a)
+                  (Err [message] (panic "compose: {}" message))
+                  (Ok [module]
+                      (let [(mut module) module]
+                        (match (jit/map-image (.image module) a)
+                          (Err [message] (panic "map: {}" message))
+                          (Ok [loaded]
+                              (let [(mut loaded) loaded
+                                    index (match (image/find-symbol (.image module) "_sp_entry")
+                                            (Some [id] id) (None [] (panic "symbol")))
+                                    function (primitive/cast (fnptr (cc/C) [i64] i64)
+                                               (primitive/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))]
+                                (for x [(: 0 i64) 1 5 7 9]
+                                  (when (or three (< x 2))
+                                    (let [want (cond (= x 0) 10 (= x 1) 17 :else 24)
+                                          got (function x)]
+                                      (unless (= got want)
+                                        (println "three {} prune {} x {}: got {} want {}" three prune x got want)
+                                        (set! failures (+ failures 1))))))
+                                (jit/release-image! (mut loaded)))))
+                        (link/release! (mut module)))))
+                (image/release! (mut code)))))
+        (free! (mut exits)) (g/release! (mut graph))))
+    ; The pruned dispatch drops one comparison and its branch.
+    (unless (< (get sizes 1) (get sizes 0))
+      (println "three {}: pruned {} bytes, original {}" three (get sizes 1) (get sizes 0))
+      (set! failures (+ failures 1)))
+    failures))
+
+(defn main [] (-> i32)
+  (let [failures (+ (check false) (check true))]
+    (println "switch prune default: {} failures" failures)
+    (if (= failures 0) 0 1)))
