@@ -1,0 +1,125 @@
+(module stogir.tests.small-loop-inline)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.symbols" :as symbols)
+(import "stogir.call-inline" :as inlining)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+;;; Whether reference R of GRAPH is still a CALL.
+(defn call? [(graph g/Graph) (r i32)] (-> bool)
+  (= (n/opcode (get (.instructions graph) (cast i64 r))) 79))
+
+;;; Check one prioritized expansion under POLICY: the number of inlined sites
+;;; and which of the four call references stayed CALLs.
+(defn expansion-failures [(registry inlining/Registry) (caller g/Graph) (entry i32)
+                          (result i32) (sites (slice inlining/RegisteredSite))
+                          (policy inlining/Policy) (expected i32) (calls (slice i32))
+                          (stays (slice bool))] (-> i64)
+  (let [a (malloc-allocator) (mut failures) 0 budget (.budget policy)]
+    (match (inlining/optimize-registered-prioritized-policy
+             registry caller entry [result] sites policy a)
+      (Err [message] (panic "expansion: {}" message))
+      (Ok [maybe]
+          (match maybe
+            (None [] (when (!= expected 0)
+                       (println "budget {}: nothing inlined" budget)
+                       (set! failures (+ failures 1))))
+            (Some [owned]
+                  (let [(mut expanded) owned graph (.graph expanded)]
+                    (unless (= (.changes expanded) expected)
+                      (println "budget {}: changes {}" budget (.changes expanded))
+                      (set! failures (+ failures 1)))
+                    (for [i 0 (len calls)]
+                      (unless (= (call? graph (get calls i)) (get stays i))
+                        (println "budget {}: site {} CALL {}" budget i (call? graph (get calls i)))
+                        (set! failures (+ failures 1))))
+                    (match (rewrite/validate graph 8 a)
+                      (Err [message] (do (println "invalid result: {}" message)
+                                         (set! failures (+ failures 1))))
+                      (Ok [_] 0))
+                    (rewrite/release! (mut expanded)))))))
+    failures))
+
+;;; Small-callee policy for a loop-scoped exemption of N cells.
+(defn small-loop [(budget i32) (cells i32) (anywhere bool)] (-> inlining/Policy)
+  (inlining/Policy :budget budget :small-cells cells :small-anywhere anywhere
+                   :indirect-calls false :pair-result-calls false))
+
+;;; A one-cell leaf called twice inside a loop and twice before it, with a
+;;; caller budget of exactly one leaf. By default the budget admits one site,
+;;; and loop priority picks the first loop call. With the loop-scoped
+;;; small-callee exemption, loop calls are not charged, so both loop calls and
+;;; one earlier call inline; the second earlier call is still refused by the
+;;; budget. The unscoped exemption inlines all four. A zero budget inlines none.
+(defn main [] (-> i32)
+  (let [a (malloc-allocator) (mut leaf) (g/create a) (mut caller) (g/create a)
+        start (require (b/emit! (mut leaf) 104 0 [(: 0 i32)]))
+        param (require (b/emit! (mut leaf) 71 5 [start (: 0 i32) 0]))
+        three (require (b/scalar-constant! (mut leaf) 5 3 8))
+        answer (require (b/emit! (mut leaf) 26 5 [param three]))
+        returned (require (b/emit! (mut leaf) 120 5 [start answer (: 0 i32)]))
+        entry (require (b/emit! (mut caller) 104 0 [(: 0 i32)]))
+        input (require (b/emit! (mut caller) 71 5 [entry (: 0 i32) 0]))
+        function (require (symbols/function! (mut caller) "_small_leaf" 0))
+        (mut signature) (match (calls/create 0 5 [(: 5 u8)] a)
+                          (Err [message] (panic "signature: {}" message))
+                          (Ok [owned] owned))
+        _ (require (calls/function! (mut leaf) signature a))
+        _ (require (calls/function! (mut caller) signature a))
+        cold1 (require (calls/emit! (mut caller) signature entry function [input] a))
+        cold2 (require (calls/emit! (mut caller) signature cold1 function [cold1] a))
+        zero (require (b/scalar-constant! (mut caller) 5 0 8))
+        one (require (b/scalar-constant! (mut caller) 5 1 8))
+        limit (require (b/scalar-constant! (mut caller) 5 3 8))
+        enter (require (b/emit! (mut caller) 114 0 [cold2]))
+        loop (require (b/loop-begin! (mut caller) enter))
+        index (require (b/loop-phi! (mut caller) loop zero))
+        sum (require (b/loop-phi! (mut caller) loop cold2))
+        condition (require (b/emit! (mut caller) 16 1 [index limit]))
+        split (require (b/emit! (mut caller) 116 0 [loop condition]))
+        body (require (b/emit! (mut caller) 107 0 [split (: 0 i32)]))
+        done (require (b/emit! (mut caller) 108 0 [split (: 0 i32)]))
+        hot1 (require (calls/emit! (mut caller) signature body function [sum] a))
+        hot2 (require (calls/emit! (mut caller) signature hot1 function [hot1] a))
+        next (require (b/emit! (mut caller) 26 5 [index one]))
+        back (require (b/emit! (mut caller) 115 0 [hot2]))
+        result (require (b/emit! (mut caller) 120 5 [done sum (: 0 i32)]))
+        (mut registry) (inlining/registry-create 8 a)
+        (mut failures) 0]
+    (require (b/patch! (mut caller) loop 2 back))
+    (require (b/patch! (mut caller) index 3 next))
+    (require (b/patch! (mut caller) sum 3 hot2))
+    (match (inlining/register! (mut registry)
+             (inlining/Callee :name "_small_leaf" :graph leaf :entry start
+                              :roots [returned] :observed [returned] :never false))
+      (Err [message] (panic "register: {}" message))
+      (Ok [handle]
+          (let [sites [(inlining/RegisteredSite :reference cold1 :callee handle)
+                       (inlining/RegisteredSite :reference cold2 :callee handle)
+                       (inlining/RegisteredSite :reference hot1 :callee handle)
+                       (inlining/RegisteredSite :reference hot2 :callee handle)]
+                calls [cold1 cold2 hot1 hot2]]
+            (set! failures (+ failures (expansion-failures registry caller entry result sites
+                                                           (inlining/default-policy 1)
+                                                           1 calls [true true false true])))
+            (set! failures (+ failures (expansion-failures registry caller entry result sites
+                                                           (small-loop 1 40 false)
+                                                           3 calls [false true false false])))
+            (set! failures (+ failures (expansion-failures registry caller entry result sites
+                                                           (small-loop 1 40 true)
+                                                           4 calls [false false false false])))
+            (for policy [(inlining/default-policy 0) (small-loop 0 40 false) (small-loop 0 40 true)]
+              (set! failures (+ failures (expansion-failures registry caller entry result sites
+                                                             policy 0 calls [true true true true])))))))
+    (inlining/registry-release! (mut registry))
+    (calls/release! (mut signature))
+    (g/release! (mut caller)) (g/release! (mut leaf))
+    (println "small loop callees: {} failures" failures)
+    (if (= failures 0) 0 1)))
