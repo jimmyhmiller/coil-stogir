@@ -42,10 +42,13 @@
                             (b/emit! (mut graph) 81 6 [start size (: 0 i32)])
                             (b/frame-object! (mut graph) start size 16)))
         offset (require (b/scalar-constant! (mut graph) 5 8 8))
-        second (if (= mode 7) (: 0 i32) (require (b/emit! (mut graph) 26 6 [buffer offset])))
+        ; Mode 12: a two-piece result whose second piece nothing addresses.
+        one-read (or (= mode 7) (= mode 12))
+        second (if one-read (: 0 i32) (require (b/emit! (mut graph) 26 6 [buffer offset])))
         piece-count (if (= mode 7) (: 1 i32) (: 2 i32))
         piece-type (if (= mode 8) (: 11 u8) (: 5 u8))
-        selected? (or (< mode 2) (= mode 7) (= mode 8))
+        selected? (or (< mode 2) (= mode 7) (= mode 8) (= mode 12))
+        projected (if one-read (: 1 i64) (cast i64 piece-count))
         (mut call) (: 0 i32) (mut first) (: 0 i32) (mut last) (: 0 i32)
         (mut control) buffer (mut saved) (ArrayList::new [i32] a)]
     ; Many independent values live across both calls exercise spills/splits.
@@ -70,7 +73,7 @@
                                    [(if (= mode 11)
                                         (require (b/emit! (mut graph) 93 0 [call destination x])) call)
                                     (if (= mode 1) second buffer)])))
-    (set! last (if (= mode 7) first
+    (set! last (if one-read first
                    (require (b/emit! (mut graph) 91 (cast i32 piece-type)
                                      [first (if (= mode 1) buffer second)]))))
     (set! control last)
@@ -105,8 +108,8 @@
                   (Ok [owned]
                       (let [(mut plan) owned
                             outputs (machine/output-range (.operands plan) call)]
-                        (assert (= (.count outputs) (if selected? (cast i64 piece-count) 0)))
-                        (assert (= (machine/definition-count (.operands plan) call) (if selected? (cast i64 piece-count) 0)))
+                        (assert (= (.count outputs) (if selected? projected 0)))
+                        (assert (= (machine/definition-count (.operands plan) call) (if selected? projected 0)))
                         (assert (= (machine/definition-count (.operands plan) first) (if selected? 0 1)))
                         (assert (= (machine/defining-reference (.operands plan) last) (if selected? call last)))
                         (assert (= (get (.omitted (.operands plan)) (cast i64 first)) selected?))
@@ -135,7 +138,7 @@
                               (Err [e] (panic "{}" e))
                               (Ok [owned]
                                   (let [(mut req) owned]
-                                    (for [piece 0 (cast i64 piece-count)]
+                                    (for [piece 0 projected]
                                       (let [output (machine/definition-at (.operands plan) call piece)
                                             (mut found) false]
                                         (for use (.uses (get req (cast i64 output)))
@@ -153,7 +156,7 @@
           (Err [e] (panic "{}" e))
           (Ok [owned]
               (let [(mut output) owned]
-                (when (and selected? (= level 3))
+                (when (and selected? (= level 3) (!= mode 12))
                   (match (macho/image-object output a)
                     (Err [e] (panic "{}" e))
                     (Ok [owned]
@@ -178,7 +181,7 @@
                             other-address (p/cast u64 (p/cast (ptr u8) (fnptr-of clobber)))]
                         (for x [(: 0 u64) 1 17 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
                           (let [pair (target x) (mut observed) (ArrayList::new [u64] a)
-                                (mut expected) (+ (.a pair) (if (= mode 7) (.a pair) (.b pair)) (clobber x))]
+                                (mut expected) (+ (.a pair) (if one-read (.a pair) (.b pair)) (clobber x))]
                             (for [i 0 36] (set! expected (+ expected (* x (cast u64 (+ i 3))))))
                             (for [i 0 40] (push! (mut observed) 0xAABBCCDDEEFF0011))
                             (for [i 0 36] (set! (mut observed) (+ i 3) (* x (cast u64 (+ i 3)))))
@@ -187,7 +190,7 @@
                             (assert (= (get observed 0) 0xAABBCCDDEEFF0011))
                             (assert (= (get observed 39) 0xAABBCCDDEEFF0011))
                             (assert (= (get observed 1) (if (= mode 1) (.b pair) (.a pair))))
-                            (assert (= (get observed 2) (if (or (= mode 1) (= mode 7)) (.a pair) (.b pair))))
+                            (assert (= (get observed 2) (if (or (= mode 1) one-read) (.a pair) (.b pair))))
                             (for [i 0 36]
                               (assert (= (get observed (+ i 3)) (* x (cast u64 (+ i 3))))))
                             (free! (mut observed))))
@@ -198,6 +201,6 @@
 
 (defn main [] (-> i64)
   (for level [(: 1 i32) 3]
-    (for [mode 0 12] (fixture (cast i32 mode) level)))
+    (for [mode 0 13] (fixture (cast i32 mode) level)))
   (println "result projection native pressure:120 answers passed, O1/O3")
   0)
