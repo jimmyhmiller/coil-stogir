@@ -1,0 +1,85 @@
+(module stogir.tests.frameless-tail)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+
+(defn word-at [(text (ArrayList u8)) (i i64)] (-> u32)
+  (| (cast u32 (get text (* i 4))) (<< (cast u32 (get text (+ (* i 4) 1))) 8)
+     (<< (cast u32 (get text (+ (* i 4) 2))) 16) (<< (cast u32 (get text (+ (* i 4) 3))) 24)))
+
+;;; STP/STR of x29 or x30 to the stack: a frame record.
+(defn frame-record? [(w u32)] (-> bool)
+  (let [pair-store (or (= (& w 0xFFC00000) 0xA9000000) (= (& w 0xFFC00000) 0xA9800000)
+                       (= (& w 0xFFC00000) 0xA8800000))
+        rt (& w 31) rt2 (& (>> w 10) 31) rn (& (>> w 5) 31)]
+    (and pair-store (= rn 31) (or (= rt 29) (= rt 30) (= rt2 29) (= rt2 30)))))
+
+;;; f(target, x) = target(x) through a pointer: an ordinary CALL whose result
+;;; is returned becomes a native tail jump. Its only call is that jump, so it
+;;; needs no frame record, and x30 must still hold its caller's return address
+;;; when it jumps (the target returns straight to f's caller).
+(defn main [] (-> i32)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        (mut failures) 0]
+    (match (calls/create 0 5 [(: 6 u8) 5] a)
+      (Err [e] (panic "{}" e))
+      (Ok [owned]
+          (let [(mut prototype) owned]
+            (require (calls/function! (mut graph) prototype a))
+            (calls/release! (mut prototype)))))
+    (match (calls/create 0 5 [(: 5 u8)] a)
+      (Err [e] (panic "{}" e))
+      (Ok [owned]
+          (let [(mut prototype) owned
+                call (require (calls/emit! (mut graph) prototype start target [x] a))
+                ret (require (b/emit! (mut graph) 120 5 [call call (: 0 i32)]))
+                (mut leaf) (ArrayList::new [u8] a)]
+            (calls/release! (mut prototype))
+            (match (encode/add-sub-immediate true false false 0 0 5)
+              (Err [e] (panic "{}" e)) (Ok [w] (bytes/append32! (mut leaf) w)))
+            (match (encode/ret 30) (Err [e] (panic "{}" e)) (Ok [w] (bytes/append32! (mut leaf) w)))
+            (match (jit/map-text (slice leaf))
+              (Err [e] (panic "{}" e))
+              (Ok [owned-leaf]
+                  (let [(mut native) owned-leaf]
+                    (match (compile/image-with-options graph start [ret] "_frameless_tail"
+                             (options/Options :level 3) a)
+                      (Err [e] (panic "{}" e))
+                      (Ok [owned-code]
+                          (let [(mut code) owned-code]
+                            (for [i 0 (/ (len (.text code)) 4)]
+                              (when (frame-record? (word-at (.text code) i))
+                                (println "frame record at word {}: {}" i (word-at (.text code) i))
+                                (set! failures (+ failures 1))))
+                            (match (jit/map-image code a)
+                              (Err [e] (panic "{}" e))
+                              (Ok [owned-image]
+                                  (let [(mut loaded) owned-image
+                                        f (p/cast (fnptr (cc/C) [u64 u64] u64) (.base (.memory loaded)))]
+                                    (for value [(: 0 u64) 1 99 0xFFFFFFFFFFFFFFF0]
+                                      (unless (= (call-ptr f (p/cast u64 (.base native)) value) (+ value 5))
+                                        (set! failures (+ failures 1))))
+                                    (jit/release-image! (mut loaded)))))
+                            (image/release! (mut code)))))
+                    (jit/release! (mut native)))))
+            (free! (mut leaf)))))
+    (g/release! (mut graph))
+    (println "frameless indirect tail jump: {} failures" failures)
+    (if (= failures 0) 0 1)))
