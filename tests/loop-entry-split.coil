@@ -1,0 +1,70 @@
+(module stogir.tests.loop-entry-split)
+(import "stogir.allocation" :as a)
+(import "stogir.allocation-check" :as verify)
+(import "stogir.split-position" :as split)
+(import "stogir.interval" :as r)
+(import "stogir.constraints" :as c)
+(import "stogir.frame" :as f)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+;;; Register of the part covering position, or -2 when none covers it.
+(defn register-at [(parts (ArrayList a/Part)) (parent i32) (position i64)] (-> i32)
+  (let [(mut found) (: -2 i32)]
+    (for part parts
+      (when (and (= (.parent part) parent) (a/covers? part position))
+        (set! found (.register part))))
+    found))
+
+;;; A value arrives in fixed register 0 (an incoming parameter), is used inside
+;;; a loop and after it, and the loop body calls a function that clobbers
+;;; registers 0 and 1. Registers 2 and 3 survive the call. The value must move
+;;; once, at the loop entry, into a surviving register for the whole loop: not
+;;; stay in register 0 until the call and move around it on every iteration.
+(defn loop-entry-check [(second-use i64)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut parts) (ArrayList::new [a/Part] allocator)
+        (mut value) (a/create 0 allocator)
+        (mut layout) (f/create allocator)
+        (mut failures) 0
+        blocks [(split/Block :start 0 :end 10 :depth 0 :header -1 :idom 0)
+                (split/Block :start 10 :end 20 :depth 1 :header 1 :idom 0)
+                (split/Block :start 20 :end 40 :depth 1 :header 1 :idom 1)
+                (split/Block :start 40 :end 50 :depth 0 :header -1 :idom 1)]]
+    (r/add! (mut (.ranges value)) 1 48)
+    (c/add! (mut (.uses value)) 1 2 0)
+    (c/add! (mut (.uses value)) 22 1 -1)
+    (c/add! (mut (.uses value)) second-use 1 -1)
+    (c/add! (mut (.uses value)) 46 1 -1)
+    (push! (mut parts) value)
+    (a/reserve! (mut parts) 0 30 31 allocator)
+    (a/reserve! (mut parts) 1 30 31 allocator)
+    (match (a/run-shaped-with-splits! (mut parts) (mut layout) 4 0xF
+             [(a/SpillShape :size 8 :alignment 8)] [] blocks allocator)
+      (Err [msg] (do (println "allocation failed: {}" msg) (set! failures (+ failures 1))))
+      (Ok [_] 0))
+    (match (verify/verify parts 4 0xF)
+      (Err [msg] (do (println "allocation invalid: {}" msg) (set! failures (+ failures 1))))
+      (Ok [_] 0))
+    (let [entry (register-at parts 0 8)
+          header (register-at parts 0 12)
+          before (register-at parts 0 22)
+          after (register-at parts 0 34)]
+      (unless (= entry 0)
+        (println "entry register {} != 0" entry) (set! failures (+ failures 1)))
+      (unless (and (= header before) (= before after) (>= before 2))
+        (println "loop registers header {} before call {} after call {}" header before after)
+        (set! failures (+ failures 1))))
+    (let [(mut i) 0]
+      (while (< i (len parts))
+        (a/release! (elem (mut parts) i))
+        (set! i (+ i 1))))
+    (free! (mut parts))
+    (f/release! (mut layout))
+    failures))
+
+(defn main [] (-> i32)
+  (let [failures (+ (loop-entry-check 36) (loop-entry-check 24))]
+    (println "loop-entry split checks: {} failures" failures)
+    (if (= failures 0) 0 1)))
