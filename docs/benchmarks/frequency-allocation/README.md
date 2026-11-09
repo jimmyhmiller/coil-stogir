@@ -1,3 +1,11 @@
+## Native regional allocation measured
+
+The [native regional allocation report](regional-native/README.md) supersedes
+the pending integration status below. The pass is implemented and validated;
+three alternating rounds show a 0.45% runtime improvement over induction,
+still 1.2677× LLVM. One serial generation observation is 227.602s versus
+induction 9.283s and LLVM 34.808s. Both targets remain unmet together.
+
 ## Regional zero-trip continuation
 
 The [regional emission and flow-frequency checkpoint](zero-trip/README.md)
