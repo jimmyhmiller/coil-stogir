@@ -1,0 +1,132 @@
+;;; Allocate independent CFG blocks and reconcile their locations with the
+;;; existing edge-transfer machinery. Incoming locations are preferences only;
+;;; every block still observes all original live ranges and fixed constraints.
+(module stogir.regional-allocation)
+(import "stogir.allocation" :as a)
+(import "stogir.allocation-check" :as check)
+(import "stogir.interval" :as range)
+(import "stogir.constraints" :as c)
+(import "stogir.frame" :as frame)
+(import "stogir.split-position" :as split)
+(import "stogir.cfg" :as cfg)
+(import "stogir.schedule" :as schedule)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err])
+
+(defstruct Edge [(from i32) (to i32)])
+
+(defn edges [(blocks cfg/Blocks) (scheduled schedule/Schedule) (regions (slice split/Block))
+              (allocator (dyn Allocator))] (-> (ArrayList Edge))
+  (let [(mut out) (ArrayList::new [Edge] allocator)]
+    (for edge (.edges blocks)
+      (let [from (split/block-at regions (* (.offset (get (.ranges scheduled) (cast i64 (.from edge)))) 2))
+            to (split/block-at regions (* (.offset (get (.ranges scheduled) (cast i64 (.to edge)))) 2))]
+        (when (and (>= from 0) (>= to 0)) (push! (mut out) (Edge :from from :to to)))))
+    out))
+
+(defn release! [(parts (mut (ArrayList a/Part)))] (-> void)
+  (for [i 0 (len parts)] (a/release! (elem (mut parts) i)))
+  (free! (mut parts)))
+
+;;; The same SSA value may have several incoming locations. Vote among already
+;;; allocated predecessors; ties prefer the lower register. Unallocated back
+;;; edges supply no guessed location. A preference never overrides a constraint.
+(defn preference [(allocated (ArrayList a/Part)) (parent i32) (block i32)
+                   (regions (slice split/Block)) (incoming (slice Edge))]
+  (-> i32)
+  (let [(mut best) (: -1 i32) (mut score) (: 0 i64)]
+    (for candidate allocated
+      (when (and (= (.parent candidate) parent) (>= (.register candidate) 0))
+        (let [reg (.register candidate) (mut votes) (: 0 i64)]
+          (for edge incoming
+            (when (= (.to edge) block)
+              (let [position (- (.end (get regions (cast i64 (.from edge)))) 1)
+                    (mut present) false]
+                (for part allocated
+                  (when (and (= (.parent part) parent) (= (.register part) reg)
+                             (a/covers? part position)) (set! present true)))
+                (when present (set! votes (+ votes 1))))))
+          (when (or (> votes score) (and (> votes 0) (= votes score) (< reg best)))
+            (set! score votes) (set! best reg)))))
+    best))
+
+;;; Intersect, do not approximate by bounding spans: lifetime holes and fixed
+;;; reservations survive. All hint indices are remapped into the local array.
+(defn clipped [(input (ArrayList a/Part)) (start i64) (end i64)
+                (allocator (dyn Allocator))] (-> (ArrayList a/Part))
+  (let [(mut out) (ArrayList::new [a/Part] allocator)
+        (mut mapping) (ArrayList::new [i32] allocator)]
+    (for part input
+      (let [(mut copy) (a/create (.parent part) allocator)]
+        (set! (.allowed copy) (.allowed part))
+        (set! (.register copy) (.register part))
+        (set! (.spill-slot copy) (.spill-slot part))
+        (set! (.preferred copy) (.preferred part))
+        (set! (.hint copy) (.hint part))
+        (set! (.hint-owner copy) (.hint-owner part))
+        (for r (.ranges part)
+          (let [low (if (> (.start r) start) (.start r) start)
+                high (if (< (.end r) end) (.end r) end)]
+            (when (< low high) (range/add! (mut (.ranges copy)) low high))))
+        (if (= (len (.ranges copy)) 0)
+            (do (push! (mut mapping) -1) (a/release! (mut copy)))
+            (do
+              (for use (.uses part)
+                (when (and (>= (.position use) start) (< (.position use) end))
+                  (unless (c/add! (mut (.uses copy)) (.position use) (.kind use) (.register use))
+                    (panic "regional constraint copy"))))
+              (push! (mut mapping) (cast i32 (len out))) (push! (mut out) copy)))))
+    (for [i 0 (len out)]
+      (let [part (elem (mut out) i)]
+        (set! (.hint part) (if (and (>= (.hint part) 0) (< (cast i64 (.hint part)) (len mapping)))
+                              (get mapping (cast i64 (.hint part))) -1))
+        (set! (.hint-owner part) (if (and (>= (.hint-owner part) 0) (< (cast i64 (.hint-owner part)) (len mapping)))
+                                    (get mapping (cast i64 (.hint-owner part))) -1))))
+    (free! (mut mapping)) out))
+
+(defn run! [(input (mut (ArrayList a/Part))) (layout (mut frame/Frame))
+             (register-count i32) (allowed u64) (shapes (slice a/SpillShape))
+             (definition-moves (slice i64)) (regions (slice split/Block))
+             (incoming (slice Edge)) (tuning a/Tuning) (allocator (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (if (= (len regions) 0)
+      (a/run-shaped-with-tuning! (mut input) (mut layout) register-count allowed shapes
+        definition-moves regions tuning allocator)
+      (let [(mut output) (ArrayList::new [a/Part] allocator) (mut error) ""
+            (mut processed) (: 0 i32) (mut coverage) (: 0 i64) (mut original) (: 0 i64)]
+        (for part input (for r (.ranges part) (set! original (+ original (- (.end r) (.start r))))))
+        (for [block 0 (len regions)]
+          (when (= error "")
+            (let [span (get regions block)
+                  (mut local) (clipped input (.start span) (.end span) allocator)]
+              (for [i 0 (len local)]
+                (let [part (elem (mut local) i)]
+                  (for r (.ranges part) (set! coverage (+ coverage (- (.end r) (.start r)))))
+                  (when (and (>= (.parent part) 0) (a/covers? (load part) (.start span)))
+                    (let [reg (preference output (.parent part) (cast i32 block) regions incoming)]
+                      (when (>= reg 0) (set! (.preferred part) reg))))))
+              ; Splits stay local. Whole-loop splitting and eviction would cross
+              ; this region's ownership, so no global split metadata is passed.
+              (match (a/run-shaped-with-tuning! (mut local) (mut layout) register-count allowed shapes
+                       definition-moves [] tuning allocator)
+                (Err [message] (set! error message))
+                (Ok [count]
+                  (set! processed (+ processed count))
+                  (match (check/verify local register-count allowed)
+                    (Err [message] (set! error message)) (Ok [_] 0))))
+              (if (!= error "") (release! (mut local))
+                  (let [offset (cast i32 (len output))]
+                    (for part local
+                      (let [(mut part) part]
+                        (when (>= (.hint part) 0) (set! (.hint part) (+ offset (.hint part))))
+                        (when (>= (.hint-owner part) 0) (set! (.hint-owner part) (+ offset (.hint-owner part))))
+                        (push! (mut output) part)))
+                    ; Ownership of the inner arrays moved to OUTPUT.
+                    (free! (mut local)))))))
+        (when (and (= error "") (!= original coverage)) (set! error "regional allocation lost interval coverage"))
+        (when (= error "")
+          (match (check/verify output register-count allowed)
+            (Err [message] (set! error message)) (Ok [_] 0)))
+        (if (!= error "") (do (release! (mut output)) (Err error))
+            (do (release! (mut input)) (set! input output) (Ok processed))))))
