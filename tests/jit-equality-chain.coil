@@ -1,0 +1,295 @@
+(module stogir.tests.jit-equality-chain)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.calls" :as calls)
+(import "stogir.types" :as types)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.equality-chain" :as chain)
+(import "stogir.uses" :as uses)
+(import "stogir.bitset" :as bits)
+(import "stogir.bitqueue" :as queue)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+;;; Shapes of the matching arms:
+;;; 0 each returns 100+i; the default returns 777
+;;; 1 all END into one MERGE that returns 1; the default returns 0
+;;; 2 all and the default END into one MERGE; a PHI of 100+i / 777 is returned
+;;; 3 arm i ENDs into MERGE (i mod 2), which returns 1 + (i mod 2); default 0
+;;; 4 as 3 with three MERGEs
+(defstruct Built [(graph g/Graph) (roots (ArrayList i32))])
+
+(defn mask [(ty i32)] (-> u64)
+  (let [size (types/scalar-size ty 8)]
+    (if (= size 8) 0xFFFFFFFFFFFFFFFF (- (<< (: 1 u64) (cast u64 (* size 8))) 1))))
+
+(defn constant [(graph (mut g/Graph)) (value i64)] (-> i32)
+  (require (b/scalar-constant! (mut graph) 11 (cast u64 value) 8)))
+
+;;; Odd links test NE with exchanged arms.
+(defn build [(ty i32) (constants (slice i64)) (shape i32) (a (dyn Allocator))] (-> Built)
+  (let [(mut graph) (g/create a)
+        (mut roots) (ArrayList::new [i32] a)
+        (mut ends) (ArrayList::new [i32] a)
+        (mut values) (ArrayList::new [i32] a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        selector (cond (= ty 11) x
+                       (= ty 5) (require (b/emit! (mut graph) 36 ty [x]))
+                       :else (require (b/emit! (mut graph) 35 ty [x])))
+        (mut control) start
+        (mut signature) (match (calls/create 0 11 [(: 11 u8)] a)
+                          (Err [message] (panic "{}" message)) (Ok [s] s))]
+    (require (calls/function! (mut graph) signature a))
+    (calls/release! (mut signature))
+    (for [i 0 (len constants)]
+      (let [key (require (b/scalar-constant! (mut graph) ty
+                                             (& (cast u64 (get constants i)) (mask ty)) 8))
+            equal (= (% i 2) 0)
+            test (require (b/emit! (mut graph) (if equal 14 15) 1 [selector key]))
+            branch (require (b/emit! (mut graph) 116 0 [control test]))
+            yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+            no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+            match (if equal yes no)]
+        (set! control (if equal no yes))
+        (if (= shape 0)
+            (push! (mut roots)
+                   (require (b/emit! (mut graph) 120 11
+                                     [match (constant (mut graph) (+ 100 i)) (: 0 i32)])))
+            (do (push! (mut ends) (require (b/emit! (mut graph) 114 0 [match])))
+                (push! (mut values) (constant (mut graph) (+ 100 i)))))))
+    (cond (= shape 0)
+            (push! (mut roots)
+                   (require (b/emit! (mut graph) 120 11
+                                     [control (constant (mut graph) 777) (: 0 i32)])))
+          (= shape 1)
+            (let [merge (require (b/emit! (mut graph) 112 0 (slice ends)))]
+              (push! (mut roots)
+                     (require (b/emit! (mut graph) 120 11
+                                       [merge (constant (mut graph) 1) (: 0 i32)])))
+              (push! (mut roots)
+                     (require (b/emit! (mut graph) 120 11
+                                       [control (constant (mut graph) 0) (: 0 i32)]))))
+          (= shape 2)
+            (let [(mut inputs) (ArrayList::new [i32] a)]
+              (push! (mut ends) (require (b/emit! (mut graph) 114 0 [control])))
+              (push! (mut values) (constant (mut graph) 777))
+              (let [merge (require (b/emit! (mut graph) 112 0 (slice ends)))]
+                (push! (mut inputs) merge)
+                (for value values (push! (mut inputs) value))
+                (let [phi (require (b/emit! (mut graph) 67 11 (slice inputs)))]
+                  (push! (mut roots)
+                         (require (b/emit! (mut graph) 120 11 [merge phi (: 0 i32)])))))
+              (free! (mut inputs)))
+          :else
+            (let [groups (if (= shape 3) 2 3)]
+              (for [group 0 groups]
+                (let [(mut members) (ArrayList::new [i32] a)]
+                  (for [i 0 (len ends)]
+                    (when (= (% i groups) group) (push! (mut members) (get ends i))))
+                  (let [merge (require (b/emit! (mut graph) 112 0 (slice members)))]
+                    (push! (mut roots)
+                           (require (b/emit! (mut graph) 120 11
+                                             [merge (constant (mut graph) (+ group 1)) (: 0 i32)]))))
+                  (free! (mut members))))
+              (push! (mut roots)
+                     (require (b/emit! (mut graph) 120 11
+                                       [control (constant (mut graph) 0) (: 0 i32)])))))
+    (free! (mut ends))
+    (free! (mut values))
+    (Built :graph graph :roots roots)))
+
+(defn expected [(ty i32) (constants (slice i64)) (shape i32) (x i64)] (-> i64)
+  (let [(mut hit) (: -1 i64)]
+    (for [i 0 (len constants)]
+      (when (and (< hit 0)
+                 (= (& (cast u64 x) (mask ty)) (& (cast u64 (get constants i)) (mask ty))))
+        (set! hit i)))
+    (cond (= shape 0) (if (< hit 0) 777 (+ 100 hit))
+          (= shape 1) (if (< hit 0) 0 1)
+          (= shape 2) (if (< hit 0) 777 (+ 100 hit))
+          (= shape 3) (if (< hit 0) 0 (+ 1 (% hit 2)))
+          :else (if (< hit 0) 0 (+ 1 (% hit 3))))))
+
+(defn switches [(graph g/Graph)] (-> i64)
+  (let [(mut count) (: 0 i64) (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (when (= (n/opcode (get (.instructions graph) r)) 117) (set! count (+ count 1)))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    count))
+
+(defn run-one [(function (fnptr (cc/C) [i64] i64))
+               (ty i32) (constants (slice i64)) (shape i32) (x i64) (label (slice u8))] (-> i64)
+  (let [want (expected ty constants shape x)
+        got (function x)]
+    (if (= got want)
+        0
+        (do (println "{} type {} shape {} x {}: got {} want {}" label ty shape x got want) 1))))
+
+;;; Every constant and its neighbours, the same low bits under other high
+;;; bits (narrow selectors ignore them), and the extremes of each width.
+(defn execute [(graph g/Graph) (roots (slice i32))
+               (ty i32) (constants (slice i64)) (shape i32) (label (slice u8))] (-> i64)
+  (let [(mut failures) (: 0 i64)]
+    (match (compile/text graph 1 roots (malloc-allocator))
+      (Err [message] (panic "{} compile: {}" label message))
+      (Ok [text]
+          (let [(mut text) text]
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "{} map: {}" label message))
+              (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        f (p/cast (fnptr (cc/C) [i64] i64) (.base loaded))]
+                    (for value constants
+                      (for delta [(: -1 i64) 0 1 64 -64 256 -256 65536 4294967296 -4294967296]
+                        (set! failures
+                              (+ failures
+                                 (run-one f ty constants shape (p/iadd value delta) label)))))
+                    (for x [(: 0 i64) 1 -1 2 62 63 64 65 127 128 129 255 256 32767 32768 65535
+                            65536 2147483647 2147483648 -2147483648 -2147483649 4294967295
+                            4294967296 9223372036854775807 (- -9223372036854775807 1)]
+                      (set! failures (+ failures (run-one f ty constants shape x label))))
+                    (for x [-300 300]
+                      (set! failures (+ failures (run-one f ty constants shape x label))))
+                    (jit/release! (mut loaded)))))
+            (free! (mut text)))))
+    failures))
+
+;;; The unoptimized IF chain and the optimized graph must agree with the
+;;; model; the optimized graph holds the expected number of SWITCH nodes.
+(defn check [(ty i32) (constants (slice i64)) (shape i32) (want-switches i64)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut built) (build ty constants shape a)
+        (mut failures) (execute (.graph built) (slice (.roots built)) ty constants shape "plain")]
+    (match (sccp/optimize (.graph built) 8 (slice (.roots built)) a)
+      (Err [message] (panic "optimize: {}" message))
+      (Ok [result]
+          (let [(mut result) result]
+            (unless (= (switches (.graph result)) want-switches)
+              (println "type {} shape {} with {} constants: {} SWITCH nodes, want {}"
+                       ty shape (len constants) (switches (.graph result)) want-switches)
+              (set! failures (+ failures 1)))
+            (set! failures
+                  (+ failures
+                     (execute (.graph result) (slice (.roots result)) ty constants shape "optimized")))
+            (rewrite/release! (mut result)))))
+    (free! (mut (.roots built)))
+    (g/release! (mut (.graph built)))
+    failures))
+
+;;; One-window dispatch selects with LSLV x17, x17, key and has no table jump.
+(defn bit-tested [(ty i32) (constants (slice i64)) (shape i32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut built) (build ty constants shape a)
+        (mut shifts) (: 0 i64)
+        (mut tables) (: 0 i64)]
+    (match (sccp/optimize (.graph built) 8 (slice (.roots built)) a)
+      (Err [message] (panic "optimize: {}" message))
+      (Ok [result]
+          (let [(mut result) result]
+            (match (compile/text (.graph result) 1 (slice (.roots result)) a)
+              (Err [message] (panic "bit test compile: {}" message))
+              (Ok [text]
+                  (let [(mut text) text]
+                    (for [i 0 (/ (len text) 4)]
+                      (let [word (| (cast u32 (get text (* i 4)))
+                                    (<< (cast u32 (get text (+ (* i 4) 1))) 8)
+                                    (<< (cast u32 (get text (+ (* i 4) 2))) 16)
+                                    (<< (cast u32 (get text (+ (* i 4) 3))) 24))]
+                        (when (= (& word 0xFFE0FFFF) 0x9AC02231) (set! shifts (+ shifts 1)))
+                        (when (= word 0xD61F0200) (set! tables (+ tables 1)))))
+                    (free! (mut text)))))
+            (rewrite/release! (mut result)))))
+    (free! (mut (.roots built)))
+    (g/release! (mut (.graph built)))
+    (if (and (= shifts 1) (= tables 0))
+        0
+        (do (println "type {} shape {} with {} constants: {} bit shifts, {} table jumps"
+                     ty shape (len constants) shifts tables)
+            1))))
+
+;;; The recognizer alone, on a chain that repeats a constant: the dispatch
+;;; stops before the repetition, which stays an IF behind the default.
+(defn repeated [] (-> i64)
+  (let [a (malloc-allocator)
+        constants [(: 5 i64) 9 11 13 5 12 14]
+        (mut built) (build 11 constants 0 a)
+        (mut edges) (uses/build (.graph built) a)
+        (mut pending) (queue/create (len (.instructions (.graph built))) a)
+        (mut protected) (bits/create (len (.instructions (.graph built))) a)
+        (mut failures) (: 0 i64)]
+    (for root (.roots built) (bits/add! (mut protected) (cast i64 root)))
+    (let [changed (chain/rewrite! (mut (.graph built)) (mut edges) (mut pending) protected a)]
+      (unless (and (= changed 1) (= (switches (.graph built)) 1))
+        (println "repeated constant: {} chains, {} SWITCH nodes" changed (switches (.graph built)))
+        (set! failures (+ failures 1))))
+    (set! failures
+          (+ failures (execute (.graph built) (slice (.roots built)) 11 constants 0 "repeated")))
+    ; A second run finds nothing left to rewrite.
+    (unless (= (chain/rewrite! (mut (.graph built)) (mut edges) (mut pending) protected a) 0)
+      (println "repeated constant: second run rewrote a chain")
+      (set! failures (+ failures 1)))
+    (uses/release! (mut edges))
+    (queue/release! (mut pending))
+    (bits/release! (mut protected))
+    (free! (mut (.roots built)))
+    (g/release! (mut (.graph built)))
+    failures))
+
+(defn main [] (-> i32)
+  (let [(mut failures) (: 0 i64)
+        (mut sparse) (ArrayList::new [i64] (malloc-allocator))]
+    (for [i 0 40] (push! (mut sparse) (- (* i 9973) 150000)))
+    ; Separate targets: four or more tests dispatch, fewer stay IFs.
+    (for ty [(: 11 i32) 10 9 8 5 4 3 2]
+      (set! failures (+ failures (check ty [(: 3 i64) -7 -128 100 40] 0 1)))
+      (set! failures (+ failures (check ty [(: 0 i64) 1 2 3 4 5 6 7 8 9] 2 1)))
+      (set! failures (+ failures (check ty [(: 5 i64) 2 0 4 1 3] 2 1)))
+      (set! failures (+ failures (check ty [(: -1 i64) -2 -3 0 1 2 127 -128] 0 1)))
+      (set! failures (+ failures (check ty [(: 7 i64) 9 11] 0 0)))
+      (set! failures (+ failures (check ty [(: 0 i64) 1] 0 0)))
+      ; One destination: three tests (bit test, with and without a base,
+      ; beyond one window), two adjacent constants (range), not two apart.
+      (set! failures (+ failures (check ty [(: 43 i64) 45 46] 1 1)))
+      (set! failures (+ failures (check ty [(: 100 i64) 105 126] 1 1)))
+      (set! failures (+ failures (check ty [(: 63 i64) 0 31 32] 1 1)))
+      (set! failures (+ failures (check ty [(: 5 i64) 120 60] 1 1)))
+      (set! failures (+ failures (check ty [(: -1 i64) 0 1] 1 1)))
+      (set! failures (+ failures (check ty [(: 10 i64) 11 12 13 14] 1 1)))
+      (set! failures (+ failures (check ty [(: 6 i64) 7] 1 1)))
+      (set! failures (+ failures (check ty [(: 7 i64) 6] 1 1)))
+      ; -1 and 0 are neighbours only in a signed order.
+      (set! failures (+ failures (check ty [(: -1 i64) 0] 1 (if (types/signed? ty) 1 0))))
+      (set! failures (+ failures (check ty [(: 6 i64) 9] 1 0)))
+      ; Two and three destinations within one window.
+      (set! failures (+ failures (check ty [(: 1 i64) 2 7 8 3 9] 3 1)))
+      (set! failures (+ failures (check ty [(: 70 i64) 75 80 85 90 95 100] 4 1))))
+    (for ty [(: 11 i32) 10 5 2]
+      (set! failures (+ failures (bit-tested ty [(: 43 i64) 45 46] 1)))
+      (set! failures (+ failures (bit-tested ty [(: 100 i64) 105 126] 1)))
+      (set! failures (+ failures (bit-tested ty [(: 63 i64) 0 31 32] 1)))
+      (set! failures (+ failures (bit-tested ty [(: 1 i64) 2 7 8 3 9] 3)))
+      (set! failures (+ failures (bit-tested ty [(: 70 i64) 75 80 85 90 95 100] 4))))
+    ; Wide constants and a long sparse chain.
+    (set! failures (+ failures (check 11 [(: 9223372036854775807 i64) (- -9223372036854775807 1)
+                                          0 -1 4294967296] 0 1)))
+    (set! failures (+ failures (check 11 [(: 9223372036854775807 i64) (- -9223372036854775807 1)
+                                          9223372036854775806] 1 1)))
+    (set! failures (+ failures (check 10 [(: 2147483647 i64) -2147483648 0 -1 65536] 0 1)))
+    (set! failures (+ failures (check 4 [(: 4294967295 i64) 0 2147483648 2147483647] 0 1)))
+    (set! failures (+ failures (check 11 (slice sparse) 0 1)))
+    (set! failures (+ failures (check 10 (slice sparse) 2 1)))
+    (set! failures (+ failures (repeated)))
+    (free! (mut sparse))
+    (println "equality chains become dispatch: {} failures" failures)
+    (if (= failures 0) 0 1)))
