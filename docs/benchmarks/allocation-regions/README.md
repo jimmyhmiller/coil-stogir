@@ -123,3 +123,43 @@ The retained region pass verifies allocations before and after modification.
 The full standalone suite is being run on frozen source; this section will be
 updated with the authoritative results. Quick FAST and remaining delivery gates
 are also required before promotion. No target is marked achieved.
+
+## Completed validation
+
+Final frozen source: 297 standalone programs, 295 pass. The two failures are
+`jit-parameter-specialize` ("expected expansion") and `private-leaf` ("wrong
+signature accepted"). Both were rerun against the preceding library and fail
+with the same assertions; they are pre-existing and remain open.
+
+All **73 linked AOT consumers pass** with fresh fixtures. The generic sweep
+omits their link flags and is not valid evidence for these consumers. The
+separate `linked.py` run used the prior validated fixture manifest, supplemented
+by explicit README/documentation commands and the mem2ssa producer's object
+path. All 5,410 unique fixtures were newer than the library checkpoint and were
+copied to a private directory before linking, with SHA-256 recorded in the
+build artifacts. `link-manifest.json` records the selected fixture paths.
+
+Quick FAST passes (63s under concurrent validation load). Full FAST/live emission
+and current-source bootstraps remain final acceptance gates. The two performance
+targets have not been achieved. Nothing installed or pushed.
+
+## Generation cost on the final candidate
+
+Three alternating default-policy emits of the fixed compiler workload:
+
+| Candidate | Minimum generation seconds | Median generation seconds |
+|---|---:|---:|
+| Prior | 6.984 | 7.070 |
+| Regions, including before/after verification | 7.269 | 7.377 |
+
+Generation costs +4.08% minimum / +4.34% median. Output objects differ as expected
+because allocation changes; this is not an output-preserving generation change.
+A fresh LLVM generation comparison is still required to establish the absolute
+5× ratio. This cost is accepted for runtime-first research, not declared compliant
+with the final generation target.
+
+Next runtime work: prove redundant bounds comparisons from dominating branches
+and integer range facts. The allocation trace and assembly expose the same
+index/length comparison repeated on paths where the first branch already proved
+it. Retain all checks without a proof; use matched-host timing and output identity
+for every candidate. The goal remains active.
