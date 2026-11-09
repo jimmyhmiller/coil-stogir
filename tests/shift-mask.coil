@@ -1,0 +1,127 @@
+(module stogir.tests.shift-mask)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.types" :as types)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.a64.match" :as matching)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+(defn need [T] [(r (Result T (slice u8)))] (-> T)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+
+;;; Wide division/multiplication models both shifts independently. No AND
+;;; mask or selector/constant-folder helper participates in this oracle.
+(defn right [(value u64) (width i32) (count u64) (arithmetic bool)] (-> u64)
+  (let [modulus (<< (: 1 u128) (cast u128 width))
+        x (% (cast u128 value) modulus)
+        divisor (<< (: 1 u128) (cast u128 (% count (cast u64 width))))
+        q (/ x divisor)]
+    (cast u64 (if (and arithmetic (>= x (/ modulus 2)))
+                  (+ q (- modulus (/ modulus divisor))) q))))
+(defn left [(value u64) (width i32) (count u64)] (-> u64)
+  (cast u64 (% (* (cast u128 value)
+                  (<< (: 1 u128) (cast u128 (% count (cast u64 width)))))
+               (<< (: 1 u128) (cast u128 width)))))
+
+;;; Plain, rooted right shift, shared right shift, rooted left shift and
+;;; unequal-count negative cases. Count literals may differ by a whole word.
+(defn fixture [(ty i32) (opcode i32) (count u64) (variant i32)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        width (* 8 (types/scalar-size ty 8))
+        full (cast u64 (- (<< (: 1 u128) (cast u128 width)) 1))
+        outer (& (+ count (if (= variant 4) 1 (cast u64 width))) full)
+        inner (& count full)
+        fits (and (or (= width 32) (= width 64)) (!= ty 6)
+                  (!= (% inner (cast u64 width)) 0)
+                  (= (% inner (cast u64 width)) (% outer (cast u64 width))))
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        arg (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        x (if (= ty 5) arg (need (b/emit! (mut graph) (if (= width 64) 36 35) ty [arg])))
+        ci (need (b/scalar-constant! (mut graph) ty inner 8))
+        co (need (b/scalar-constant! (mut graph) ty outer 8))
+        shr (need (b/emit! (mut graph) opcode ty [x ci]))
+        shl (need (b/emit! (mut graph) 49 ty [shr co]))
+        combined (if (= variant 2) (need (b/emit! (mut graph) 48 ty [shl shr])) shl)
+        value (if (= ty 5) combined (need (b/emit! (mut graph) (if (= width 64) 36 34) 5 [combined])))
+        ret (need (b/emit! (mut graph) 120 5 [start value (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)]
+    (push! (mut roots) ret)
+    (when (= variant 1) (push! (mut roots) shr))
+    (when (= variant 3) (push! (mut roots) shl))
+    (let [(mut prepared) (need (pipeline/prepare graph start (slice roots) a))]
+      (for fuse [false true]
+        (let [(mut plan) (need (matching/build graph (.schedule prepared) (slice roots) fuse a))
+              tile (get (.tiles plan) (cast i64 shl))
+              fused (and fits fuse)]
+          (assert (= (= (.rule tile) 42) fused))
+          (when fused
+            (let [range (get (.ranges (.operands plan)) (cast i64 shl))]
+              (assert (= (.count range) 1))
+              (assert (= (get (.inputs (.operands plan)) (.offset range)) x))))
+          (assert (= (get (.omitted (.operands plan)) (cast i64 shr))
+                     (and fused (or (= variant 0) (= variant 3)))))
+          (matching/release! (mut plan))))
+      (pipeline/release! (mut prepared)))
+    (let [(mut text) (need (compile/text graph start (slice roots) a))
+          (mut mapped) (need (jit/map-text (slice text)))
+          f (p/cast (fnptr (cc/C) [u64] u64) (.base mapped))
+          (mut seed) (: 0x123456789ABCDEF0 u64)]
+      (for [i 0 80]
+        (set! seed (+ (* seed 6364136223846793005) 1442695040888963407))
+        (let [v (case i 0 (: 0 u64) 1 1 2 0xFFFFFFFFFFFFFFFF
+                      3 0x8000000000000000 4 0x80000000 5 0x7FFFFFFF seed)
+              r (right v width inner (= opcode 51))
+              l (left r width outer)
+              expected (if (= variant 2) (^ l r) l)]
+          (assert (= (f v) expected))))
+      (jit/release! (mut mapped)) (free! (mut text)))
+    (free! (mut roots)) (g/release! (mut graph))))
+
+;;; A later indexed-address match absorbs SHL after it selected a mask.
+;;; Retiring it must subtract the selected edge, while the address retains
+;;; the original right shift as its index. Shared/roots keep both meanings.
+(defn address-fixture [(opcode i32) (variant i32)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        base (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        three (need (b/scalar-constant! (mut graph) 5 3 8))
+        shr (need (b/emit! (mut graph) opcode 5 [x three]))
+        shl (need (b/emit! (mut graph) 49 5 [shr three]))
+        ptr (need (b/emit! (mut graph) 26 6 [base shl]))
+        loaded (need (b/emit! (mut graph) 91 5 [start ptr]))
+        value (if (= variant 2) (need (b/emit! (mut graph) 48 5 [loaded shl])) loaded)
+        ret (need (b/emit! (mut graph) 120 5 [loaded value (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)
+        (mut cells) (ArrayList::new [u64] a)]
+    (push! (mut roots) ret)
+    (when (= variant 1) (push! (mut roots) shl))
+    (let [(mut prepared) (need (pipeline/prepare graph start (slice roots) a))
+          (mut plan) (need (matching/build graph (.schedule prepared) (slice roots) true a))]
+      (assert (= (get (.omitted (.operands plan)) (cast i64 shl)) (= variant 0)))
+      (assert (not (get (.omitted (.operands plan)) (cast i64 shr))))
+      (matching/release! (mut plan)) (pipeline/release! (mut prepared)))
+    (for [i 0 64] (push! (mut cells) (+ (: 0xFFEEDDCCBBAA0000 u64) (cast u64 i))))
+    (let [(mut text) (need (compile/text graph start (slice roots) a))
+          (mut mapped) (need (jit/map-text (slice text)))
+          f (p/cast (fnptr (cc/C) [u64 (ptr u64)] u64) (.base mapped))]
+      (for [x (: 0 u64) 512]
+        (let [offset (* (/ x 8) 8) v (get cells (cast i64 (/ offset 8)))]
+          (assert (= (f x (.data cells)) (if (= variant 2) (^ v offset) v)))))
+      (jit/release! (mut mapped)) (free! (mut text)))
+    (free! (mut cells)) (free! (mut roots)) (g/release! (mut graph))))
+
+(defn main [] (-> i32)
+  (for ty [(: 4 i32) 10 5 11 2 3 6]
+    (for opcode [(: 50 i32) 51]
+      (for count [(: 0 u64) 1 3 5 31 32 63 64 0xFFFFFFFFFFFFFFFF]
+        (for [variant (: 0 i32) 5] (fixture ty opcode count variant)))))
+  (for opcode [(: 50 i32) 51]
+    (for [variant (: 0 i32) 3] (address-fixture opcode variant)))
+  (println "shift-mask: 630 scalar and 6 address fixtures; 53472 native answers")
+  0)
