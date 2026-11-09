@@ -122,3 +122,6 @@ pass. Build both rotation-only and regional hosts using
 `budget=4096,template=2048,small=256,small-scope=any,hoist=1,always=1,pair=1,indirect=1`.
 That policy previously regressed before regional splitting existed. The pending
 interaction experiment is not a new runtime result or a promoted policy.
+
+
+Follow-up: [exact setup improvements](indexed-setup/README.md) reproduce this full host object byte for byte, resolve the two stale standalone test assumptions, and retain focused oracle/native and quick FAST evidence. [Broader-inlining interaction](wide-inlining/README.md) remains in progress; it has no runtime result yet.
