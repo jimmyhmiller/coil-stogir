@@ -133,3 +133,6 @@ minimum and median are reported. Raw timing streams are saved compressed in
 Implementation and integration commits: library `3edd0e0`, Coil `2bca489f`.
 The research branches remain separate from installed tools; nothing is pushed
 or installed. The original root handoff and result directory are untouched.
+
+The final candidate rebuilt after the provenance update emits byte-identical
+bytes to the measured all-functions host object. See `final-identity.txt`.
