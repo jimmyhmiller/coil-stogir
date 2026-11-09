@@ -1,0 +1,140 @@
+;;; Nested address recurrences, calls, stores, early exit and null zero-trip.
+(module stogir.tests.loop-strength-native)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.builder" :as b)
+(import "stogir.loop-strength" :as strength)
+(import "stogir.loop-rotate" :as rotate)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.fs" :as fs)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+(defn need [T] [(r (Result T (slice u8)))] (-> T)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+(defn callback :cc (cc/C) [(v u64)] (-> u64) (+ (* v 3) 7))
+
+(defn fixture [(enabled bool) (a (dyn Allocator))] (-> image/Image)
+  (let [(mut graph) (g/create a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        pointer (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        count (need (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        stop (need (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        inner-count (need (b/emit! (mut graph) 71 11 [start (: 0 i32) 3]))
+        function (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 4]))
+        zero (need (b/scalar-constant! (mut graph) 11 0 8))
+        one (need (b/scalar-constant! (mut graph) 11 1 8))
+        eight (need (b/scalar-constant! (mut graph) 11 8 8))
+        forty (need (b/scalar-constant! (mut graph) 11 40 8))
+        entry (need (b/emit! (mut graph) 114 0 [start]))
+        header (need (b/loop-begin! (mut graph) entry))
+        i (need (b/loop-phi! (mut graph) header zero))
+        sum (need (b/loop-phi! (mut graph) header zero))
+        test (need (b/emit! (mut graph) 20 1 [i count]))
+        branch (need (b/emit! (mut graph) 116 0 [header test]))
+        yes (need (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        no (need (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        early (need (b/emit! (mut graph) 14 1 [i stop]))
+        choose (need (b/emit! (mut graph) 116 0 [yes early]))
+        done (need (b/emit! (mut graph) 107 0 [choose (: 0 i32)]))
+        body (need (b/emit! (mut graph) 108 0 [choose (: 0 i32)]))
+        offset (need (b/emit! (mut graph) 28 11 [i forty]))
+        address (need (b/emit! (mut graph) 26 6 [pointer offset]))
+        field (need (b/emit! (mut graph) 26 6 [address eight]))
+        ie (need (b/emit! (mut graph) 114 0 [body]))
+        ih (need (b/loop-begin! (mut graph) ie))
+        j (need (b/loop-phi! (mut graph) ih zero))
+        inner-sum (need (b/loop-phi! (mut graph) ih sum))
+        inner-test (need (b/emit! (mut graph) 20 1 [j inner-count]))
+        inner-branch (need (b/emit! (mut graph) 116 0 [ih inner-test]))
+        inner-body (need (b/emit! (mut graph) 107 0 [inner-branch (: 0 i32)]))
+        inner-done (need (b/emit! (mut graph) 108 0 [inner-branch (: 0 i32)]))
+        inner-offset (need (b/emit! (mut graph) 28 11 [j eight]))
+        inner-address (need (b/emit! (mut graph) 26 6 [address inner-offset]))
+        loaded (need (b/emit! (mut graph) 91 11 [inner-body inner-address]))
+        (mut sig) (need (calls/create 9 11 [(: 11 u8)] a))
+        called (need (calls/emit! (mut graph) sig loaded function [loaded] a))
+        added (need (b/emit! (mut graph) 26 11 [inner-sum called]))
+        jnext (need (b/emit! (mut graph) 26 11 [j one]))
+        ib (need (b/emit! (mut graph) 115 0 [called]))
+        stored (need (b/emit! (mut graph) 93 0 [inner-done field inner-sum]))
+        next (need (b/emit! (mut graph) 26 11 [i one]))
+        back (need (b/emit! (mut graph) 115 0 [stored]))
+        ret (need (b/emit! (mut graph) 120 11 [no sum (: 0 i32)]))
+        ret-early (need (b/emit! (mut graph) 120 11 [done sum (: 0 i32)]))]
+    (calls/release! (mut sig))
+    (need (b/patch! (mut graph) header 2 back)) (need (b/patch! (mut graph) i 3 next))
+    (need (b/patch! (mut graph) sum 3 inner-sum))
+    (need (b/patch! (mut graph) ih 2 ib)) (need (b/patch! (mut graph) j 3 jnext))
+    (need (b/patch! (mut graph) inner-sum 3 added))
+    (let [(mut sig) (need (calls/create 9 11 [(: 6 u8) 11 11 11 6] a))]
+      (need (calls/function! (mut graph) sig a)) (calls/release! (mut sig)))
+    (let [result (if enabled (need (strength/run graph 1 [ret ret-early] a))
+                    (strength/Reduced :graph (None [g/Graph]) :recurrences 0))
+          code (match (.graph result)
+            (None [] (assert (not enabled))
+              (need (compile/image-with-options graph 1 [ret ret-early] "_stogir_strength_loop"
+                      (options/Options :level 1) a)))
+            (Some [owned]
+              (let [(mut owned) owned
+                    (mut prepared) (need (pipeline/prepare owned 1 [ret ret-early] a))
+                    (mut owners) (rotate/block-map owned prepared a)]
+                (assert (= (.recurrences result) 2))
+                (for r (.nodes (.schedule prepared))
+                  (when (= (n/opcode (get (.instructions owned) (cast i64 r))) 28)
+                    (assert (= (get (.depths prepared) (cast i64 (get owners (cast i64 r)))) 0))))
+                (free! (mut owners)) (pipeline/release! (mut prepared))
+                (let [code (need (compile/image-with-private graph 1 [ret ret-early] "_stogir_strength_loop"
+                                  (options/Options :level 3) a
+                                  (private/with-strength (private/with-hoist-loads
+                                    (private/with-regional (private/with-rotate (private/no-context) true) true) true) true)))]
+                  (g/release! (mut owned)) code))))]
+      (g/release! (mut graph)) code)))
+
+(defn execute [(code image/Image) (a (dyn Allocator))] (-> void)
+  (let [(mut module) (need (link/compose [code] a)) (mut loaded) (need (jit/map-image (.image module) a))
+        id (match (image/find-symbol (.image module) "_stogir_strength_loop")
+             (Some [id] id) (None [] (panic "symbol")))
+        f (p/cast (fnptr (cc/C) [(ptr u64) u64 u64 u64 u64] u64)
+            (p/cast (ptr u8) (get (.addresses loaded) (cast i64 id))))
+        target (p/cast u64 (p/cast (ptr u8) (fnptr-of callback)))]
+    (assert (= (f (p/cast (ptr u64) 0) 0 99 5 target) 0))
+    (assert (= (f (p/cast (ptr u64) 0) 3 0 5 target) 0))
+    (for count [(: 0 u64) 1 3]
+      (for stop [(: 0 u64) 1 2 99]
+        (for trips [(: 0 u64) 1 3 5]
+          (for seed [(: 0 u64) 17 0xFFFFFFFFFFFFFFF0]
+            (let [(mut cells) (ArrayList::new [u64] a) (mut expected) (ArrayList::new [u64] a)
+                  (mut sum) (: 0 u64)]
+              (for [k 0 15] (push! (mut cells) (+ seed (cast u64 k))) (push! (mut expected) (get cells k)))
+              (for [i (: 0 u64) (if (< count stop) count stop)]
+                (for [j (: 0 u64) trips]
+                  (set! sum (+ sum (callback (get expected (cast i64 (+ (* i 5) j)))))))
+                (set! (mut expected) (cast i64 (+ (* i 5) 1)) sum))
+              (assert (= (f (.data cells) count stop trips target) sum))
+              (for [k 0 15] (assert (= (get cells k) (get expected k))))
+              (free! (mut cells)) (free! (mut expected)))))))
+    (jit/release-image! (mut loaded)) (link/release! (mut module))))
+
+(defn main [] (-> i32)
+  (let [a (malloc-allocator)]
+    (for enabled [false true]
+      (let [(mut code) (fixture enabled a)]
+        (execute code a)
+        (when enabled
+          (let [(mut object) (need (macho/image-object code a))]
+            (match (fs/write-file a "/tmp/coil-stogir-strength-loop.o" (slice object))
+              (Ok [_] 0) (Err [_] (panic "object write")))
+            (free! (mut object))))
+        (image/release! (mut code)))))
+  0)
