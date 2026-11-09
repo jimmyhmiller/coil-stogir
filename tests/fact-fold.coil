@@ -54,7 +54,7 @@
 
 ;;; Proof for one IF as compilation computes it for a candidate.
 (defn proof-of [(graph g/Graph) (branch i32) (a (dyn Allocator))] (-> i32)
-  (match (fold/flow-of graph 1 a)
+  (match (fold/flow-of graph 1 [] false a)
     (Err [message] (panic "flow: {}" message))
     (Ok [flow]
       (let [(mut flow) flow
@@ -62,6 +62,16 @@
         (free! (mut (.idom flow)))
         (cfg/release! (mut (.blocks flow)))
         proof))))
+
+;;; Whether the whole-function scan, with its candidate filter, decides `branch`.
+(defn scan-decides? [(graph g/Graph) (branch i32) (a (dyn Allocator))] (-> bool)
+  (match (fold/changes graph 1 [] false a)
+    (Err [message] (panic "changes: {}" message))
+    (Ok [found]
+      (let [(mut found) found (mut answer) false]
+        (for change found (when (= (.branch change) branch) (set! answer true)))
+        (free! (mut found))
+        answer))))
 
 ;;; The function compiled by the default pipeline, called on each (x, y).
 (defn native [(graph g/Graph) (exits (slice i32)) (xs (slice i64)) (ys (slice i64))
@@ -181,6 +191,11 @@
             (when (and exact (!= proof want))
               (panic "missed literal fact: op1 {} arm {} swapped {} c1 {} op2 {} c2 {} proof {} want {}"
                      op1 arm swapped c1 op2 c2 proof want)))
+          ; The scan keeps every such proof that involves an ordering.
+          (when (and (>= proof 0) (> reaching 0) (not (.folded c)) (or (>= op1 16) (>= op2 16))
+                     (not (scan-decides? (.graph c) (.query c) a)))
+            (panic "scan missed literal fact: op1 {} arm {} swapped {} c1 {} op2 {} c2 {}"
+                   op1 arm swapped c1 op2 c2))
           (release-chain! (mut c)))))))))
     proofs))
 
@@ -218,8 +233,11 @@
         (when (and (= op2 16) arm (or (= f 1) (= f 3)))
           (let [want (match op3 (20 (: 1 i32)) (22 1) (21 0) (23 0) (15 1) (14 0) (16 1) (18 1)
                        (17 0) (_ 0))]
-            (unless (= proof want)
+            (unless (and (= proof want) (scan-decides? (.graph c) (.query c) a))
               (panic "missed bounds fact: first {} op3 {} proof {} want {}" f op3 proof want))))
+        ; A repeated or implied comparison of the same pair needs no literal.
+        (when (and none (>= proof 0) (not (scan-decides? (.graph c) (.query c) a)))
+          (panic "scan missed pair fact: op2 {} arm {} op3 {}" op2 arm op3))
         (when (and none (= op2 16) arm (>= op3 20))
           (unless (= proof -1) (panic "signed order decided an unsigned one: op3 {}" op3)))
         (release-chain! (mut c)))))))
@@ -499,7 +517,8 @@
         safe (and (= step 1) (or (and (= op 16) arm) (and (= op 17) (not arm)))
                   (or (not post) (< (cast i128 seed) maximum)))
         expected (and safe (if post (>= seed -1) (>= seed 0)))]
-    (unless (= proof (if expected 0 -1))
+    (unless (and (= proof (if expected 0 -1))
+                 (= expected (scan-decides? (.graph f) (.query f) a)))
       (panic "counter proof mismatch: ty {} seed {} step {} post {} op {} arm {} merge {} swapped {} proof {}"
         ty seed step post op arm merge swapped proof))
     (if (= width 1)
@@ -548,7 +567,7 @@
     (require (b/patch! (mut graph) header 3 back2))
     (require (b/patch! (mut graph) phi 3 next))
     (require (b/patch! (mut graph) phi 4 next))
-    (match (fold/flow-of graph 1 a)
+    (match (fold/flow-of graph 1 [] false a)
       (Err [message] (panic "multiple backs: {}" message))
       (Ok [flow]
         (unless (and (= (.kind (induction/counter graph (.idom flow) phi 1048576)) 0)
@@ -652,7 +671,7 @@
     (signature! (mut graph) a)
     (push! (mut exits) (require (b/emit! (mut graph) 120 11 [yes quotient (: 0 i32)])))
     (push! (mut exits) (require (b/emit! (mut graph) 120 11 [no bumped (: 0 i32)])))
-    (match (fold/changes graph 1 a)
+    (match (fold/changes graph 1 [] false a)
       (Err [message] (panic "changes: {}" message))
       (Ok [found]
         (let [(mut found) found]
@@ -660,7 +679,7 @@
             (panic "guarded division: the test is not decided"))
           (free! (mut found)))))
     (unless (= (fold/guarded-data? graph) pinned) (panic "guarded data detection"))
-    (match (fold/run graph 1 a)
+    (match (fold/run graph 1 [] false a)
       (Err [message] (panic "run: {}" message))
       (Ok [edited]
         (match edited

@@ -12,11 +12,13 @@
 (import "stogir.opcode" :as op)
 (import "stogir.uses" :as uses)
 (import "stogir.cfg" :as cfg)
+(import "stogir.verify" :as verify)
 (import "stogir.adjacency" :as adj)
 (import "stogir.dominators" :as dom)
 (import "stogir.branch-facts" :as facts)
 (import "stogir.induction" :as induction)
 (import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as primitive)
 (import "coil.alloc" :use [Allocator])
 (import "coil.result" :use [Result Ok Err Option Some None])
 
@@ -271,8 +273,13 @@
 ;;; operand with a literal narrows that operand's interval. The tested SSA
 ;;; values are the same dynamic instances at the dominated IF.
 (defn prove [(graph g/Graph) (idom (ArrayList i32)) (flow bool) (branch i32)] (-> i32)
-  (let [query (facts/relation graph (.op2 (get (.instructions graph) (cast i64 branch))))
-        (mut result) (: -1 i32)]
+  (prove-relation graph idom flow branch
+                  (facts/relation graph (.op2 (get (.instructions graph) (cast i64 branch))))))
+
+;;; As prove, for the relation already read from the IF's condition.
+(defn prove-relation [(graph g/Graph) (idom (ArrayList i32)) (flow bool) (branch i32)
+                      (query facts/Relation)] (-> i32)
+  (let [(mut result) (: -1 i32)]
     (when (!= (.mask query) 0)
       (let [width (.width query)
             ranged (and (facts/range-type? (facts/type-of graph (.left query)))
@@ -335,23 +342,68 @@
                  (or (phi? graph (facts/operand graph (.op1 node)))
                      (phi? graph (facts/operand graph (.op2 node)))))))))
 
-;;; An undecided IF is worth control flow when an operand of its comparison
-;;; is mentioned by another undecided IF comparison or may be a loop counter.
-(defn candidate? [(graph g/Graph) (mentions (ArrayList u8)) (branch i32)] (-> bool)
-  (let [query (facts/relation graph (.op2 (get (.instructions graph) (cast i64 branch))))
-        values [(.left query) (.right query)]
-        (mut answer) false]
+;;; Open-addressed multiset of comparison operand pairs, counting up to two.
+(defstruct Pairs [(keys (ArrayList u64)) (counts (ArrayList u8)) (shift u64)])
+
+(defn pair-key [(query facts/Relation)] (-> u64)
+  (| (<< (cast u64 (cast u32 (.left query))) 32) (cast u64 (cast u32 (.right query)))))
+
+(defn pairs-create [(expected i64) (a (dyn Allocator))] (-> Pairs)
+  (let [(mut bits) (: 2 u64)
+        (mut keys) (ArrayList::new [u64] a)
+        (mut counts) (ArrayList::new [u8] a)]
+    (while (< (<< (: 1 i64) (cast i64 bits)) (* expected 2)) (set! bits (+ bits 1)))
+    (extend-zeroed! (mut keys) (<< (: 1 i64) (cast i64 bits)))
+    (extend-zeroed! (mut counts) (<< (: 1 i64) (cast i64 bits)))
+    (Pairs :keys keys :counts counts :shift (- 64 bits))))
+
+;;; Slot holding `key`, or the empty slot where it belongs. The table is at
+;;; most half full, so the probe ends.
+(defn pair-slot [(pairs Pairs) (key u64)] (-> i64)
+  (let [mask (- (len (.keys pairs)) 1)
+        (mut slot) (cast i64 (>> (primitive/imul key (: 0x9E3779B97F4A7C15 u64)) (.shift pairs)))]
+    (while (and (!= (get (.counts pairs) slot) 0) (!= (get (.keys pairs) slot) key))
+      (set! slot (& (+ slot 1) mask)))
+    slot))
+
+(defn pair-note! [(pairs (mut Pairs)) (key u64)] (-> void)
+  (let [slot (pair-slot pairs key)]
+    (set! (mut (.keys pairs)) slot key)
+    (when (< (get (.counts pairs) slot) 2)
+      (set! (mut (.counts pairs)) slot (+ (get (.counts pairs) slot) 1)))))
+
+;;; An undecided IF is worth control flow when another undecided IF compares
+;;; the same operand pair, when an operand is also compared with a literal by
+;;; an IF (at least one of those an ordering, which is what narrows a range),
+;;; or when an operand may be a loop counter. `literals` holds, per value, the
+;;; number of pending literal comparisons of it (up to three) in bits 0-1 and
+;;; whether one is an ordering in bit 2.
+(defn candidate? [(graph g/Graph) (pairs Pairs) (literals (ArrayList u8))
+                  (query facts/Relation)]
+  (-> bool)
+  (let [values [(.left query) (.right query)]
+        needed (if (< (.left query) 0) (: 2 u8) 1)
+        (mut answer) (>= (get (.counts pairs) (pair-slot pairs (pair-key query))) 2)]
     (for value values
-      (when (and (> value 0)
-                 (or (>= (get mentions (cast i64 value)) 2) (counter-like? graph value)))
-        (set! answer true)))
+      (when (and (> value 0) (not answer))
+        (let [seen (get literals (cast i64 value))]
+          (set! answer (or (and (>= (& seen 3) needed) (!= (& seen 4) 0))
+                           (counter-like? graph value))))))
     answer))
 
 (defstruct Flow [(blocks cfg/Blocks) (idom (ArrayList i32))])
 
-(defn flow-of [(graph g/Graph) (entry i32) (a (dyn Allocator))]
+;;; Blocks and immediate dominators only. `validated` is as in the pipeline:
+;;; the graph's exact content passed sccp-rewrite/validate, which covers the
+;;; structural check, so only entry, roots and control sources are checked.
+(defn flow-of [(graph g/Graph) (entry i32) (roots (slice i32)) (validated bool)
+               (a (dyn Allocator))]
   (-> (Result Flow (slice u8)))
-  (match (cfg/build graph a)
+  (match (if validated
+             (match (verify/schedule-input-and-control-after-validate graph entry roots)
+               (Err [message] (Err message))
+               (Ok [_] (cfg/build-verified graph a)))
+             (cfg/build graph a))
     (Err [message] (Err message))
     (Ok [blocks]
       (let [(mut owned) blocks
@@ -365,10 +417,12 @@
         (Ok (Flow :blocks owned :idom idom))))))
 
 ;;; Proven IF outcomes of the graph, each from the unedited graph.
-(defn changes [(graph g/Graph) (entry i32) (a (dyn Allocator))]
+(defn changes [(graph g/Graph) (entry i32) (roots (slice i32)) (validated bool)
+               (a (dyn Allocator))]
   (-> (Result (ArrayList facts/Change) (slice u8)))
   (let [(mut found) (ArrayList::new [facts/Change] a)
         (mut pending) (ArrayList::new [i32] a)
+        (mut queries) (ArrayList::new [facts/Relation] a)
         (mut empty) (ArrayList::new [i32] a)
         (mut error) ""
         size (len (.instructions graph))
@@ -378,39 +432,45 @@
         (when (and (>= count 2) (= (n/opcode (get (.instructions graph) r)) 116))
           (let [query (facts/relation graph (.op2 (get (.instructions graph) r)))]
             (when (!= (.mask query) 0)
-              (let [truth (prove graph empty false (cast i32 r))]
+              (let [truth (prove-relation graph empty false (cast i32 r) query)]
                 (if (>= truth 0)
                     (push! (mut found) (facts/Change :branch (cast i32 r) :truth (!= truth 0)))
-                    (push! (mut pending) (cast i32 r)))))))
+                    (do (push! (mut pending) (cast i32 r))
+                        (push! (mut queries) query)))))))
         (set! r (+ r (if (< count 0) 1 (/ (+ count 4) 4))))))
     (when (> (len pending) 0)
-      ; Per operand, how many pending comparisons mention it (saturating).
-      (let [(mut mentions) (ArrayList::new [u8] a)
+      (let [(mut literals) (ArrayList::new [u8] a)
+            (mut pairs) (pairs-create (len pending) a)
             (mut wanted) false]
-        (extend-zeroed! (mut mentions) size)
-        (for branch pending
-          (let [query (facts/relation graph (.op2 (get (.instructions graph) (cast i64 branch))))
-                values [(.left query) (.right query)]]
-            (for value values
-              (when (and (> value 0) (< (get mentions (cast i64 value)) 2))
-                (set! (mut mentions) (cast i64 value) (+ (get mentions (cast i64 value)) 1))))))
-        (for branch pending
-          (when (candidate? graph mentions branch) (set! wanted true)))
+        (extend-zeroed! (mut literals) size)
+        (for query queries
+          (pair-note! (mut pairs) (pair-key query))
+          (when (and (< (.left query) 0) (> (.right query) 0))
+            (let [seen (get literals (cast i64 (.right query)))
+                  count (if (< (& seen 3) 3) (+ (& seen 3) 1) (: 3 u8))]
+              (set! (mut literals) (cast i64 (.right query))
+                    (| count (& seen 4) (if (!= (.domain query) 0) (: 4 u8) 0))))))
+        (for query queries
+          (when (and (not wanted) (candidate? graph pairs literals query)) (set! wanted true)))
         (when wanted
-          (match (flow-of graph entry a)
+          (match (flow-of graph entry roots validated a)
             (Err [message] (set! error message))
             (Ok [flow]
               (let [(mut flow) flow]
-                (for branch pending
-                  (when (candidate? graph mentions branch)
-                    (let [truth (prove graph (.idom flow) true branch)]
-                      (when (>= truth 0)
-                        (push! (mut found)
-                               (facts/Change :branch branch :truth (!= truth 0)))))))
+                (for [index 0 (len pending)]
+                  (let [query (get queries index) branch (get pending index)]
+                    (when (candidate? graph pairs literals query)
+                      (let [truth (prove-relation graph (.idom flow) true branch query)]
+                        (when (>= truth 0)
+                          (push! (mut found)
+                                 (facts/Change :branch branch :truth (!= truth 0))))))))
                 (cfg/release! (mut (.blocks flow)))
                 (free! (mut (.idom flow)))))))
-        (free! (mut mentions))))
+        (free! (mut literals))
+        (free! (mut (.keys pairs)))
+        (free! (mut (.counts pairs)))))
     (free! (mut pending))
+    (free! (mut queries))
     (free! (mut empty))
     (if (!= error "")
         (do (free! (mut found)) (Err error))
@@ -439,9 +499,10 @@
     found))
 
 ;;; An owned edited graph when at least one IF outcome is proven.
-(defn run [(graph g/Graph) (entry i32) (a (dyn Allocator))]
+(defn run [(graph g/Graph) (entry i32) (roots (slice i32)) (validated bool)
+           (a (dyn Allocator))]
   (-> (Result (Option g/Graph) (slice u8)))
-  (match (changes graph entry a)
+  (match (changes graph entry roots validated a)
     (Err [message] (Err message))
     (Ok [found]
       (let [(mut found) found
