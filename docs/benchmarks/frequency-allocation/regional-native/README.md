@@ -88,10 +88,11 @@ with a more favorable historical generation baseline.
 - The nested-loop fixture changes emitted bytes with regional allocation. It
   checks every result for zero/nonzero outer and inner trips, calls, register
   pressure and wrapping inputs in both JIT and C-linked AOT execution.
-- 306/308 standalone library programs pass. `jit-parameter-specialize` still
-  reports `expected expansion`; `private-leaf` still reports `wrong signature
-  accepted`, at the same source locations as before. These are not waived as
-  overall-goal acceptance; they are the known baseline failures.
+- The full run passed 306/308 standalone library programs. Follow-up test
+  commit `e34da76` corrects the two stale test assumptions, and both focused
+  native reruns pass without production changes. Together these cover all 308
+  programs; this is not a newly repeated full suite. See the
+  [test-contract evidence](../../../validation/regional-test-contracts/README.md).
 - All 73 linked consumers pass using 5,410 freshly generated, privately copied
   and hashed object fixtures. Standalone runs of linked consumers without link
   flags are superseded by this linked run.
