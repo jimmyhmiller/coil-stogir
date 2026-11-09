@@ -23,7 +23,8 @@
 (import "stogir.bitset" :as bits)
 (import "stogir.bitqueue" :as q)
 (import "coil.alloc" :use [Allocator])
-(import "coil.result" :use [Result Ok Err])
+(import "coil.mem" :as memory)
+(import "coil.result" :use [Result Ok Err Option Some None])
 
 ;;; Uses are rebuilt after the bulk rewrite. Only the owned working graph is
 ;;; mutable; no second copy or repeated SCCP fixed-point analysis is needed.
@@ -38,7 +39,18 @@
                           (pointer-bytes i32)
                           (compacting bool)
                           (a (dyn Allocator))] (-> (Result i32 (slice u8)))
-  (let [(mut edges) (uses/build (.graph result) a)
+  (finish-with-uses! (mut result) pointer-bytes compacting (None) a))
+
+;;; As finish-compacting!. PREPARED, when given, is uses/build of the result's
+;;; graph as it is now; it is consumed. Without it the index is built here.
+(defn finish-with-uses! [(result (mut rewrite/Rewritten))
+                         (pointer-bytes i32)
+                         (compacting bool)
+                         (prepared (Option uses/Uses))
+                         (a (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (let [(mut edges) (match prepared
+                      (Some [given] given)
+                      (None [] (uses/build (.graph result) a)))
         (mut protected) (bits/create (len (.instructions (.graph result))) a)
         (mut error) ""
         (mut changes) (: 0 i32)]
@@ -131,6 +143,16 @@
   (-> (Result rewrite/Rewritten (slice u8)))
   (optimize-proven-compacting source pointer-bytes roots proof false a))
 
+;;; Whether two graphs hold the same instruction cells and arities, so a use
+;;; index of one is exactly the use index of the other.
+(defn same-instructions? [(first g/Graph) (second g/Graph)] (-> bool)
+  (and (= (len (.instructions first)) (len (.instructions second)))
+       (= (len (.arities first)) (len (.arities second)))
+       (memory/eql (.data (.instructions first)) (.data (.instructions second))
+                (len (.instructions first)))
+       (memory/eql (.data (.arities first)) (.data (.arities second))
+                (len (.arities first)))))
+
 ;;; As optimize-proven. When compacting, a result with many dead NOP cells is
 ;;; a compacted copy whose references are renumbered in order; only its roots
 ;;; name its nodes.
@@ -141,24 +163,40 @@
                                   (compacting bool)
                                   (a (dyn Allocator))]
   (-> (Result rewrite/Rewritten (slice u8)))
-  (match (analysis/analyze-rooted-proven source pointer-bytes roots
-                                         (and (!= proof 0)
-                                              (= (rewrite/content-hash source pointer-bytes) proof))
-                                         a)
+  (match (analysis/verify-input source pointer-bytes
+                                (and (!= proof 0)
+                                     (= (rewrite/content-hash source pointer-bytes) proof))
+                                a)
     (Err [message] (Err message))
-    (Ok [facts]
-        (let [(mut facts) facts
-              transformed (rewrite/rewrite source facts roots a)]
-          (analysis/release! (mut facts))
-          (match transformed
-            (Err [message] (Err message))
-            (Ok [result]
-                (let [(mut result) result]
-                  (match (finish-compacting! (mut result) pointer-bytes compacting a)
+    (Ok [_]
+        ; One use index of the source serves the analysis and the rewrite. A
+        ; rewrite that left every instruction cell as it was hands the same
+        ; index on to the cleanup, which otherwise indexes the rewritten graph.
+        (let [(mut edges) (uses/build source a)]
+          (match (analysis/analyze-verified source pointer-bytes roots edges a)
+            (Err [message]
+                 (uses/release! (mut edges))
+                 (Err message))
+            (Ok [facts]
+                (let [(mut facts) facts
+                      transformed (rewrite/rewrite-sharing-uses source facts roots (Some edges) a)]
+                  (analysis/release! (mut facts))
+                  (match transformed
                     (Err [message]
-                         (rewrite/release! (mut result))
+                         (uses/release! (mut edges))
                          (Err message))
-                    (Ok [_] (Ok result))))))))))
+                    (Ok [result]
+                        (let [(mut result) result
+                              prepared (if (same-instructions? source (.graph result))
+                                           (Some edges)
+                                           (do
+                                             (uses/release! (mut edges))
+                                             (None [uses/Uses])))]
+                          (match (finish-with-uses! (mut result) pointer-bytes compacting prepared a)
+                            (Err [message]
+                                 (rewrite/release! (mut result))
+                                 (Err message))
+                            (Ok [_] (Ok result)))))))))))))
 
 ;;; Upstream runs optional memory promotion before SCCP and resets CFG facts.
 ;;; Keep that ordering without changing the SCCP-only component entry point.
