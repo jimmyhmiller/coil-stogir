@@ -1,0 +1,188 @@
+;;; A value that feeds a Phi and is computed from that Phi (or from another
+;;; input of it) is ordered after the other same-block users of its source, so
+;;; the two never interfere and coalesce into one register without a move.
+(module stogir.tests.loop-carried-update-order)
+(import "stogir.graph" :as g)
+(import "stogir.relocate" :as read)
+(import "stogir.builder" :as b)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [msg] (do (println "{}" msg) 0))))
+
+(defstruct Built [(graph g/Graph) (start i32) (ret i32) (early i32) (late i32)])
+
+;;; sum += index (kind 0) or sum += index * (index + 1) (kind 1), index += 1.
+;;; The update is created first, so reference order alone puts it first.
+(defn counting [(ty i32) (kind i32)] (-> Built)
+  (let [(mut graph) (g/create (malloc-allocator))
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        limit (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        entry (require (b/emit! (mut graph) 114 0 [start]))
+        loop (require (b/loop-begin! (mut graph) entry))
+        zero (require (b/scalar-constant! (mut graph) ty 0 8))
+        one (require (b/scalar-constant! (mut graph) ty 1 8))
+        index (require (b/loop-phi! (mut graph) loop zero))
+        sum (require (b/loop-phi! (mut graph) loop zero))
+        condition (require (b/emit! (mut graph) 16 1 [index limit]))
+        split (require (b/emit! (mut graph) 116 0 [loop condition]))
+        body (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        exit (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        next-index (require (b/emit! (mut graph) 26 ty [index one]))
+        term (if (= kind 0)
+                 index
+                 (require (b/emit! (mut graph) 28 ty [index next-index])))
+        next-sum (require (b/emit! (mut graph) 26 ty [sum term]))
+        back (require (b/emit! (mut graph) 115 0 [body]))
+        ret (require (b/emit! (mut graph) 120 ty [exit sum (: 0 i32)]))]
+    (b/patch! (mut graph) loop 2 back)
+    (b/patch! (mut graph) index 3 next-index)
+    (b/patch! (mut graph) sum 3 next-sum)
+    (Built :graph graph :start start :ret ret
+           :early (if (= kind 0) next-sum next-index)
+           :late (if (= kind 0) next-index next-sum))))
+
+;;; Odd indices take a path that reads count and then bumps it; the bumped
+;;; value and the unchanged count meet at a merge Phi that feeds the loop Phi.
+(defn merging [(ty i32)] (-> Built)
+  (let [(mut graph) (g/create (malloc-allocator))
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        limit (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        entry (require (b/emit! (mut graph) 114 0 [start]))
+        loop (require (b/loop-begin! (mut graph) entry))
+        zero (require (b/scalar-constant! (mut graph) ty 0 8))
+        one (require (b/scalar-constant! (mut graph) ty 1 8))
+        index (require (b/loop-phi! (mut graph) loop zero))
+        count (require (b/loop-phi! (mut graph) loop zero))
+        sum (require (b/loop-phi! (mut graph) loop zero))
+        condition (require (b/emit! (mut graph) 16 1 [index limit]))
+        split (require (b/emit! (mut graph) 116 0 [loop condition]))
+        body (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        exit (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        odd (require (b/emit! (mut graph) 47 ty [index one]))
+        odd? (require (b/emit! (mut graph) 15 1 [odd zero]))
+        inner (require (b/emit! (mut graph) 116 0 [body odd?]))
+        yes (require (b/emit! (mut graph) 107 0 [inner (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [inner (: 0 i32)]))
+        bumped (require (b/emit! (mut graph) 26 ty [count one]))
+        scaled (require (b/emit! (mut graph) 28 ty [count index]))
+        added (require (b/emit! (mut graph) 26 ty [sum scaled]))
+        yes-end (require (b/emit! (mut graph) 114 0 [yes]))
+        no-end (require (b/emit! (mut graph) 114 0 [no]))
+        merge (require (b/emit! (mut graph) 112 0 [yes-end no-end]))
+        count-out (require (b/emit! (mut graph) 67 ty [merge bumped count]))
+        sum-out (require (b/emit! (mut graph) 67 ty [merge added sum]))
+        next-index (require (b/emit! (mut graph) 26 ty [index one]))
+        back (require (b/emit! (mut graph) 115 0 [merge]))
+        total (require (b/emit! (mut graph) 26 ty [sum count]))
+        ret (require (b/emit! (mut graph) 120 ty [exit total (: 0 i32)]))]
+    (b/patch! (mut graph) loop 2 back)
+    (b/patch! (mut graph) index 3 next-index)
+    (b/patch! (mut graph) count 3 count-out)
+    (b/patch! (mut graph) sum 3 sum-out)
+    (Built :graph graph :start start :ret ret :early scaled :late bumped)))
+
+(defn position [(nodes (ArrayList i32)) (reference i32)] (-> i64)
+  (let [(mut found) -1]
+    (for [i 0 (len nodes)]
+      (when (= (get nodes i) reference) (set! found i)))
+    found))
+
+;;; Both references are scheduled, EARLY before LATE.
+(defn ordered [(built Built)] (-> i64)
+  (match (pipeline/prepare-native (.graph built) (.start built) [(.ret built)]
+                                  (malloc-allocator))
+    (Err [message] (println "{}" message) 1)
+    (Ok [prepared]
+      (let [(mut owned) prepared
+            early (position (.nodes (.schedule owned)) (.early built))
+            late (position (.nodes (.schedule owned)) (.late built))
+            failures (if (and (>= early 0) (< early late)) 0 1)]
+        (pipeline/release! (mut owned))
+        failures))))
+
+;;; Register-to-register moves (ORR Rd, ZR, Rm at either width) in the text.
+(defn register-moves [(bytes (ArrayList u8))] (-> i64)
+  (let [(mut count) 0]
+    (for [i 0 (/ (len bytes) 4)]
+      (when (= (& (read/read32 bytes (* i 4)) 0x7FE0FFE0) 0x2A0003E0)
+        (set! count (+ count 1))))
+    count))
+
+(defn expected-counting [(n i64) (kind i32)] (-> i64)
+  (let [(mut index) 0 (mut sum) 0]
+    (while (< index n)
+      (set! sum (primitive/iadd sum (if (= kind 0) index
+                                        (primitive/imul index (+ index 1)))))
+      (set! index (+ index 1)))
+    sum))
+
+(defn expected-merging [(n i64)] (-> i64)
+  (let [(mut index) 0 (mut count) 0 (mut sum) 0]
+    (while (< index n)
+      (when (!= (& index 1) 0)
+        (set! sum (primitive/iadd sum (primitive/imul count index)))
+        (set! count (+ count 1)))
+      (set! index (+ index 1)))
+    (primitive/iadd sum count)))
+
+;;; Shape 0/1 is counting kind 0/1, shape 2 is merging. MOVES is the exact
+;;; number of register moves the whole function may contain.
+(defn run [(ty i32) (shape i32) (moves i64)] (-> i64)
+  (let [built (if (= shape 2) (merging ty) (counting ty shape))
+        (mut graph) (.graph built)
+        (mut failures) (ordered built)]
+    (match (compile/text graph (.start built) [(.ret built)] (malloc-allocator))
+      (Err [msg] (println "{}" msg) (set! failures (+ failures 1)))
+      (Ok [text]
+        (let [(mut bytes) text]
+          (when (!= (register-moves bytes) moves)
+            (println "type {} shape {}: {} register moves, expected {}"
+                     ty shape (register-moves bytes) moves)
+            (set! failures (+ failures 1)))
+          (match (jit/map-text (slice bytes))
+            (Err [msg] (println "{}" msg) (set! failures (+ failures 1)))
+            (Ok [image]
+              (let [(mut owned) image
+                    limits [(: -9223372036854775807 i64) -2147483648 -5 -1 0 1 2 3
+                            7 8 100 1001]]
+                (for n limits
+                  (let [want (if (= shape 2) (expected-merging n)
+                                 (expected-counting n shape))]
+                    (if (= ty 11)
+                        (let [f (primitive/cast (fnptr (cc/C) [i64] i64)
+                                                (.base owned))]
+                          (when (!= (call-ptr f n) want)
+                            (set! failures (+ failures 1))))
+                        (let [f (primitive/cast (fnptr (cc/C) [i32] i32)
+                                                (.base owned))
+                              narrow (primitive/cast i32 n)]
+                          (when (!= (call-ptr f narrow)
+                                    (primitive/cast i32
+                                      (if (= shape 2)
+                                          (expected-merging (cast i64 narrow))
+                                          (expected-counting (cast i64 narrow) shape))))
+                            (set! failures (+ failures 1)))))))
+                (jit/release! (mut owned)))))
+          (free! (mut bytes)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for ty [(: 11 i32) 10]
+      ; sum and index each stay in one register; only the result reaches x0.
+      (set! failures (+ failures (run ty 0 1)))
+      ; index + 1 is needed while index is still read: one loop-carried move.
+      (set! failures (+ failures (run ty 1 2)))
+      ; The bumped count shares the count register; the result is formed in x0.
+      (set! failures (+ failures (run ty 2 0))))
+    (println "loop-carried update order checks: {} failures" failures)
+    (if (= failures 0) 0 1)))
