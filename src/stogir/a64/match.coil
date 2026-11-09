@@ -9,6 +9,7 @@
 (import "stogir.schedule" :as schedule)
 (import "stogir.matched-uses" :as machine)
 (import "stogir.conditional" :as conditional)
+(import "stogir.nonnegative" :as nonnegative)
 (import "stogir.a64.select" :as select)
 (import "stogir.a64.address" :as address)
 (import "stogir.a64.memory" :as memory)
@@ -73,12 +74,52 @@
                      (if (scratch-operand? graph (.right tile)) 1 0))
                   2)))))
 
+;;; An X-form, or W-form word, integer comparison of one register value with
+;;; an encodable immediate. Repeating it at a later use needs only that value,
+;;; which SSA dominance supplies; RLOAD inputs are pinned to their original
+;;; position. The value of a narrowed comparison is its extension's source.
+(defn immediate-comparison? [(graph g/Graph) (tile select/Tile) (reference i32)] (-> bool)
+  (and (select/direct-comparison? graph tile)
+       (= (.right tile) 0) (> (.left tile) 0)
+       (conditional/movable-condition? graph reference)))
+
+;;; For EQ/NE(ZEXT(Boolean integer comparison), 0), the inner comparison;
+;;; otherwise zero. Floating predicates are excluded: scalar-tile? selects
+;;; integer comparisons only, and their inversion would need unordered codes.
+(defn truth-source [(graph g/Graph) (tiles (ArrayList select/Tile)) (tile select/Tile)] (-> i32)
+  (if (and (or (= (.rule tile) 20) (= (.rule tile) 21)) (.wide tile)
+           (= (.right tile) 0) (= (.immediate tile) 0) (> (.left tile) 0))
+      (let [view (get (.instructions graph) (cast i64 (.left tile)))
+            inner (.op1 view)]
+        (if (and (= (n/opcode view) 34) (> inner 0)
+                 (= (n/type-id (get (.instructions graph) (cast i64 inner))) 1)
+                 (>= (.rule (get tiles (cast i64 inner))) 20)
+                 (<= (.rule (get tiles (cast i64 inner))) 33))
+            inner
+            0))
+      0))
+
+;;; The flags recipe of a fused IF or COND: an IF may carry its own (possibly
+;;; inverted) recipe; otherwise the absorbed comparison's selected tile.
+(defn condition-tile [(plan Plan) (reference i32)] (-> select/Tile)
+  (let [own (get (.tiles plan) (cast i64 reference))]
+    (if (and (>= (.rule own) 20) (<= (.rule own) 33))
+        own
+        (get (.tiles plan) (cast i64 (get (.comparisons plan) (cast i64 reference)))))))
+
 ;;; A plan borrows graph references and becomes invalid after graph mutation.
-;;; Branch fusion mirrors IR_CMP_AND_BRANCH_INT. The optional independent
-;;; COND extension consumes a single-use, unobserved, same-block 64-bit integer
-;;; comparison for a word integer result. Other rules keep ordinary def/uses.
+;;; Branch fusion mirrors IR_CMP_AND_BRANCH_INT: a single-use, unobserved,
+;;; same-block full-width integer comparison is consumed by its IF, and with
+;;; fuse-selects by an integer COND. Beyond upstream, a comparison with an
+;;; encodable immediate is repeated at every IF/COND user wherever it was
+;;; placed, and IF(EQ/NE(ZEXT(such a comparison), 0)) uses its flags directly.
+;;; The comparison keeps its definition only while another user needs the
+;;; Boolean. Other rules keep ordinary def/uses.
+;;; idom is indexed by block-start reference (pipeline dominators); an empty
+;;; list restricts signed power-of-two division proofs to expression structure.
 (defn build-with-selects [(graph g/Graph)
              (scheduled schedule/Schedule)
+             (idom (ArrayList i32))
              (roots (slice i32))
              (fuse bool)
              (fuse-selects bool)
@@ -101,6 +142,11 @@
         (mut word-views) (ArrayList::new [i32] a)
         (mut choices) (ArrayList::new [i32] a)
         (mut selects) (ArrayList::new [i32] a)
+        (mut narrowable) (ArrayList::new [i32] a)
+        (mut narrow-tiles) (ArrayList::new [select/Tile] a)
+        (mut narrow-users) (ArrayList::new [i32] a)
+        (mut narrow-switches) (ArrayList::new [i32] a)
+        (mut wide-switches) (ArrayList::new [i32] a)
         (mut block) (: 0 i32)
         (mut error) ""]
     (for [i 0 (len (.instructions graph))]
@@ -155,6 +201,23 @@
                                          (cast i64 (.op1 node))))
                           79)))
           (set! has-tail true))
+        ; A SWITCH on a word extension can dispatch on the source word when
+        ; every case literal is itself such an extension.
+        (when (and fuse (>= (n/opcode node) 109) (<= (n/opcode node) 117))
+          (cond (= (n/opcode node) 117)
+                  (when (> (select/switch-extension graph node) 0)
+                    (push! (mut narrow-switches) reference))
+                (<= (n/opcode node) 110)
+                  (let [source (get (.instructions graph) (cast i64 (.op1 node)))
+                        selector (if (= (n/opcode source) 117)
+                                     (select/switch-extension graph source)
+                                     0)]
+                    (when (and (> selector 0)
+                               (not (and (select/word-case? graph selector (.op2 node))
+                                         (or (= (n/opcode node) 109)
+                                             (select/word-case? graph selector (.op3 node))))))
+                      (push! (mut wide-switches) (.op1 node))))
+                :else 0))
         ; Discover choices in the existing walk; no extra whole-schedule scan.
         (when (and (= (n/opcode node) 60) fuse (= error ""))
           (match (select/ordered-choice graph reference)
@@ -165,7 +228,22 @@
         (when (scalar-tile? graph node)
           (match (select/select graph reference)
             (Err [message] (set! error message))
-            (Ok [tile] (set! (mut tiles) index tile)))))) (set! for-index-1 (+ for-index-1 1))))
+            ; A signed power-of-two DIV/MOD of a dividend proven non-negative
+            ; at this block equals the unsigned one: a single LSR or AND.
+            (Ok [tile]
+              (set! (mut tiles) index
+                    (if (and fuse (or (= (.rule tile) 45) (= (.rule tile) 47))
+                             (>= (types/scalar-size (cast i32 (n/type-id node)) 8) 4)
+                             (nonnegative/proven? graph idom block (.left tile)))
+                        (select/Tile :rule (- (.rule tile) 1) :wide (.wide tile)
+                                     :left (.left tile) :right 0
+                                     :immediate (.immediate tile))
+                        tile))
+              ; Only a 64-bit comparison of an extension can be narrowed.
+              (when (and fuse (.wide tile) (>= (.rule tile) 20) (<= (.rule tile) 33)
+                         (or (select/word-extension? graph (.left tile))
+                             (select/word-extension? graph (.right tile))))
+                (push! (mut narrowable) reference))))))) (set! for-index-1 (+ for-index-1 1))))
     ; Remove only each consumed Boolean edge. Shared/protected comparisons
     ; remain definitions; no new arithmetic edges are speculated.
     (for reference choices
@@ -180,38 +258,198 @@
             (when (> value 0)
               (set! (mut counts) (cast i64 value)
                     (- (get counts (cast i64 value)) 1)))))))
+    ; Compare and dispatch on the 32-bit sources of SEXT/ZEXT directly. An
+    ; extension is retired only when every machine use is such a comparison
+    ; or SWITCH; otherwise all of them keep the extended value, which is then
+    ; free to read. Take each candidate's extension edges, then return those
+    ; of rejected candidates until every remaining extension has no other use.
+    (for reference wide-switches
+      (for [i 0 (len narrow-switches)]
+        (when (= (get narrow-switches i) reference)
+          (set! (mut narrow-switches) i 0))))
+    (free! (mut wide-switches))
+    (when (and (> (+ (len narrowable) (len narrow-switches)) 0) (= error ""))
+      (for [i 0 (len narrow-switches)]
+        (let [reference (get narrow-switches i)]
+          (when (> reference 0)
+            (let [selector (cast i64 (.op2 (get (.instructions graph) (cast i64 reference))))]
+              (set! (mut counts) selector (- (get counts selector) 1))))))
+      (for [i 0 (len narrowable)]
+        (let [reference (get narrowable i)
+              tile (get tiles (cast i64 reference))]
+          (push! (mut narrow-tiles) tile)
+          (match (if (get omitted (cast i64 reference)) (None)
+                     (select/narrowed-comparison graph tile))
+            (None [] (set! (mut narrowable) i 0))
+            (Some [narrow]
+              (set! (mut narrow-tiles) i narrow)
+              (when (!= (.left narrow) (.left tile))
+                (set! (mut counts) (cast i64 (.left tile))
+                      (- (get counts (cast i64 (.left tile))) 1)))
+              (when (!= (.right narrow) (.right tile))
+                (set! (mut counts) (cast i64 (.right tile))
+                      (- (get counts (cast i64 (.right tile))) 1)))))))
+      (let [(mut stable) false]
+        (while (not stable)
+          (set! stable true)
+          (for [i 0 (len narrowable)]
+            (let [reference (get narrowable i)]
+              (when (> reference 0)
+                (let [tile (get tiles (cast i64 reference))
+                      narrow (get narrow-tiles i)
+                      left? (!= (.left narrow) (.left tile))
+                      right? (!= (.right narrow) (.right tile))]
+                  (when (or (and left?
+                                 (or (!= (get counts (cast i64 (.left tile))) 0)
+                                     (get protected (cast i64 (.left tile)))))
+                            (and right?
+                                 (or (!= (get counts (cast i64 (.right tile))) 0)
+                                     (get protected (cast i64 (.right tile))))))
+                    (when left?
+                      (set! (mut counts) (cast i64 (.left tile))
+                            (+ (get counts (cast i64 (.left tile))) 1)))
+                    (when right?
+                      (set! (mut counts) (cast i64 (.right tile))
+                            (+ (get counts (cast i64 (.right tile))) 1)))
+                    (set! (mut narrowable) i 0)
+                    (set! stable false))))))
+          (for [i 0 (len narrow-switches)]
+            (let [reference (get narrow-switches i)]
+              (when (> reference 0)
+                (let [selector (cast i64 (.op2 (get (.instructions graph) (cast i64 reference))))]
+                  (when (or (!= (get counts selector) 0) (get protected selector))
+                    (set! (mut counts) selector (+ (get counts selector) 1))
+                    (set! (mut narrow-switches) i 0)
+                    (set! stable false))))))))
+      (for reference narrow-switches
+        (when (> reference 0)
+          (let [selector (cast i64 (.op2 (get (.instructions graph) (cast i64 reference))))
+                source (cast i64 (.op1 (get (.instructions graph) selector)))]
+            (set! (mut counts) source (+ (get counts source) 1))
+            (unless (get omitted selector)
+              (set! (mut omitted) selector true)
+              (set! (mut counts) source (- (get counts source) 1)))
+            (push! (mut narrow-users) reference))))
+      ; Each absorbed edge now reads the source; a retired extension gives
+      ; up its own source edge exactly once.
+      (for [i 0 (len narrowable)]
+        (let [reference (get narrowable i)]
+          (when (> reference 0)
+            (let [tile (get tiles (cast i64 reference))
+                  narrow (get narrow-tiles i)
+                  extensions [(.left tile) (.right tile)]
+                  sources [(.left narrow) (.right narrow)]]
+              (for [j 0 2]
+                (let [extension (get extensions j)
+                      source (cast i64 (get sources j))]
+                  (when (!= (get sources j) extension)
+                    (set! (mut counts) source (+ (get counts source) 1))
+                    (unless (get omitted (cast i64 extension))
+                      (set! (mut omitted) (cast i64 extension) true)
+                      (set! (mut counts) source (- (get counts source) 1))))))
+              (set! (mut tiles) (cast i64 reference) narrow))))))
+    (free! (mut narrow-tiles))
+    (free! (mut narrow-switches))
     (when (and fuse (= error ""))
       (let [items-2 (.nodes scheduled) (mut for-index-2) (: 0 i64)] (while (< for-index-2 (len items-2)) (let [reference (get items-2 for-index-2)]
         (let [node (get (.instructions graph) (cast i64 reference))
               selection (and fuse-selects (= (n/opcode node) 60)
                              (types/integer? (cast i32 (n/type-id node)))
-                             (>= (types/scalar-size (cast i32 (n/type-id node)) 8) 4)
                              (= (.rule (get tiles (cast i64 reference))) 0))
               source (if selection (.op1 node) (.op2 node))]
           (when (and (or selection (= (n/opcode node) 116)) (> source 0))
             (let [index (cast i64 source)
                   tile (get tiles index)]
-              (when (and (= (get counts index) 1)
+              (let [inner (if selection 0 (truth-source graph tiles tile))
+                    inverted (and (> inner 0)
+                                  (immediate-comparison? graph (get tiles (cast i64 inner)) inner))]
+                (if (and (not inverted)
+                         (= (get counts index) 1)
                          (not (get protected index))
                          (= (get blocks index)
                             (get blocks (cast i64 reference)))
-                         (>= (.rule tile) 20)
-                         (<= (.rule tile) 33)
-                         (.wide tile)
+                         (select/direct-comparison? graph tile)
                          (or (not selection) (conditional/movable-condition? graph source)))
-                (set! (mut omitted) index true)
-                (set! (mut comparisons) (cast i64 reference) source)
-                (when selection (push! (mut selects) reference))))))) (set! for-index-2 (+ for-index-2 1)))))
+                    (do
+                      (set! (mut omitted) index true)
+                      (set! (mut comparisons) (cast i64 reference) source)
+                      (unless (.wide tile) (push! (mut narrow-users) reference))
+                      (when selection (push! (mut selects) reference)))
+                    (if inverted
+                        ; IF(EQ/NE(ZEXT(comparison), 0)) branches on the inner
+                        ; flags, inverted for EQ. Each absorbed edge is released
+                        ; in turn; a still-used link keeps its definition.
+                        (let [base (get tiles (cast i64 inner))
+                              operand (cast i64 (.left base))
+                              (mut link) source
+                              (mut live) true]
+                          (set! (mut comparisons) (cast i64 reference) inner)
+                          (unless (.wide base) (push! (mut narrow-users) reference))
+                          (set! (mut tiles) (cast i64 reference)
+                                (select/Tile :rule (if (= (.rule tile) 20)
+                                                       (+ 20 (^ (- (.rule base) 20) 1))
+                                                       (.rule base))
+                                             :wide (.wide base) :left (.left base) :right 0
+                                             :immediate (.immediate base)))
+                          (set! (mut counts) operand (+ (get counts operand) 1))
+                          (while live
+                            (let [slot (cast i64 link)]
+                              (set! (mut counts) slot (- (get counts slot) 1))
+                              (if (and (= (get counts slot) 0) (not (get protected slot)))
+                                  (do
+                                    (set! (mut omitted) slot true)
+                                    (if (= link inner)
+                                        (do
+                                          (set! (mut counts) operand (- (get counts operand) 1))
+                                          (set! live false))
+                                        (set! link (if (= link source) (.left tile) inner))))
+                                  (set! live false)))))
+                        ; A shared or earlier-placed comparison with an encodable
+                        ; immediate is repeated at each IF and word COND: its one
+                        ; register input replaces the Boolean one-for-one in every
+                        ; live range, so pressure never grows. Two-register forms
+                        ; stay Booleans unless single-use in the same block.
+                        (when (and (or selection (= (n/opcode node) 116))
+                                   (immediate-comparison? graph tile source))
+                          (set! (mut comparisons) (cast i64 reference) source)
+                          (unless (.wide tile) (push! (mut narrow-users) reference))
+                          (when selection (push! (mut selects) reference))
+                          (set! (mut counts) index (- (get counts index) 1))
+                          (if (and (= (get counts index) 0) (not (get protected index)))
+                              (set! (mut omitted) index true)
+                              (set! (mut counts) (cast i64 (.left tile))
+                                    (+ (get counts (cast i64 (.left tile))) 1))))))))))) (set! for-index-2 (+ for-index-2 1)))))
     ; TRUNC(SHR/SAR) extracts a field; SHL(SHR/SAR) with matching counts
-    ; clears low bits with one AND. Both select a single machine input.
+    ; clears low bits with one AND; SEXT/ZEXT of a word TRUNC view extends the
+    ; low word of the view's source. Each selects a single machine input.
+    ; UBFX clears every bit above its field, so ZEXT of an extracted field is
+    ; that same extraction; its TRUNC was visited first in schedule order.
     ; Redirect each use first, then retire a producer only after all actual
     ; edges have been absorbed. Shared and rooted shifts remain definitions.
     (when (and fuse (= error ""))
       (let [items-3 (.nodes scheduled) (mut for-index-3) (: 0 i64)] (while (< for-index-3 (len items-3)) (let [reference (get items-3 for-index-3)]
         (let [opcode (n/opcode (get (.instructions graph) (cast i64 reference)))]
-        (when (or (= opcode 35) (= opcode 49))
-          (match (if (= opcode 35) (select/extraction graph reference)
-                     (select/shift-mask graph reference))
+        (when (or (= opcode 35) (= opcode 49)
+                  (and (or (= opcode 33) (= opcode 34))
+                       (not (get omitted (cast i64 reference)))))
+          (match (cond (= opcode 35) (select/extraction graph reference)
+                       (= opcode 49) (select/shift-mask graph reference)
+                       :else
+                         ; Only for the last reader of the TRUNC: reading
+                         ; past a TRUNC that stays would keep its source live
+                         ; across it and cost the copy that a view avoids.
+                         (let [view (.op1 (get (.instructions graph) (cast i64 reference)))]
+                           (cond (or (<= view 0) (!= (get counts (cast i64 view)) 1)
+                                     (get protected (cast i64 view)))
+                                   (None)
+                                 (> (get extractions (cast i64 view)) 0)
+                                   (if (and (= opcode 34)
+                                            (= (.rule (get tiles (cast i64 view))) 48)
+                                            (= (n/opcode (get (.instructions graph) (cast i64 view)))
+                                               35))
+                                       (Some (get tiles (cast i64 view)))
+                                       (None))
+                                 :else (select/word-view-extension graph reference))))
             (None [] 0)
             (Some [tile]
                   (let [index (cast i64 reference)
@@ -326,7 +564,7 @@
                     (let [multiply (get tiles (cast i64 product))
                           sources [(.left multiply) (.right multiply)]]
                       (set! (mut tiles) index
-                        (select/Tile :rule (+ (.rule current) 52) :wide (.wide current)
+                        (select/Tile :rule (+ (.rule current) 53) :wide (.wide current)
                           :left addend :right (.left multiply)
                           :immediate (cast u64 (cast i64 (.right multiply)))))
                       (for value sources
@@ -362,7 +600,10 @@
                                                         8)
                                      8))
                               (or (= (n/opcode node) 28) (= (n/opcode node) 49)
-                                  (= (n/opcode node) 50) (= (n/opcode node) 51)))))
+                                  (= (n/opcode node) 50) (= (n/opcode node) 51)))
+                         ; A TRUNC whose extensions all read its source.
+                         (and (= (n/opcode node) 35)
+                              (types/integer? (cast i32 (n/type-id node))))))
             (set! (mut omitted) index true)
             ; Fused unary and shifted ADD/SUB tiles already replaced their
             ; uses. Retirement must subtract those selected edges, including
@@ -413,6 +654,8 @@
           (free! (mut blocks))
           (free! (mut protected))
           (free! (mut word-views))
+          (free! (mut narrowable))
+          (free! (mut narrow-users))
           (free! (mut choices))
           (free! (mut selects))
           (free! (mut tiles))
@@ -460,13 +703,29 @@
                   (set! (mut (.inputs operands)) (+ (.offset range) 1) (.right tile))))
               ; MADD/MSUB read three sources; give them their own range.
               (when (and (not (get (.omitted operands) (cast i64 reference)))
-                         (or (= (.rule tile) 53) (= (.rule tile) 54)))
+                         (or (= (.rule tile) 54) (= (.rule tile) 55)))
                 (let [offset (len (.inputs operands))]
                   (push! (mut (.inputs operands)) (.left tile))
                   (push! (mut (.inputs operands)) (.right tile))
                   (push! (mut (.inputs operands)) (select/multiplier tile))
                   (set! (mut (.ranges operands)) (cast i64 reference)
                         (machine/Range :offset offset :count 3)))))) (set! for-index-8 (+ for-index-8 1))))
+          ; A narrowed comparison, or the branch that consumed it, was given
+          ; the comparison's graph operands. Read each retired extension
+          ; through its source, as the selected tile does.
+          (for reference narrowable (push! (mut narrow-users) reference))
+          (free! (mut narrowable))
+          (for reference narrow-users
+            (when (and (> reference 0)
+                       (not (get (.omitted operands) (cast i64 reference))))
+              (let [range (get (.ranges operands) (cast i64 reference))]
+                (for [i 0 (.count range)]
+                  (let [value (get (.inputs operands) (+ (.offset range) i))]
+                    (when (and (> value 0) (get (.omitted operands) (cast i64 value))
+                               (select/word-extension? graph value))
+                      (set! (mut (.inputs operands)) (+ (.offset range) i)
+                            (.op1 (get (.instructions graph) (cast i64 value))))))))))
+          (free! (mut narrow-users))
           ; Only selected choices need replacement input ranges.
           (for reference choices
             (let [index (cast i64 reference) tile (get tiles index)
@@ -529,6 +788,15 @@
     (free! (mut roots))
     result))
 
+;;; The machine selector of a SWITCH: its operand, or the 32-bit source of an
+;;; extension that matching retired in favor of word dispatch.
+(defn switch-selector [(plan Plan) (graph g/Graph) (reference i32)] (-> i32)
+  (let [selector (.op2 (get (.instructions graph) (cast i64 reference)))]
+    (if (and (select/word-extension? graph selector)
+             (get (.omitted (.operands plan)) (cast i64 selector)))
+        (.op1 (get (.instructions graph) (cast i64 selector)))
+        selector)))
+
 (defn selected [(plan Plan) (reference i32)]
   (-> (Result select/Tile (slice u8)))
   (let [tile (get (.tiles plan) (cast i64 reference))]
@@ -538,7 +806,10 @@
 
 (defn build [(graph g/Graph) (scheduled schedule/Schedule) (roots (slice i32))
              (fuse bool) (a (dyn Allocator))] (-> (Result Plan (slice u8)))
-  (build-with-selects graph scheduled roots fuse false a))
+  (let [(mut idom) (ArrayList::new [i32] a)
+        result (build-with-selects graph scheduled idom roots fuse false a)]
+    (free! (mut idom))
+    result))
 
 (defn release! [(plan (mut Plan))] (-> void)
   (free! (mut (.static-sizes plan)))

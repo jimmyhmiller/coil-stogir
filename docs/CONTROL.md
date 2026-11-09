@@ -31,6 +31,25 @@ Use END nodes to feed a MERGE and PHI nodes for case results. The order of PHI
 inputs follows MERGE predecessor order, independent of dispatch sorting. Loop
 backedges use the existing LOOP_BEGIN/LOOP_END and loop-phi construction.
 
+## Equality chains
+
+`equality-chain/rewrite!` runs in the SCCP pipeline after the iterative cleanup
+has settled (`sccp/finish-compacting!`), followed by one more cleanup when it
+changed anything. It finds IF nodes that test `EQ(v, c)` or `NE(v, c)` for one
+integer value `v` and a same-typed constant, where the projection taken when
+`v != c` is used only by the next such IF. The head IF becomes the SWITCH, each
+matching projection its CASE_VAL, the last non-matching projection the
+CASE_DEFAULT; the links between them become NOPs. Nothing moves to a new
+reference, so MERGE predecessors, PHI inputs and roots are unchanged, and a
+projection or IF that is an observable root ends the chain instead of being
+removed. A repeated constant ends the chain before the repetition.
+
+Four or more tests always become a SWITCH. Three do when every match reaches
+one MERGE through empty blocks and no PHI there needs a per-edge value (one
+bit test); two do under the same condition when their constants are adjacent
+(one range test). Other short chains, including two-way tag tests with separate
+targets, stay IFs.
+
 ## AArch64 dispatch
 
 Case intervals are heapsorted in O(n log n) time with bounded extra sorting
@@ -50,6 +69,16 @@ cases and `(maximum-minimum) < case-count*8`. Ranges, sparse cases and smaller
 switches retain balanced comparisons. The normalized selector subtracts the
 minimum and uses one unsigned bounds check, which also rejects values below the
 minimum. Holes in the table point to the default edge stub.
+
+Before choosing a strategy, dispatch compares the code addresses behind its
+edges: a case block that is forwarded to the default's address is the default
+and gets no test. Singleton cases inside one 64-value window that reach at most
+three addresses use a bounds check and one mask test per address (`mov x17, #1`,
+`lsl x17, x17, key`, `and x16, x17, #mask`, `cbnz x16`), with LLVM's thresholds:
+three cases for one address, five for two, six for three. One address that
+covers its whole window needs the bounds check alone. This takes precedence
+over a table. A closing jump to the default is omitted when the default block
+follows the dispatch and no edge needs a stub.
 
 Tables contain signed 32-bit displacements relative to the table base. ADR,
 indexed LDRSW, ADD and BR form the destination without an absolute pointer or a

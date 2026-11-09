@@ -26,7 +26,8 @@
         :else false))
 
 ;;; All integer predicates, register and signed-immediate CMP/CMN, result
-;;; widths, literal choices, and rooted/shared producer rejection. Matching is
+;;; widths, literal choices, and rooted/shared producers: a register comparison
+;;; stays a Boolean, an immediate one is repeated while its definition remains. Matching is
 ;;; inspected before allocation; native execution checks the same stored plan.
 (defn check [(opcode i32) (mode i32) (ty i32) (literal i32)] (-> i64)
   (let [a (malloc-allocator) (mut graph) (g/create a)
@@ -38,20 +39,33 @@
         bound (if (= literal 0) y
                   (need (b/scalar-constant! (mut graph) 5
                     (if (= literal 1) (: 37 u64) 0xFFFFFFFFFFFFFFDB) 8)))
-        cmp-x (if (= mode 8) (need (b/emit! (mut graph) 35 4 [x])) x)
-        cmp-y (if (= mode 8) (need (b/emit! (mut graph) 35 4 [bound])) bound)
+        ; Mode 8 compares 32-bit views; 9 and 10 compare their SEXT/ZEXT with
+        ; another such extension or with the 64-bit literal itself.
+        extension (if (= mode 9) (: 33 i32) 34)
+        narrow (if (= mode 9) (: 10 i32) 4)
+        extended? (or (= mode 9) (= mode 10))
+        cmp-x (cond (= mode 8) (need (b/emit! (mut graph) 35 4 [x]))
+                    extended?
+                      (need (b/emit! (mut graph) extension 5
+                              [(need (b/emit! (mut graph) 35 narrow [x]))]))
+                    :else x)
+        cmp-y (cond (= mode 8) (need (b/emit! (mut graph) 35 4 [bound]))
+                    (and extended? (= literal 0))
+                      (need (b/emit! (mut graph) extension 5
+                              [(need (b/emit! (mut graph) 35 narrow [bound]))]))
+                    :else bound)
         condition (need (b/emit! (mut graph) opcode 1 [cmp-x cmp-y]))
         lhs (if (= ty 5) left (need (b/emit! (mut graph) 35 ty [left])))
         rhs (if (= ty 5) right (need (b/emit! (mut graph) 35 ty [right])))
         yes-bits (cond (or (= mode 1) (= mode 4)) (: 0 u64) (= mode 5) 1 :else 0xFEDCBA9876543210)
         no-bits (cond (= mode 4) (: 1 u64) (= mode 5) 0 :else 0x123456789ABCDEF0)
-        mask (if (= ty 4) (: 0xFFFFFFFF u64) 0xFFFFFFFFFFFFFFFF)
+        mask (case ty 2 (: 0xFF u64) 3 0xFFFF 4 0xFFFFFFFF 0xFFFFFFFFFFFFFFFF)
         yes (if (or (= mode 1) (= mode 3) (= mode 4) (= mode 5))
                 (need (b/scalar-constant! (mut graph) ty (& yes-bits mask) 8)) lhs)
         no (if (or (= mode 2) (= mode 3) (= mode 4) (= mode 5))
                (need (b/scalar-constant! (mut graph) ty (& no-bits mask) 8)) rhs)
         chosen (need (b/emit! (mut graph) 60 ty [condition yes no]))
-        result (if (= ty 4) (need (b/emit! (mut graph) 34 5 [chosen])) chosen)
+        result (if (= ty 5) chosen (need (b/emit! (mut graph) 34 5 [chosen])))
         ret (need (b/emit! (mut graph) 120 5 [start result (: 0 i32)]))
         (mut roots) (ArrayList::new [i32] a) (mut answers) (: 0 i64)]
     (push! (mut roots) ret)
@@ -60,15 +74,18 @@
       (push! (mut roots) (need (b/emit! (mut graph) 60 ty [condition no yes]))))
     (for enabled [false true]
       (let [(mut prepared) (need (pipeline/prepare-native graph start (slice roots) a))
-            (mut plan) (need (matching/build-with-selects graph (.schedule prepared) (slice roots) true enabled a))
-            fused (and enabled (< mode 6))
+            (mut plan) (need (matching/build-with-selects graph (.schedule prepared) (.idom prepared) (slice roots) true enabled a))
+            ; Single-use word comparisons (modes 8..10) fuse like full-width ones.
+            absorbed (and enabled (or (< mode 6) (>= mode 8) (and (= mode 7) (!= literal 0))))
+            fused (and enabled (or (< mode 6) (>= mode 8) (!= literal 0)))
             range (get (.ranges (.operands plan)) (cast i64 chosen))
             (mut emitted) (need (compile/generate-matched graph prepared plan a))]
         (assert (= (> (get (.comparisons plan) (cast i64 chosen)) 0) fused))
-        (assert (= (get (.omitted (.operands plan)) (cast i64 condition)) fused))
+        (assert (= (get (.omitted (.operands plan)) (cast i64 condition)) absorbed))
         (assert (get (.definitions (.operands plan)) (cast i64 chosen)))
         (when fused
-          (assert (= (.count range) (if (= literal 0) 4 3)))
+          ; The 32-bit view of a literal is a register operand.
+          (assert (= (.count range) (if (or (= literal 0) (= mode 8)) 4 3)))
           (for [i 0 (.count range)]
             (assert (!= (get (.inputs (.operands plan)) (+ (.offset range) i)) condition))))
         (let [(mut image) (need (jit/map-text (slice (.text emitted))))
@@ -80,10 +97,14 @@
                   yes (if (or (= mode 1) (= mode 3) (= mode 4) (= mode 5)) yes-bits left)
                   no (if (or (= mode 2) (= mode 3) (= mode 4) (= mode 5)) no-bits right)
                   narrow-signed (and (= mode 8) (>= opcode 16) (<= opcode 19))
-                  x-test (if narrow-signed (cast u64 (cast i64 (cast i32 x)))
-                             (if (= mode 8) (& x 0xFFFFFFFF) x))
-                  y-test (if narrow-signed (cast u64 (cast i64 (cast i32 y-test)))
-                             (if (= mode 8) (& y-test 0xFFFFFFFF) y-test))
+                  x-test (cond (or narrow-signed (= mode 9)) (cast u64 (cast i64 (cast i32 x)))
+                               (or (= mode 8) (= mode 10)) (& x 0xFFFFFFFF)
+                               :else x)
+                  y-test (cond (or narrow-signed (and (= mode 9) (= literal 0)))
+                                 (cast u64 (cast i64 (cast i32 y-test)))
+                               (or (= mode 8) (and (= mode 10) (= literal 0)))
+                                 (& y-test 0xFFFFFFFF)
+                               :else y-test)
                   expected (& (if (truth opcode x-test y-test) yes no) mask)
                   actual (f x y left right)]
               (unless (= actual expected)
@@ -116,7 +137,7 @@
       (let [ret (need (b/emit! (mut graph) 120 5 [chain sum (: 0 i32)]))]
         (for enabled [false true]
           (let [(mut prepared) (need (pipeline/prepare-native graph start [ret] a))
-                (mut plan) (need (matching/build-with-selects graph (.schedule prepared) [ret] true enabled a))
+                (mut plan) (need (matching/build-with-selects graph (.schedule prepared) (.idom prepared) [ret] true enabled a))
                 (mut emitted) (need (compile/generate-matched graph prepared plan a))
                 (mut image) (need (jit/map-text (slice (.text emitted))))
                 f (p/cast (fnptr (cc/C) [(ptr u64) u64 u64] u64) (.base image))]
@@ -131,7 +152,7 @@
 (defn main [] (-> i32)
   (pressure)
   (let [(mut answers) (: 0 i64)]
-    (for [op 14 24] (for [mode 0 9] (for [literal 0 3]
-      (for ty [(: 4 i32) 5]
+    (for [op 14 24] (for [mode 0 11] (for [literal 0 3]
+      (for ty [(: 2 i32) 3 4 5]
         (set! answers (+ answers (check (cast i32 op) (cast i32 mode) ty (cast i32 literal))))))))
     (println "select comparison: {} native answers" answers)) 0)

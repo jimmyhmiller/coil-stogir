@@ -36,7 +36,7 @@ assertion fails before the fix, while native correctness alone would miss it.
 
 ## Multiply-accumulate
 
-Rules 53/54 are an independent extension: persistent matching turns `ADD(c, MUL(a, b))`
+Rules 54/55 are an independent extension: persistent matching turns `ADD(c, MUL(a, b))`
 (either operand order) into MADD and `SUB(c, MUL(a, b))` into MSUB when the MUL is a
 register multiply (rule 3) with that single use, unrooted and in the consumer's block.
 The tile's left is the addend, right the multiplicand and the immediate the multiplier's

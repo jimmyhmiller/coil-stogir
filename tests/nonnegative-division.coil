@@ -1,0 +1,309 @@
+(module stogir.tests.nonnegative-division)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.match" :as matching)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn sext32 [(x i64)] (-> i64)
+  (>> (cast i64 (<< (cast u64 x) 32)) 32))
+
+;;; Comparison of two sign-extended operands at the given bit width.
+(defn eval [(op i32) (width i32) (x i64) (y i64)] (-> bool)
+  (let [mask (if (= width 64) (: 0xFFFFFFFFFFFFFFFF u64) (: 0xFFFFFFFF u64))
+        ux (& (cast u64 x) mask) uy (& (cast u64 y) mask)]
+    (match op (14 (= x y)) (15 (!= x y)) (16 (< x y)) (17 (>= x y))
+      (18 (<= x y)) (19 (> x y)) (20 (< ux uy)) (21 (>= ux uy))
+      (22 (<= ux uy)) (23 (> ux uy)) (_ (panic "bad opcode")))))
+
+(defn samples [] (-> (array i64 30))
+  [(: -9223372036854775808 i64) -9223372036854775807 -4294967301 -2147483649
+   -2147483648 -2147483647 -9 -8 -5 -4 -3 -2 -1 0 1 2 3 4 5 7 8 9
+   2147483646 2147483647 2147483648 4294967295 4294967301
+   9223372036854775806 9223372036854775807 6])
+
+(defn signature! [(graph (mut g/Graph)) (a (dyn Allocator))] (-> void)
+  (let [(mut signature) (match (calls/create 0 11 [(: 11 u8) 11] a)
+                          (Err [message] (panic "{}" message)) (Ok [s] s))]
+    (require (calls/function! (mut graph) signature a))
+    (calls/release! (mut signature))))
+
+;;; Selected rule of one node, using the pipeline dominators as compilation does.
+(defn rule-of [(graph g/Graph) (exits (slice i32)) (reference i32) (a (dyn Allocator))]
+  (-> i32)
+  (match (pipeline/prepare graph 1 exits a)
+    (Err [message] (panic "prepare: {}" message))
+    (Ok [prepared]
+      (let [(mut prepared) prepared
+            rule (match (matching/build-with-selects graph (.schedule prepared)
+                          (.idom prepared) exits true false a)
+                   (Err [message] (panic "match: {}" message))
+                   (Ok [plan]
+                     (let [(mut plan) plan
+                           rule (.rule (get (.tiles plan) (cast i64 reference)))]
+                       (matching/release! (mut plan))
+                       rule)))]
+        (pipeline/release! (mut prepared))
+        rule))))
+
+;;; Native answers for every (x, y) pair; y takes the three given values.
+(defn native [(graph g/Graph) (exits (slice i32)) (ys (slice i64)) (a (dyn Allocator))]
+  (-> (ArrayList i64))
+  (let [(mut out) (ArrayList::new [i64] a)]
+    (match (compile/image-with-private graph 1 exits "_nn_entry"
+             (options/Options :level 3) a (private/no-context))
+      (Err [message] (panic "compile: {}" message))
+      (Ok [code]
+        (let [(mut code) code]
+          (match (link/compose [code] a)
+            (Err [message] (panic "compose: {}" message))
+            (Ok [module]
+              (let [(mut module) module]
+                (match (jit/map-image (.image module) a)
+                  (Err [message] (panic "map: {}" message))
+                  (Ok [loaded]
+                    (let [(mut loaded) loaded
+                          index (match (image/find-symbol (.image module) "_nn_entry")
+                                  (Some [id] id) (None [] (panic "symbol")))
+                          function (primitive/cast (fnptr (cc/C) [i64 i64] i64)
+                            (primitive/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))]
+                      (for x (samples) (for y ys (push! (mut out) (function x y))))
+                      (jit/release-image! (mut loaded)))))
+                (link/release! (mut module)))))
+          (image/release! (mut code)))))
+    out))
+
+(defn divide [(opcode i32) (wide bool) (v i64) (exponent i32)] (-> i64)
+  (let [d (<< (: 1 i64) (cast i64 exponent))
+        x (if wide v (sext32 v))]
+    (if (= opcode 29) (/ x d) (% x d))))
+
+;;; One guarded signed DIV/MOD. Shapes: 0 = i64 compare and divide; 1 = i32
+;;; both; 2 = compare SEXT(t) at 64 bits, divide t at 32; 3 = compare t at 32,
+;;; divide SEXT(t) at 64; 4 = compare a u64 BITCAST view, divide the i64 value.
+;;; The untested arm returns 7777. Returns the number of failures.
+(defn guarded [(shape i32) (op i32) (bits u64) (arm bool) (swapped bool)
+               (opcode i32) (exponent i32) (pinned bool) (run bool)] (-> i64)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        (mut exits) (ArrayList::new [i32] a) (mut failures) (: 0 i64)
+        compare-wide (or (= shape 0) (= shape 2) (= shape 4))
+        value-wide (or (= shape 0) (= shape 3) (= shape 4))
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        t (if (or (= shape 0) (= shape 4)) x (require (b/emit! (mut graph) 35 10 [x])))
+        s (if (or (= shape 2) (= shape 3)) (require (b/emit! (mut graph) 33 11 [t])) t)
+        compared (match shape (2 s) (3 t) (4 (require (b/emit! (mut graph) 36 5 [x]))) (_ t))
+        divided (match shape (2 t) (3 s) (_ t))
+        compare-type (if (= shape 4) (: 5 i32) (if compare-wide 11 10))
+        value-type (if value-wide (: 11 i32) 10)
+        literal (require (b/scalar-constant! (mut graph) compare-type bits 8))
+        test (require (b/emit! (mut graph) op 1
+               (if swapped [literal compared] [compared literal])))
+        split (require (b/emit! (mut graph) 116 0 [start test]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        taken (if arm yes no)
+        divisor (require (b/scalar-constant! (mut graph) value-type
+                  (<< (: 1 u64) (cast u64 exponent)) 8))
+        result (require (b/emit! (mut graph) opcode value-type
+                 [divided divisor (if pinned taken (: 0 i32))]))
+        wide-result (if value-wide result (require (b/emit! (mut graph) 33 11 [result])))
+        other (require (b/scalar-constant! (mut graph) 11 7777 8))
+        constant (if compare-wide (cast i64 bits) (sext32 (cast i64 bits)))
+        (mut reaching) false (mut negative) false]
+    (signature! (mut graph) a)
+    (push! (mut exits) (require (b/emit! (mut graph) 120 11 [taken wide-result (: 0 i32)])))
+    (push! (mut exits) (require (b/emit! (mut graph) 120 11 [(if arm no yes) other (: 0 i32)])))
+    (for x (samples)
+      (let [v (if (or (= shape 0) (= shape 4)) x (sext32 x))
+            width (if compare-wide (: 64 i32) 32)
+            truth (if swapped (eval op width constant v) (eval op width v constant))]
+        (when (= truth arm)
+          (set! reaching true)
+          (when (< v 0) (set! negative true)))))
+    (let [rule (rule-of graph (slice exits) result a)
+          signed-rule (if (= opcode 29) (: 45 i32) 47)
+          proven (= rule (- signed-rule 1))]
+      (unless (or proven (= rule signed-rule))
+        (println "unexpected rule {}" rule) (set! failures (+ failures 1)))
+      (when (and proven negative)
+        (println "unsound: shape {} op {} bits {} arm {} swapped {}" shape op bits arm swapped)
+        (set! failures (+ failures 1)))
+      ; Same-width shapes must find every fact that the samples witness.
+      (when (and (or (= shape 0) (= shape 1) (= shape 4)) reaching (not negative) (not proven))
+        (println "missed: shape {} op {} bits {} arm {} swapped {}" shape op bits arm swapped)
+        (set! failures (+ failures 1))))
+    (when run
+      (let [(mut got) (native graph (slice exits) [(: 0 i64)] a) (mut i) 0]
+        (for x (samples)
+          (let [v (if (or (= shape 0) (= shape 4)) x (sext32 x))
+                width (if compare-wide (: 64 i32) 32)
+                truth (if swapped (eval op width constant v) (eval op width v constant))
+                want (if (= truth arm) (divide opcode value-wide v exponent) 7777)]
+            (unless (= (get got i) want)
+              (println "native shape {} op {} bits {} arm {} swapped {} opcode {} k {} x {}: got {} want {}"
+                       shape op bits arm swapped opcode exponent x (get got i) want)
+              (set! failures (+ failures 1)))
+            (set! i (+ i 1))))
+        (free! (mut got))))
+    (free! (mut exits)) (g/release! (mut graph))
+    failures))
+
+(defn q8 [(v i64) (opcode i32)] (-> i64)
+  (if (= opcode 29) (/ v 8) (% v 8)))
+
+;;; Hand-built graphs. kind selects the dividend and its guard; the returned
+;;; triple is (failures). `want` is the required selected rule.
+(defn directed [(kind i32) (opcode i32)] (-> i64)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        (mut exits) (ArrayList::new [i32] a) (mut failures) (: 0 i64)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        y (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        five (require (b/scalar-constant! (mut graph) 11 5 8))
+        eight (require (b/scalar-constant! (mut graph) 11 8 8))
+        other (require (b/scalar-constant! (mut graph) 11 7777 8))
+        positive (require (b/scalar-constant! (mut graph) 11 0x7FFFFFFFFFFFFFFF 8))
+        even (require (b/scalar-constant! (mut graph) 11 0xFFFFFFFFFFFFFFFE 8))
+        signed-rule (if (= opcode 29) (: 45 i32) 47)
+        (mut node) (: 0 i32) (mut want) signed-rule]
+    (signature! (mut graph) a)
+    (cond
+      ; 0: the fact does not survive a join of both arms.
+      (= kind 0) (do (let [test (require (b/emit! (mut graph) 17 1 [x zero]))
+               split (require (b/emit! (mut graph) 116 0 [start test]))
+               yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+               no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+               end1 (require (b/emit! (mut graph) 114 0 [yes]))
+               end2 (require (b/emit! (mut graph) 114 0 [no]))
+               merge (require (b/emit! (mut graph) 112 0 [end1 end2]))]
+           (set! node (require (b/emit! (mut graph) opcode 11 [x eight (: 0 i32)])))
+           (push! (mut exits) (require (b/emit! (mut graph) 120 11 [merge node (: 0 i32)])))))
+      ; 1: a PHI of the tested value and an untested one is a different value.
+      (= kind 1) (do (let [test (require (b/emit! (mut graph) 17 1 [x zero]))
+               split (require (b/emit! (mut graph) 116 0 [start test]))
+               yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+               no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+               inner-test (require (b/emit! (mut graph) 16 1 [y five]))
+               inner (require (b/emit! (mut graph) 116 0 [yes inner-test]))
+               left (require (b/emit! (mut graph) 107 0 [inner (: 0 i32)]))
+               right (require (b/emit! (mut graph) 108 0 [inner (: 0 i32)]))
+               end1 (require (b/emit! (mut graph) 114 0 [left]))
+               end2 (require (b/emit! (mut graph) 114 0 [right]))
+               merge (require (b/emit! (mut graph) 112 0 [end1 end2]))
+               phi (require (b/emit! (mut graph) 67 11 [merge x y]))]
+           (set! node (require (b/emit! (mut graph) opcode 11 [phi eight (: 0 i32)])))
+           (push! (mut exits) (require (b/emit! (mut graph) 120 11 [merge node (: 0 i32)])))
+           (push! (mut exits) (require (b/emit! (mut graph) 120 11 [no other (: 0 i32)])))))
+      ; 2: a quotient also used on the untested arm is placed above the test.
+      (= kind 2) (do (let [test (require (b/emit! (mut graph) 17 1 [x one]))
+               split (require (b/emit! (mut graph) 116 0 [start test]))
+               yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+               no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))]
+           (set! node (require (b/emit! (mut graph) opcode 11 [x eight (: 0 i32)])))
+           (let [bumped (require (b/emit! (mut graph) 26 11 [node one]))]
+             (push! (mut exits) (require (b/emit! (mut graph) 120 11 [yes node (: 0 i32)])))
+             (push! (mut exits) (require (b/emit! (mut graph) 120 11 [no bumped (: 0 i32)]))))))
+      ; 3..6: structure alone. 3 = AND with a non-negative literal, 4 = SHR by
+      ; one, 5 = PHI of both, 6 = AND with a negative literal (no proof).
+      (<= kind 6) (do
+         (let [masked (require (b/emit! (mut graph) 47 11 [x (if (= kind 6) even positive)]))
+               shifted (require (b/emit! (mut graph) 50 11 [y one]))
+               test (require (b/emit! (mut graph) 16 1 [y five]))
+               split (require (b/emit! (mut graph) 116 0 [start test]))
+               yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+               no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+               end1 (require (b/emit! (mut graph) 114 0 [yes]))
+               end2 (require (b/emit! (mut graph) 114 0 [no]))
+               merge (require (b/emit! (mut graph) 112 0 [end1 end2]))
+               phi (require (b/emit! (mut graph) 67 11 [merge masked shifted]))
+               dividend (match kind (4 shifted) (5 phi) (_ masked))]
+           (set! node (require (b/emit! (mut graph) opcode 11 [dividend eight (: 0 i32)])))
+           (when (!= kind 6) (set! want (- signed-rule 1)))
+           (push! (mut exits) (require (b/emit! (mut graph) 120 11 [merge node (: 0 i32)])))))
+      ; 7: true arm of a conjunction; 8: its false arm proves nothing;
+      ; 9: false arm of a disjunction of the negated tests.
+      (<= kind 9) (do
+         (let [first (require (b/emit! (mut graph) (if (= kind 9) (: 16 i32) 17) 1 [x zero]))
+               second (require (b/emit! (mut graph) (if (= kind 9) (: 17 i32) 16) 1 [y five]))
+               both (require (b/emit! (mut graph) (if (= kind 9) (: 46 i32) 47) 1 [first second]))
+               split (require (b/emit! (mut graph) 116 0 [start both]))
+               yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+               no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+               taken (if (= kind 7) yes no)]
+           (set! node (require (b/emit! (mut graph) opcode 11 [x eight taken])))
+           (when (!= kind 8) (set! want (- signed-rule 1)))
+           (push! (mut exits) (require (b/emit! (mut graph) 120 11 [taken node (: 0 i32)])))
+           (push! (mut exits) (require (b/emit! (mut graph) 120 11
+             [(if (= kind 7) no yes) other (: 0 i32)])))))
+      :else (panic "bad kind"))
+    (let [rule (rule-of graph (slice exits) node a)]
+      (unless (= rule want)
+        (println "directed {} opcode {}: rule {} want {}" kind opcode rule want)
+        (set! failures (+ failures 1))))
+    (let [ys [(: -6 i64) 3 9] (mut got) (native graph (slice exits) ys a) (mut i) 0]
+      (for x (samples) (for y ys
+        (let [masked (& x (if (= kind 6) (: -2 i64) 0x7FFFFFFFFFFFFFFF))
+              shifted (cast i64 (>> (cast u64 y) 1))
+              expected
+                (match kind
+                  (0 (q8 x opcode))
+                  (1 (if (>= x 0) (q8 (if (< y 5) x y) opcode) 7777))
+                  (2 (if (>= x 1) (q8 x opcode) (+ (q8 x opcode) 1)))
+                  (4 (q8 shifted opcode))
+                  (5 (q8 (if (< y 5) masked shifted) opcode))
+                  (7 (if (and (>= x 0) (< y 5)) (q8 x opcode) 7777))
+                  (8 (if (and (>= x 0) (< y 5)) 7777 (q8 x opcode)))
+                  (9 (if (or (< x 0) (>= y 5)) 7777 (q8 x opcode)))
+                  (_ (q8 masked opcode)))]
+          (unless (= (get got i) expected)
+            (println "directed native {} opcode {} x {} y {}: got {} want {}"
+                     kind opcode x y (get got i) expected)
+            (set! failures (+ failures 1)))
+          (set! i (+ i 1)))))
+      (free! (mut got)))
+    (free! (mut exits)) (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i32)
+  (let [(mut failures) (: 0 i64) (mut count) (: 0 i64)
+        wide [(: 0x8000000000000000 u64) 0xFFFFFFFFFFFFFFFD 0xFFFFFFFFFFFFFFFE
+              0xFFFFFFFFFFFFFFFF 0 1 2 0x7FFFFFFFFFFFFFFF]
+        narrow [(: 0x80000000 u64) 0xFFFFFFFD 0xFFFFFFFE 0xFFFFFFFF 0 1 2 0x7FFFFFFF]]
+    (for kind [(: 0 i32) 1 2 3 4 5 6 7 8 9]
+      (for opcode [(: 29 i32) 30]
+        (set! failures (+ failures (directed kind opcode)))))
+    (for shape [(: 0 i32) 1 2 3 4]
+      (for [op 14 24]
+        (for [c 0 8]
+          (for arm [true false]
+            (for swapped [false true]
+              (for opcode [(: 29 i32) 30]
+                (let [compare-wide (or (= shape 0) (= shape 2) (= shape 4))
+                      value-wide (or (= shape 0) (= shape 3) (= shape 4))
+                      bits (if compare-wide (get wide c) (get narrow c))
+                      top (if value-wide (: 62 i32) 30)
+                      exponent (match (% count 4) (0 1) (1 2) (2 5) (_ top))]
+                  (set! failures
+                        (+ failures
+                           (guarded shape (cast i32 op) bits arm swapped opcode
+                                    exponent (= (% (/ count 4) 2) 0) true)))
+                  (set! count (+ count 1)))))))))
+    (when (!= failures 0) (println "nonnegative-division failures: {}" failures))
+    (if (= failures 0) 0 1)))
