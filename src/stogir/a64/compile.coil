@@ -13,6 +13,7 @@
 (import "stogir.global-load-forward" :as global-loads)
 (import "stogir.if-convert" :as if-convert)
 (import "stogir.branch-facts" :as branch-facts)
+(import "stogir.fact-fold" :as fact-fold)
 (import "stogir.sccp" :as sccp)
 (import "stogir.sccp-rewrite" :as rewrite)
 (import "stogir.calls" :as calls)
@@ -26,6 +27,7 @@
 (import "stogir.register-live" :as live)
 (import "stogir.live-ranges" :as ranges)
 (import "stogir.a64.match" :as matching)
+(import "stogir.a64.constant-hoist" :as hoist)
 (import "stogir.a64.return-values" :as return-values)
 (import "stogir.matched-uses" :as machine)
 (import "stogir.node" :as n)
@@ -176,25 +178,57 @@
     (Ok [prepared]
         (let [(mut owned) prepared
               result
-                (match (matching/build-with-selects graph
-                                       (.schedule owned)
-                                       (.idom owned)
-                                       roots
-                                       true
-                                       true
-                                       allocator)
+                (match (hoist/run graph (mut owned) (= (len returns) 0) allocator)
                   (Err [message] (Err [buffer/Buffer (slice u8)] message))
-                  (Ok [selected]
-                      (let [(mut matched) selected
-                            installed (install-return-uses! graph returns (mut (.operands matched)))
-                            emitted
-                              (match installed
-                                (Err [message] (Err [buffer/Buffer (slice u8)] message))
-                                (Ok [_] (generate-matched-private graph owned matched allocator context)))]
-                        (matching/release! (mut matched))
-                        emitted)))]
+                  (Ok [hoisted]
+                    (let [(mut hoisted) hoisted
+                          work (.graph hoisted)
+                          generated
+                            (match (matching/build-with-selects work
+                                                   (.schedule owned)
+                                                   (.idom owned)
+                                                   roots
+                                                   true
+                                                   true
+                                                   allocator)
+                              (Err [message] (Err [buffer/Buffer (slice u8)] message))
+                              (Ok [selected]
+                                  (let [(mut matched) selected
+                                        installed (install-return-uses! work returns (mut (.operands matched)))
+                                        emitted
+                                          (match installed
+                                            (Err [message] (Err [buffer/Buffer (slice u8)] message))
+                                            (Ok [_] (generate-matched-hoisted work owned (mut matched)
+                                                      (slice (.nodes hoisted)) 0 allocator context)))]
+                                    (matching/release! (mut matched))
+                                    emitted)))]
+                      (hoist/release! (mut hoisted))
+                      generated)))]
           (pipeline/release! (mut owned))
           result))))
+
+;;; hoisted are constant-hoist definitions in graph. When allocation spills
+;;; one, it is withdrawn (each use then rebuilds the literal, as without
+;;; hoisting) and the function is allocated again. The second reallocation
+;;; withdraws every remaining one, so there are at most three allocations.
+(defn generate-matched-hoisted [(graph g/Graph) (owned pipeline/Prepared)
+                                (matched (mut matching/Plan)) (hoisted (slice i32))
+                                (attempt i32) (allocator (dyn Allocator))
+                                (context private/Context)]
+  (-> (Result buffer/Buffer (slice u8)))
+  (let [(mut pressured) (ArrayList::new [i32] allocator)
+        result (generate-matched-checked graph owned matched
+                 (if (< attempt 2) hoisted (slice pressured)) (mut pressured)
+                 allocator context)]
+    (if (= (len pressured) 0)
+        (do (free! (mut pressured)) result)
+        (do
+          (for node (if (= attempt 0) (slice pressured) hoisted)
+            (unless (machine/rematerialized? (.operands matched) node)
+              (machine/rematerialize! (mut (.operands matched)) node)))
+          (free! (mut pressured))
+          (generate-matched-hoisted graph owned (mut matched) hoisted (+ attempt 1)
+                                    allocator context)))))
 
 ;;; Allocation as usual. With shrink-wrapping, when only preserved registers
 ;;; keep the entry path from being frameless, allocate again assigning them late
@@ -247,6 +281,21 @@
                         (matched matching/Plan)
                         (allocator (dyn Allocator)) (context private/Context)]
   (-> (Result buffer/Buffer (slice u8)))
+  (let [(mut pressured) (ArrayList::new [i32] allocator)
+        result (generate-matched-checked graph owned matched [] (mut pressured) allocator context)]
+    (free! (mut pressured))
+    result))
+
+;;; When allocation spills any of hoisted, those are appended to pressured,
+;;; nothing is emitted and the result is an error the caller must replace by
+;;; generating again; otherwise pressured stays empty.
+(defn generate-matched-checked [(graph g/Graph)
+                        (owned pipeline/Prepared)
+                        (matched matching/Plan)
+                        (hoisted (slice i32))
+                        (pressured (mut (ArrayList i32)))
+                        (allocator (dyn Allocator)) (context private/Context)]
+  (-> (Result buffer/Buffer (slice u8)))
   (let [(mut analysis)
           (live/analyze-matched graph
                                 (.blocks owned)
@@ -279,14 +328,19 @@
                           (Ok [assigned]
                               (let [(mut allocation) assigned
                                     code
-                                      (function/body-prepared graph
-                                                              owned
-                                                              allocation
-                                                              analysis
-                                                              req
-                                                              matched
-                                                              (private/shrink-wrap? context)
-                                                              allocator)]
+                                      (if (> (hoist/pressured! (.parts allocation) hoisted
+                                                               (.operands matched) (mut pressured))
+                                             0)
+                                          (Err [buffer/Buffer (slice u8)]
+                                               "hoisted constants need reallocation")
+                                          (function/body-prepared graph
+                                                                  owned
+                                                                  allocation
+                                                                  analysis
+                                                                  req
+                                                                  matched
+                                                                  (private/shrink-wrap? context)
+                                                                  allocator))]
                                 (allocate/release! (mut allocation))
                                 code)))]
                   (free! (mut split-blocks))
@@ -422,9 +476,11 @@
                     (allocator (dyn Allocator)) (context private/Context) (embed bool)
                     (validated bool)]
   (-> (Result code/Image (slice u8)))
-  (if (not (or (private/branch-facts? context) (private/induction? context)))
-      (vector-image-selects graph entry roots symbol allocator context embed validated)
-      (match (branch-facts/run-with-induction graph entry roots allocator (private/induction? context))
+  ; The sparse fact fold always runs. Either option selects the older
+  ; whole-graph pass in its place.
+  (match (if (or (private/branch-facts? context) (private/induction? context))
+             (branch-facts/run-with-induction graph entry roots allocator (private/induction? context))
+             (fact-fold/run graph entry roots validated allocator))
         (Err [message] (Err message))
         (Ok [edited]
           (match edited
@@ -437,10 +493,12 @@
                   (Err [message] (Err message))
                   (Ok [rewritten]
                     (let [(mut rewritten) rewritten
+                          ; SCCP's nonzero proof says this very graph
+                          ; passed validation just now.
                           output (vector-image-selects (.graph rewritten) entry (slice (.roots rewritten))
-                                    symbol allocator context embed false)]
+                                    symbol allocator context embed (!= (.proof rewritten) 0))]
                       (rewrite/release! (mut rewritten))
-                      output))))))))))
+                      output)))))))))
 
 (defn vector-image-selects [(graph g/Graph) (entry i32) (roots (slice i32))
                            (symbol (slice u8)) (allocator (dyn Allocator))

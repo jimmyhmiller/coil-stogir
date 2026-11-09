@@ -41,10 +41,11 @@
       (encode/add-sub (.wide tile) true true 31 rn rm)))
 
 ;;; Register forms whose source register 31 encodes XZR: ADD/SUB and logical
-;;; shifted-register forms, MUL (MADD) and the flag-setting comparison.
+;;; shifted-register forms, MUL (MADD), the flag-setting comparison and the
+;;; CMP/CSEL pair of MIN/MAX.
 (defn zero-register-rule? [(rule i32)] (-> bool)
   (or (= rule 1) (= rule 2) (= rule 3) (= rule 6) (= rule 7) (= rule 8)
-      (and (>= rule 20) (<= rule 33))))
+      (and (>= rule 20) (<= rule 37))))
 
 (defn zero-literal? [(graph graph/Graph) (reference i32)] (-> bool)
   (and (< reference 0)
@@ -274,7 +275,53 @@
            (encode/extend false (types/signed? ty) bits rd rd))
     (if (= error "") (Ok (cast i32 (- (len output) start))) (Err error))))
 
+;;; MADD/MSUB: rd = addend +/- multiplicand * multiplier. Matching admits at
+;;; most two sources that need a scratch register; a third is a hard error.
+(defn multiply-accumulate! [(output (mut code/Buffer))
+                            (graph graph/Graph)
+                            (parts locations/View)
+                            (tile select/Tile)
+                            (rd i32)
+                            (position i64)] (-> (Result i32 (slice u8)))
+  (match (operand-register-with-locations! (mut output) graph parts (.left tile)
+                                           position (.wide tile) 16)
+    (Err [message] (Err message))
+    (Ok [ra]
+      (match (operand-register-with-locations! (mut output) graph parts (.right tile)
+                                               position (.wide tile) (if (= ra 16) 17 16))
+        (Err [message] (Err message))
+        (Ok [rn]
+          (let [third (cond (and (!= ra 16) (!= rn 16)) (: 16 i32)
+                            (and (!= ra 17) (!= rn 17)) (: 17 i32)
+                            :else (: -1 i32))]
+            (match (operand-register-with-locations! (mut output) graph parts
+                                                     (select/multiplier tile)
+                                                     position (.wide tile) third)
+              (Err [message] (Err message))
+              (Ok [rm]
+                (if (or (< rd 0) (> rd 30) (< ra 0) (> ra 30) (< rn 0) (> rn 30)
+                        (< rm 0) (> rm 30))
+                    (Err "invalid multiply-accumulate physical register")
+                    (match (if (= (.rule tile) 54)
+                               (encode/multiply-add (.wide tile) rd rn rm ra)
+                               (encode/multiply-subtract (.wide tile) rd rn rm ra))
+                      (Err [message] (Err message))
+                      (Ok [word]
+                        (bytes/append32! (mut (.text output)) word)
+                        (Ok 4))))))))))))
+
 (defn operands-with-locations! [(output (mut code/Buffer))
+                                (graph graph/Graph)
+                                (parts locations/View)
+                                (tile select/Tile)
+                                (opcode i32)
+                                (rd i32)
+                                (position i64)] (-> (Result i32 (slice u8)))
+  (if (or (= (.rule tile) 54) (= (.rule tile) 55))
+      (multiply-accumulate! (mut output) graph parts tile rd position)
+      (operands-selected-with-locations! (mut output) graph parts tile opcode rd position)))
+
+(defn operands-selected-with-locations! [(output (mut code/Buffer))
                                 (graph graph/Graph)
                                 (parts locations/View)
                                 (tile select/Tile)
@@ -448,66 +495,65 @@
                       (word! (mut output)
                              (mut error)
                              (encode/shift-immediate (.wide tile) 1 rd rn shift)))
-                  (let [scratch (if (= rd 16) (: 17 i32) (: 16 i32))
-                        source (if (= rn scratch) rd rn)]
-                    (when (= rn scratch)
-                      (word! (mut output)
-                             (mut error)
-                             (encode/logical-register (.wide tile) 1 rd 31 rn)))
-                    (word! (mut output)
-                           (mut error)
-                           (encode/shift-immediate (.wide tile)
-                                                   2
-                                                   scratch
-                                                   source
-                                                   (- width 1)))
-                    (word! (mut output)
-                           (mut error)
-                           (encode/shift-immediate (.wide tile)
-                                                   1
-                                                   scratch
-                                                   scratch
-                                                   (- width shift)))
-                    (word! (mut output)
-                           (mut error)
-                           (encode/add-sub (.wide tile)
-                                           false
-                                           false
-                                           rd
-                                           source
-                                           scratch))
-                    (if remainder?
-                        (do
-                          (match (encode/logical-mask (.wide tile)
-                                                      (- (<< (: 1 u64)
-                                                             (cast u64 shift))
-                                                         1))
-                            (None []
-                                  (set! error
-                                        "power-of-two remainder mask is invalid"))
-                            (Some [fields]
-                                  (word! (mut output)
-                                         (mut error)
-                                         (encode/logical-immediate (.wide tile)
-                                                                   0
-                                                                   rd
-                                                                   rd
-                                                                   fields))))
+                  (if (and (= shift 1) (not remainder?))
+                      ; Halving: the rounding bias is the sign bit itself.
+                      (do
+                        (word! (mut output)
+                               (mut error)
+                               (encode/add-sub-shifted (.wide tile) false rd rn rn 1
+                                                       (- width 1)))
+                        (word! (mut output)
+                               (mut error)
+                               (encode/shift-immediate (.wide tile) 2 rd rd 1)))
+                      ; The scratch holds the sign mask; its top `shift` bits
+                      ; shifted down are the bias 2^shift-1 of a negative
+                      ; dividend, added and (for a remainder) subtracted by
+                      ; shifted-register forms.
+                      (let [scratch (if (= rd 16) (: 17 i32) (: 16 i32))
+                            source (if (= rn scratch) rd rn)]
+                        (when (= rn scratch)
                           (word! (mut output)
                                  (mut error)
-                                 (encode/add-sub (.wide tile)
-                                                 true
-                                                 false
-                                                 rd
-                                                 rd
-                                                 scratch)))
+                                 (encode/logical-register (.wide tile) 1 rd 31 rn)))
                         (word! (mut output)
                                (mut error)
                                (encode/shift-immediate (.wide tile)
                                                        2
-                                                       rd
-                                                       rd
-                                                       shift))))))
+                                                       scratch
+                                                       source
+                                                       (- width 1)))
+                        (word! (mut output)
+                               (mut error)
+                               (encode/add-sub-shifted (.wide tile) false rd source scratch 1
+                                                       (- width shift)))
+                        (if remainder?
+                            (do
+                              (match (encode/logical-mask (.wide tile)
+                                                          (- (<< (: 1 u64)
+                                                                 (cast u64 shift))
+                                                             1))
+                                (None []
+                                      (set! error
+                                            "power-of-two remainder mask is invalid"))
+                                (Some [fields]
+                                      (word! (mut output)
+                                             (mut error)
+                                             (encode/logical-immediate (.wide tile)
+                                                                       0
+                                                                       rd
+                                                                       rd
+                                                                       fields))))
+                              (word! (mut output)
+                                     (mut error)
+                                     (encode/add-sub-shifted (.wide tile) true rd rd scratch 1
+                                                             (- width shift))))
+                            (word! (mut output)
+                                   (mut error)
+                                   (encode/shift-immediate (.wide tile)
+                                                           2
+                                                           rd
+                                                           rd
+                                                           shift)))))))
           (if (= error "") (Ok (cast i32 (- (len output) start))) (Err error))))))
 
 (defn arithmetic! [(output (mut (ArrayList u8)))
