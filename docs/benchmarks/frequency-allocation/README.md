@@ -1,6 +1,6 @@
 # Coordinated allocation recoloring
 
-This experiment finds a verified way to retain outer values across the inner-loop bypass in the captured `primitive-providers-in` graph. The bounded search is now also implemented as an optional native post-allocation pass; the compiler workload has not yet been timed with it. There is no new cycle measurement or claim that the 5× generation / 1.10× runtime target is met.
+This experiment implements and validates coordinated recoloring, but it does not fix the hot zero-trip path or improve measured runtime. The earlier allocation analysis misidentified two rejection edges inside the `k` loop as its zero-trip bypass; the correction below supersedes that interpretation. The bounded search is now also implemented as an optional native post-allocation pass; the compiler workload has not yet been timed with it. There is no new cycle measurement or claim that the 5× generation / 1.10× runtime target is met.
 
 ## Evidence and algorithm
 
@@ -22,18 +22,18 @@ The proxy charges one unit for register/constant copies and three for memory cop
 
 The whole-function search stops after 13 improving transactions when no further improvement is found within its search limits. The inner-region search stops after 3. This is a bounded local search result, not global optimality. The Python prototype takes roughly 14 seconds for the whole function and 0.2 seconds for the inner region on this Mac; those are research-tool times, not compiler generation overhead.
 
-The whole-function result also passes a second, direct replay on the original 402 allocation children: 14 register fields change, with no new split, spill home, frame change, live-range edit or constraint edit. Its output exactly matches the modeled assignment. This confirms that the bypass improvement can be implemented by recoloring existing pieces; the model's 1,950 block fragments need not become native allocation pieces. The emitted replay and exact plan are in `results/whole-children*`.
+The whole-function result also passes a second, direct allocation replay on the original 402 allocation children: 14 register fields change, with no new split, spill home, frame change, live-range edit or constraint edit. Its output exactly matches the modeled assignment. This confirms that the modeled body-path improvement can be implemented by recoloring existing pieces; the model's 1,950 block fragments need not become native allocation pieces. The emitted replay and exact plan are in `results/whole-children*`.
 
-The enclosing-loop case directly addresses the bypass identified in the handoff:
+The enclosing-loop case improves these body-path edges (previously misidentified as the handoff’s zero-trip bypass):
 
 | CFG edge | Baseline memory copies | Recolored memory copies |
 |---|---:|---:|
-| 203 → 19, first bypass entrance | 5 | 0 |
-| 206 → 19, second bypass entrance | 5 | 0 |
+| 203 → 19, first body rejection | 5 | 0 |
+| 206 → 19, second body rejection | 5 | 0 |
 | 61 → 55, shared continuation | 6 | 1 |
 | 60 → 61, body return | 0 | 4 |
 
-The remaining continuation copy carries parent 65. The other outer values retain their registers on the bypass; restores move onto the body path. Some memory stores counted here may already be eliminated by canonical spill-home logic, so only native disassembly and execution can establish the emitted and dynamic benefit. Full edge changes are retained in `results/enclosing-loop-edge-changes.json`.
+The remaining continuation copy carries parent 65. These copies disappear on rejection paths within the loop; the actual zero-trip exit is unchanged. Some memory stores counted here may already be eliminated by canonical spill-home logic, so only native disassembly and execution can establish the emitted and dynamic benefit. Full edge changes are retained in `results/enclosing-loop-edge-changes.json`.
 
 This differs from the earlier independent-block probe: it can coordinate assignments across several blocks and charges all resulting boundaries. The prior independent allocator increased both edge and internal traffic and was rejected.
 
@@ -63,7 +63,7 @@ For the optional finite-choice oracle, run `choices.py TRACE BASELINE_LOG OUTPUT
 
 ## Native implementation gate
 
-The next implementation should first preserve the whole-function interval structure: the verified bypass result needs coordinated reassignment of existing children, not additional splits or a solver. Port the bounded ejection-chain search and complete transfer-cost model as an optional post-allocation pass, after control-only inheritance and before final location indexing/callee-save layout.
+The next implementation should first preserve the whole-function interval structure: the verified body-path result needs coordinated reassignment of existing children, not additional splits or a solver. Port the bounded ejection-chain search and complete transfer-cost model as an optional post-allocation pass, after control-only inheritance and before final location indexing/callee-save layout.
 
 The bridge must use the real alias and PHI metadata and recognize validated constant/frame-address rematerialization. New spill homes must use each parent's actual `SpillShape` and frame allocator; the offline verifier's synthetic home identities do not validate stack geometry. Fixed and SIMD classes, required uses, lifetime holes and all existing ABI checks remain mandatory. Verify assignments before and after each accepted transaction; rebuild any assignment-derived indexes before emission. Preserve source identity and deterministic tie breaks.
 
@@ -80,3 +80,21 @@ Focused tests cover coordinated swaps, fixed clobbers, exact lifetime holes, GPR
 ### Instruction-phase correction
 
 The initial full-workload candidate rejected `coil.compiler.unit.unit-interface-render` with `odd split boundary needs instruction-specific lowering`. Recoloring had converted an existing spill cut into a register move at a phase where emission only permits a register-to-home store. The fix adds explicit transfer-direction constraints to candidate validation. Coalesced redefinitions are excluded through a shared predicate used by both the cost builder and actual split-move emission, including selected multi-output instructions. Allocation now passes the real matched definition plan to the cost builder. A regression proves that an otherwise cheaper unsupported register move is rejected in favor of the legal assignment. The 24-value JIT pressure fixture still passes. The first broad suite completed 303/305 standalone tests, with only the two previously recorded failures; 73 linked consumers require their separate fixture-aware run. A fresh full suite and workload build follow the correction.
+
+## Measured native result and path correction
+
+Corrected library `01adb66` and integration `8ae701ab` pass FAST, 303/305 standalone tests (only the known `jit-parameter-specialize` and `private-leaf` failures), all 73 linked consumers with 5,410 fresh object fixtures, and the C-linked pressure test. Raw validation is under `native/validation/`. Three alternating workload rounds reproduce the fixed seed object in every run.
+
+| Host | Minimum cycles (B) | Median cycles (B) |
+|---|---:|---:|
+| LLVM | 42.560 | 42.767 |
+| Retained induction | 54.087 | 54.595 |
+| Recolor research | 54.043 | 54.835 |
+
+Median recoloring runtime is 0.44% slower than retained and 1.282× LLVM; minimum is essentially equal to retained. Instructions fall by about 0.74%, but there is no reliable cycle gain. Keep the option disabled. One separate serial generation pair takes 9.675 seconds retained versus 303.916 seconds recolored (31.4× slower); this is one pair, not a repeated distribution or a fresh LLVM comparison. Both policy objects exactly match their prior host-build objects; with the option off, baseline object `221639…` remains byte-identical.
+
+A full graph replay now confirms that the compiler bridge produces exactly the allocation-only assignment: 402 original children, 14 changed registers, no new home, cost 503,298→454,018, and successful native object emission. Its baseline and recolored functions match the host instruction counts (336→320), stack-load instructions (29→27), and stack-store instructions (28→24). Thus the lack of gain is not a failure to port the modeled assignment.
+
+**The earlier path interpretation was wrong.** In the fixed source, block 54 is the outer `i` loop, block 55 is the `k` loop over reexports, and block 56 is the inner `j` loop over existing providers. Edges 203→19 and 206→19 reject a target match within a nonempty `k` loop; 61→55 returns to its header. These are not the hot zero-trip path. The actual zero-trip path is 321→55→16→54. Its exit 16→54 still has three memory transfers before and after recoloring, visible as `ldp x25, x23` and `ldr x27` in both emitted functions. The loop-depth proxy rewards changes within the body while leaving the frequently taken zero-trip path unchanged. Captured register assignments remain valid, but they do not demonstrate the handoff’s desired optimization.
+
+The next experiment must first establish an improvement on 16→54 through actual generated code. Candidate mechanisms include region splitting around the body or a rotated guard combined with allocation, using graph-derived frequencies and complete transport legality. Do not promote this pass or merely raise inlining budgets based on the previous bypass claim. Raw runtime/generation results, source identities, disassembly and the full-graph replay are retained in `native/`.
