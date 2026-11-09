@@ -1,0 +1,119 @@
+(module stogir.tests.branch-predict)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.block-layout" :as layout)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result
+    (Ok [value] value)
+    (Err [message] (panic "{}" message))))
+
+;;; f(p) = if (p OP k) 1 else p + 5, both arms returning. OP is an opcode
+;;; (EQ 14, NE 15, LT 16, GT 19); TYPE is p's type (11 I64, 6 ADDR); k is zero.
+;;; Returns failures: the predicted IF_TRUE percentage must be WANT (within
+;;; one), and with prediction the likelier arm must follow the entry block.
+(defn two-way [(opcode i32) (ty i32) (want i32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut failures) (: 0 i64)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        zero (require (b/scalar-constant! (mut graph) ty 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        five (require (b/scalar-constant! (mut graph) 11 5 8))
+        test (require (b/emit! (mut graph) opcode 1 [p zero]))
+        split (require (b/emit! (mut graph) 116 0 [start test]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        wide (if (= ty 6) (require (b/emit! (mut graph) 36 11 [p])) p)
+        sum (require (b/emit! (mut graph) 26 11 [wide five]))
+        yes-ret (require (b/emit! (mut graph) 120 11 [yes one (: 0 i32)]))
+        no-ret (require (b/emit! (mut graph) 120 11 [no sum (: 0 i32)]))]
+    (match (pipeline/prepare graph start [yes-ret no-ret] a)
+      (Err [message] (do (println "prepare: {}" message) (set! failures 1)))
+      (Ok [prepared]
+          (let [(mut owned) prepared
+                (mut empty) (ArrayList::new [bool] a)]
+            (for [i 0 (len (.instructions graph))] (push! (mut empty) false))
+            (let [(mut facts) (layout/facts graph owned empty a)]
+              (layout/predict! graph owned (mut facts) a)
+              (let [got (.probability (get (.items facts) (cast i64 (get (.ranks facts) (cast i64 yes)))))
+                    other (.probability (get (.items facts) (cast i64 (get (.ranks facts) (cast i64 no)))))]
+                (unless (and (<= (- got want) 1) (>= (- got want) -1) (= (+ got other) 100))
+                  (println "opcode {} type {}: IF_TRUE {}% IF_FALSE {}%, want {}%" opcode ty got other want)
+                  (set! failures (+ failures 1))))
+              (layout/release-facts! (mut facts)))
+            (let [(mut plan) (layout/build graph owned empty true a)
+                  likely (if (> want 50) yes no)]
+              (unless (and (>= (len (.blocks plan)) 2) (= (get (.blocks plan) 1) likely))
+                (println "opcode {} type {}: block after entry is {}, want {}" opcode ty
+                         (if (>= (len (.blocks plan)) 2) (get (.blocks plan) 1) -1) likely)
+                (set! failures (+ failures 1)))
+              (layout/release! (mut plan)))
+            (free! (mut empty))
+            (pipeline/release! (mut owned)))))
+    (g/release! (mut graph))
+    failures))
+
+;;; g(p, q) = if (p < q) (if (q < 9) p else trap) else (if (p = 3) trap else trap):
+;;; the outer IF_FALSE reaches the shared UNREACHABLE only through a nested
+;;; diamond and two merges, so it is cold and the outer IF_TRUE is 98%.
+(defn cold-chain [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut failures) (: 0 i64)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        q (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        nine (require (b/scalar-constant! (mut graph) 11 9 8))
+        three (require (b/scalar-constant! (mut graph) 11 3 8))
+        outer-test (require (b/emit! (mut graph) 16 1 [p q]))
+        outer (require (b/emit! (mut graph) 116 0 [start outer-test]))
+        yes (require (b/emit! (mut graph) 107 0 [outer (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [outer (: 0 i32)]))
+        inner-test (require (b/emit! (mut graph) 16 1 [q nine]))
+        inner (require (b/emit! (mut graph) 116 0 [yes inner-test]))
+        inner-yes (require (b/emit! (mut graph) 107 0 [inner (: 0 i32)]))
+        inner-no (require (b/emit! (mut graph) 108 0 [inner (: 0 i32)]))
+        ret (require (b/emit! (mut graph) 120 11 [inner-yes p (: 0 i32)]))
+        side-test (require (b/emit! (mut graph) 14 1 [p three]))
+        side (require (b/emit! (mut graph) 116 0 [no side-test]))
+        side-yes (require (b/emit! (mut graph) 107 0 [side (: 0 i32)]))
+        side-no (require (b/emit! (mut graph) 108 0 [side (: 0 i32)]))
+        side-yes-end (require (b/emit! (mut graph) 114 0 [side-yes]))
+        side-no-end (require (b/emit! (mut graph) 114 0 [side-no]))
+        side-merge (require (b/emit! (mut graph) 112 0 [side-yes-end side-no-end]))
+        side-end (require (b/emit! (mut graph) 114 0 [side-merge]))
+        inner-end (require (b/emit! (mut graph) 114 0 [inner-no]))
+        trap-merge (require (b/emit! (mut graph) 112 0 [side-end inner-end]))
+        trap (require (b/emit! (mut graph) 96 0 [trap-merge]))
+        stop (require (b/emit! (mut graph) 121 0 [trap (: 0 i32) (: 0 i32)]))]
+    (match (pipeline/prepare graph start [ret stop] a)
+      (Err [message] (do (println "prepare: {}" message) (set! failures 1)))
+      (Ok [prepared]
+          (let [(mut owned) prepared
+                (mut empty) (ArrayList::new [bool] a)]
+            (for [i 0 (len (.instructions graph))] (push! (mut empty) false))
+            (let [(mut facts) (layout/facts graph owned empty a)]
+              (layout/predict! graph owned (mut facts) a)
+              (let [got (.probability (get (.items facts) (cast i64 (get (.ranks facts) (cast i64 yes)))))]
+                (unless (= got 98)
+                  (println "cold chain: outer IF_TRUE {}%, want 98%" got)
+                  (set! failures (+ failures 1))))
+              (layout/release-facts! (mut facts)))
+            (free! (mut empty))
+            (pipeline/release! (mut owned)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i32)
+  (let [failures (+ (two-way 14 11 34) (two-way 15 11 66)
+                    (two-way 14 6 30) (two-way 15 6 70)
+                    (two-way 16 11 36) (two-way 19 11 64)
+                    (cold-chain))]
+    (println "branch predict checks: {} failures" failures)
+    (if (= failures 0) 0 1)))
