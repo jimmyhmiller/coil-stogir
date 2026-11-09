@@ -1,0 +1,67 @@
+(module stogir.tests.allocation-cost)
+(import "stogir.allocation" :as allocation)
+(import "stogir.allocation-recolor" :as rc)
+(import "stogir.locations" :as loc)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+
+(defn append! [(copies (mut (ArrayList rc/Copy))) (source rc/Endpoint)
+               (target i32) (site i64) (weight i64)] (-> void)
+  ; Keep logical duplicates deliberately: the cost model must count physical
+  ; pairs once, even when their logical children differ or become equal later.
+  (push! (mut copies) (rc/Copy :source source :target target :site site :weight weight :store-only false)))
+
+(defn main [] (-> i32)
+  (let [a (malloc-allocator) (mut parts) (ArrayList::new [allocation/Part] a)
+        (mut copies) (ArrayList::new [rc/Copy] a) (mut plan) (ArrayList::new [rc/Change] a)
+        (mut empty) (ArrayList::new [rc/Change] a)]
+    (for [i 0 5]
+      (let [(mut part) (allocation/create (cast i32 (/ i 2)) a)]
+        (set! (.register part) (cast i32 (% i 3)))
+        (push! (mut parts) part)))
+    (append! (mut copies) (rc/allocated 0) 2 17 3)
+    (append! (mut copies) (rc/allocated 1) 3 17 3)
+    (append! (mut copies) (rc/allocated 0) 2 17 3)
+    (append! (mut copies) (rc/allocated 0) 3 17 3)
+    (append! (mut copies) (rc/recipe (loc/Location :kind 4 :value -7)) 0 19 100)
+    (append! (mut copies) (rc/recipe (loc/Location :kind 4 :value -7)) 1 19 100)
+    (append! (mut copies) (rc/allocated 2) 0 23 7)
+    (append! (mut copies) (rc/allocated 3) 1 23 7)
+    (append! (mut copies) (rc/recipe (loc/Location :kind 2 :value 16)) 2 23 7)
+    (append! (mut copies) (rc/recipe (loc/Location :kind 3 :value 16)) 3 41 1)
+    (let [(mut costs) (rc/cost-create (len parts) copies a)]
+      ; Refreshes model real accepted transactions. Proposals include omitted
+      ; children, spills with shared parent identities and all register colors.
+      ; Many proposals are conflicting partial plans, as in ejection search.
+      (for [round 0 5]
+        (set! (.register (elem (mut parts) 0)) (cast i32 (- round 1)))
+        (rc/cost-refresh! (mut costs) parts copies)
+        (let [baseline (rc/score parts copies empty)]
+          (assert (= (.total costs) baseline))
+          (for [code 0 1296]
+            (clear! (mut plan))
+            (let [(mut digits) code]
+              (for [part 0 4]
+                (let [choice (% digits 6)]
+                  (when (> choice 0)
+                    (push! (mut plan) (rc/Change :part (cast i32 part)
+                      :register (cast i32 (- choice 2)) :depth 3)))
+                  (set! digits (/ digits 6)))))
+            ; Child 4 has no incident transfers and must not affect the score.
+            (push! (mut plan) (rc/Change :part 4 :register -1 :depth 3))
+            (let [expected (rc/score parts copies plan)]
+              (assert (= (rc/cost-score! (mut costs) parts copies plan) expected))
+              (assert (= (rc/cost-score! (mut costs) parts copies plan) expected)))
+            (assert (= (.total costs) baseline))
+            (assert (= (len (.affected costs)) 0))
+            (for marked (.marked costs) (assert (not marked))))))
+      (rc/cost-release! (mut costs)))
+    (clear! (mut copies))
+    (let [(mut costs) (rc/cost-create (len parts) copies a)]
+      (rc/cost-refresh! (mut costs) parts copies)
+      (assert (= (rc/cost-score! (mut costs) parts copies plan) 0))
+      (rc/cost-release! (mut costs)))
+    (for [i 0 (len parts)] (allocation/release! (elem (mut parts) i)))
+    (free! (mut parts)) (free! (mut copies)) (free! (mut plan)) (free! (mut empty)))
+  (println "incremental allocation cost: 6480 proposals, repeats, refreshes and empty graph pass")
+  0)

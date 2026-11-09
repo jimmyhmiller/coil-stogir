@@ -62,5 +62,14 @@ s+='''
     (println "exact domain/interference oracle: {} parts" (len parts))
     (oracle/release! (mut expected)) actual))
 '''
+# Compare every incremental proposal score with the unmodified full scorer.
+if '(defn cost-score!' in s:
+ s=s.replace('(defn cost-score! [', '(defn cost-score-indexed! [')
+ s+="""
+(defn cost-score! [(model (mut CostModel)) (parts (ArrayList a/Part))
+                    (copies (ArrayList Copy)) (plan (ArrayList Change))] (-> i64)
+  (let [actual (cost-score-indexed! (mut model) parts copies plan)]
+    (assert (= actual (score parts copies plan))) actual))
+"""
 p.write_text(s)
 print(out)
