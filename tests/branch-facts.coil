@@ -1,0 +1,203 @@
+(module stogir.tests.branch-facts)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.branch-facts" :as facts)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn eval [(op i32) (x i64) (y i64)] (-> bool)
+  (match op (14 (= x y)) (15 (!= x y)) (16 (< x y)) (17 (>= x y))
+    (18 (<= x y)) (19 (> x y)) (20 (< (cast u64 x) (cast u64 y)))
+    (21 (>= (cast u64 x) (cast u64 y))) (22 (<= (cast u64 x) (cast u64 y)))
+    (23 (> (cast u64 x) (cast u64 y))) (_ (panic "bad opcode"))))
+
+(defstruct Fixture [(graph g/Graph) (exits (ArrayList i32)) (query i32) (condition i32)])
+
+;;; Chain of branches compares the same SSA operands. Each untaken arm returns
+;;; 3; the query returns 1 or 2. Its condition also escapes as a return value on
+;;; the first untaken arm, so changing the shared comparison is incorrect.
+(defn build [(ops (slice i32)) (arms (slice bool)) (query-op i32) (swapped bool)
+             (a (dyn Allocator))] (-> Fixture)
+  (let [(mut graph) (g/create a) (mut exits) (ArrayList::new [i32] a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        y (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        two (require (b/scalar-constant! (mut graph) 11 2 8))
+        three (require (b/scalar-constant! (mut graph) 11 3 8))
+        condition (require (b/emit! (mut graph) query-op 1 [(if swapped y x) (if swapped x y)]))
+        shared (require (b/emit! (mut graph) 34 11 [condition]))
+        (mut control) start]
+    (for [i 0 (len ops)]
+      (let [test (require (b/emit! (mut graph) (get ops i) 1 [x y]))
+            split (require (b/emit! (mut graph) 116 0 [control test]))
+            yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+            no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+            arm (get arms i)]
+        (push! (mut exits) (require (b/emit! (mut graph) 120 11
+          [(if arm no yes) (if (= i 0) shared three) (: 0 i32)])))
+        (set! control (if arm yes no))))
+    (let [query (require (b/emit! (mut graph) 116 0 [control condition]))
+          yes (require (b/emit! (mut graph) 107 0 [query (: 0 i32)]))
+          no (require (b/emit! (mut graph) 108 0 [query (: 0 i32)]))
+          (mut signature) (match (calls/create 0 11 [(: 11 u8) 11] a)
+                            (Err [message] (panic "{}" message)) (Ok [s] s))]
+      (require (calls/function! (mut graph) signature a))
+      (calls/release! (mut signature))
+      (push! (mut exits) (require (b/emit! (mut graph) 120 11 [yes one (: 0 i32)])))
+      (push! (mut exits) (require (b/emit! (mut graph) 120 11 [no two (: 0 i32)])))
+      (Fixture :graph graph :exits exits :query query :condition condition))))
+
+(defn release! [(f (mut Fixture))] (-> void)
+  (free! (mut (.exits f))) (g/release! (mut (.graph f))))
+
+(defn expected [(ops (slice i32)) (arms (slice bool)) (query-op i32) (swapped bool)
+                (x i64) (y i64)] (-> i64)
+  (let [query (if swapped (eval query-op y x) (eval query-op x y))
+        (mut result) (if query (: 1 i64) (: 2 i64)) (mut i) 0 (mut done) false]
+    (while (and (< i (len ops)) (not done))
+      (when (!= (eval (get ops i) x y) (get arms i))
+        (set! result (if (= i 0) (if query (: 1 i64) (: 0 i64)) (: 3 i64)))
+        (set! done true))
+      (set! i (+ i 1)))
+    result))
+
+;;; Every pair of predicates, both source projections, both query operand
+;;; orders, with values covering every signed/unsigned relation combination.
+(defn check [(ops (slice i32)) (arms (slice bool)) (query-op i32) (swapped bool)
+             (native bool)] (-> i64)
+  (let [a (malloc-allocator) (mut f) (build ops arms query-op swapped a)
+        samples [(: -9223372036854775808 i64) -2 -1 0 1 2 9223372036854775807]
+        (mut failures) (: 0 i64) (mut proof) (: -1 i32)]
+    (match (pipeline/prepare (.graph f) 1 (slice (.exits f)) a)
+      (Err [message] (panic "prepare: {}" message))
+      (Ok [prepared]
+        (let [(mut prepared) prepared]
+          (set! proof (facts/prove (.graph f) prepared (.query f)))
+          (pipeline/release! (mut prepared)))))
+    (when (>= proof 0)
+      (for x samples (for y samples
+        (let [(mut reaches) true]
+          (for [i 0 (len ops)]
+            (unless (= (eval (get ops i) x y) (get arms i)) (set! reaches false)))
+          (when reaches
+            (unless (= (!= proof 0) (if swapped (eval query-op y x) (eval query-op x y)))
+              (println "unsound query {} swapped {} x {} y {} proof {}" query-op swapped x y proof)
+              (set! failures (+ failures 1))))))))
+    (when (and (= (len ops) 1) (= (get ops 0) query-op) (not swapped))
+      (unless (= proof (if (get arms 0) 1 0))
+        (println "missed identical comparison") (set! failures (+ failures 1))))
+    (match (facts/run (.graph f) 1 (slice (.exits f)) a)
+      (Err [message] (panic "facts: {}" message))
+      (Ok [result]
+        (match result
+          (None [] (when (>= proof 0) (panic "proven branch not rewritten")))
+          (Some [working]
+            (let [(mut working) working]
+              (unless (= (n/opcode (get (.instructions working) (cast i64 (.condition f)))) (cast u8 query-op))
+                (panic "shared comparison modified"))
+              (g/release! (mut working)))))))
+    (when native
+      (match (compile/image-with-private (.graph f) 1 (slice (.exits f)) "_bf_entry"
+                 (options/Options :level 3) a (private/with-branch-facts (private/no-context) true))
+        (Err [message] (panic "compile: {}" message))
+        (Ok [code]
+          (let [(mut code) code]
+            (match (link/compose [code] a)
+              (Err [message] (panic "compose: {}" message))
+              (Ok [module]
+                (let [(mut module) module]
+                  (match (jit/map-image (.image module) a)
+                    (Err [message] (panic "map: {}" message))
+                    (Ok [loaded]
+                      (let [(mut loaded) loaded
+                            index (match (image/find-symbol (.image module) "_bf_entry")
+                                    (Some [id] id) (None [] (panic "symbol")))
+                            function (primitive/cast (fnptr (cc/C) [i64 i64] i64)
+                              (primitive/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))]
+                        (for x samples (for y samples
+                          (let [got (function x y) want (expected ops arms query-op swapped x y)]
+                            (unless (= got want)
+                              (println "native {} {}: got {} want {}" x y got want)
+                              (set! failures (+ failures 1))))))
+                        (jit/release-image! (mut loaded)))))
+                  (link/release! (mut module)))))
+            (image/release! (mut code))))))
+    (release! (mut f))
+    failures))
+
+;;; A fact must not escape a diamond, or move from one LOAD value to another
+;;; after a STORE. Both cases must leave the query condition unchanged.
+(defn barriers [(joined bool)] (-> i64)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        (mut exits) (ArrayList::new [i32] a) (mut failures) (: 0 i64)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        first (require (b/emit! (mut graph) 91 11 [start p]))
+        cmp (require (b/emit! (mut graph) 16 1 [x first]))
+        outer (require (b/emit! (mut graph) 116 0 [first cmp]))
+        yes (require (b/emit! (mut graph) 107 0 [outer (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [outer (: 0 i32)]))
+        (mut control) yes (mut value) first]
+    (if joined
+        (let [end1 (require (b/emit! (mut graph) 114 0 [yes]))
+              end2 (require (b/emit! (mut graph) 114 0 [no]))]
+          (set! control (require (b/emit! (mut graph) 112 0 [end1 end2]))))
+        (let [store (require (b/emit! (mut graph) 93 0 [yes p x]))]
+          (push! (mut exits) (require (b/emit! (mut graph) 120 11 [no x (: 0 i32)])))
+          (set! value (require (b/emit! (mut graph) 91 11 [store p])))
+          (set! control value)))
+    (let [condition (require (b/emit! (mut graph) 16 1 [x value]))
+          query (require (b/emit! (mut graph) 116 0 [control condition]))
+          qyes (require (b/emit! (mut graph) 107 0 [query (: 0 i32)]))
+          qno (require (b/emit! (mut graph) 108 0 [query (: 0 i32)]))]
+      (push! (mut exits) (require (b/emit! (mut graph) 120 11 [qyes x (: 0 i32)])))
+      (push! (mut exits) (require (b/emit! (mut graph) 120 11 [qno first (: 0 i32)])))
+      (match (facts/run graph start (slice exits) a)
+        (Err [message] (panic "barrier: {}" message))
+        (Ok [result]
+          (match result
+            (None [] 0)
+            (Some [working]
+              (let [(mut working) working]
+                (println "fact crossed barrier, joined {}" joined)
+                (set! failures 1)
+                (g/release! (mut working))))))))
+    (free! (mut exits)) (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i32)
+  (let [(mut failures) (+ (barriers true) (barriers false))]
+    (for [source 14 24] (for [query 14 24]
+      (for arm [true false] (for swapped [false true]
+        (let [ops [(cast i32 source)] arms [arm]]
+          (set! failures (+ failures (check ops arms (cast i32 query) swapped false))))))))
+    ; All two-source ordering combinations, including the signed LE / unsigned
+    ; GE counterexample for EQ. Do not merge signed and unsigned masks.
+    (for [first 14 24] (for [second 14 24]
+      (for arm1 [true false] (for arm2 [true false]
+        (for query [(: 14 i32) 15]
+          (let [ops [(cast i32 first) (cast i32 second)] arms [arm1 arm2]]
+            (set! failures (+ failures (check ops arms query false false)))))))))
+    (let [a [(: 16 i32)] b [(: 20 i32)] c [(: 18 i32) 21] d [(: 18 i32) 17]
+          yes [true] no [false] both [true true]]
+      (set! failures (+ failures (check a yes 17 false true)
+        (check b no 22 true true) (check c both 14 false true) (check d both 14 false true))))
+    (println "branch facts: {} failures" failures)
+    (if (= failures 0) 0 1)))
