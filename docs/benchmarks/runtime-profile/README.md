@@ -68,3 +68,10 @@ The cost filter removes about 4.48B retired instructions from the combined unres
 ## Hardware-profile availability
 
 The current Xcode lists CPU Counters and CPU Profiler templates, and developer mode is enabled. A fresh CPU Profiler launch still exits 2 with “Error connecting to DTServiceHub,” matching the old handoff's limitation. The app interface also timed out twice before returning any Instruments state. No permissions or settings were changed, and no hardware-counter result is claimed. Commands/errors are saved in `evidence/profiler-availability/`. Ordinary per-process sampling is the fallback.
+
+
+## Ordinary sampling fallback
+
+Both LLVM and the cost-filtered combined host completed per-process 1 ms sampling and emitted the fixed seed. There are 10,970 and 13,882 non-wait samples respectively after excluding the sleeping coordinator; the call-tree summarizer verifies sample-count conservation and avoids double-counting recursive frames. Samples and host provenance are in `samples-a/`. These are single statistical profiles, not hardware events or replacement timing evidence. Inlining and tail calls materially change frame attribution, so common-function inclusive deltas are not causal estimates.
+
+Some directly named self-sample pairs (LLVM → filtered) are verification structure 199→303, import lookup 160→234, export checking 120→198, and call expansion 159→209. Memory copying has 486→557; string hashing is 243→220. The gap remains spread across the workload. This profile does not establish cache misses or branch misses, and it does not identify one transformation sufficient to meet the goal. A fresh three-host runtime repeat is in progress before considering the small filtered-policy gain reliable.
