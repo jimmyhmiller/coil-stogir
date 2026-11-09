@@ -93,3 +93,15 @@ Filtered hoisting/strength improves median by 0.829% and minimum by 0.740% again
 ## Broad validation
 
 The frozen-source full run completed all 384 Coil test programs. All 311 standalone programs pass. The 73 linked consumers all pass using 5410 freshly generated, privately copied and hashed fixtures; these linked results supersede the generic runner's unlinked consumer attempts. The separate 122-case strength C consumer was freshly relinked and passes too. Full FAST is now running with all retained combined research settings. Live emission and final repeated bootstrap remain acceptance gates.
+
+## FAST completion and environment correction
+
+The initial full FAST run forced benchmarking options globally, including cache-off and aggressive inlining. Those overrides invalidate the cache-comparison, helper-ordinal and residual-call test contracts, so that run is not a full-FAST acceptance result. The unchanged LLVM diagnostic passes in the normal environment. A mistakenly filed diagnostic report was removed as a non-bug.
+
+The standard-environment rerun clears every `COIL_*` override and uses the rebuilt `build/bin/coil-candidate` with its normal library-state cache. It passed 48 of 49 steps in 235.5 seconds. The remaining objects step exposed a genuine stale fixture: `stogir-emission-lifetime.coil` still supplied five arguments after `module-prepare!` gained an `always` boolean. Integration commit `c3f90fad` adds the explicit `false`, preserving its normal inlining policy. The fixture then passed under ASAN, and the complete objects step passed all 39 cases, including live emission. The bug was recorded and removed on resolution according to the Coil bug pad's rules. Logs are archived under `validation/`. All 49 steps have passing results across the full run plus affected-step rerun; this is not claimed as a single clean full invocation. A 4.41 GB peak warning remains in the objects step. No production code or test expectation was changed for these failures.
+
+## Allocation follow-up: exact source of the hot view
+
+The cost-filtered combined generator's primitive-provider trace reproduces host object `8108f6f0f916a53e0d6e39c1f0ce93dbf38a6a6a290335425368fe7cc11b5a14`. The hot `ldr x0; orr x3,x0,xzr; cmp` corresponds to unsigned load 631 and signed-word view 633. PHI coalescing first aliases load 631 and PHI 629 to load 619. The canonical source ranges include [1189,1200); view 633 occupies [1191,1195), wholly contained. It still cannot coalesce because the canonical source belongs to a PHI group; register hints cannot share its live register.
+
+The blanket PHI-group exclusion is intentional: group ranges can hold different dynamic values. Do not remove it. The next experiment is to prove contained same-value aliases before PHI-group construction, then let the existing noninterference/fixed-use checks decide PHI joins. This needs native loop/redefinition tests, structural proof checks and the captured graph before any whole-host claim. No range-union relaxation is justified by this finding.
