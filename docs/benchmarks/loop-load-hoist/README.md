@@ -126,3 +126,18 @@ Integration commit: Coil `6d1cccbb` on `research/loop-load-hoist`.
 The source and vendored library trees match byte for byte. The pass remains
 available as a validated, opt-in research component, but the best runtime policy
 continues to omit both load hoisting and rotation. No install or push occurred.
+
+## Next allocation investigation
+
+`induction-primitive.trace.gz` is a fresh graph and allocation snapshot of
+`coil.compiler.resolve.primitive-providers-in`, emitted by the final candidate
+with the induction baseline policy (hoisting and rotation off). The traced
+full host object matches the measured induction object exactly (`22163941...`).
+It supersedes the older region-only allocation trace for subsequent replay.
+The trace has 111 allocation blocks and 560 scheduled nodes, with before/after
+allocation parts, ranges and uses. No diagnostic allocation change is enabled.
+
+Next investigate remaining spill transfers and allocation decisions in this
+current graph before revisiting larger inlining budgets. The handoff's measured
+large-function regressions make spill pressure a more substantial remaining
+target than the load-hoisting-only change just tested.
