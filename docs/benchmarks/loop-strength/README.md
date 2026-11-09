@@ -23,7 +23,7 @@ Constant field offsets and representation views share a recurrence for their com
 
 The combined object's loop advances its pointer with `add #40`; the previous `mov #40; mul; add` chain is gone. Field offsets remain direct loads. A register copy remains before the first field load. This snapshot is a code-shape diagnostic, not a runtime benchmark and not the fully inlined host. Disassemblies and snapshot identity are under `lookup/`.
 
-The first full compiler integration and runtime comparison are below. The target remains ≥5× LLVM generation speed and ≤1.10× LLVM runtime on the fixed workload. The last accepted comparison is still 1.27471× LLVM runtime; this implementation does not establish an improvement yet. Nothing installed or pushed.
+The first full compiler integration and runtime comparison are below. The target remains ≥5× LLVM generation speed and ≤1.10× LLVM runtime on the fixed workload. The retained small-regional control is 1.27347× LLVM in runtime-a; the combined hoisting/strength result is mixed against that control. No runtime policy is promoted. Nothing installed or pushed.
 
 
 ## First whole-compiler comparison (COPY-based rewrite)
@@ -56,3 +56,10 @@ The normal persistent matcher now has a fallback for word-to-address views when 
 The expanded address suite passes, including 30 new native view fixtures (120 executions), fuse-disabled controls, rooted/escaping values, COPY before/after the view, long chains, and width-conversion checks. Existing offset/indexed/pressure tests, named/nested addresses, integrated nested strength execution and the freshly linked C consumer pass. Replacing only the matcher with pre-change `6423076` in an isolated copy makes the new selected-base assertion fail as expected; the helper API remains available so this is a behavioral negative control, not a missing-symbol failure.
 
 The captured combined loop now loads directly from its carried pointer. Its text is 284 bytes versus 288 before the rule; the other three captured variants remain unchanged. Evidence is under `address-views/`. No new full-workload runtime result exists for this matching follow-up yet. The next comparison needs freshly generated controls because the general matcher change also affects configurations with strength disabled.
+
+
+## Follow-up compiler preparation
+
+Library `da3e6b0` / integration `4473e86e` includes the direct-PHI rewrite and zero-offset address views. Preserved generator SHA-256 `8282cf7083fdc784ca48e560e54080e76295d730495306776798ac98f85f4716` is under integration `build/loop-strength/views/`. The candidate rebuilt successfully and the vendored library matches. Fresh `regional`, `hoist`, `strength` and `hoist-strength` hosts and quick FAST are preparing there. These overlapping builds are not controlled generation measurements.
+
+Once all jobs are terminal, verify each new host's fixed-seed output and compare six hosts serially for three alternating rounds: fixed LLVM, previous regional (`build/loop-strength/control/bin/coil`), and all four new `views/` hosts. Use the existing `docs/benchmarks/deferred-loop-splits/compare.py` with a fresh output directory and require `9d775276…` for every output. Preserve the previous generator and hosts. This preparation is not a completed follow-up runtime result.
