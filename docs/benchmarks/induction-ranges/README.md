@@ -140,3 +140,7 @@ at `build/induction-ranges/measured-candidate` with its toolchain record.
 
 Library implementation `3752b9b`; integration `e885ff63`. No install or push.
 Root user-owned handoff and results remain untouched.
+
+The final rebuilt candidate emits byte-identical bytes to the measured host.
+The preserved generator matches the generation metadata hash. See
+`final-identity.txt`. All checkpoint processes exited; no work remains running.
