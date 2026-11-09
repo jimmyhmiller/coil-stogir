@@ -75,3 +75,16 @@ The current Xcode lists CPU Counters and CPU Profiler templates, and developer m
 Both LLVM and the cost-filtered combined host completed per-process 1 ms sampling and emitted the fixed seed. There are 10,970 and 13,882 non-wait samples respectively after excluding the sleeping coordinator; the call-tree summarizer verifies sample-count conservation and avoids double-counting recursive frames. Samples and host provenance are in `samples-a/`. These are single statistical profiles, not hardware events or replacement timing evidence. Inlining and tail calls materially change frame attribution, so common-function inclusive deltas are not causal estimates.
 
 Some directly named self-sample pairs (LLVM → filtered) are verification structure 199→303, import lookup 160→234, export checking 120→198, and call expansion 159→209. Memory copying has 486→557; string hashing is 243→220. The gap remains spread across the workload. This profile does not establish cache misses or branch misses, and it does not identify one transformation sufficient to meet the goal. A fresh three-host runtime repeat is in progress before considering the small filtered-policy gain reliable.
+
+
+## Three-host runtime repeat
+
+After all profiling completed, every host passed another untimed seed check/warm-up, then three serial alternating rounds. All nine timed outputs match the seed. No task-owned build, test or profile overlapped.
+
+| Host | Min cycles (B) | Median cycles (B) | Median instructions (B) |
+|---|---:|---:|---:|
+| llvm | 42.888 | 42.968 | 139.847 |
+| regional | 54.221 | 54.309 | 206.695 |
+| hoist-strength | 53.820 | 53.858 | 204.603 |
+
+Filtered hoisting/strength improves median by 0.829% and minimum by 0.740% against regional. Its median ratio to LLVM is 1.25345×. Both this repeat and runtime-c favor it on minimum/median; carry the combined option as a modest research baseline, with broad validation following. The different absolute ratios across rounds reinforce using within-round controls. No generation-speed claim is added, and the joint goal remains unmet.
