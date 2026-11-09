@@ -11,3 +11,11 @@ A later indexed-address match may absorb the already-selected outer shift. Casca
 The captured replay replaces ASR+LSL with `and x0,x0,#0xffffffffffffffe0`. Total text remains 1468 bytes because alignment adds one NOP elsewhere; do not claim a code-size reduction. Whole-host seed correctness, broad validation and matched timing are pending. No runtime or generation gain is claimed yet.
 
 The replay generator consumes the lossless snapshot preserved here (decompress it before passing it to `benchmarks/shift-mask/generate.py`). The snapshot generator was the cost-filtered candidate b132cd9e…, and its full object matched 8108f6f0…. The isolated replay does not import complete-module private call masks.
+
+## Full validation before timing
+
+Integration `f5131583` vendors `efc2b64` unchanged. Rebuilt generator SHA-256 is `5b8611c544e86bc9a8c72ab84bc42b8ea907532b220dded3fef2e2bc17e869b5`. The retained-policy host object is `5f73913a63ac15bd1ca0bfd92e21eec38532ff85f8a3d647ab6139aef9a3ecc9`. It emits the fixed seed `9d775276…`, and full-host disassembly confirms AND replaces the shift pair.
+
+All 312 standalone library programs pass, all 73 linked consumers pass with 5,410 fresh private fixture copies, and the freshly linked strength C consumer passes. Standard full FAST passes all 49 steps, including live emission and ASAN checks. Preparation was concurrent, so its time and the printed host-generation duration are not controlled performance measurements. The existing objects-step memory warning remains. Evidence is under `validation/`.
+
+All task-owned build/test jobs finished before fresh warm-ups and the six-round alternating runtime comparison. The source workload remains clean at `892641a250c5ab508134a989eec1c96167b9a250`, source tree `82558967946e5863d28704d93d37704b67d6e1a6`. Timing is pending; no performance claim yet.
