@@ -1,0 +1,454 @@
+;;; 64-bit comparisons of SEXT/ZEXT of 32-bit values select W-form comparisons
+;;; of the sources, and the extension disappears when nothing else reads it.
+(module stogir.tests.jit-extension-compare)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.match" :as matching)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [x] x) (Err [message] (panic "{}" message))))
+
+;;; The 64-bit value of the extension, computed on the host. Kind 0 is a
+;;; plain 64-bit value without an extension.
+(defn extended [(kind i32) (value u64)] (-> u64)
+  (let [low (& value 0xFFFFFFFF)]
+    (cond (= kind 0) value
+          (and (= kind 33) (>= low 0x80000000)) (| low 0xFFFFFFFF00000000)
+          :else low)))
+
+(defn holds? [(opcode i32) (left u64) (right u64)] (-> bool)
+  (let [sl (p/cast i64 left)
+        sr (p/cast i64 right)]
+    (case opcode
+      14 (= left right)
+      15 (!= left right)
+      16 (< sl sr)
+      17 (>= sl sr)
+      18 (<= sl sr)
+      19 (> sl sr)
+      20 (< left right)
+      21 (>= left right)
+      22 (<= left right)
+      23 (> left right)
+      (panic "unknown comparison"))))
+
+;;; SXTW Xd, Wn and the UBFX Xd, Xn, #0, #32 form of a 32-bit zero extension.
+(defn extension-words [(text (slice u8))] (-> i64)
+  (let [(mut count) 0
+        (mut at) 0]
+    (while (< (+ at 3) (len text))
+      (let [word (| (cast u32 (get text at))
+                    (<< (cast u32 (get text (+ at 1))) 8)
+                    (<< (cast u32 (get text (+ at 2))) 16)
+                    (<< (cast u32 (get text (+ at 3))) 24))
+            pattern (& word (: 0xFFFFFC00 u32))]
+        (when (or (= pattern (: 0x93407C00 u32)) (= pattern (: 0xD3407C00 u32)))
+          (set! count (+ count 1))))
+      (set! at (+ at 4)))
+    count))
+
+;;; MOV X16, Xn (as ADD #0) or MOV W16, Wn: a table key copied into the
+;;; scratch register instead of being read where it already is.
+(defn key-copies [(text (slice u8))] (-> i64)
+  (let [(mut count) 0
+        (mut at) 0]
+    (while (< (+ at 3) (len text))
+      (let [word (| (cast u32 (get text at))
+                    (<< (cast u32 (get text (+ at 1))) 8)
+                    (<< (cast u32 (get text (+ at 2))) 16)
+                    (<< (cast u32 (get text (+ at 3))) 24))]
+        (when (or (= (& word (: 0xFFFFFC1F u32)) (: 0x91000010 u32))
+                  (= (& word (: 0xFFE0FFFF u32)) (: 0x2A0003F0 u32)))
+          (set! count (+ count 1))))
+      (set! at (+ at 4)))
+    count))
+
+(def inputs
+  [(: 0 u64) 1 2 5 4095 4096 4097 0x12344 0x12345 0x12346
+   0x7FFFFFFE 0x7FFFFFFF 0x80000000 0x80000001 0xFFFEDCBA 0xFFFEDCBB 0xFFFEDCBC
+   0xFFFFEFFF 0xFFFFF000 0xFFFFF001 0xFFFFFFFB 0xFFFFFFFE 0xFFFFFFFF])
+
+(defn immediate? [(literal u64)] (-> bool)
+  (let [value (p/cast i64 literal)
+        magnitude (if (< value 0) (- (: 0 i64) value) value)]
+    (and (>= value -16773120) (<= value 16773120)
+         (or (<= magnitude 4095) (= (% magnitude 4096) 0)))))
+
+;;; Exactly the cases the selection documents as narrowed.
+(defn narrowed? [(kind i32) (literal u64)] (-> bool)
+  (if (= kind 33)
+      (or (immediate? literal) (<= literal 0x7FFFFFFF))
+      (<= literal 0xFFFFFFFF)))
+
+;;; Mode 0 returns the Boolean, 1 branches on it, 2 branches and also roots
+;;; it, 3 branches and returns the extension itself so that it stays live.
+(defn literal-case [(kind i32) (source-type i32) (opcode i32) (literal u64)
+                    (left-constant bool) (mode i32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut roots) (ArrayList::new [i32] a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        argument (require (b/emit! (mut graph) 71 source-type [start (: 0 i32) 0]))
+        extension (require (b/emit! (mut graph) kind 5 [argument]))
+        constant (require (b/scalar-constant! (mut graph) 5 literal 8))
+        comparison
+          (require (b/emit! (mut graph) opcode 1
+                            (if left-constant [constant extension] [extension constant])))
+        (mut checked) 0]
+    (if (= mode 0)
+        (push! (mut roots)
+               (require (b/emit! (mut graph) 120 1 [start comparison (: 0 i32)])))
+        (let [split (require (b/emit! (mut graph) 116 0 [start comparison]))
+              yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+              no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+              one (require (b/scalar-constant! (mut graph) 5 1 8))
+              other (require (b/scalar-constant! (mut graph) 5 (if (= mode 3) 7 0) 8))]
+          (push! (mut roots)
+                 (require (b/emit! (mut graph) 120 5
+                                   [yes (if (= mode 3) extension one) (: 0 i32)])))
+          (push! (mut roots)
+                 (require (b/emit! (mut graph) 120 5 [no other (: 0 i32)])))
+          (when (= mode 2) (push! (mut roots) comparison))))
+    (match (compile/text graph start (slice roots) a)
+      (Err [message] (panic "{}" message))
+      (Ok [text]
+          (let [(mut text) text
+                extensions (extension-words (slice text))]
+            (when (and (!= mode 3) (narrowed? kind literal) (!= extensions 0))
+              (panic "extension kept: kind={} type={} op={} literal={} left={} mode={}"
+                     kind source-type opcode literal left-constant mode))
+            (when (and (= mode 3) (!= extensions 1))
+              (panic "shared extension count {}: kind={} op={} literal={}"
+                     extensions kind opcode literal))
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "{}" message))
+              (Ok [image]
+                  (let [(mut image) image
+                        function (p/cast (fnptr (cc/C) [u64] u64) (.base image))]
+                    (for low inputs
+                      (for high [(: 0 u64) 0xDEADBEEF00000000 0xFFFFFFFF00000000]
+                        (let [value (| low high)
+                              wide (extended kind value)
+                              yes (if left-constant
+                                      (holds? opcode literal wide)
+                                      (holds? opcode wide literal))
+                              want (if (= mode 3) (if yes wide 7) (if yes (: 1 u64) 0))
+                              got (function value)]
+                          (set! checked (+ checked 1))
+                          (when (!= got want)
+                            (panic "kind={} type={} op={} literal={} left={} mode={} input={} expected={} got={}"
+                                   kind source-type opcode literal left-constant mode
+                                   value want got)))))
+                    (jit/release! (mut image)))))
+            (free! (mut text)))))
+    (free! (mut roots))
+    (g/release! (mut graph))
+    checked))
+
+;;; Mode 0 returns the Boolean and 1 branches on it.
+(defn pair-case [(left-kind i32) (right-kind i32) (opcode i32) (mode i32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut roots) (ArrayList::new [i32] a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        first (require (b/emit! (mut graph) 71 10 [start (: 0 i32) 0]))
+        second (require (b/emit! (mut graph) 71 4 [start (: 0 i32) 1]))
+        left (require (b/emit! (mut graph) left-kind 5 [first]))
+        right (require (b/emit! (mut graph) right-kind 5 [second]))
+        comparison (require (b/emit! (mut graph) opcode 1 [left right]))
+        (mut checked) 0]
+    (if (= mode 0)
+        (push! (mut roots)
+               (require (b/emit! (mut graph) 120 1 [start comparison (: 0 i32)])))
+        (let [split (require (b/emit! (mut graph) 116 0 [start comparison]))
+              yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+              no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+              one (require (b/scalar-constant! (mut graph) 5 1 8))
+              zero (require (b/scalar-constant! (mut graph) 5 0 8))]
+          (push! (mut roots) (require (b/emit! (mut graph) 120 5 [yes one (: 0 i32)])))
+          (push! (mut roots) (require (b/emit! (mut graph) 120 5 [no zero (: 0 i32)])))))
+    (match (compile/text graph start (slice roots) a)
+      (Err [message] (panic "{}" message))
+      (Ok [text]
+          (let [(mut text) text
+                extensions (extension-words (slice text))]
+            (when (!= extensions (if (= left-kind right-kind) 0 2))
+              (panic "pair extension count {}: kinds={}/{} op={} mode={}"
+                     extensions left-kind right-kind opcode mode))
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "{}" message))
+              (Ok [image]
+                  (let [(mut image) image
+                        function (p/cast (fnptr (cc/C) [u64 u64] u64) (.base image))]
+                    (for x inputs
+                      (for y inputs
+                        (let [yes (holds? opcode (extended left-kind x)
+                                          (extended right-kind y))
+                              want (if yes (: 1 u64) 0)
+                              got (function (| x 0xABCD000000000000) (| y 0x1234567800000000))]
+                          (set! checked (+ checked 1))
+                          (when (!= got want)
+                            (panic "pair kinds={}/{} op={} mode={} x={} y={} expected={} got={}"
+                                   left-kind right-kind opcode mode x y want got)))))
+                    (jit/release! (mut image)))))
+            (free! (mut text)))))
+    (free! (mut roots))
+    (g/release! (mut graph))
+    checked))
+
+;;; A SWITCH on the extension dispatches on the source word when every case
+;;; literal is the extension of its own low word. BOUNDS holds low/high pairs;
+;;; case i returns 100*(i+1) and the default 7, or the selector when SHARED.
+(defn switch-case [(kind i32) (source-type i32) (bounds (slice u64))
+                   (shared bool) (narrow bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut roots) (ArrayList::new [i32] a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        argument (require (b/emit! (mut graph) 71 (if (= kind 0) 5 source-type)
+                                   [start (: 0 i32) 0]))
+        selector (if (= kind 0) argument (require (b/emit! (mut graph) kind 5 [argument])))
+        split (require (b/switch! (mut graph) start selector))
+        count (/ (len bounds) 2)
+        (mut checked) 0]
+    (for [i 0 count]
+      (let [low (require (b/scalar-constant! (mut graph) 5 (get bounds (* i 2)) 8))
+            high (require (b/scalar-constant! (mut graph) 5 (get bounds (+ (* i 2) 1)) 8))
+            projection (if (= low high)
+                           (require (b/case-value! (mut graph) split low))
+                           (require (b/case-range! (mut graph) split low high)))
+            code (require (b/scalar-constant! (mut graph) 5 (cast u64 (* (+ i 1) 100)) 8))]
+        (push! (mut roots) (require (b/emit! (mut graph) 120 5 [projection code (: 0 i32)])))))
+    (let [fallback (require (b/case-default! (mut graph) split))
+          seven (require (b/scalar-constant! (mut graph) 5 7 8))]
+      (push! (mut roots)
+             (require (b/emit! (mut graph) 120 5
+                               [fallback (if shared selector seven) (: 0 i32)]))))
+    (match (compile/text graph start (slice roots) a)
+      (Err [message] (panic "{}" message))
+      (Ok [text]
+          (let [(mut text) text
+                extensions (extension-words (slice text))]
+            (when (!= extensions (if narrow 0 1))
+              (panic "switch extension count {}: kind={} cases={} shared={}"
+                     extensions kind count shared))
+            (when (!= (key-copies (slice text)) 0)
+              (panic "switch key copied: kind={} cases={} shared={}" kind count shared))
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "{}" message))
+              (Ok [image]
+                  (let [(mut image) image
+                        function (p/cast (fnptr (cc/C) [u64] u64) (.base image))
+                        (mut probes) (ArrayList::new [u64] a)]
+                    (for value inputs (push! (mut probes) value))
+                    (for bound bounds
+                      (for near [(- bound 1) bound (+ bound 1)]
+                        (push! (mut probes) (if (= kind 0) near (& near 0xFFFFFFFF)))))
+                    (for low probes
+                      (for high [(: 0 u64) 0xDEADBEEF00000000 0xFFFFFFFF00000000]
+                        (let [wide (extended kind (| low high))
+                              (mut want) (if shared wide (: 7 u64))]
+                          (for [i 0 count]
+                            (when (and (>= wide (get bounds (* i 2)))
+                                       (<= wide (get bounds (+ (* i 2) 1))))
+                              (set! want (cast u64 (* (+ i 1) 100)))))
+                          (let [got (function (| low high))]
+                            (set! checked (+ checked 1))
+                            (when (!= got want)
+                              (panic "switch kind={} type={} cases={} shared={} input={} expected={} got={}"
+                                     kind source-type count shared (| low high) want got))))))
+                    (free! (mut probes))
+                    (jit/release! (mut image)))))
+            (free! (mut text)))))
+    (free! (mut roots))
+    (g/release! (mut graph))
+    checked))
+
+(defn switches [] (-> i64)
+  (let [(mut checked) 0]
+    ; A 64-bit selector without an extension indexes its table in place.
+    (set! checked (+ checked
+      (switch-case 0 5 [(: 0 u64) 0 1 1 2 2 3 3 5 5] false true)
+      (switch-case 0 5 [(: 10 u64) 10 11 11 12 12 13 13 15 15] false true)
+      (switch-case 0 5 [(: 0xFFFFFFFE u64) 0xFFFFFFFE 0xFFFFFFFF 0xFFFFFFFF
+                        0x100000000 0x100000000 0x100000001 0x100000001]
+                   false true)
+      (switch-case 0 5 [(: 0x7FFFFFFFFFFFFFFE u64) 0x7FFFFFFFFFFFFFFE
+                        0x7FFFFFFFFFFFFFFF 0x7FFFFFFFFFFFFFFF
+                        0x8000000000000000 0x8000000000000000
+                        0x8000000000000002 0x8000000000000002]
+                   false true)))
+    (for kind [(: 33 i32) 34]
+      (for source-type [(: 4 i32) 10]
+        (for shared [false true]
+          (let [narrow (not shared)]
+            ; One, two and three sparse singletons use compare-and-branch.
+            (set! checked (+ checked
+              (switch-case kind source-type [(: 0 u64) 0] shared narrow)
+              (switch-case kind source-type [(: 1 u64) 1 0 0] shared narrow)
+              (switch-case kind source-type [(: 0 u64) 0 1000 1000 0x7FFFFFFF 0x7FFFFFFF]
+                           shared narrow)
+              (switch-case kind source-type [(: 0x12345 u64) 0x12345 4096 4096] shared narrow)
+              ; Dense singletons use a table, from zero and from an offset.
+              (switch-case kind source-type [(: 0 u64) 0 1 1 2 2 3 3 5 5] shared narrow)
+              (switch-case kind source-type [(: 5 u64) 5 3 3 1 1 2 2 0 0 6 6 7 7 9 9]
+                           shared narrow)
+              (switch-case kind source-type
+                           [(: 0x7FFFFFF9 u64) 0x7FFFFFF9 0x7FFFFFFB 0x7FFFFFFB
+                            0x7FFFFFFC 0x7FFFFFFC 0x7FFFFFFF 0x7FFFFFFF]
+                           shared narrow)
+              ; Ranges and sparse cases use the comparison tree.
+              (switch-case kind source-type
+                           [(: 2 u64) 4 9 9 0x7FFFFFFE 0x7FFFFFFF 0x12345678 0x12345678
+                            100 200 0 0]
+                           shared narrow)))
+            (if (= kind 34)
+                (set! checked (+ checked
+                  (switch-case kind source-type
+                               [(: 0xFFFFFFFA u64) 0xFFFFFFFA 0xFFFFFFFB 0xFFFFFFFB
+                                0xFFFFFFFC 0xFFFFFFFC 0xFFFFFFFF 0xFFFFFFFF]
+                               shared narrow)
+                  (switch-case kind source-type
+                               [(: 0x80000000 u64) 0x80000010 0xFFFFFFFF 0xFFFFFFFF 3 3
+                                0x7FFFFFFF 0x7FFFFFFF 10 20]
+                               shared narrow)
+                  (switch-case kind source-type [(: 0xFFFFFFFF u64) 0xFFFFFFFF] shared narrow)
+                  ; A literal no zero extension can equal keeps the 64-bit dispatch.
+                  (switch-case kind source-type [(: 1 u64) 1 0x100000000 0x100000000] shared false)
+                  (switch-case kind source-type
+                               [(: 0 u64) 0 0xFFFFFFFF 0x100000000 5 5 0xFFFFFFFFFFFFFFFF
+                                0xFFFFFFFFFFFFFFFF]
+                               shared false)))
+                (set! checked (+ checked
+                  (switch-case kind source-type
+                               [(: 0xFFFFFFFFFFFFFFFA u64) 0xFFFFFFFFFFFFFFFA
+                                0xFFFFFFFFFFFFFFFB 0xFFFFFFFFFFFFFFFB
+                                0xFFFFFFFFFFFFFFFC 0xFFFFFFFFFFFFFFFC
+                                0xFFFFFFFFFFFFFFFF 0xFFFFFFFFFFFFFFFF]
+                               shared narrow)
+                  (switch-case kind source-type
+                               [(: 0xFFFFFFFFFFFFFFFE u64) 0xFFFFFFFFFFFFFFFE
+                                0xFFFFFFFFFFFFFFFF 0xFFFFFFFFFFFFFFFF 0 0 1 1]
+                               shared narrow)
+                  (switch-case kind source-type
+                               [(: 0xFFFFFFFF80000000 u64) 0xFFFFFFFF80000010
+                                0xFFFFFFFFFFFFFFFF 0xFFFFFFFFFFFFFFFF 3 3
+                                0x7FFFFFFF 0x7FFFFFFF 10 20 0xFFFFFFFFFFFFFF00 0xFFFFFFFFFFFFFF80]
+                               shared narrow)
+                  ; Literals no sign extension can equal keep the 64-bit dispatch.
+                  (switch-case kind source-type [(: 1 u64) 1 0x80000000 0x80000000] shared false)
+                  (switch-case kind source-type
+                               [(: 0 u64) 0 0xFFFFFFFF7FFFFFFF 0xFFFFFFFF80000000 5 5]
+                               shared false))))))))
+    checked))
+
+;;; SEXT/ZEXT that is the only reader of a 32-bit TRUNC view of a 64-bit value
+;;; extends the low word of that value directly, and the view is retired.
+;;; SHARED adds a 32-bit use of the view, which then keeps the extension.
+(defn view-case [(kind i32) (narrow i32) (wide i32) (shared bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut roots) (ArrayList::new [i32] a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        argument (require (b/emit! (mut graph) 71 wide [start (: 0 i32) 0]))
+        view (require (b/emit! (mut graph) 35 narrow [argument]))
+        extension (require (b/emit! (mut graph) kind 5 [view]))
+        mixed (if shared
+                  (let [doubled (require (b/emit! (mut graph) 26 narrow [view view]))
+                        widened (require (b/emit! (mut graph) 34 5 [doubled]))]
+                    (require (b/emit! (mut graph) 48 5 [extension widened])))
+                  extension)
+        container (if (= wide 5) argument (require (b/emit! (mut graph) 36 5 [argument])))
+        sum (require (b/emit! (mut graph) 26 5 [mixed container]))
+        (mut checked) 0]
+    (push! (mut roots) (require (b/emit! (mut graph) 120 5 [start sum (: 0 i32)])))
+    (match (pipeline/prepare graph start (slice roots) a)
+      (Err [message] (panic "{}" message))
+      (Ok [prepared]
+          (let [(mut owned) prepared]
+            (match (matching/build graph (.schedule owned) (slice roots) true a)
+              (Err [message] (panic "{}" message))
+              (Ok [selected]
+                  (let [(mut plan) selected
+                        tile (get (.tiles plan) (cast i64 extension))
+                        range (get (.ranges (.operands plan)) (cast i64 extension))]
+                    (when (or (!= (.rule tile) (if shared 0 (if (= kind 34) 48 53)))
+                              (!= (.count range) 1)
+                              (!= (get (.inputs (.operands plan)) (.offset range))
+                                  (if shared view argument))
+                              (!= (get (.omitted (.operands plan)) (cast i64 view))
+                                  (not shared)))
+                      (panic "view extension not selected: kind={} narrow={} wide={} shared={}"
+                             kind narrow wide shared))
+                    (matching/release! (mut plan)))))
+            (pipeline/release! (mut owned)))))
+    (match (compile/text graph start (slice roots) a)
+      (Err [message] (panic "{}" message))
+      (Ok [text]
+          (let [(mut text) text]
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "{}" message))
+              (Ok [image]
+                  (let [(mut image) image
+                        function (p/cast (fnptr (cc/C) [u64] u64) (.base image))]
+                    (for low inputs
+                      (for high [(: 0 u64) 0xDEADBEEF00000000 0xFFFFFFFF00000000
+                                 0x8000000000000000]
+                        (let [value (| low high)
+                              first (extended kind value)
+                              second (if shared (& (* low 2) 0xFFFFFFFF) (: 0 u64))
+                              want (p/iadd (^ first second) value)
+                              got (function value)]
+                          (set! checked (+ checked 1))
+                          (when (!= got want)
+                            (panic "view kind={} narrow={} wide={} shared={} input={} expected={} got={}"
+                                   kind narrow wide shared value want got)))))
+                    (jit/release! (mut image)))))
+            (free! (mut text)))))
+    (free! (mut roots))
+    (g/release! (mut graph))
+    checked))
+
+(defn views [] (-> i64)
+  (let [(mut checked) 0]
+    (for kind [(: 33 i32) 34]
+      (for narrow [(: 4 i32) 10]
+        (for wide [(: 5 i32) 11]
+          (for shared [false true]
+            (set! checked (+ checked (view-case kind narrow wide shared)))))))
+    checked))
+
+(defn main [] (-> i64)
+  (let [(mut checked) 0]
+    (for kind [(: 33 i32) 34]
+      (for opcode [(: 14 i32) 15 16 17 18 19 20 21 22 23]
+        (for literal [(: 0 u64) 1 4 4095 4096 4097 0x12345 0xFFF000 0x1000000
+                      0x7FFFFFFF 0x80000000 0xFFFFFFFF 0x100000000
+                      0x7FFFFFFFFFFFFFFF 0x8000000000000000
+                      0xFFFFFFFF7FFFFFFF 0xFFFFFFFF80000000 0xFFFFFFFFFFFEDCBB
+                      0xFFFFFFFFFF001000 0xFFFFFFFFFFFFF000 0xFFFFFFFFFFFFFFFB
+                      0xFFFFFFFFFFFFFFFF]
+          (for left-constant [false true]
+            (for mode [(: 0 i32) 1 2 3]
+              (set! checked
+                    (+ checked
+                       (literal-case kind (if (= (% mode 2) 0) 10 4) opcode literal
+                                     left-constant mode)
+                       (literal-case kind (if (= (% mode 2) 0) 4 10) opcode literal
+                                     left-constant mode)))))))
+      (for other [(: 33 i32) 34]
+        (for opcode [(: 14 i32) 15 16 17 18 19 20 21 22 23]
+          (for mode [(: 0 i32) 1]
+            (set! checked (+ checked (pair-case kind other opcode mode)))))))
+    (println "extension comparisons: {} results" checked)
+    (println "extension switches: {} results" (switches))
+    (println "extension views: {} results" (views))
+    0))

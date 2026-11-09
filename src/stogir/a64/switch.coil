@@ -24,24 +24,23 @@
   (bytes/append32! (mut (.text output)) 0))
 
 ;;; x16 holds the normalized order key throughout dispatch, x17 is scratch.
-(defn compare-in! [(output (mut code/Buffer)) (error (mut (slice u8))) (reg i32) (key u64)]
+;;; A W-form comparison reads only the low word of reg; its keys fit 32 bits.
+(defn compare-in! [(output (mut code/Buffer)) (error (mut (slice u8))) (wide bool)
+                   (reg i32) (key u64)]
   (-> void)
-  (match (encode/add-sub-immediate true true true 31 reg (cast i64 key))
+  (match (encode/add-sub-immediate wide true true 31 reg (cast i64 key))
     (Ok [word] (emit/word! (mut (.text output)) (mut error) (Ok word)))
     (Err [_]
-         (match (constants/emit! (mut (.text output)) true 17 key)
+         (match (constants/emit! (mut (.text output)) wide 17 key)
            (Err [message] (set! error message))
            (Ok [_] 0))
          (emit/word! (mut (.text output))
                      (mut error)
-                     (encode/add-sub true true true 31 reg 17)))))
-
-(defn compare! [(output (mut code/Buffer)) (error (mut (slice u8))) (key u64)]
-  (-> void)
-  (compare-in! (mut output) (mut error) 16 key))
+                     (encode/add-sub wide true true 31 reg 17)))))
 
 ;;; Half-open case interval [begin,end); recursion depth is O(log n).
 (defn tree! [(output (mut code/Buffer))
+             (wide bool)
              (reg i32)
              (dispatch switch/Dispatch)
              (stubs (ArrayList i32))
@@ -58,7 +57,7 @@
               item (get (.cases dispatch) middle)
               left-label (if (= begin middle) fallback (cast i32 (len labels)))]
           (when (!= begin middle) (push! (mut labels) -1))
-          (compare-in! (mut output) (mut error) reg (.low item))
+          (compare-in! (mut output) (mut error) wide reg (.low item))
           (if (= (.low item) (.high item))
               (do
                 (branch! (mut output) (mut branches) (get stubs middle) 0)
@@ -66,9 +65,10 @@
                   (branch! (mut output) (mut branches) left-label 3)))
               (do
                 (branch! (mut output) (mut branches) left-label 3)
-                (compare-in! (mut output) (mut error) reg (.high item))
+                (compare-in! (mut output) (mut error) wide reg (.high item))
                 (branch! (mut output) (mut branches) (get stubs middle) 9)))
           (tree! (mut output)
+                 wide
                  reg
                  dispatch
                  stubs
@@ -81,6 +81,7 @@
           (when (!= begin middle)
             (set! (mut labels) (cast i64 left-label) (len (.text output)))
             (tree! (mut output)
+                   wide
                    reg
                    dispatch
                    stubs
@@ -109,7 +110,13 @@
 
 ;;; The inline table holds signed displacements relative to its first byte.
 ;;; ADR is adjacent, so its displacement is always 16, independently of size.
+;;; REG holds the order key and is never x17. A nonzero first key is
+;;; subtracted into x16 in the key's width, so a word key leaves the
+;;; zero-extended index there; a word key that starts at zero is compared and
+;;; scaled directly as the low word of REG.
 (defn table! [(output (mut code/Buffer))
+              (wide bool)
+              (reg i32)
               (dispatch switch/Dispatch)
               (stubs (ArrayList i32))
               (fallback i32)
@@ -117,18 +124,21 @@
               (branches (mut (ArrayList fixups/Branch)))
               (relatives (mut (ArrayList fixups/Relative)))
               (error (mut (slice u8)))] (-> void)
-  (let [first (.low (get (.cases dispatch) 0))]
+  (let [first (.low (get (.cases dispatch) 0))
+        index (if (= first 0) reg (: 16 i32))
+        word-index? (and (not wide) (= first 0))]
     (when (!= first 0)
-      (match (encode/add-sub-immediate true true false 16 16 (cast i64 first))
+      (match (encode/add-sub-immediate wide true false 16 reg (cast i64 first))
         (Ok [word] (emit/word! (mut (.text output)) (mut error) (Ok word)))
         (Err [_]
-             (match (constants/emit! (mut (.text output)) true 17 first)
+             (match (constants/emit! (mut (.text output)) wide 17 first)
                (Err [message] (set! error message))
                (Ok [_] 0))
              (emit/word! (mut (.text output))
                          (mut error)
-                         (encode/add-sub true true false 16 16 17)))))
-    (compare! (mut output) (mut error) (cast u64 (- length 1)))
+                         (encode/add-sub wide true false 16 reg 17)))))
+    (compare-in! (mut output) (mut error) (not word-index?) index
+                 (cast u64 (- length 1)))
     (branch! (mut output) (mut branches) fallback 8)
     (let [base (+ (len (.text output)) 16)
           (mut slot) (: 0 i64)
@@ -138,7 +148,9 @@
                   (encode/address-relative 17 16))
       (emit/word! (mut (.text output))
                   (mut error)
-                  (encode/load-signed-word-indexed 16 17 16))
+                  (if word-index?
+                      (encode/load-signed-word-extended 16 17 index)
+                      (encode/load-signed-word-indexed 16 17 index)))
       (emit/word! (mut (.text output))
                   (mut error)
                   (encode/add-sub true false false 16 17 16))
@@ -172,6 +184,7 @@
 ;;; Up to three singleton cases: one compare and B.EQ per case, then the
 ;;; fallback branch, with no tree-internal labels or extra jumps.
 (defn linear! [(output (mut code/Buffer))
+               (wide bool)
                (reg i32)
                (dispatch switch/Dispatch)
                (stubs (ArrayList i32))
@@ -180,13 +193,16 @@
                (error (mut (slice u8)))] (-> void)
   (for [i 0 (len (.cases dispatch))]
     (when (= error "")
-      (compare-in! (mut output) (mut error) reg (.low (get (.cases dispatch) i)))
+      (compare-in! (mut output) (mut error) wide reg (.low (get (.cases dispatch) i)))
       (branch! (mut output) (mut branches) (get stubs i) 0)))
   (when (= error "") (branch! (mut output) (mut branches) fallback -1)))
 
 ;;; reg holds the normalized order key; it is x16 unless the selector needed
-;;; no normalization. Tables always address through x16/x17.
+;;; no normalization. Tables always address through x16/x17. A word key is
+;;; the low word of reg, whose upper bits are unspecified: its comparisons and
+;;; table index use the W form.
 (defn dispatch! [(output (mut code/Buffer))
+                 (wide bool)
                  (reg i32)
                  (dispatch switch/Dispatch)
                  (stubs (ArrayList i32))
@@ -197,9 +213,10 @@
                  (error (mut (slice u8)))] (-> void)
   (let [length (table-length dispatch)]
     (cond (and (= length 0) (<= (len (.cases dispatch)) 3) (singletons? dispatch))
-            (linear! (mut output) reg dispatch stubs fallback (mut branches) (mut error))
+            (linear! (mut output) wide reg dispatch stubs fallback (mut branches) (mut error))
           (= length 0)
             (tree! (mut output)
+                   wide
                    reg
                    dispatch
                    stubs
@@ -210,11 +227,11 @@
                    (mut branches)
                    (mut error))
           :else
-            (do
-              (when (!= reg 16)
-                (emit/word! (mut (.text output)) (mut error)
-                            (encode/add-sub-immediate true false false 16 reg 0)))
-              (table! (mut output)
+            (if (or (< reg 0) (> reg 30) (= reg 17))
+                (set! error "invalid SWITCH table key register")
+                (table! (mut output)
+                      wide
+                      reg
                       dispatch
                       stubs
                       fallback

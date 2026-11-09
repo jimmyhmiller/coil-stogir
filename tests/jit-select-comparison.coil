@@ -38,8 +38,21 @@
         bound (if (= literal 0) y
                   (need (b/scalar-constant! (mut graph) 5
                     (if (= literal 1) (: 37 u64) 0xFFFFFFFFFFFFFFDB) 8)))
-        cmp-x (if (= mode 8) (need (b/emit! (mut graph) 35 4 [x])) x)
-        cmp-y (if (= mode 8) (need (b/emit! (mut graph) 35 4 [bound])) bound)
+        ; Mode 8 compares 32-bit views; 9 and 10 compare their SEXT/ZEXT with
+        ; another such extension or with the 64-bit literal itself.
+        extension (if (= mode 9) (: 33 i32) 34)
+        narrow (if (= mode 9) (: 10 i32) 4)
+        extended? (or (= mode 9) (= mode 10))
+        cmp-x (cond (= mode 8) (need (b/emit! (mut graph) 35 4 [x]))
+                    extended?
+                      (need (b/emit! (mut graph) extension 5
+                              [(need (b/emit! (mut graph) 35 narrow [x]))]))
+                    :else x)
+        cmp-y (cond (= mode 8) (need (b/emit! (mut graph) 35 4 [bound]))
+                    (and extended? (= literal 0))
+                      (need (b/emit! (mut graph) extension 5
+                              [(need (b/emit! (mut graph) 35 narrow [bound]))]))
+                    :else bound)
         condition (need (b/emit! (mut graph) opcode 1 [cmp-x cmp-y]))
         lhs (if (= ty 5) left (need (b/emit! (mut graph) 35 ty [left])))
         rhs (if (= ty 5) right (need (b/emit! (mut graph) 35 ty [right])))
@@ -61,14 +74,15 @@
     (for enabled [false true]
       (let [(mut prepared) (need (pipeline/prepare-native graph start (slice roots) a))
             (mut plan) (need (matching/build-with-selects graph (.schedule prepared) (slice roots) true enabled a))
-            fused (and enabled (< mode 6))
+            fused (and enabled (or (< mode 6) (>= mode 8)))
             range (get (.ranges (.operands plan)) (cast i64 chosen))
             (mut emitted) (need (compile/generate-matched graph prepared plan a))]
         (assert (= (> (get (.comparisons plan) (cast i64 chosen)) 0) fused))
         (assert (= (get (.omitted (.operands plan)) (cast i64 condition)) fused))
         (assert (get (.definitions (.operands plan)) (cast i64 chosen)))
         (when fused
-          (assert (= (.count range) (if (= literal 0) 4 3)))
+          ; The 32-bit view of a literal is a register operand.
+          (assert (= (.count range) (if (or (= literal 0) (= mode 8)) 4 3)))
           (for [i 0 (.count range)]
             (assert (!= (get (.inputs (.operands plan)) (+ (.offset range) i)) condition))))
         (let [(mut image) (need (jit/map-text (slice (.text emitted))))
@@ -80,10 +94,14 @@
                   yes (if (or (= mode 1) (= mode 3) (= mode 4) (= mode 5)) yes-bits left)
                   no (if (or (= mode 2) (= mode 3) (= mode 4) (= mode 5)) no-bits right)
                   narrow-signed (and (= mode 8) (>= opcode 16) (<= opcode 19))
-                  x-test (if narrow-signed (cast u64 (cast i64 (cast i32 x)))
-                             (if (= mode 8) (& x 0xFFFFFFFF) x))
-                  y-test (if narrow-signed (cast u64 (cast i64 (cast i32 y-test)))
-                             (if (= mode 8) (& y-test 0xFFFFFFFF) y-test))
+                  x-test (cond (or narrow-signed (= mode 9)) (cast u64 (cast i64 (cast i32 x)))
+                               (or (= mode 8) (= mode 10)) (& x 0xFFFFFFFF)
+                               :else x)
+                  y-test (cond (or narrow-signed (and (= mode 9) (= literal 0)))
+                                 (cast u64 (cast i64 (cast i32 y-test)))
+                               (or (= mode 8) (and (= mode 10) (= literal 0)))
+                                 (& y-test 0xFFFFFFFF)
+                               :else y-test)
                   expected (& (if (truth opcode x-test y-test) yes no) mask)
                   actual (f x y left right)]
               (unless (= actual expected)
@@ -131,7 +149,7 @@
 (defn main [] (-> i32)
   (pressure)
   (let [(mut answers) (: 0 i64)]
-    (for [op 14 24] (for [mode 0 9] (for [literal 0 3]
+    (for [op 14 24] (for [mode 0 11] (for [literal 0 3]
       (for ty [(: 4 i32) 5]
         (set! answers (+ answers (check (cast i32 op) (cast i32 mode) ty (cast i32 literal))))))))
     (println "select comparison: {} native answers" answers)) 0)

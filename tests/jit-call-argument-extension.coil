@@ -1,0 +1,154 @@
+;;; A sub-32-bit register argument that already holds its ABI extension is not
+;;; extended again: literals that are their own extension, and BOOL/U8/U16
+;;; values whose own emission zero-extends them. Everything else still is.
+(module stogir.tests.jit-call-argument-extension)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.types" :as types)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.encode" :as e)
+(import "stogir.bytes" :as bytes)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [message] (panic "{}" message))))
+
+;;; SXTB/SXTH/UXTB/UXTH Wd, Wn.
+(defn narrow-extensions [(text (slice u8))] (-> i64)
+  (let [(mut count) 0
+        (mut at) 0]
+    (while (< (+ at 3) (len text))
+      (let [word (| (cast u32 (get text at))
+                    (<< (cast u32 (get text (+ at 1))) 8)
+                    (<< (cast u32 (get text (+ at 2))) 16)
+                    (<< (cast u32 (get text (+ at 3))) 24))
+            pattern (& word (: 0xFFFFFC00 u32))]
+        (when (or (= pattern (: 0x13001C00 u32)) (= pattern (: 0x13003C00 u32))
+                  (= pattern (: 0x53001C00 u32)) (= pattern (: 0x53003C00 u32)))
+          (set! count (+ count 1))))
+      (set! at (+ at 4)))
+    count))
+
+;;; The callee returns its whole W0 sign-extended, so any bit of the argument
+;;; register above the narrow value is observed.
+(defn observed [(ty i32) (bits u64)] (-> i64)
+  (let [width (cast u64 (* 8 (types/scalar-size ty 8)))
+        low (& bits (- (<< (: 1 u64) width) 1))]
+    (if (and (types/signed? ty) (!= (& low (<< (: 1 u64) (- width 1))) 0))
+        (- (p/cast i64 low) (p/cast i64 (<< (: 1 u64) width)))
+        (p/cast i64 low))))
+
+;;; Kind 0 passes the literal BITS; 1 passes the first parameter, of unknown
+;;; extension; 2 passes a comparison of both parameters (BOOL only); 3 passes
+;;; a value loaded from the address in the first parameter.
+(defn check [(target u64) (ty i32) (kind i32) (bits u64) (extensions i64)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut slot) bits
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        callee (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        first (require (b/emit! (mut graph) 71 (if (= kind 3) 6 (if (= kind 2) 5 ty))
+                                [start (: 0 i32) 1]))
+        second (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        load (if (= kind 3) (require (b/emit! (mut graph) 91 ty [start first])) 0)
+        argument
+          (case kind
+            0 (require (b/scalar-constant! (mut graph) ty bits 8))
+            1 first
+            2 (require (b/emit! (mut graph) 20 1 [first second]))
+            load)
+        prototype (match (calls/create 0 11 [(cast u8 ty)] a)
+                    (Ok [owned] owned) (Err [message] (panic "{}" message)))
+        (mut owned-prototype) prototype
+        call (require (calls/emit! (mut graph) owned-prototype
+                                   (if (= kind 3) load start) callee [argument] a))
+        ret (require (b/emit! (mut graph) 120 11 [call call (: 0 i32)]))
+        (mut checked) 0]
+    (match (compile/text graph start [ret] a)
+      (Err [message] (panic "{}" message))
+      (Ok [compiled]
+          (let [(mut code) compiled]
+            (when (!= (narrow-extensions (slice code)) extensions)
+              (panic "type={} kind={} bits={}: {} narrow extensions, expected {}"
+                     ty kind bits (narrow-extensions (slice code)) extensions))
+            (match (jit/map-text (slice code))
+              (Err [message] (panic "{}" message))
+              (Ok [image]
+                  (let [(mut owned) image
+                        f (p/cast (fnptr (cc/C) [u64 u64 u64] i64) (.base owned))]
+                    (for garbage [(: 0 u64) 0xFFFFFFFFFFFFFF00 0xABCDEF0123450000]
+                      (let [input (case kind
+                                    1 (| bits (if (= (types/scalar-size ty 8) 1)
+                                                  garbage
+                                                  (& garbage 0xFFFFFFFFFFFF0000)))
+                                    2 bits
+                                    3 (p/cast u64 (p/cast (ptr i8) (mut slot)))
+                                    garbage)
+                            want (if (= kind 2)
+                                     (if (< bits 77) (: 1 i64) 0)
+                                     (observed ty bits))
+                            actual (call-ptr f target input 77)]
+                        (set! checked (+ checked 1))
+                        (when (!= actual want)
+                          (panic "type={} kind={} bits={} input={} expected={} actual={}"
+                                 ty kind bits input want actual))))
+                    (jit/release! (mut owned)))))
+            (free! (mut code)))))
+    (calls/release! (mut owned-prototype))
+    (g/release! (mut graph))
+    checked))
+
+(defn main [] (-> i64)
+  (let [(mut probe) (ArrayList::new [u8] (malloc-allocator))
+        (mut checked) 0]
+    (match (e/extend true true 32 0 0)
+      (Err [message] (panic "{}" message))
+      (Ok [word] (bytes/append32! (mut probe) word)))
+    (match (e/ret 30)
+      (Err [message] (panic "{}" message))
+      (Ok [word] (bytes/append32! (mut probe) word)))
+    (match (jit/map-text (slice probe))
+      (Err [message] (panic "{}" message))
+      (Ok [image]
+          (let [(mut owned) image
+                target (p/cast u64 (.base owned))]
+            ; Literals: unsigned ones and nonnegative signed ones are their
+            ; own extension; a negative signed one still needs SXTB/SXTH.
+            (for bits [(: 0 u64) 1]
+              (set! checked (+ checked (check target 1 0 bits 0))))
+            (for bits [(: 0 u64) 1 127 128 255]
+              (set! checked (+ checked
+                               (check target 2 0 bits 0)
+                               (check target 7 0 bits (if (< bits 128) 0 1))
+                               (check target 8 0 bits (if (< bits 128) 0 1)))))
+            (for bits [(: 0 u64) 1 255 256 32767 32768 65535]
+              (set! checked (+ checked
+                               (check target 3 0 bits 0)
+                               (check target 9 0 bits (if (< bits 32768) 0 1)))))
+            ; A parameter of unknown extension is extended for the callee.
+            (for bits [(: 0 u64) 1 127 128 255]
+              (set! checked (+ checked
+                               (check target 2 1 bits 1)
+                               (check target 8 1 bits 1))))
+            (for bits [(: 0 u64) 255 256 32767 32768 65535]
+              (set! checked (+ checked
+                               (check target 3 1 bits 1)
+                               (check target 9 1 bits 1))))
+            ; A comparison result and unsigned loads are already extended;
+            ; a signed load into W is not the argument's sign extension.
+            (for bits [(: 0 u64) 76 77 78 0xFFFFFFFFFFFFFFFF]
+              (set! checked (+ checked (check target 1 2 bits 0))))
+            (for bits [(: 0 u64) 1 127 128 255]
+              (set! checked (+ checked (check target 2 3 bits 0))))
+            (for bits [(: 0 u64) 255 256 32767 32768 65535]
+              (set! checked (+ checked (check target 3 3 bits 0))))
+            (jit/release! (mut owned)))))
+    (free! (mut probe))
+    (println "argument extension checks: {} results" checked)
+    0))
