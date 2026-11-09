@@ -50,6 +50,66 @@ bit test); two do under the same condition when their constants are adjacent
 (one range test). Other short chains, including two-way tag tests with separate
 targets, stay IFs.
 
+## Jump threading
+
+`jump-thread/rewrite!` runs first in `sccp/finish-compacting!`, on exact use
+lists, before boundary merging and the diamond rewrites. A candidate is a MERGE
+whose only users are its PHIs and one IF or SWITCH, with a condition built from
+those PHIs and constants by at most four levels of integer comparisons, wrapping
+arithmetic, Boolean NOT and integer extensions or views. The block therefore
+holds nothing but the choice of values and the test.
+
+An input END that comes from another MERGE holding only PHIs, each read solely
+by the candidate's PHIs at that input, is replaced by that MERGE's own inputs
+(up to eight levels, 64 edges in all). Short-circuit `and`/`or` and flags set
+on some arms of a loop body reach their test this way.
+
+Each incoming edge is then classified:
+
+- its PHI inputs fold the condition to a constant: the edge goes to the chosen
+  projection (for a SWITCH, the matching CASE_VAL or the default);
+- every PHI the condition reads carries itself along the edge, the condition
+  reads nothing else, and an IF on the straight control chain above the END
+  already decided it (`conditional/dominating-truth`): the edge goes the same
+  way. A PHI that is the condition itself may instead carry any value such an
+  IF decided;
+- an IF edge whose input is a comparison (possibly extended) used nowhere else:
+  the END becomes an IF on that comparison, and its two new ENDs go to the two
+  projections;
+- anything else stays at the MERGE.
+
+A projection that gains edges becomes a block start: with undecided edges left,
+a new MERGE of the projection's END and the threaded ENDs takes over its users;
+otherwise the projection is rewritten in place as BEGIN or MERGE (a new MERGE
+past three inputs). When no edge stays, the MERGE, its PHIs and the branch
+become NOPs, and a projection nothing reaches becomes the transient BEGIN(0)
+that `iter-control/prune!` removes together with its region.
+
+Values are repaired from the definitions that reach each use. Walking control
+upward from a pinned use (a control node, or a PHI's predecessor END) ends at a
+projection of the branch, at the MERGE itself, or at a MERGE whose inputs
+disagree; the answer is memoized per control node. A PHI of the candidate read
+below a projection becomes a PHI at that projection's join (or the single
+incoming value); where different joins meet it gets a PHI at the meeting MERGE.
+Floating values computed from the PHIs are rewritten in place when all their
+uses see one definition, and copied per definition otherwise. Below an IF's
+projections the condition itself is the known constant.
+
+Left alone: a MERGE with any other user (a block with loads, calls or stores
+before the test), LOOP_BEGIN headers, CASE_RANGE dispatch, vector PHIs,
+observed (root) MERGE, PHI, branch or projection nodes (an observed END that
+disappears with a flattened MERGE is replaced in the roots by the edges it
+stood for), a narrowed MERGE that would need more inputs than it has cells,
+and candidates over the bounds at the top of the module (256 floating values,
+1024 pinned uses, 4096 control nodes walked).
+
+Loops stay reducible. One depth-first walk per pass marks the ENDs that close a
+cycle. A MERGE with such an input is threaded only if exactly one projection
+remains inside its natural loop: edges to other projections leave the loop,
+edges to that one enter below the test. Entry edges may enter below the test
+only when the MERGE keeps no entry edge or no back edge, so each cycle keeps
+one entry; a constant entry test then leaves the loop bottom-tested.
+
 ## AArch64 dispatch
 
 Case intervals are heapsorted in O(n log n) time with bounded extra sorting
