@@ -1,3 +1,11 @@
+## Regional zero-trip continuation
+
+The [regional emission and flow-frequency checkpoint](zero-trip/README.md)
+now removes the actual empty-inner-loop reloads in full native diagnostic
+fixtures. A CFG-derived, bounded search finds the assignment without global
+recoloring or measured profile weights. The tested native flow estimator is
+implemented; native regional allocation and workload measurements remain next.
+
 # Coordinated allocation recoloring
 
 This experiment implements and validates coordinated recoloring, but it does not fix the hot zero-trip path or improve measured runtime. The earlier allocation analysis misidentified two rejection edges inside the `k` loop as its zero-trip bypass; the correction below supersedes that interpretation. The bounded search is now also implemented as an optional native post-allocation pass; the compiler workload has not yet been timed with it. There is no new cycle measurement or claim that the 5× generation / 1.10× runtime target is met.

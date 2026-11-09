@@ -14,12 +14,15 @@ from model import Model
 
 
 class Recolor:
-    def __init__(self, model, region, initial):
+    def __init__(self, model, region, initial, free_first=False):
         self.m = model
+        self.free_first = free_first
         keys = {}
         self.members, self.domains, self.current, self.groupof = [], [], [], []
         for i, (part, domain, old) in enumerate(zip(model.parts, model.domains, initial)):
-            key = ('inside', part.origin) if part.block in region else ('outside', i)
+            # An earlier region may already have split the original child.
+            # Keep differently assigned pieces distinct in later regions.
+            key = ('inside', part.origin, old) if part.block in region else ('outside', i)
             domain = set(domain) if part.block in region else {old}
             if key not in keys:
                 keys[key] = len(self.members)
@@ -103,8 +106,11 @@ class Recolor:
                 if alternative != location:
                     attempt = dict(proposed)
                     attempt[victim] = alternative
-                    alternatives.append((self.score(attempt), alternative))
-            for _, alternative in sorted(alternatives):
+                    occupied = (sum(proposed.get(n, self.current[n]) == alternative
+                                    for n in self.neighbors[victim])
+                                if self.free_first and alternative < self.m.register_count else 0)
+                    alternatives.append((occupied, self.score(attempt), alternative))
+            for _, _, alternative in sorted(alternatives):
                 if self.visits >= limit:
                     break
                 for solved in self.place(victim, alternative, proposed, depth-1, limit, max_changes):

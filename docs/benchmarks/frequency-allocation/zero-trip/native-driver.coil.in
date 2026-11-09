@@ -1,0 +1,100 @@
+(defn need [T] [(r (Result T (slice u8)))] (-> T)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+
+;;; Diagnostic fixture: apply only the independently checked regional candidate.
+;;; Production allocation remains unchanged. Every original child is checked
+;;; against the captured baseline before any split is made.
+(defn hypothesis! [(assigned (mut allocate/Assigned)) (a (dyn Allocator))] (-> void)
+  BASELINE_ASSERTIONS
+  REGION_ASSIGNMENTS
+  (need (check/verify (.parts assigned) 29 536412159))
+  ; No new preserved register may be introduced after the saved area is laid
+  ; out. This fixture uses the same preserved register set and no new homes.
+  (let [(mut used) (: 0 u64)]
+    (for part (.parts assigned)
+      (when (and (> (.parent part) 0) (> (len (.ranges part)) 0)
+                 (>= (.register part) 19) (<= (.register part) 28))
+        (set! used (| used (<< (: 1 u64) (cast u64 (.register part)))))))
+    (assert (= used (.mask (.callee assigned))))))
+
+(defn assign! [(parts (mut (ArrayList allocation/Part))) (parent i32) (position i64)
+                (start i64) (end i64) (reg i32) (a (dyn Allocator))] (-> void)
+  (let [(mut found) (: -1 i32)]
+    (for [i 0 (len parts)]
+      (let [part (get parts i)]
+        (when (and (= (.parent part) parent) (interval/covers? (.ranges part) position))
+          (assert (< found 0)) (set! found (cast i32 i)))))
+    (assert (>= found 0))
+    (regions/assign-region! (mut parts) (regions/Change :part found :register reg :slot -1) start end a)))
+
+(defn emit-fixture [(graph g/Graph) (roots (slice i32)) (modified bool) (a (dyn Allocator))] (-> void)
+  ; This captured function uses an indirect aggregate return. Fail rather than
+  ; silently omitting any newly introduced return lowering in future replays.
+  (match (need (returns/prepare graph 1 roots a))
+    (None [] 0)
+    (Some [_] (panic "unexpected return lowering")))
+  (let [(mut prepared) (need (pipeline/prepare-native graph 1 roots a))
+        (mut matched) (need (matching/build graph (.schedule prepared) roots true a))
+        (mut analysis) (live/analyze-matched graph (.blocks prepared) (.schedule prepared)
+                         (.order prepared) (.operands matched) a)
+        (mut intervals) (ranges/build-matched graph (.schedule prepared) analysis
+                         (.order prepared) (.operands matched) a)
+        (mut req) (need (constraints/build-matched graph (.schedule prepared) matched a))
+        (mut blocks) (split/build (.blocks prepared) (.schedule prepared) (.idom prepared) (.depths prepared) a)
+        context (private/with-recolor (private/with-predict (private/with-loop-reloads
+                   (private/with-loop-evict (private/no-context) true) true) true) RECOLOR_ENABLED)
+        (mut assigned) (need (allocate/build-prepared-with-machine-private-splits intervals req graph
+                         (.schedule prepared) (.static-sizes matched) (.operands matched) (.blocks prepared)
+                         (.depths prepared) a (slice (.modes (.tails matched))) context (slice blocks)))
+        (mut aliases) (ArrayList::new [i32] a)]
+    (for [i 0 (len (.instructions graph))]
+      (let [bucket (get (.parents (.locations assigned)) i)]
+        (push! (mut aliases) (if (> (.count bucket) 0)
+          (locations/owner (.parts assigned) (.locations assigned) (cast i32 i)) (cast i32 i)))))
+    (when modified
+      (hypothesis! (mut assigned) a)
+      (need (allocate/bind-index! (mut assigned) aliases graph (.static-sizes matched) req a)))
+    (let [(mut body) (need (function/body-prepared graph prepared assigned analysis req matched false a))
+          (mut code) (need (emitted/finish! (mut body) graph "_primitive" a))
+          (mut bytes) (need (macho/image-object code a))]
+      (match (fs/write-file a (if modified "OUTPUT_PREFIX-hypothesis.o" "OUTPUT_PREFIX-control.o") (slice bytes))
+        (Err [_] (panic "write")) (Ok [_] 0))
+      (free! (mut bytes)) (image/release! (mut code)) (buffer/release! (mut body)))
+    (free! (mut aliases)) (allocate/release! (mut assigned)) (free! (mut blocks))
+    (constraints/release! (mut req)) (ranges/release! (mut intervals))
+    (live/release-analysis! (mut analysis)) (matching/release! (mut matched)) (pipeline/release! (mut prepared))))
+
+(defn vector-stage [(graph g/Graph) (roots (slice i32)) (modified bool) (a (dyn Allocator))] (-> void)
+  (let [result (need (vectorize/optimize-prepared graph 1 roots 2 a))]
+    (match (.graph result)
+      (None [] (emit-fixture graph roots modified a))
+      (Some [working] (let [(mut working) working] (emit-fixture working roots modified a) (g/release! (mut working)))))
+    (match (.prepared result)
+      (None [] 0) (Some [owned] (let [(mut owned) owned] (pipeline/release! (mut owned)))))))
+(defn rotation-stage [(graph g/Graph) (roots (slice i32)) (modified bool) (a (dyn Allocator))] (-> void)
+  (let [result (need (rotate/run graph 1 roots a)) (mut exits) (.roots result)]
+    (match (.graph result)
+      (None [] (vector-stage graph roots modified a))
+      (Some [working] (let [(mut working) working] (vector-stage working (slice exits) modified a) (g/release! (mut working)))))
+    (free! (mut exits))))
+(defn facts-stage [(graph g/Graph) (roots (slice i32)) (modified bool) (a (dyn Allocator))] (-> void)
+  (match (need (facts/run-with-induction graph 1 roots a true))
+    (None [] (rotation-stage graph roots modified a))
+    (Some [working]
+      (let [(mut working) working (mut cleaned) (need (sccp/optimize working 8 roots a))]
+        (rotation-stage (.graph cleaned) (slice (.roots cleaned)) modified a)
+        (rewrite/release! (mut cleaned)) (g/release! (mut working))))))
+(defn dense-stage [(graph g/Graph) (roots (slice i32)) (modified bool) (a (dyn Allocator))] (-> void)
+  (if (>= (* (compact/nop-cells graph) 8) (len (.instructions graph)))
+      (let [(mut packed) (compact/compact graph roots a)]
+        (facts-stage (.graph packed) (slice (.roots packed)) modified a) (compact/release! (mut packed)))
+      (facts-stage graph roots modified a)))
+(defn run-fixture [(graph g/Graph) (roots (slice i32)) (modified bool) (a (dyn Allocator))] (-> void)
+  (let [result (if (< (* (compact/nop-cells graph) 8) (len (.instructions graph)))
+                  (sccp/optimize-memory-compacting graph 8 roots true true a)
+                  (let [(mut packed) (compact/compact graph roots a)
+                        result (sccp/optimize-memory-owned! (.graph packed) 8 (slice (.roots packed)) true a)]
+                    (free! (mut (.roots packed))) result))
+        (mut optimized) (need result)]
+    (dense-stage (.graph optimized) (slice (.roots optimized)) modified a)
+    (rewrite/release! (mut optimized))))
