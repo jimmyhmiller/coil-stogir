@@ -13,7 +13,7 @@ p.add_argument('root', type=Path)
 p.add_argument('compiler', type=Path)
 p.add_argument('output', type=Path)
 p.add_argument('--rounds', type=int, default=3)
-p.add_argument('--policies', nargs='+', choices=['llvm', 'regions', 'facts', 'induction', 'hoist', 'hoist-rotate'],
+p.add_argument('--policies', nargs='+', choices=['llvm', 'regions', 'facts', 'induction', 'hoist', 'hoist-rotate', 'leaf80'],
                default=['llvm', 'regions', 'facts'])
 a = p.parse_args()
 if a.rounds < 1:
@@ -31,6 +31,8 @@ available = dict(llvm=('llvm', {}), regions=('stogir', policy),
     hoist=('stogir', dict(policy, COIL_STOGIR_INDUCTION='1', COIL_STOGIR_HOIST_LOADS='1')),
     hoist_rotate=('stogir', dict(policy, COIL_STOGIR_INDUCTION='1', COIL_STOGIR_HOIST_LOADS='1', COIL_STOGIR_ROTATE='1')))
 available['hoist-rotate'] = available.pop('hoist_rotate')
+available['leaf80'] = ('stogir', dict(policy, COIL_STOGIR_INDUCTION='1',
+    COIL_STOGIR_INLINE='small=80,small-scope=any,small-leaf=1,hoist=1'))
 configs = [(name, *available[name]) for name in a.policies]
 metadata = dict(compiler=str(a.compiler.resolve()),
     compiler_sha256=hashlib.sha256(a.compiler.read_bytes()).hexdigest(),
