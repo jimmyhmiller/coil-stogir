@@ -112,14 +112,16 @@
         returned (require (b/emit! (mut graph) 120 5 [stored result (: 0 i32)]))
         (mut roots) (ArrayList::new [i32] a)
         bytes (types/size ty 8)
-        selected (and (!= shape 6) (!= variant 2) (encodable? bytes offset))
+        arithmetic (and (!= shape 6) (!= variant 2) (encodable? bytes offset))
+        view-base (address/base-view graph actual-address)
+        viewed (!= view-base actual-address)
+        selected (or arithmetic viewed)
         omitted
-          (and (!= shape 6)
-               (!= variant 1)
+          (and (!= variant 1)
                (!= variant 2)
                (!= variant 3)
-               (encodable? bytes offset)
-               (or (!= variant 4) (encodable? 1 offset)))
+               (or viewed
+                   (and arithmetic (or (!= variant 4) (encodable? 1 offset)))))
         (mut failures) 0]
     (push! (mut roots) returned)
     (when (= variant 1) (push! (mut roots) address))
@@ -145,10 +147,10 @@
                       (set! failures (+ failures 1)))
                     (when (!= (.count range) 1) (set! failures (+ failures 1)))
                     (when (!= (get (.inputs (.operands plan)) (.offset range))
-                              (if selected source actual-address))
+                              (if arithmetic source (if viewed view-base actual-address)))
                       (set! failures (+ failures 1)))
                     (when selected
-                      (when (!= (get (.offsets plan) (cast i64 loaded)) offset)
+                      (when (!= (get (.offsets plan) (cast i64 loaded)) (if arithmetic offset 0))
                         (set! failures (+ failures 1))))
                     (matching/release! (mut plan)))))
             (pipeline/release! (mut prepared)))))
@@ -240,7 +242,7 @@
         effective-offset (* offset (if (= shape 0) 1 (cast i64 bytes)))
         selected (!= variant 2)
         omitted (and (!= variant 1) (!= variant 2) (!= variant 3)
-                     (or (!= variant 4) (= shape 0) (= bytes 1)))
+                     (or (!= variant 4) (= shape 0) (= shape 2) (= bytes 1)))
         (mut failures) 0]
     (push! (mut roots) returned)
     (when (= variant 1) (push! (mut roots) address))
@@ -428,7 +430,104 @@
           (Some [_] (panic "missing indexed address accepted")) (None [] 0))))
     (g/release! (mut graph))))
 
+(defn view-chain! [(graph (mut g/Graph)) (base i32) (depth i64)] (-> (ArrayList i32))
+  (let [(mut refs) (ArrayList::new [i32] (malloc-allocator)) (mut current) base]
+    (push! (mut refs) base)
+    (for [i 1 (+ depth 1)]
+      (set! current (require (b/emit! (mut graph) 36
+        (if (= i depth) 6 (if (= (% i 2) 0) 5 11)) [current])))
+      (push! (mut refs) current))
+    refs))
+
+;;; No address ADD exists: parameter -> full-width views -> memory. Cover
+;;; shared/rooted/escaping views, barriers on either side and bounded partial
+;;; chains. Expected bases are references recorded during graph construction.
+(defn bare-view [(ty i32) (depth i64) (variant i32)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        source (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        target (require (b/emit! (mut graph) 71 ty [start (: 0 i32) 1]))
+        base (if (= variant 3) (require (b/emit! (mut graph) 68 ty [source (: 1 i32)])) source)
+        (mut views) (view-chain! (mut graph) base depth)
+        (mut targets) (view-chain! (mut graph) target depth)
+        address (get views depth)
+        actual (if (= variant 2) (require (b/emit! (mut graph) 68 6 [address (: 1 i32)])) address)
+        loaded (require (b/emit! (mut graph) 91 11 [start actual]))
+        stored (require (b/emit! (mut graph) 93 0 [loaded (get targets depth) loaded]))
+        result (if (= variant 4) (require (b/emit! (mut graph) 36 11 [address])) loaded)
+        ret (require (b/emit! (mut graph) 120 11 [stored result (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)]
+    (push! (mut roots) ret) (when (= variant 1) (push! (mut roots) address))
+    (match (pipeline/prepare graph start (slice roots) a)
+      (Err [message] (panic "view prepare: {}" message))
+      (Ok [prepared]
+        (let [(mut prepared) prepared]
+          (for enabled [false true]
+            (match (matching/build graph (.schedule prepared) (slice roots) enabled a)
+              (Err [message] (panic "view matching: {}" message))
+              (Ok [plan]
+                (let [(mut plan) plan selected (and enabled (!= variant 2))
+                      expected (if selected (get views (if (> depth 16) (- depth 16) 0)) actual)
+                      range (get (.ranges (.operands plan)) (cast i64 loaded))]
+                  (assert (= (get (.addresses plan) (cast i64 loaded)) (if selected expected 0)))
+                  (assert (= (get (.offsets plan) (cast i64 loaded)) 0))
+                  (assert (= (.count range) 1))
+                  (assert (= (get (.inputs (.operands plan)) (.offset range)) expected))
+                  (assert (= (get (.omitted (.operands plan)) (cast i64 address))
+                             (and selected (!= variant 1) (!= variant 4))))
+                  (when selected (assert (not (get (.omitted (.operands plan)) (cast i64 expected)))))
+                  (when (= variant 3) (assert (not (get (.omitted (.operands plan)) (cast i64 base)))))
+                  (matching/release! (mut plan))))))
+          (pipeline/release! (mut prepared)))))
+    (match (compile/text graph start (slice roots) a)
+      (Err [message] (panic "view native: {}" message))
+      (Ok [text]
+        (let [(mut text) text]
+          (match (jit/map-text (slice text))
+            (Err [message] (panic "view map: {}" message))
+            (Ok [mapped]
+              (let [(mut mapped) mapped
+                    f (p/cast (fnptr (cc/C) [(ptr u64) (ptr u64)] u64) (.base mapped))]
+                (for value [(: 0 u64) 17 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
+                  (let [(mut input) value (mut output) (: 99 u64)
+                        want (if (= variant 4) (p/cast u64 (p/cast (ptr u64) (mut input))) value)]
+                    (assert (= (f (mut input) (mut output)) want)) (assert (= output value))))
+                (jit/release! (mut mapped)))))
+          (free! (mut text)))))
+    (free! (mut roots)) (free! (mut views)) (free! (mut targets)) (g/release! (mut graph))))
+
+(defn view-widths [] (-> void)
+  (let [a (malloc-allocator)]
+    (for narrow [false true]
+      (let [(mut graph) (g/create a)
+            start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+            source (require (b/emit! (mut graph) 71 (if narrow 10 13) [start (: 0 i32) 0]))
+            base (if narrow (require (b/emit! (mut graph) 34 11 [source])) source)
+            address (require (b/emit! (mut graph) 36 6 [base]))
+            loaded (require (b/emit! (mut graph) 91 11 [start address]))
+            ret (require (b/emit! (mut graph) 120 11 [loaded loaded (: 0 i32)]))]
+        (match (pipeline/prepare graph start [ret] a)
+          (Err [message] (panic "view widths prepare: {}" message))
+          (Ok [prepared]
+            (let [(mut prepared) prepared]
+              (match (matching/build graph (.schedule prepared) [ret] true a)
+                (Err [message] (panic "view widths match: {}" message))
+                (Ok [plan]
+                  (let [(mut plan) plan]
+                    (assert (= (get (.addresses plan) (cast i64 loaded)) (if narrow base 0)))
+                    (assert (not (get (.omitted (.operands plan)) (cast i64 base))))
+                    (matching/release! (mut plan)))))
+              (pipeline/release! (mut prepared)))))
+        (for width [(: -1 i32) 0 3 32]
+          (match (address/select-view graph address width)
+            (Some [_] (panic "invalid bare-view width")) (None [] 0)))
+        (g/release! (mut graph))))))
+
 (defn main [] (-> i64)
+  (view-widths)
+  (for ty [(: 5 i32) 11]
+    (for depth [(: 1 i64) 3 20]
+      (for [variant (: 0 i32) 5] (bare-view ty depth variant))))
   (indexed-selection-cases)
   (indexed-pressure)
   (for ty [(: 2 i32) 3 4 5 8 9 10 11 12 13 (types/vector-type 2 16) (types/vector-type 4 4) (types/vector-type 5 2)]
