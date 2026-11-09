@@ -63,3 +63,25 @@ The captured combined loop now loads directly from its carried pointer. Its text
 Library `da3e6b0` / integration `4473e86e` includes the direct-PHI rewrite and zero-offset address views. Preserved generator SHA-256 `8282cf7083fdc784ca48e560e54080e76295d730495306776798ac98f85f4716` is under integration `build/loop-strength/views/`. The candidate rebuilt successfully and the vendored library matches. Fresh `regional`, `hoist`, `strength` and `hoist-strength` hosts and quick FAST are preparing there. These overlapping builds are not controlled generation measurements.
 
 Once all jobs are terminal, verify each new host's fixed-seed output and compare six hosts serially for three alternating rounds: fixed LLVM, previous regional (`build/loop-strength/control/bin/coil`), and all four new `views/` hosts. Use the existing `docs/benchmarks/deferred-loop-splits/compare.py` with a fresh output directory and require `9d775276…` for every output. Preserve the previous generator and hosts. This preparation is not a completed follow-up runtime result.
+
+
+## Direct-PHI and address-view whole-workload comparison
+
+All four fresh hosts passed separate fixed-seed checks; quick FAST passed (48.6s, concurrent preparation only). All 18 timed outputs also match the fixed seed. Three serial alternating rounds completed with no task-owned build/test overlap. The first LLVM sample was again slower (44.465B); all samples are retained.
+
+| Host | Min cycles (B) | Median cycles (B) | Median / LLVM | Median instructions (B) |
+|---|---:|---:|---:|---:|
+| llvm | 42.820 | 42.861 | 1.0000 | 139.652 |
+| old-regional | 54.017 | 54.355 | 1.2682 | 206.629 |
+| regional | 53.932 | 54.261 | 1.2660 | 206.480 |
+| hoist | 54.159 | 54.175 | 1.2640 | 205.544 |
+| strength | 54.396 | 54.454 | 1.2705 | 210.024 |
+| hoist-strength | 53.964 | 54.014 | 1.2602 | 208.823 |
+
+regional versus old-regional: median -0.174%, minimum -0.157%.
+
+strength versus regional: median +0.355%, minimum +0.859%.
+
+hoist-strength versus regional: median -0.455%, minimum +0.058%.
+
+The combined pass remains mixed against the fresh regional control; no runtime option is promoted. It still executes about 2.34B extra instructions. The address-view change removes roughly 0.15B instructions in the no-strength control, with minimum and median cycles both about 0.16–0.17% lower in this comparison; this small change needs a repeat before claiming a reliable runtime benefit. The runtime ratio remains around 1.26× LLVM, outside 1.10×. No controlled generation measurement was added. Runtime-first research continues with a fresh dynamic profile; see `../runtime-profile/README.md`.
