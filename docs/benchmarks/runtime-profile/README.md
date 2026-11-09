@@ -67,7 +67,7 @@ The cost filter removes about 4.48B retired instructions from the combined unres
 
 ## Hardware-profile availability
 
-The current Xcode lists CPU Counters and CPU Profiler templates, and developer mode is enabled. A fresh CPU Profiler launch still exits 2 with “Error connecting to DTServiceHub,” matching the old handoff's limitation. The app interface also timed out twice before returning any Instruments state. No permissions or settings were changed, and no hardware-counter result is claimed. Commands/errors are saved in `evidence/profiler-availability/`. Ordinary per-process sampling is the fallback.
+The current Xcode lists CPU Counters and CPU Profiler templates, and developer mode is enabled. A fresh CPU Profiler launch still exits 2 with “Error connecting to DTServiceHub,” matching the old handoff's limitation. The app interface timed out twice before returning any Instruments state; a third attempt after the process was visibly running also timed out. No permissions or settings were changed, and no hardware-counter result is claimed. Commands/errors are saved in `evidence/profiler-availability/`. Ordinary per-process sampling is the fallback.
 
 
 ## Ordinary sampling fallback
@@ -88,3 +88,8 @@ After all profiling completed, every host passed another untimed seed check/warm
 | hoist-strength | 53.820 | 53.858 | 204.603 |
 
 Filtered hoisting/strength improves median by 0.829% and minimum by 0.740% against regional. Its median ratio to LLVM is 1.25345×. Both this repeat and runtime-c favor it on minimum/median; carry the combined option as a modest research baseline, with broad validation following. The different absolute ratios across rounds reinforce using within-round controls. No generation-speed claim is added, and the joint goal remains unmet.
+
+
+## Broad validation
+
+The frozen-source full run completed all 384 Coil test programs. All 311 standalone programs pass. The 73 linked consumers all pass using 5410 freshly generated, privately copied and hashed fixtures; these linked results supersede the generic runner's unlinked consumer attempts. The separate 122-case strength C consumer was freshly relinked and passes too. Full FAST is now running with all retained combined research settings. Live emission and final repeated bootstrap remain acceptance gates.
