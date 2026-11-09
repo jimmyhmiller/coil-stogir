@@ -67,4 +67,5 @@ definition in a spill slot, `matched-uses/rematerialize!` withdraws it (its uses
 the literal in a scratch register exactly as before, through the constant recipe of
 `word-constant/recipe`) and the function is allocated again; a second such round
 withdraws all remaining ones, so at most three allocations run. On the compiler
-workload 5 of about 450 functions with hoisted literals need the second allocation.
+workload (10,079 functions) 506 functions get 941 hoisted definitions and 4 of them
+need the second allocation.
