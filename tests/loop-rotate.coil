@@ -1,0 +1,155 @@
+(module stogir.tests.loop-rotate)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.loop-rotate" :as rotate)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+;;; f(p, k) = sum of i in [0, *p) with (i & 1) == k; *p is reloaded in the
+;;; header each iteration. The sum is used in the loop and after it.
+(defn build [(a (dyn Allocator))] (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        k (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        enter (require (b/emit! (mut graph) 114 0 [start]))
+        loop (require (b/loop-begin! (mut graph) enter))
+        i (require (b/loop-phi! (mut graph) loop zero))
+        sum (require (b/loop-phi! (mut graph) loop zero))
+        limit (require (b/emit! (mut graph) 91 11 [loop p]))
+        more (require (b/emit! (mut graph) 16 1 [i limit]))
+        test (require (b/emit! (mut graph) 116 0 [limit more]))
+        body (require (b/emit! (mut graph) 107 0 [test (: 0 i32)]))
+        done (require (b/emit! (mut graph) 108 0 [test (: 0 i32)]))
+        bit (require (b/emit! (mut graph) 47 11 [i one]))
+        hit (require (b/emit! (mut graph) 14 1 [bit k]))
+        pick (require (b/emit! (mut graph) 116 0 [body hit]))
+        yes (require (b/emit! (mut graph) 107 0 [pick (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [pick (: 0 i32)]))
+        yes-end (require (b/emit! (mut graph) 114 0 [yes]))
+        no-end (require (b/emit! (mut graph) 114 0 [no]))
+        join (require (b/emit! (mut graph) 112 0 [yes-end no-end]))
+        added (require (b/emit! (mut graph) 26 11 [sum i]))
+        next-sum (require (b/emit! (mut graph) 67 11 [join added sum]))
+        next-i (require (b/emit! (mut graph) 26 11 [i one]))
+        back (require (b/emit! (mut graph) 115 0 [join]))
+        (mut signature) (match (calls/create 0 11 [(: 6 u8) (: 11 u8)] a)
+                          (Err [message] (panic "{}" message)) (Ok [s] s))]
+    (require (calls/function! (mut graph) signature a))
+    (calls/release! (mut signature))
+    (require (b/patch! (mut graph) loop 2 back))
+    (require (b/patch! (mut graph) i 3 next-i))
+    (require (b/patch! (mut graph) sum 3 next-sum))
+    (require (b/emit! (mut graph) 120 11 [done sum (: 0 i32)]))
+    graph))
+
+(defn roots [(graph g/Graph) (a (dyn Allocator))] (-> (ArrayList i32))
+  (let [(mut out) (ArrayList::new [i32] a) (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (when (= (n/opcode (get (.instructions graph) r)) 120) (push! (mut out) (cast i32 r)))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    out))
+
+(defn count-opcode [(graph g/Graph) (opcode u8)] (-> i64)
+  (let [(mut c) (: 0 i64) (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (when (= (n/opcode (get (.instructions graph) r)) opcode) (set! c (+ c 1)))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    c))
+
+(defn want [(limit i64) (k i64)] (-> i64)
+  (let [(mut s) (: 0 i64)]
+    (for [i 0 limit] (when (= (& i 1) k) (set! s (+ s i))))
+    s))
+
+(defn run [(rotated bool)] (-> i64)
+  (let [a (malloc-allocator) (mut failures) (: 0 i64)
+        (mut graph) (build a)
+        (mut exits) (roots graph a)]
+    (match (compile/image-with-private graph 1 (slice exits) "_lr_entry" (options/Options :level 3) a
+                                       (private/with-rotate (private/no-context) rotated))
+      (Err [message] (panic "compile: {}" message))
+      (Ok [code]
+          (let [(mut code) code]
+            (match (link/compose [code] a)
+              (Err [message] (panic "compose: {}" message))
+              (Ok [module]
+                  (let [(mut module) module]
+                    (match (jit/map-image (.image module) a)
+                      (Err [message] (panic "map: {}" message))
+                      (Ok [loaded]
+                          (let [(mut loaded) loaded
+                                index (match (image/find-symbol (.image module) "_lr_entry")
+                                        (Some [id] id) (None [] (panic "symbol")))
+                                function (primitive/cast (fnptr (cc/C) [(ptr i64) i64] i64)
+                                           (primitive/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))]
+                            (for limit [(: 0 i64) 1 2 3 10 101]
+                              (for k [(: 0 i64) 1]
+                                (let [(mut cell) limit
+                                      got (function (mut cell) k)]
+                                  (unless (= got (want limit k))
+                                    (println "rotated {} limit {} k {}: got {} want {}" rotated limit k got (want limit k))
+                                    (set! failures (+ failures 1))))))
+                            (jit/release-image! (mut loaded)))))
+                    (link/release! (mut module)))))
+            (image/release! (mut code)))))
+    (free! (mut exits)) (g/release! (mut graph))
+    failures))
+
+;;; The transform itself: one rotation, the header LOAD cloned into the guard
+;;; and the latch, and a graph that prepares.
+(defn shape [] (-> i64)
+  (let [a (malloc-allocator) (mut failures) (: 0 i64)
+        (mut graph) (build a)
+        (mut exits) (roots graph a)]
+    (match (rotate/run graph 1 (slice exits) a)
+      (Err [message] (println "rotate: {}" message) (set! failures 1))
+      (Ok [result]
+          (match (.graph result)
+            (None [] (println "no rotation") (set! failures 1))
+            (Some [rotated]
+                  (let [(mut rotated) rotated]
+                    (unless (= (.rotations result) 1)
+                      (println "rotations {}" (.rotations result)) (set! failures (+ failures 1)))
+                    (unless (= (count-opcode rotated 91) 2)
+                      (println "loads {}" (count-opcode rotated 91)) (set! failures (+ failures 1)))
+                    (match (rotate/run rotated 1 (slice (.roots result)) a)
+                      (Err [message] (println "second rotate: {}" message) (set! failures (+ failures 1)))
+                      (Ok [again]
+                          (let [(mut again-roots) (.roots again)]
+                            (unless (= (.rotations again) 0)
+                              (println "rotated output rotated again: {}" (.rotations again))
+                              (set! failures (+ failures 1)))
+                            (match (.graph again)
+                              (None [] 0)
+                              (Some [g2] (let [(mut g2) g2] (g/release! (mut g2)))))
+                            (free! (mut again-roots)))))
+                    (match (pipeline/prepare rotated 1 (slice (.roots result)) a)
+                      (Err [message] (println "prepare: {}" message) (set! failures (+ failures 1)))
+                      (Ok [prepared] (let [(mut prepared) prepared] (pipeline/release! (mut prepared)))))
+                    (g/release! (mut rotated)))))
+          (let [(mut kept) (.roots result)] (free! (mut kept)))))
+    (free! (mut exits)) (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i32)
+  (let [failures (+ (shape) (run false) (run true))]
+    (println "loop rotate: {} failures" failures)
+    (if (= failures 0) 0 1)))
