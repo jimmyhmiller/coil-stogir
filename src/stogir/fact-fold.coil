@@ -9,6 +9,8 @@
 (import "stogir.graph" :as g)
 (import "stogir.node" :as n)
 (import "stogir.types" :as types)
+(import "stogir.opcode" :as op)
+(import "stogir.uses" :as uses)
 (import "stogir.cfg" :as cfg)
 (import "stogir.adjacency" :as adj)
 (import "stogir.dominators" :as dom)
@@ -230,23 +232,38 @@
                 (when (= (& available (.mask query)) available) (set! result 1)))))))
     result))
 
-(defn decide [(query facts/Relation) (ranged bool) (left facts/Range) (right facts/Range)
+;;; The intervals after a known signed order between the two values: the
+;;; smaller side is bounded by the larger one's maximum and conversely. `mask`
+;;; is the set of outcomes of (left ? right) still possible, and is not empty.
+(defn ordered-left [(left facts/Range) (right facts/Range) (mask i32)] (-> facts/Range)
+  (let [gap (if (= (& mask 2) 0) (: 1 i128) 0)
+        (mut low) (.low left) (mut high) (.high left)]
+    (when (and (= (& mask 4) 0) (< (- (.high right) gap) high))
+      (set! high (- (.high right) gap)))
+    (when (and (= (& mask 1) 0) (> (+ (.low right) gap) low))
+      (set! low (+ (.low right) gap)))
+    (interval low high (.width left))))
+
+(defn decide [(query facts/Relation) (ranged bool) (first facts/Range) (second facts/Range)
               (signed i32) (unsigned i32)] (-> i32)
   (if (not ranged)
       (verdict query signed unsigned)
-      (if (or (> (.low left) (.high left)) (> (.low right) (.high right)))
-          -1
-          (let [ordered (possible left right)
-                same (and (>= (.low left) 0) (>= (.low right) 0))
-                modular (if same ordered
-                            (possible (facts/unsigned-range left) (facts/unsigned-range right)))
-                s (& signed ordered)
-                u (& unsigned modular)
-                ; Equality does not depend on the order, and on non-negative
-                ; operands neither does anything else.
-                s2 (if same (& s u) (if (= (& u 2) 0) (& s 5) s))
-                u2 (if same (& s u) (if (= (& s 2) 0) (& u 5) u))]
-            (verdict query s2 u2)))))
+      (let [left (if (= signed 0) first (ordered-left first second signed))
+            right (if (= signed 0) second
+                      (ordered-left second first (facts/swap-mask signed)))]
+        (if (or (> (.low left) (.high left)) (> (.low right) (.high right)))
+            -1
+            (let [ordered (possible left right)
+                  same (and (>= (.low left) 0) (>= (.low right) 0))
+                  modular (if same ordered
+                              (possible (facts/unsigned-range left) (facts/unsigned-range right)))
+                  s (& signed ordered)
+                  u (& unsigned modular)
+                  ; Equality does not depend on the order, and on non-negative
+                  ; operands neither does anything else.
+                  s2 (if same (& s u) (if (= (& u 2) 0) (& s 5) s))
+                  u2 (if same (& s u) (if (= (& s 2) 0) (& u 5) u))]
+              (verdict query s2 u2))))))
 
 ;;; Decide the comparison of IF `branch` from the ranges of its operands and,
 ;;; when `flow`, from IF projections dominating it. A dominating projection on
@@ -399,6 +416,28 @@
         (do (free! (mut found)) (Err error))
         (Ok found))))
 
+;;; Whether a data node other than a PHI names a control node other than
+;;; START, as a guarded DIV/MOD does. SCCP keeps such a node when a fold makes
+;;; its guard unreachable and then rejects the graph, so nothing is folded in
+;;; a function that has one. START is never removed.
+(defn guarded-data? [(graph g/Graph)] (-> bool)
+  (let [(mut found) false (mut r) 1 size (len (.instructions graph))]
+    (while (and (< r size) (not found))
+      (let [count (cast i64 (get (.arities graph) r))
+            opcode (cast i32 (n/opcode (get (.instructions graph) r)))]
+        (when (and (> count 0) (!= opcode 0) (!= opcode 67) (not (op/control? opcode)))
+          (let [facts (get (op/metadata) (cast i64 opcode))]
+            (for [index 1 (+ count 1)]
+              (let [kind (op/operand-code-word facts (cast i32 index))]
+                (when (and (uses/edge-code? kind) (!= kind op/OPERAND-DEF)
+                           (!= kind op/OPERAND-REF) (!= kind op/OPERAND-RET))
+                  (let [target (uses/verified-input graph r (cast i32 index))]
+                    (when (and (> target 0) (< (cast i64 target) size)
+                               (!= (n/opcode (get (.instructions graph) (cast i64 target))) 104))
+                      (set! found true))))))))
+        (set! r (+ r (if (< count 0) 1 (/ (+ count 4) 4))))))
+    found))
+
 ;;; An owned edited graph when at least one IF outcome is proven.
 (defn run [(graph g/Graph) (entry i32) (a (dyn Allocator))]
   (-> (Result (Option g/Graph) (slice u8)))
@@ -407,7 +446,7 @@
     (Ok [found]
       (let [(mut found) found
             result
-              (if (= (len found) 0)
+              (if (or (= (len found) 0) (guarded-data? graph))
                   (None [g/Graph])
                   (let [(mut working) (g/duplicate graph a)]
                     (for change found
