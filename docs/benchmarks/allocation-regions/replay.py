@@ -14,7 +14,7 @@ assert sum(r[0] == 'begin' for r in rows) == 1, 'exactly one allocation required
 assert sum(r[0] == 'end' for r in rows) == 1
 begin = next(r for r in rows if r[0] == 'begin')
 version, count, mask, frame_size = map(int, begin[1:])
-assert version == 1
+assert version in (1, 2)
 out = ['(module allocation.replay)']
 for mod, alias in [('allocation','a'), ('allocation-check','check'),
                    ('allocation-snapshot','snapshot'), ('allocation-regions','regions'), ('frame','f'),
@@ -41,7 +41,7 @@ for row in rows:
         if kind != 'end':
             expected.append('ra-snapshot ' + ' '.join(row))
         continue
-    if kind in ('begin', 'parts', 'node', 'edge'):
+    if kind in ('begin', 'parts', 'node', 'edge', 'alias', 'phi'):
         continue
     v = list(map(int, values))
     if kind == 'tuning':
