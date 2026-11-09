@@ -10,4 +10,22 @@ Validate each counted host by emitting the unchanged fixed compiler workload and
 
 Physical block execution counts are exact for the serial run, subject to 64-bit counter overflow not occurring. Derived instruction mixes are estimates: emitter-created branches/stubs and prologues lack independent counters, and code after unconditional terminators is excluded. Do not equate their sum with the hardware instruction count. Profile counts guide investigation only; no measured weights or workload identifiers enter production policy.
 
-Status: instrumentation prepared, not yet built or validated. The six-host ordinary runtime comparison is still running; all diagnostic builds wait until it finishes.
+## Completed diagnostic
+
+All three counted hosts emit the fixed seed. The disabled instrumentation host reproduces the ordinary fresh regional object exactly. Source identity and generator/host hashes are in `evidence/results.json`. The original complete disassemblies remain in integration `build/runtime-profile/current/`; maps, counters, derived mixes, tools and ranked deltas are archived here. No production hooks were added and the old audit worktree was not accessed.
+
+| Host | Estimated counted instructions (B) |
+|---|---:|
+| Regional | 188.395 |
+| Strength | 191.575 |
+| Hoisting + strength | 190.425 |
+
+The dominant new regression is `coil.compiler.closure.closure-subprogram-scoped`: +1.514B estimated instructions in both strength configurations, from 2.525B to 4.038B. Its hottest search body runs about 289M times. Previously it loaded the array pointer, used `add index, lsl #4`, and loaded two adjacent words with LDP. Strength reduction adds an offset recurrence, entry/back-edge moves and a hot reload; the two data loads also cease to pair. These are actual annotated machine instructions, not a hypothetical graph cost.
+
+Other combined increases include assigned-indexed-pressure (+0.344B), pressure-class-into (+0.221B), string hashing (+0.155B), and register liveness (+0.117B). Conversely, the intended lookup loop improves by 1.134B and primitive-providers by 0.317B. The local success is real but outweighed by other transformed loops. Derived totals remain estimates, with the coverage limits above; they are not substituted for measured cycles.
+
+## Target-cost follow-up
+
+The generic affine pass now accepts a product-profitability predicate, evaluated on the current immutable graph each batch. The unrestricted entry point retains its existing proof/test behavior. The AArch64 wrapper queries the existing arithmetic selector and accepts only products selecting its actual multiply rule. Constant powers of two and 2^k+1 already select shifts/shifted ADD and do not alone justify another carried value. They can still be part of an affine expression that also removes a real multiply. No profile weights, function names, strides or source references enter this policy.
+
+Expanded tests cover 88 constant-product fixtures across signed/unsigned 32/64-bit words, both operand orders, cheap scales and real multiplies. They check that the unrestricted proof admits every fixture and the target accepts only the costly cases; native execution uses the independent modular oracle. Together with existing arithmetic fixtures, 207,360 native executions pass. Alternate existing fixtures exercise the target callback with variable products, mixed products and shifted expressions. Nested integrated native and C-linked cases pass. The full-workload cost-filtered hosts have not yet been measured.
