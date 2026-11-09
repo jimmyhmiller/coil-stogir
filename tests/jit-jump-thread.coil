@@ -1,0 +1,319 @@
+(module stogir.tests.jit-jump-thread)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.calls" :as calls)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defstruct Built [(graph g/Graph) (roots (ArrayList i32)) (x i32) (start i32)])
+
+(defn begin [(a (dyn Allocator))] (-> Built)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        (mut signature) (match (calls/create 0 11 [(: 11 u8)] a)
+                          (Err [message] (panic "{}" message)) (Ok [s] s))]
+    (require (calls/function! (mut graph) signature a))
+    (calls/release! (mut signature))
+    (Built :graph graph :roots (ArrayList::new [i32] a) :x x :start start)))
+
+(defn k [(t (mut Built)) (value i64)] (-> i32)
+  (require (b/scalar-constant! (mut (.graph t)) 11 (cast u64 value) 8)))
+
+(defn ku [(t (mut Built)) (value u64)] (-> i32)
+  (require (b/scalar-constant! (mut (.graph t)) 5 value 8)))
+
+(defn node [(t (mut Built)) (opcode i32) (ty i32) (inputs (slice i32))] (-> i32)
+  (require (b/emit! (mut (.graph t)) opcode ty inputs)))
+
+(defn end [(t (mut Built)) (control i32)] (-> i32)
+  (node (mut t) 114 0 [control]))
+
+(defn yes [(t (mut Built)) (branch i32)] (-> i32)
+  (node (mut t) 107 0 [branch (: 0 i32)]))
+
+(defn no [(t (mut Built)) (branch i32)] (-> i32)
+  (node (mut t) 108 0 [branch (: 0 i32)]))
+
+(defn ret! [(t (mut Built)) (control i32) (value i32)] (-> void)
+  (push! (mut (.roots t)) (node (mut t) 120 11 [control value (: 0 i32)])))
+
+;;; (and (> x 0) (< x 100) (!= x 50)) evaluated as nested two-input MERGEs of
+;;; zero-extended comparisons, then tested: 7 if true, 9 if false. With extra
+;;; the false constants are 0 and the last test's result also feeds a second
+;;; PHI that the true arm returns.
+(defn build-and [(a (dyn Allocator))] (-> Built)
+  (let [(mut t) (begin a)
+        x (.x t)
+        zero (ku (mut t) 0)
+        c1 (node (mut t) 19 1 [x (k (mut t) 0)])
+        if1 (node (mut t) 116 0 [(.start t) c1])
+        t1 (yes (mut t) if1)
+        f1 (no (mut t) if1)
+        c2 (node (mut t) 16 1 [x (k (mut t) 100)])
+        if2 (node (mut t) 116 0 [t1 c2])
+        t2 (yes (mut t) if2)
+        f2 (no (mut t) if2)
+        c3 (node (mut t) 15 1 [x (k (mut t) 50)])
+        z3 (node (mut t) 34 5 [c3])
+        e3 (end (mut t) t2)
+        ef2 (end (mut t) f2)
+        inner (node (mut t) 112 0 [e3 ef2])
+        p-inner (node (mut t) 67 5 [inner z3 zero])
+        e-inner (end (mut t) inner)
+        ef1 (end (mut t) f1)
+        outer (node (mut t) 112 0 [e-inner ef1])
+        p-outer (node (mut t) 67 5 [outer p-inner zero])
+        test (node (mut t) 15 1 [p-outer zero])
+        branch (node (mut t) 116 0 [outer test])]
+    (ret! (mut t) (yes (mut t) branch) (k (mut t) 7))
+    (ret! (mut t) (no (mut t) branch) (k (mut t) 9))
+    t))
+
+(defn expect-and [(x i64)] (-> i64)
+  (if (and (> x 0) (< x 100) (!= x 50)) 7 9))
+
+;;; i = 40, found = 0; while (found == 0 and i >= 0) { if (i == x) found = 1
+;;; else i = i - 1 }; found != 0 ? 1000 + i : -1. The loop header is a MERGE
+;;; whose back edge comes from the MERGE of the two body arms. With shared the
+;;; test after the loop is the loop's own comparison node.
+(defn build-search [(shared bool) (a (dyn Allocator))] (-> Built)
+  (let [(mut t) (begin a)
+        x (.x t)
+        zero (ku (mut t) 0)
+        one (ku (mut t) 1)
+        entry (end (mut t) (.start t))
+        ; The header and latch are patched once their inputs exist.
+        header (node (mut t) 112 0 [entry entry])
+        found (node (mut t) 67 5 [header zero zero])
+        i (node (mut t) 67 11 [header (k (mut t) 40) (k (mut t) 40)])
+        test (node (mut t) 15 1 [found zero])
+        branch (node (mut t) 116 0 [header test])
+        done (yes (mut t) branch)
+        going (no (mut t) branch)
+        below (node (mut t) 16 1 [i (k (mut t) 0)])
+        bound (node (mut t) 116 0 [going below])
+        out (yes (mut t) bound)
+        body (no (mut t) bound)
+        same (node (mut t) 14 1 [i x])
+        hit (node (mut t) 116 0 [body same])
+        e-hit (end (mut t) (yes (mut t) hit))
+        e-miss (end (mut t) (no (mut t) hit))
+        latch (node (mut t) 112 0 [e-hit e-miss])
+        next-found (node (mut t) 67 5 [latch one found])
+        next-i (node (mut t) 67 11 [latch i (node (mut t) 27 11 [i (k (mut t) 1)])])
+        back (end (mut t) latch)
+        e-done (end (mut t) done)
+        e-out (end (mut t) out)
+        exit (node (mut t) 112 0 [e-done e-out])
+        after (if shared test (node (mut t) 15 1 [found zero]))
+        final (node (mut t) 116 0 [exit after])]
+    (require (b/patch! (mut (.graph t)) header 2 back))
+    (require (b/patch! (mut (.graph t)) found 3 next-found))
+    (require (b/patch! (mut (.graph t)) i 3 next-i))
+    (ret! (mut t) (yes (mut t) final) (node (mut t) 26 11 [i (k (mut t) 1000)]))
+    (ret! (mut t) (no (mut t) final) (k (mut t) -1))
+    (push! (mut (.roots t)) back)
+    t))
+
+(defn expect-search [(x i64)] (-> i64)
+  (if (and (>= x 0) (<= x 40)) (+ 1000 x) -1))
+
+;;; Three ways into a MERGE with a tag PHI (1, 0, 1) and a payload PHI. The
+;;; tag is tested; both arms compute from the payload, rejoin, and the payload
+;;; is read again after the rejoin.
+(defn build-tag [(a (dyn Allocator))] (-> Built)
+  (let [(mut t) (begin a)
+        x (.x t)
+        c1 (node (mut t) 16 1 [x (k (mut t) 0)])
+        if1 (node (mut t) 116 0 [(.start t) c1])
+        e-neg (end (mut t) (yes (mut t) if1))
+        rest (no (mut t) if1)
+        c2 (node (mut t) 16 1 [x (k (mut t) 100)])
+        if2 (node (mut t) 116 0 [rest c2])
+        e-small (end (mut t) (yes (mut t) if2))
+        e-big (end (mut t) (no (mut t) if2))
+        merge (node (mut t) 112 0 [e-neg e-small e-big])
+        tag (node (mut t) 67 5 [merge (ku (mut t) 1) (ku (mut t) 0) (ku (mut t) 1)])
+        payload (node (mut t) 67 11 [merge
+                                     (node (mut t) 27 11 [(k (mut t) 0) x])
+                                     (node (mut t) 26 11 [x (k (mut t) 7)])
+                                     (node (mut t) 28 11 [x (k (mut t) 2)])])
+        test (node (mut t) 14 1 [tag (ku (mut t) 1)])
+        branch (node (mut t) 116 0 [merge test])
+        e-some (end (mut t) (yes (mut t) branch))
+        e-none (end (mut t) (no (mut t) branch))
+        rejoin (node (mut t) 112 0 [e-some e-none])
+        result (node (mut t) 67 11 [rejoin
+                                    (node (mut t) 26 11 [payload (k (mut t) 1)])
+                                    (node (mut t) 28 11 [payload (k (mut t) 3)])])]
+    (ret! (mut t) rejoin (node (mut t) 26 11 [result payload]))
+    t))
+
+(defn expect-tag [(x i64)] (-> i64)
+  (cond (< x 0) (p/iadd (p/iadd (p/isub 0 x) 1) (p/isub 0 x))
+        (< x 100) (p/iadd (p/imul (p/iadd x 7) 3) (p/iadd x 7))
+        :else (p/iadd (p/iadd (p/imul x 2) 1) (p/imul x 2))))
+
+;;; A first SWITCH maps x in 0..5 to a code through a PHI of constants (two
+;;; inputs share a code, others take the default); a second SWITCH on the
+;;; PHI returns per code. One code is never produced.
+(defn build-switch [(a (dyn Allocator))] (-> Built)
+  (let [(mut t) (begin a)
+        x (.x t)
+        first (node (mut t) 117 0 [(.start t) x])
+        (mut ends) (ArrayList::new [i32] a)
+        (mut codes) (ArrayList::new [i32] a)]
+    (for [i 0 6]
+      (push! (mut ends) (end (mut t) (node (mut t) 109 0 [first (k (mut t) i) (: 0 i32)])))
+      (push! (mut codes) (k (mut t) (get [(: 6 i64) 9 7 3 6 4] i))))
+    (push! (mut ends) (end (mut t) (node (mut t) 111 0 [first (: 0 i32)])))
+    (push! (mut codes) (k (mut t) 2))
+    (let [merge (node (mut t) 112 0 (slice ends))
+          (mut inputs) (ArrayList::new [i32] a)]
+      (push! (mut inputs) merge)
+      (for code codes (push! (mut inputs) code))
+      (let [code (node (mut t) 67 11 (slice inputs))
+            second (node (mut t) 117 0 [merge code])]
+        (ret! (mut t) (node (mut t) 109 0 [second (k (mut t) 6) (: 0 i32)]) (k (mut t) 60))
+        (ret! (mut t) (node (mut t) 109 0 [second (k (mut t) 7) (: 0 i32)]) (k (mut t) 70))
+        (ret! (mut t) (node (mut t) 109 0 [second (k (mut t) 8) (: 0 i32)]) (k (mut t) 80))
+        (ret! (mut t) (node (mut t) 111 0 [second (: 0 i32)])
+              (node (mut t) 26 11 [code (k (mut t) 500)])))
+      (free! (mut inputs)))
+    (free! (mut ends))
+    (free! (mut codes))
+    t))
+
+(defn expect-switch [(x i64)] (-> i64)
+  (cond (= x 0) 60
+        (= x 1) 509
+        (= x 2) 70
+        (= x 3) 503
+        (= x 4) 60
+        (= x 5) 504
+        :else 502))
+
+;;; A PHI of 8, 4 and 2 tested for being negative: every edge takes the same
+;;; arm, and the other arm's RETURN is unreachable.
+(defn build-same [(a (dyn Allocator))] (-> Built)
+  (let [(mut t) (begin a)
+        x (.x t)
+        c1 (node (mut t) 16 1 [x (k (mut t) 0)])
+        if1 (node (mut t) 116 0 [(.start t) c1])
+        e-neg (end (mut t) (yes (mut t) if1))
+        rest (no (mut t) if1)
+        c2 (node (mut t) 16 1 [x (k (mut t) 100)])
+        if2 (node (mut t) 116 0 [rest c2])
+        e-small (end (mut t) (yes (mut t) if2))
+        e-big (end (mut t) (no (mut t) if2))
+        merge (node (mut t) 112 0 [e-neg e-small e-big])
+        size (node (mut t) 67 11 [merge (k (mut t) 8) (k (mut t) 4) (k (mut t) 2)])
+        test (node (mut t) 16 1 [size (k (mut t) 0)])
+        branch (node (mut t) 116 0 [merge test])]
+    (ret! (mut t) (yes (mut t) branch) (k (mut t) 111))
+    (ret! (mut t) (no (mut t) branch) (node (mut t) 26 11 [size x]))
+    t))
+
+(defn expect-same [(x i64)] (-> i64)
+  (cond (< x 0) (p/iadd x 8)
+        (< x 100) (p/iadd x 4)
+        :else (p/iadd x 2)))
+
+(defn build [(shape i32) (a (dyn Allocator))] (-> Built)
+  (cond (= shape 0) (build-and a)
+        (= shape 1) (build-search false a)
+        (= shape 2) (build-tag a)
+        (= shape 3) (build-switch a)
+        (= shape 4) (build-search true a)
+        :else (build-same a)))
+
+(defn expected [(shape i32) (x i64)] (-> i64)
+  (cond (= shape 0) (expect-and x)
+        (= shape 1) (expect-search x)
+        (= shape 2) (expect-tag x)
+        (= shape 3) (expect-switch x)
+        (= shape 4) (expect-search x)
+        :else (expect-same x)))
+
+(defn count-of [(graph g/Graph) (opcode u8)] (-> i64)
+  (let [(mut count) (: 0 i64) (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (when (= (n/opcode (get (.instructions graph) r)) opcode) (set! count (+ count 1)))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    count))
+
+(defn execute [(graph g/Graph) (roots (slice i32)) (shape i32) (label (slice u8))] (-> i64)
+  (let [(mut failures) (: 0 i64)]
+    (match (compile/text graph 1 roots (malloc-allocator))
+      (Err [message] (panic "{} shape {} compile: {}" label shape message))
+      (Ok [text]
+          (let [(mut text) text]
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "{} map: {}" label message))
+              (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        f (p/cast (fnptr (cc/C) [i64] i64) (.base loaded))]
+                    (for x [(: 0 i64) 1 -1 2 3 4 5 6 7 39 40 41 49 50 51 99 100 101 255 256
+                            -2 -100 65536 2147483647 2147483648 -2147483648 4294967296
+                            4611686018427387903 -4611686018427387904]
+                      (let [want (expected shape x)
+                            got (f x)]
+                        (unless (= got want)
+                          (println "{} shape {} x {}: got {} want {}" label shape x got want)
+                          (set! failures (+ failures 1)))))
+                    (jit/release! (mut loaded)))))
+            (free! (mut text)))))
+    failures))
+
+;;; The plain and the optimized graph agree with the model, and the optimized
+;;; graph holds at most the given number of IF, PHI and SWITCH nodes.
+(defn check [(shape i32) (ifs i64) (phis i64) (switches i64)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut built) (build shape a)
+        (mut failures) (execute (.graph built) (slice (.roots built)) shape "plain")]
+    (match (sccp/optimize (.graph built) 8 (slice (.roots built)) a)
+      (Err [message] (panic "optimize shape {}: {}" shape message))
+      (Ok [result]
+          (let [(mut result) result
+                graph (.graph result)]
+            (unless (and (<= (count-of graph 116) ifs)
+                         (<= (count-of graph 67) phis)
+                         (<= (count-of graph 117) switches))
+              (println "shape {}: {} IF {} PHI {} SWITCH, want at most {} {} {}"
+                       shape (count-of graph 116) (count-of graph 67) (count-of graph 117)
+                       ifs phis switches)
+              (set! failures (+ failures 1)))
+            (set! failures
+                  (+ failures (execute graph (slice (.roots result)) shape "optimized")))
+            (rewrite/release! (mut result)))))
+    (free! (mut (.roots built)))
+    (g/release! (mut (.graph built)))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) (: 0 i64)]
+    ; Three comparisons branch directly: no PHI and no test of a merged value.
+    (set! failures (+ failures (check 0 3 0 0)))
+    ; The flag is never tested: the loop keeps its bound and equality tests.
+    (set! failures (+ failures (check 1 2 3 0)))
+    ; The tag test is gone; the payload PHIs remain.
+    (set! failures (+ failures (check 2 2 3 0)))
+    ; Each case of the first SWITCH reaches its final target.
+    (set! failures (+ failures (check 3 0 1 1)))
+    (set! failures (+ failures (check 4 2 3 0)))
+    ; The always-false test is gone with its unreachable arm.
+    (set! failures (+ failures (check 5 2 1 0)))
+    (println "jump threading: {} failures" failures)
+    (if (= failures 0) 0 1)))
