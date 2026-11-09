@@ -1,0 +1,422 @@
+;;; Sparse folding of IF conditions decided by value ranges and dominating
+;;; branch projections. Only IFs on an integer comparison are examined. Ranges
+;;; that follow from an expression alone are tried first and need no control
+;;; flow; blocks and dominators are built only when an undecided comparison
+;;; shares an operand with another IF comparison or tests a loop PHI or its
+;;; update. A function without such a candidate costs one scan of its nodes.
+;;; Only IF condition edges are rewritten; SCCP repairs control afterwards.
+(module stogir.fact-fold)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.cfg" :as cfg)
+(import "stogir.adjacency" :as adj)
+(import "stogir.dominators" :as dom)
+(import "stogir.branch-facts" :as facts)
+(import "stogir.induction" :as induction)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+(defn maximum [(width i32)] (-> i128)
+  (- (<< (: 1 i128) (cast i128 (- (* width 8) 1))) 1))
+
+(defn interval [(low i128) (high i128) (width i32)] (-> facts/Range)
+  (facts/Range :valid true :low low :high high :width width))
+
+(defn full [(width i32)] (-> facts/Range)
+  (interval (- (- 0 (maximum width)) 1) (maximum width) width))
+
+(defn union [(a facts/Range) (b facts/Range)] (-> facts/Range)
+  (if (and (.valid a) (.valid b) (= (.width a) (.width b)))
+      (interval (if (< (.low a) (.low b)) (.low a) (.low b))
+                (if (> (.high a) (.high b)) (.high a) (.high b))
+                (.width a))
+      (facts/no-range)))
+
+;;; Interval of the signed value of `reference`'s bits, true of every dynamic
+;;; instance of the value. Loop counters are recognized only when `flow` says
+;;; `idom` is available. PHIs other than counters take the union of their
+;;; inputs; the depth bound makes a PHI cycle yield no range rather than
+;;; assume itself. DIV and MOD take their signedness from the type.
+(defn value-range [(graph g/Graph) (idom (ArrayList i32)) (flow bool)
+                   (reference i32) (depth i32)] (-> facts/Range)
+  (let [value (facts/operand graph reference)]
+    (if (< value 0)
+        (facts/literal-range graph value)
+        (if (or (= value 0) (<= depth 0)
+                (>= (cast i64 value) (len (.instructions graph))))
+            (facts/no-range)
+            (let [node (get (.instructions graph) (cast i64 value))
+                  opcode (cast i32 (n/opcode node))
+                  ty (cast i32 (n/type-id node))
+                  width (types/size ty 8)
+                  top (maximum width)
+                  source (facts/type-of graph (.op1 node))
+                  narrow (if (types/integer? source) (types/size source 8) 0)]
+              (if (not (facts/range-type? ty))
+                  (facts/no-range)
+                  (cond
+                    (= opcode 47)
+                      (let [a (value-range graph idom flow (.op1 node) (- depth 1))
+                            b (value-range graph idom flow (.op2 node) (- depth 1))
+                            left (and (.valid a) (= (.width a) width) (>= (.low a) 0))
+                            right (and (.valid b) (= (.width b) width) (>= (.low b) 0))]
+                        (cond
+                          (and left right)
+                            (interval 0 (if (< (.high a) (.high b)) (.high a) (.high b)) width)
+                          left (interval 0 (.high a) width)
+                          right (interval 0 (.high b) width)
+                          :else (facts/no-range)))
+                    (= opcode 34)
+                      (if (and (> narrow 0) (< narrow width))
+                          (let [inner (value-range graph idom flow (.op1 node) (- depth 1))]
+                            (if (and (.valid inner) (= (.width inner) narrow) (>= (.low inner) 0))
+                                (interval (.low inner) (.high inner) width)
+                                (interval 0 (- (<< (: 1 i128) (cast i128 (* narrow 8))) 1) width)))
+                          (facts/no-range))
+                    (= opcode 33)
+                      (if (and (> narrow 0) (< narrow width))
+                          (let [inner (value-range graph idom flow (.op1 node) (- depth 1))]
+                            (if (and (.valid inner) (= (.width inner) narrow))
+                                (interval (.low inner) (.high inner) width)
+                                (interval (- (- 0 (maximum narrow)) 1) (maximum narrow) width)))
+                          (facts/no-range))
+                    (= opcode 35)
+                      (let [inner (value-range graph idom flow (.op1 node) (- depth 1))]
+                        (if (and (.valid inner) (> (.width inner) width)
+                                 (>= (.low inner) (- (- 0 top) 1)) (<= (.high inner) top))
+                            (interval (.low inner) (.high inner) width)
+                            (facts/no-range)))
+                    (= opcode 50)
+                      (let [count (facts/literal-range graph (.op2 node))]
+                        (if (and (.valid count) (>= (.low count) 1)
+                                 (< (.low count) (cast i128 (* width 8))))
+                            (interval 0
+                                      (- (<< (: 1 i128) (- (cast i128 (* width 8)) (.low count))) 1)
+                                      width)
+                            (facts/no-range)))
+                    (or (= opcode 29) (= opcode 30))
+                      (let [literal (facts/literal-range graph (.op2 node))]
+                        (if (not (and (.valid literal) (= (.width literal) width)))
+                            (facts/no-range)
+                            (if (types/unsigned? ty)
+                                (let [divisor (if (< (.low literal) 0)
+                                                  (+ (.low literal) (<< (: 1 i128) (cast i128 (* width 8))))
+                                                  (.low literal))
+                                      all (- (<< (: 1 i128) (cast i128 (* width 8))) 1)]
+                                  (if (= opcode 29)
+                                      (if (>= divisor 2) (interval 0 (/ all divisor) width)
+                                          (facts/no-range))
+                                      (if (and (>= divisor 1) (<= (- divisor 1) top))
+                                          (interval 0 (- divisor 1) width)
+                                          (facts/no-range))))
+                                (let [divisor (.low literal)
+                                      dividend (value-range graph idom flow (.op1 node) (- depth 1))
+                                      known (and (.valid dividend) (= (.width dividend) width))]
+                                  (if (<= divisor 0)
+                                      (facts/no-range)
+                                      (if (= opcode 29)
+                                          ; Truncating division by a positive
+                                          ; literal is monotonic and cannot wrap.
+                                          (if known
+                                              (interval (/ (.low dividend) divisor)
+                                                        (/ (.high dividend) divisor) width)
+                                              (facts/no-range))
+                                          (if (and known (>= (.low dividend) 0))
+                                              (interval 0
+                                                        (if (< (.high dividend) (- divisor 1))
+                                                            (.high dividend) (- divisor 1))
+                                                        width)
+                                              (interval (- 1 divisor) (- divisor 1) width))))))))
+                    (and (>= opcode 55) (<= opcode 57))
+                      (interval 0 (cast i128 (* width 8)) width)
+                    (= opcode 60)
+                      (union (value-range graph idom flow (.op2 node) (- depth 1))
+                             (value-range graph idom flow (.op3 node) (- depth 1)))
+                    (or (= opcode 26) (= opcode 27))
+                      (let [a (value-range graph idom flow (.op1 node) (- depth 1))
+                            b (value-range graph idom flow (.op2 node) (- depth 1))]
+                        (if (not (and (.valid a) (.valid b) (= (.width a) width) (= (.width b) width)))
+                            (facts/no-range)
+                            (let [low (if (= opcode 26) (+ (.low a) (.low b)) (- (.low a) (.high b)))
+                                  high (if (= opcode 26) (+ (.high a) (.high b)) (- (.high a) (.low b)))]
+                              ; Exact only when no instance can wrap.
+                              (if (and (>= low (- (- 0 top) 1)) (<= high top))
+                                  (interval low high width)
+                                  (facts/no-range)))))
+                    (= opcode 67)
+                      (let [counter (if flow (induction/counter graph idom value 1048576)
+                                        (induction/none))]
+                        (if (!= (.kind counter) 0)
+                            (let [seed (value-range graph idom flow (.seed counter) (- depth 1))]
+                              (if (not (and (.valid seed) (= (.width seed) width)))
+                                  (facts/no-range)
+                                  (if (= (.kind counter) 2)
+                                      (interval (.low seed) top width)
+                                      (if (< (.high seed) top)
+                                          (interval (.low seed) (- top 1) width)
+                                          (facts/no-range)))))
+                            (let [arity (cast i32 (get (.arities graph) (cast i64 value)))
+                                  (mut all) (facts/no-range)
+                                  (mut slot) (: 2 i32)
+                                  (mut live) (and (>= arity 2) (<= arity 5))]
+                              (while (and live (<= slot arity))
+                                (match (g/operand graph value slot)
+                                  (None [] (set! live false))
+                                  (Some [input]
+                                    (let [one (value-range graph idom flow input (- depth 1))]
+                                      (set! all (if (= slot 2) one (union all one)))
+                                      (set! live (and (.valid all) (= (.width all) width))))))
+                                (set! slot (+ slot 1)))
+                              (if live all (facts/no-range)))))
+                    :else (facts/no-range))))))))
+
+;;; Outcomes of (left ? right) the two intervals allow: LT=1, EQ=2, GT=4.
+(defn possible [(l facts/Range) (r facts/Range)] (-> i32)
+  (| (if (< (.low l) (.high r)) (: 1 i32) 0)
+     (if (and (<= (.low l) (.high r)) (<= (.low r) (.high l))) (: 2 i32) 0)
+     (if (> (.high l) (.low r)) (: 4 i32) 0)))
+
+;;; Narrow the signed interval of a value by a true comparison (value ? c)
+;;; whose allowed outcomes are `mask`; `domain` is the fact's (0 equality,
+;;; 1 signed, 2 unsigned) and `c` the literal's signed value. An unsigned
+;;; bound says something about the signed value only below the sign bit.
+(defn narrow [(range facts/Range) (mask i32) (domain i32) (c i128)] (-> facts/Range)
+  (let [width (.width range)
+        top (maximum width)
+        (mut low) (.low range)
+        (mut high) (.high range)
+        unsigned (if (< c 0) (+ c (<< (: 1 i128) (cast i128 (* width 8)))) c)]
+    (if (!= domain 2)
+        (do
+          (when (= (& mask 4) 0)
+            (let [bound (if (!= (& mask 2) 0) c (- c 1))]
+              (when (< bound high) (set! high bound))))
+          (when (= (& mask 1) 0)
+            (let [bound (if (!= (& mask 2) 0) c (+ c 1))]
+              (when (> bound low) (set! low bound))))
+          (when (= mask 5)
+            (when (= c low) (set! low (+ low 1)))
+            (when (= c high) (set! high (- high 1)))))
+        (if (>= low 0)
+            ; Both orders agree on non-negative values; a literal above the
+            ; signed maximum bounds nothing from above and excludes nothing
+            ; reachable from below.
+            (when (<= unsigned top)
+              (when (= (& mask 4) 0)
+                (let [bound (if (!= (& mask 2) 0) unsigned (- unsigned 1))]
+                  (when (< bound high) (set! high bound))))
+              (when (= (& mask 1) 0)
+                (let [bound (if (!= (& mask 2) 0) unsigned (+ unsigned 1))]
+                  (when (> bound low) (set! low bound)))))
+            (when (= (& mask 4) 0)
+              (let [bound (if (!= (& mask 2) 0) unsigned (- unsigned 1))]
+                (when (<= bound top)
+                  (set! low 0)
+                  (when (< bound high) (set! high bound)))))))
+    (interval low high width)))
+
+;;; -1 unknown, 0 false, 1 true, from the outcomes still allowed in the signed
+;;; and unsigned orders. An empty set means the IF is unreachable: no claim.
+(defn verdict [(query facts/Relation) (signed i32) (unsigned i32)] (-> i32)
+  (let [(mut result) (: -1 i32)]
+    (for domain [(: 1 i32) 2]
+      (when (and (< result 0) (or (= (.domain query) 0) (= (.domain query) domain)))
+        (let [available (if (= domain 1) signed unsigned)]
+          (when (!= available 0)
+            (if (= (& available (.mask query)) 0)
+                (set! result 0)
+                (when (= (& available (.mask query)) available) (set! result 1)))))))
+    result))
+
+(defn decide [(query facts/Relation) (ranged bool) (left facts/Range) (right facts/Range)
+              (signed i32) (unsigned i32)] (-> i32)
+  (if (not ranged)
+      (verdict query signed unsigned)
+      (if (or (> (.low left) (.high left)) (> (.low right) (.high right)))
+          -1
+          (let [ordered (possible left right)
+                same (and (>= (.low left) 0) (>= (.low right) 0))
+                modular (if same ordered
+                            (possible (facts/unsigned-range left) (facts/unsigned-range right)))
+                s (& signed ordered)
+                u (& unsigned modular)
+                ; Equality does not depend on the order, and on non-negative
+                ; operands neither does anything else.
+                s2 (if same (& s u) (if (= (& u 2) 0) (& s 5) s))
+                u2 (if same (& s u) (if (= (& s 2) 0) (& u 5) u))]
+            (verdict query s2 u2)))))
+
+;;; Decide the comparison of IF `branch` from the ranges of its operands and,
+;;; when `flow`, from IF projections dominating it. A dominating projection on
+;;; the same operand pair restricts the outcome directly; one comparing either
+;;; operand with a literal narrows that operand's interval. The tested SSA
+;;; values are the same dynamic instances at the dominated IF.
+(defn prove [(graph g/Graph) (idom (ArrayList i32)) (flow bool) (branch i32)] (-> i32)
+  (let [query (facts/relation graph (.op2 (get (.instructions graph) (cast i64 branch))))
+        (mut result) (: -1 i32)]
+    (when (!= (.mask query) 0)
+      (let [width (.width query)
+            ranged (and (facts/range-type? (facts/type-of graph (.left query)))
+                        (facts/range-type? (facts/type-of graph (.right query))))
+            first (if ranged (value-range graph idom flow (.left query) 4) (facts/no-range))
+            second (if ranged (value-range graph idom flow (.right query) 4) (facts/no-range))
+            (mut left) (if (and (.valid first) (= (.width first) width)) first (full width))
+            (mut right) (if (and (.valid second) (= (.width second) width)) second (full width))
+            (mut signed) (: 7 i32)
+            (mut unsigned) (: 7 i32)]
+        (set! result (decide query ranged left right signed unsigned))
+        (when (and flow (< result 0))
+          (let [(mut cursor) (induction/block-of graph branch 1048576)]
+            (while (and (induction/reachable? idom cursor) (< result 0))
+              (let [start (get (.instructions graph) (cast i64 cursor))
+                    opcode (n/opcode start)
+                    parent (get idom (cast i64 cursor))]
+                (when (and (or (= opcode 107) (= opcode 108)) (> (.op1 start) 0))
+                  (let [source (get (.instructions graph) (cast i64 (.op1 start)))
+                        fact (if (= (n/opcode source) 116) (facts/relation graph (.op2 source))
+                                 (facts/relation graph 0))
+                        mask (if (= opcode 107) (.mask fact) (^ (.mask fact) 7))]
+                    (when (and (!= (.mask fact) 0) (= (.width fact) width))
+                      (if (and (= (.left fact) (.left query)) (= (.right fact) (.right query)))
+                          (do
+                            ; Keep the two orders apart: signed LE and
+                            ; unsigned GE do not imply equality.
+                            (when (!= (.domain fact) 2) (set! signed (& signed mask)))
+                            (when (!= (.domain fact) 1) (set! unsigned (& unsigned mask)))
+                            (set! result (decide query ranged left right signed unsigned)))
+                          (when (and ranged (< (.left fact) 0) (> (.right fact) 0))
+                            (let [literal (facts/literal-range graph (.left fact))]
+                              (when (and (.valid literal) (= (.width literal) width)
+                                         (or (= (.right fact) (.left query))
+                                             (= (.right fact) (.right query))))
+                                ; The fact reads (literal ? value).
+                                (if (= (.right fact) (.left query))
+                                    (set! left (narrow left (facts/swap-mask mask)
+                                                       (.domain fact) (.low literal)))
+                                    (set! right (narrow right (facts/swap-mask mask)
+                                                        (.domain fact) (.low literal))))
+                                (set! result
+                                      (decide query ranged left right signed unsigned)))))))))
+                (set! cursor (if (= parent cursor) 0 parent))))))))
+    result))
+
+;;; Whether a range for this operand may need control flow: a loop PHI, or an
+;;; ADD/SUB of one.
+(defn phi? [(graph g/Graph) (reference i32)] (-> bool)
+  (and (> reference 0) (< (cast i64 reference) (len (.instructions graph)))
+       (= (n/opcode (get (.instructions graph) (cast i64 reference))) 67)))
+
+(defn counter-like? [(graph g/Graph) (reference i32)] (-> bool)
+  (if (or (<= reference 0) (>= (cast i64 reference) (len (.instructions graph))))
+      false
+      (let [node (get (.instructions graph) (cast i64 reference))
+            opcode (n/opcode node)]
+        (or (= opcode 67)
+            (and (or (= opcode 26) (= opcode 27))
+                 (or (phi? graph (facts/operand graph (.op1 node)))
+                     (phi? graph (facts/operand graph (.op2 node)))))))))
+
+;;; An undecided IF is worth control flow when an operand of its comparison
+;;; is mentioned by another undecided IF comparison or may be a loop counter.
+(defn candidate? [(graph g/Graph) (mentions (ArrayList u8)) (branch i32)] (-> bool)
+  (let [query (facts/relation graph (.op2 (get (.instructions graph) (cast i64 branch))))
+        values [(.left query) (.right query)]
+        (mut answer) false]
+    (for value values
+      (when (and (> value 0)
+                 (or (>= (get mentions (cast i64 value)) 2) (counter-like? graph value)))
+        (set! answer true)))
+    answer))
+
+(defstruct Flow [(blocks cfg/Blocks) (idom (ArrayList i32))])
+
+(defn flow-of [(graph g/Graph) (entry i32) (a (dyn Allocator))]
+  (-> (Result Flow (slice u8)))
+  (match (cfg/build graph a)
+    (Err [message] (Err message))
+    (Ok [blocks]
+      (let [(mut owned) blocks
+            (mut pred) (adj/build owned true a)
+            (mut succ) (adj/build owned false a)
+            (mut order) (adj/reverse-postorder owned succ entry a)
+            idom (dom/build owned pred order a)]
+        (adj/release! (mut pred))
+        (adj/release! (mut succ))
+        (free! (mut order))
+        (Ok (Flow :blocks owned :idom idom))))))
+
+;;; Proven IF outcomes of the graph, each from the unedited graph.
+(defn changes [(graph g/Graph) (entry i32) (a (dyn Allocator))]
+  (-> (Result (ArrayList facts/Change) (slice u8)))
+  (let [(mut found) (ArrayList::new [facts/Change] a)
+        (mut pending) (ArrayList::new [i32] a)
+        (mut empty) (ArrayList::new [i32] a)
+        (mut error) ""
+        size (len (.instructions graph))
+        (mut r) 1]
+    (while (< r size)
+      (let [count (cast i64 (get (.arities graph) r))]
+        (when (and (>= count 2) (= (n/opcode (get (.instructions graph) r)) 116))
+          (let [query (facts/relation graph (.op2 (get (.instructions graph) r)))]
+            (when (!= (.mask query) 0)
+              (let [truth (prove graph empty false (cast i32 r))]
+                (if (>= truth 0)
+                    (push! (mut found) (facts/Change :branch (cast i32 r) :truth (!= truth 0)))
+                    (push! (mut pending) (cast i32 r)))))))
+        (set! r (+ r (if (< count 0) 1 (/ (+ count 4) 4))))))
+    (when (> (len pending) 0)
+      ; Per operand, how many pending comparisons mention it (saturating).
+      (let [(mut mentions) (ArrayList::new [u8] a)
+            (mut wanted) false]
+        (extend-zeroed! (mut mentions) size)
+        (for branch pending
+          (let [query (facts/relation graph (.op2 (get (.instructions graph) (cast i64 branch))))
+                values [(.left query) (.right query)]]
+            (for value values
+              (when (and (> value 0) (< (get mentions (cast i64 value)) 2))
+                (set! (mut mentions) (cast i64 value) (+ (get mentions (cast i64 value)) 1))))))
+        (for branch pending
+          (when (candidate? graph mentions branch) (set! wanted true)))
+        (when wanted
+          (match (flow-of graph entry a)
+            (Err [message] (set! error message))
+            (Ok [flow]
+              (let [(mut flow) flow]
+                (for branch pending
+                  (when (candidate? graph mentions branch)
+                    (let [truth (prove graph (.idom flow) true branch)]
+                      (when (>= truth 0)
+                        (push! (mut found)
+                               (facts/Change :branch branch :truth (!= truth 0)))))))
+                (cfg/release! (mut (.blocks flow)))
+                (free! (mut (.idom flow)))))))
+        (free! (mut mentions))))
+    (free! (mut pending))
+    (free! (mut empty))
+    (if (!= error "")
+        (do (free! (mut found)) (Err error))
+        (Ok found))))
+
+;;; An owned edited graph when at least one IF outcome is proven.
+(defn run [(graph g/Graph) (entry i32) (a (dyn Allocator))]
+  (-> (Result (Option g/Graph) (slice u8)))
+  (match (changes graph entry a)
+    (Err [message] (Err message))
+    (Ok [found]
+      (let [(mut found) found
+            result
+              (if (= (len found) 0)
+                  (None [g/Graph])
+                  (let [(mut working) (g/duplicate graph a)]
+                    (for change found
+                      (let [constant (match (g/intern-scalar! (mut working) 1
+                                                              (if (.truth change) (: 1 u64) (: 0 u64)))
+                                       (Some [r] r)
+                                       (None [] (panic "fact fold constant allocation failed")))]
+                        (unless (g/set-operand! (mut working) (.branch change) 2 constant)
+                          (panic "fact fold condition update failed"))))
+                    (Some working)))]
+        (free! (mut found))
+        (Ok result)))))
