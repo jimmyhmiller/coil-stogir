@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build an isolated library with exact old/new transfer and domain checks."""
 import argparse
+import gzip
 from pathlib import Path
 import shutil
 import subprocess
@@ -12,7 +13,8 @@ shutil.copytree(root/'src',out/'src');shutil.copy(root/'Coil.toml',out/'Coil.tom
 (out/'tests').mkdir();(out/'build/regional-native').mkdir(parents=True)
 for name in ('regional-native','allocation-regional','allocation-recolor','recolor-native'):
  shutil.copy(root/f'tests/{name}.coil',out/f'tests/{name}.coil')
-shutil.copy(root/'build/regional-native/primitive.coil',out/'tests/primitive.coil')
+(out/'tests/primitive.coil').write_bytes(gzip.decompress(
+ (root/'docs/benchmarks/frequency-allocation/regional-native/primitive.coil.gz').read_bytes()))
 for name in ('allocation-transfers','allocation-recolor'):
  old=subprocess.check_output(['git','show',f'579c817:src/stogir/{name}.coil'],text=True)
  old=old.replace(f'(module stogir.{name})',f'(module stogir.{name}-reference)')
