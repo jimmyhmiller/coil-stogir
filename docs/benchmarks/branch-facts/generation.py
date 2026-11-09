@@ -13,19 +13,28 @@ p.add_argument('root', type=Path)
 p.add_argument('compiler', type=Path)
 p.add_argument('output', type=Path)
 p.add_argument('--rounds', type=int, default=3)
+p.add_argument('--policies', nargs='+', choices=['llvm', 'regions', 'facts', 'induction'],
+               default=['llvm', 'regions', 'facts'])
 a = p.parse_args()
 if a.rounds < 1:
     p.error('rounds must be positive')
+if len(set(a.policies)) != len(a.policies):
+    p.error('policies must be distinct')
 a.output.mkdir(parents=True, exist_ok=False)
 base = {k: v for k, v in os.environ.items() if not k.startswith('COIL_')}
 base.update(COIL_LIBRARY_STATE='0', COIL_TPDE_SERIAL='1', COIL_CODEGEN_TIMINGS='1')
 policy = dict(COIL_STOGIR_INLINE='small=80,small-scope=any,hoist=1',
               COIL_STOGIR_LOOP_EVICT='1', COIL_STOGIR_LOOP_RELOAD='1', COIL_STOGIR_PREDICT='1')
-configs = [('llvm', 'llvm', {}), ('regions', 'stogir', policy),
-           ('facts', 'stogir', dict(policy, COIL_STOGIR_BRANCH_FACTS='1'))]
+available = dict(llvm=('llvm', {}), regions=('stogir', policy),
+    facts=('stogir', dict(policy, COIL_STOGIR_BRANCH_FACTS='1')),
+    induction=('stogir', dict(policy, COIL_STOGIR_INDUCTION='1')))
+configs = [(name, *available[name]) for name in a.policies]
 metadata = dict(compiler=str(a.compiler.resolve()),
     compiler_sha256=hashlib.sha256(a.compiler.read_bytes()).hexdigest(),
-    root=str(a.root.resolve()), configs=configs)
+    root=str(a.root.resolve()), configs=configs,
+    source_head=subprocess.check_output(['git', '-C', str(a.root), 'rev-parse', 'HEAD'], text=True).strip(),
+    source_tree=subprocess.check_output(['git', '-C', str(a.root), 'rev-parse', 'HEAD:src'], text=True).strip(),
+    source_status=subprocess.check_output(['git', '-C', str(a.root), 'status', '--porcelain', '--', 'src'], text=True))
 (a.output/'metadata.json').write_text(json.dumps(metadata, indent=2)+'\n')
 rows = []
 digests = {}
