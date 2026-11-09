@@ -1,0 +1,260 @@
+(module stogir.tests.induction-ranges)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.branch-facts" :as facts)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.types" :as types)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+(defstruct Fixture [(graph g/Graph) (exits (ArrayList i32)) (query i32) (phi i32) (next i32)])
+
+;;; Return -1 if the tested counter is negative, 0 on normal loop exit. The
+;;; comparison opcode supplies signedness even when TY is unsigned storage.
+;;; OP=0 supplies an unguarded back edge; ARM chooses the continuing projection.
+(defn build [(ty i32) (seed i64) (step i64) (post bool) (op i32) (arm bool)
+             (merge bool) (swapped bool) (a (dyn Allocator))] (-> Fixture)
+  (let [(mut graph) (g/create a) (mut exits) (ArrayList::new [i32] a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        param (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        limit (if (= ty 11) param
+                  (require (b/emit! (mut graph) (if (= (types/size ty 8) 8) 36 35) ty [param])))
+        initial (require (b/scalar-constant! (mut graph) ty (cast u64 (unsigned (cast i128 seed) (types/size ty 8))) 8))
+        delta (require (b/scalar-constant! (mut graph) ty (cast u64 (unsigned (cast i128 step) (types/size ty 8))) 8))
+        zero (require (b/scalar-constant! (mut graph) ty 0 8))
+        retzero (require (b/scalar-constant! (mut graph) 11 0 8))
+        minus (require (b/scalar-constant! (mut graph) 11 0xFFFFFFFFFFFFFFFF 8))
+        enter (require (b/emit! (mut graph) 114 0 [start]))
+        header (require (b/loop-begin! (mut graph) enter))
+        phi (require (b/loop-phi! (mut graph) header initial))
+        next (require (b/emit! (mut graph) 26 ty [phi delta]))
+        tested (if post next phi)
+        condition (if (= op 0) (require (b/scalar-constant! (mut graph) 1 (if arm 1 0) 8))
+                      (require (b/emit! (mut graph) op 1 [tested limit])))
+        guard (require (b/emit! (mut graph) 116 0 [header condition]))
+        yes (require (b/emit! (mut graph) 107 0 [guard (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [guard (: 0 i32)]))
+        negative (require (b/emit! (mut graph) 16 1 [tested zero]))
+        query (require (b/emit! (mut graph) 116 0 [(if arm yes no) negative]))
+        bad (require (b/emit! (mut graph) 107 0 [query (: 0 i32)]))
+        good (require (b/emit! (mut graph) 108 0 [query (: 0 i32)]))
+        back (require (b/emit! (mut graph) 115 0 [good]))
+        (mut signature) (match (calls/create 0 11 [(: 11 u8)] a)
+                          (Err [message] (panic "{}" message)) (Ok [s] s))]
+    (require (b/patch! (mut graph) header 1 (if swapped back enter)))
+    (require (b/patch! (mut graph) header 2 (if swapped enter back)))
+    (require (b/patch! (mut graph) phi 2 (if swapped next initial)))
+    (require (b/patch! (mut graph) phi 3 (if swapped initial next)))
+    (when merge
+      (let [old (get (.instructions graph) (cast i64 header))]
+        (set! (mut (.instructions graph)) (cast i64 header)
+          (n/make 112 0 (n/auxiliary old) (.op1 old) (.op2 old) (.op3 old))))
+      (g/invalidate-expressions! (mut graph)))
+    (require (calls/function! (mut graph) signature a))
+    (calls/release! (mut signature))
+    (push! (mut exits) (require (b/emit! (mut graph) 120 11 [(if arm no yes) retzero (: 0 i32)])))
+    (push! (mut exits) (require (b/emit! (mut graph) 120 11 [bad minus (: 0 i32)])))
+    (Fixture :graph graph :exits exits :query query :phi phi :next next)))
+
+(defn signed [(value i128) (width i32)] (-> i128)
+  (let [modulus (<< (: 1 i128) (cast i128 (* width 8)))
+        bits (& value (- modulus 1))]
+    (if (>= bits (/ modulus 2)) (- bits modulus) bits)))
+(defn unsigned [(value i128) (width i32)] (-> i128)
+  (& value (- (<< (: 1 i128) (cast i128 (* width 8))) 1)))
+(defn test [(op i32) (arm bool) (x i128) (y i128) (width i32)] (-> bool)
+  (if (= op 0) true
+      (= arm (match op (16 (< x y)) (17 (>= x y)) (18 (<= x y))
+                 (20 (< (unsigned x width) (unsigned y width))) (_ (panic "op"))))))
+
+;;; Bounded concrete execution for semantic validation; -2 means no exit in
+;;; 300 iterations. The proof is checked at every reached query, not just return.
+(defn simulate [(seed i64) (step i64) (post bool) (op i32) (arm bool)
+                (width i32) (limit i64) (proof i32)] (-> i64)
+  (let [(mut value) (signed (cast i128 seed) width) bound (signed (cast i128 limit) width)
+        (mut answer) (: -2 i64) (mut done) false (mut i) 0]
+    (while (and (not done) (< i 300))
+      (let [next (signed (+ value (cast i128 step)) width) checked (if post next value)]
+        (if (not (test op arm checked bound width))
+            (do (set! answer 0) (set! done true))
+            (do
+              (when (and (>= proof 0) (!= (!= proof 0) (< checked 0)))
+                (panic "unsound range: seed {} step {} post {} op {} width {} bound {} value {} proof {}"
+                  seed step post op width limit checked proof))
+              (when (< checked 0) (set! answer -1) (set! done true))))
+        (set! value next))
+      (set! i (+ i 1)))
+    answer))
+
+(defn native-check [(f Fixture) (seed i64) (step i64) (post bool) (op i32)
+                   (arm bool) (width i32) (proof i32) (a (dyn Allocator))] (-> void)
+  (match (compile/image-with-private (.graph f) 1 (slice (.exits f)) "_iv_entry"
+           (options/Options :level 3) a (private/with-induction (private/no-context) true))
+    (Err [message] (panic "compile: {}" message))
+    (Ok [code]
+      (let [(mut code) code]
+        (match (link/compose [code] a)
+          (Err [message] (panic "compose: {}" message))
+          (Ok [module]
+            (let [(mut module) module]
+              (match (jit/map-image (.image module) a)
+                (Err [message] (panic "map: {}" message))
+                (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        index (match (image/find-symbol (.image module) "_iv_entry")
+                                (Some [id] id) (None [] (panic "symbol")))
+                        function (primitive/cast (fnptr (cc/C) [i64] i64)
+                          (primitive/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))]
+                    (for [delta -2 3]
+                      (let [limit (cast i64 (signed (+ (cast i128 seed) (cast i128 delta)) width))
+                            want (simulate seed step post op arm width limit proof)]
+                        (when (!= want -2)
+                          (let [got (function limit)]
+                            (unless (= got want)
+                              (panic "native: seed {} post {} op {} width {} limit {} got {} want {}"
+                                seed post op width limit got want))))))
+                    (jit/release-image! (mut loaded)))))
+              (link/release! (mut module)))))
+        (image/release! (mut code))))))
+
+(defn check [(ty i32) (seed i64) (step i64) (post bool) (op i32) (arm bool)
+             (merge bool) (swapped bool) (native bool)] (-> void)
+  (let [a (malloc-allocator) (mut f) (build ty seed step post op arm merge swapped a)
+        width (types/size ty 8) (mut proof) (: -1 i32)
+        (mut phi-known) false (mut next-known) false]
+    (match (pipeline/prepare (.graph f) 1 (slice (.exits f)) a)
+      (Err [message] (panic "prepare: {}" message))
+      (Ok [prepared]
+        (let [(mut prepared) prepared (mut ranges) (facts/induction-ranges (.graph f) prepared a)]
+          (set! proof (facts/prove-range (.graph f) ranges (.query f)))
+          (set! phi-known (.valid (get ranges (cast i64 (.phi f)))))
+          (set! next-known (.valid (get ranges (cast i64 (.next f)))))
+          (free! (mut ranges)) (pipeline/release! (mut prepared)))))
+    (let [maximum (- (<< (: 1 i128) (cast i128 (- (* width 8) 1))) 1)
+          safe (and (= step 1) (or (and (= op 16) arm) (and (= op 17) (not arm)))
+                    (or (not post) (< (cast i128 seed) maximum)))
+          expected (and safe (if post (>= seed -1) (>= seed 0)))]
+      (unless (and (= phi-known safe) (= next-known (and safe post))
+                   (= proof (if expected 0 -1)))
+        (panic "proof mismatch: ty {} seed {} step {} post {} op {} arm {} merge {} swapped {} phi {} next {} proof {}"
+          ty seed step post op arm merge swapped phi-known next-known proof)))
+    (if (= width 1)
+        (for [limit -128 128] (simulate seed step post op arm width limit proof))
+        (for [delta -2 3]
+          (simulate seed step post op arm width
+            (cast i64 (signed (+ (cast i128 seed) (cast i128 delta)) width)) proof)))
+    (when native (native-check f seed step post op arm width proof a))
+    (free! (mut (.exits f))) (g/release! (mut (.graph f)))))
+
+;;; Independent interval comparison oracle, including EQ/NE and unsigned
+;;; intervals that cross zero. Artificial ranges exercise the comparison layer
+;;; independently of which ranges the current recurrence recognizer discovers.
+(defn comparison-ranges [] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 2 [start (: 0 i32) 0]))
+        y (require (b/emit! (mut graph) 71 2 [start (: 0 i32) 1]))
+        cmp (require (b/emit! (mut graph) 14 1 [x y]))
+        branch (require (b/emit! (mut graph) 116 0 [start cmp]))
+        (mut ranges) (ArrayList::new [facts/Range] a)
+        lows [(: -128 i128) -128 -2 -1 0 0 126 127]
+        highs [(: -128 i128) -1 2 127 0 127 127 127]]
+    (for [i 0 (len (.instructions graph))] (push! (mut ranges) (facts/no-range)))
+    (for [i 0 (len lows)] (for [j 0 (len lows)]
+      (set! (mut ranges) (cast i64 x)
+        (facts/Range :valid true :low (get lows i) :high (get highs i) :width 1))
+      (set! (mut ranges) (cast i64 y)
+        (facts/Range :valid true :low (get lows j) :high (get highs j) :width 1))
+      (for [op 14 24]
+        (set! (mut (.instructions graph)) (cast i64 cmp) (n/make (cast u8 op) 1 0 x y 0))
+        (g/invalidate-expressions! (mut graph))
+        (let [proof (facts/prove-range graph ranges branch)]
+          (when (>= proof 0)
+            (for [l (cast i64 (get lows i)) (+ (cast i64 (get highs i)) 1)]
+              (for [r (cast i64 (get lows j)) (+ (cast i64 (get highs j)) 1)]
+                (let [ul (unsigned (cast i128 l) 1) ur (unsigned (cast i128 r) 1)
+                      expected (match op (14 (= l r)) (15 (!= l r)) (16 (< l r))
+                        (17 (>= l r)) (18 (<= l r)) (19 (> l r)) (20 (< ul ur))
+                        (21 (>= ul ur)) (22 (<= ul ur)) (23 (> ul ur)) (_ false))]
+                  (unless (= expected (!= proof 0))
+                    (panic "interval comparison op {} values {} {} proof {}" op l r proof))))))))))
+    (free! (mut ranges)) (g/release! (mut graph))))
+
+;;; A second, unbounded back edge invalidates a recurrence even when another
+;;; incoming edge has a strict guard. This must not inherit the guarded edge's
+;;; no-overflow property.
+(defn multiple-backs [] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        bound (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        one (require (b/scalar-constant! (mut graph) 5 1 8))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        enter (require (b/emit! (mut graph) 114 0 [start]))
+        header (match (g/append-inputs! (mut graph) 112 0 [enter (: 0 i32) 0])
+                 (Some [r] r) (None [] (panic "header")))
+        phi (match (g/append-inputs! (mut graph) 67 5 [header zero (: 0 i32) 0])
+              (Some [r] r) (None [] (panic "phi")))
+        next (require (b/emit! (mut graph) 26 5 [phi one]))
+        less (require (b/emit! (mut graph) 16 1 [phi bound]))
+        guard (require (b/emit! (mut graph) 116 0 [header less]))
+        yes (require (b/emit! (mut graph) 107 0 [guard (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [guard (: 0 i32)]))
+        neg (require (b/emit! (mut graph) 16 1 [phi zero]))
+        query (require (b/emit! (mut graph) 116 0 [no neg]))
+        bad (require (b/emit! (mut graph) 107 0 [query (: 0 i32)]))
+        good (require (b/emit! (mut graph) 108 0 [query (: 0 i32)]))
+        back1 (require (b/emit! (mut graph) 115 0 [yes]))
+        back2 (require (b/emit! (mut graph) 115 0 [good]))
+        ret (require (b/emit! (mut graph) 120 5 [bad phi (: 0 i32)]))]
+    (require (b/patch! (mut graph) header 2 back1))
+    (require (b/patch! (mut graph) header 3 back2))
+    (require (b/patch! (mut graph) phi 3 next))
+    (require (b/patch! (mut graph) phi 4 next))
+    (match (pipeline/prepare graph 1 [ret] a)
+      (Err [message] (panic "multiple backs: {}" message))
+      (Ok [prepared]
+        (let [(mut prepared) prepared (mut ranges) (facts/induction-ranges graph prepared a)]
+          (when (or (.valid (get ranges (cast i64 phi)))
+                    (!= (facts/prove-range graph ranges query) -1))
+            (panic "ignored unbounded back edge"))
+          (free! (mut ranges)) (pipeline/release! (mut prepared)))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i32)
+  (comparison-ranges)
+  (multiple-backs)
+  ; Exhaust all 8-bit initial values and bounds, including the wrapping cases.
+  (for [seed -128 128]
+    (for post [false true]
+      (for op [(: 16 i32) 18 20]
+        (check 2 seed 1 post op true true false false))))
+  ; Both region spellings, reversed predecessor slots and continuing IF_FALSE.
+  (for merge [false true] (for swapped [false true] (for post [false true]
+    (check 5 -1 1 post 16 true merge swapped true)
+    (check 5 0 1 post 17 false merge swapped true))))
+  ; Boundary native executions and rejections of non-unit/unbounded recurrences.
+  (for ty [(: 2 i32) 4 5 11]
+    (let [width (types/size ty 8)
+          maximum (cast i64 (- (<< (: 1 i128) (cast i128 (- (* width 8) 1))) 1))
+          minimum (cast i64 (- 0 (<< (: 1 i128) (cast i128 (- (* width 8) 1)))))]
+      (for seed [minimum (- maximum 1) maximum]
+        (for post [false true]
+          (for op [(: 16 i32) 18 20 0]
+            (check ty seed 1 post op true true false true))))
+      (check ty maximum 2 true 16 true true false true)
+      (check ty 0 -1 false 16 true true false true)))
+  (println "induction ranges: all checks passed")
+  0)
