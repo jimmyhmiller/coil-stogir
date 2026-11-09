@@ -163,3 +163,9 @@ and integer range facts. The allocation trace and assembly expose the same
 index/length comparison repeated on paths where the first branch already proved
 it. Retain all checks without a proof; use matched-host timing and output identity
 for every candidate. The goal remains active.
+
+Final candidate identity check: after retaining both verifier calls and excluding
+external entry blocks, it emits a byte-identical host object to the measured
+region-only host (`8449a7d2460a32f66f5bcc2a22ddcf8245a1c7f5eb9fd828d24fd9f33caca4b7`).
+Thus the retained implementation produces the machine code used in the reported
+runtime measurements. See `final-identity.txt`.
