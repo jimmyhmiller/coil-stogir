@@ -1,0 +1,757 @@
+;;; Sparse IF folding from value ranges, dominating literal and pair facts and
+;;; guarded loop counters; the non-negative proof for loop-counter division;
+;;; and the shortened signed power-of-two division sequences. Every proof is
+;;; compared with exhaustive or boundary evaluation, and proven graphs are
+;;; executed natively through the default pipeline.
+(module stogir.tests.fact-fold)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.fact-fold" :as fold)
+(import "stogir.induction" :as induction)
+(import "stogir.cfg" :as cfg)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.types" :as types)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.match" :as matching)
+(import "stogir.a64.select" :as select)
+(import "stogir.a64.emit" :as emit)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn signed [(value i128) (width i32)] (-> i128)
+  (let [modulus (<< (: 1 i128) (cast i128 (* width 8)))
+        bits (& value (- modulus 1))]
+    (if (>= bits (/ modulus 2)) (- bits modulus) bits)))
+(defn unsigned [(value i128) (width i32)] (-> i128)
+  (& value (- (<< (: 1 i128) (cast i128 (* width 8))) 1)))
+
+;;; Comparison opcode applied to two values at `width` bytes.
+(defn eval [(op i32) (width i32) (x i128) (y i128)] (-> bool)
+  (let [sx (signed x width) sy (signed y width)
+        ux (unsigned x width) uy (unsigned y width)]
+    (match op (14 (= sx sy)) (15 (!= sx sy)) (16 (< sx sy)) (17 (>= sx sy))
+      (18 (<= sx sy)) (19 (> sx sy)) (20 (< ux uy)) (21 (>= ux uy))
+      (22 (<= ux uy)) (23 (> ux uy)) (_ (panic "bad opcode")))))
+
+(defn signature! [(graph (mut g/Graph)) (a (dyn Allocator))] (-> void)
+  (let [(mut signature) (match (calls/create 0 11 [(: 11 u8) 11] a)
+                          (Err [message] (panic "{}" message)) (Ok [s] s))]
+    (require (calls/function! (mut graph) signature a))
+    (calls/release! (mut signature))))
+
+;;; Proof for one IF as compilation computes it for a candidate.
+(defn proof-of [(graph g/Graph) (branch i32) (a (dyn Allocator))] (-> i32)
+  (match (fold/flow-of graph 1 [] false a)
+    (Err [message] (panic "flow: {}" message))
+    (Ok [flow]
+      (let [(mut flow) flow
+            proof (fold/prove graph (.idom flow) true branch)]
+        (free! (mut (.idom flow)))
+        (cfg/release! (mut (.blocks flow)))
+        proof))))
+
+;;; Whether the whole-function scan, with its candidate filter, decides `branch`.
+(defn scan-decides? [(graph g/Graph) (branch i32) (a (dyn Allocator))] (-> bool)
+  (match (fold/changes graph 1 [] false a)
+    (Err [message] (panic "changes: {}" message))
+    (Ok [found]
+      (let [(mut found) found (mut answer) false]
+        (for change found (when (= (.branch change) branch) (set! answer true)))
+        (free! (mut found))
+        answer))))
+
+;;; The function compiled by the default pipeline, called on each (x, y).
+(defn native [(graph g/Graph) (exits (slice i32)) (xs (slice i64)) (ys (slice i64))
+              (a (dyn Allocator))] (-> (ArrayList i64))
+  (let [(mut out) (ArrayList::new [i64] a)]
+    (match (compile/image-with-private graph 1 exits "_ff_entry"
+             (options/Options :level 3) a (private/no-context))
+      (Err [message] (panic "compile: {}" message))
+      (Ok [code]
+        (let [(mut code) code]
+          (match (link/compose [code] a)
+            (Err [message] (panic "compose: {}" message))
+            (Ok [module]
+              (let [(mut module) module]
+                (match (jit/map-image (.image module) a)
+                  (Err [message] (panic "map: {}" message))
+                  (Ok [loaded]
+                    (let [(mut loaded) loaded
+                          index (match (image/find-symbol (.image module) "_ff_entry")
+                                  (Some [id] id) (None [] (panic "symbol")))
+                          function (primitive/cast (fnptr (cc/C) [i64 i64] i64)
+                            (primitive/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))]
+                      (for x xs (for y ys (push! (mut out) (function x y))))
+                      (jit/release-image! (mut loaded)))))
+                (link/release! (mut module)))))
+          (image/release! (mut code)))))
+    out))
+
+(defn samples [] (-> (array i64 34))
+  [(: -9223372036854775808 i64) -9223372036854775807 -4294967297 -4294967296
+   -2147483649 -2147483648 -2147483647 -129 -128 -127 -9 -8 -2 -1 0 1 2 7 8 9
+   126 127 128 2147483646 2147483647 2147483648 4294967295 4294967296
+   9223372036854775806 9223372036854775807 5 -5 31 32])
+
+;;; --- Dominating facts -----------------------------------------------------
+
+;;; rhs 0 names the literal, 1 the second parameter.
+(defstruct Test [(op i32) (arm bool) (rhs i32) (bits i64) (swapped bool)])
+
+(defstruct Chain [(graph g/Graph) (exits (ArrayList i32)) (query i32) (folded bool)])
+
+;;; x passes each fact in order (the other arm returns 7), then the query IF
+;;; returns 1 or 0. ty 2 uses 8-bit parameters directly (graph only); ty 10
+;;; compares the 32-bit truncations; ty 11 the parameters themselves.
+(defn chain [(ty i32) (facts (slice Test)) (query Test) (a (dyn Allocator))] (-> Chain)
+  (let [(mut graph) (g/create a) (mut exits) (ArrayList::new [i32] a)
+        width (types/size ty 8)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        px (require (b/emit! (mut graph) 71 (if (= ty 2) 2 11) [start (: 0 i32) 0]))
+        py (require (b/emit! (mut graph) 71 (if (= ty 2) 2 11) [start (: 0 i32) 1]))
+        x (if (= ty 10) (require (b/emit! (mut graph) 35 10 [px])) px)
+        y (if (= ty 10) (require (b/emit! (mut graph) 35 10 [py])) py)
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        (mut control) start (mut folded) false]
+    (when (!= ty 2) (signature! (mut graph) a))
+    (for fact facts
+      (let [other (if (= (.rhs fact) 1) y
+                      (require (b/scalar-constant! (mut graph) ty
+                                 (cast u64 (unsigned (cast i128 (.bits fact)) width)) 8)))
+            test (require (b/emit! (mut graph) (.op fact) 1
+                   (if (.swapped fact) [other x] [x other])))
+            split (require (b/emit! (mut graph) 116 0 [control test]))
+            yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+            no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))]
+        (when (<= test 0) (set! folded true))
+        (push! (mut exits)
+               (require (b/emit! (mut graph) 120 11 [(if (.arm fact) no yes) seven (: 0 i32)])))
+        (set! control (if (.arm fact) yes no))))
+    (let [other (if (= (.rhs query) 1) y
+                    (require (b/scalar-constant! (mut graph) ty
+                               (cast u64 (unsigned (cast i128 (.bits query)) width)) 8)))
+          test (require (b/emit! (mut graph) (.op query) 1
+                 (if (.swapped query) [other x] [x other])))
+          split (require (b/emit! (mut graph) 116 0 [control test]))
+          yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+          no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))]
+      (when (<= test 0) (set! folded true))
+      (push! (mut exits) (require (b/emit! (mut graph) 120 11 [yes one (: 0 i32)])))
+      (push! (mut exits) (require (b/emit! (mut graph) 120 11 [no zero (: 0 i32)])))
+      (Chain :graph graph :exits exits :query split :folded folded))))
+
+(defn holds? [(test Test) (width i32) (x i128) (y i128)] (-> bool)
+  (let [other (if (= (.rhs test) 1) y (cast i128 (.bits test)))]
+    (if (.swapped test) (eval (.op test) width other x) (eval (.op test) width x other))))
+
+(defn release-chain! [(c (mut Chain))] (-> void)
+  (free! (mut (.exits c))) (g/release! (mut (.graph c))))
+
+;;; One literal fact, then a literal query, on every 8-bit value. A proof must
+;;; hold wherever the fact does; a signed-order or point fact with a signed
+;;; or equality query must be decided exactly.
+(defn literal-facts [] (-> i64)
+  (let [a (malloc-allocator) (mut proofs) (: 0 i64)
+        literals [(: -128 i64) -127 -2 -1 0 1 2 126 127]]
+    (for [op1 14 24] (for arm [true false] (for swapped [false true]
+      (for c1 literals (for [op2 14 24] (for c2 literals
+        (let [fact (Test :op (cast i32 op1) :arm arm :rhs 0 :bits c1 :swapped swapped)
+              query (Test :op (cast i32 op2) :arm true :rhs 0 :bits c2 :swapped false)
+              (mut c) (chain 2 [fact] query a)
+              proof (proof-of (.graph c) (.query c) a)
+              (mut reaching) (: 0 i64) (mut trues) (: 0 i64)]
+          (for [x -128 128]
+            (when (= (holds? fact 1 (cast i128 x) 0) arm)
+              (set! reaching (+ reaching 1))
+              (when (holds? query 1 (cast i128 x) 0) (set! trues (+ trues 1)))))
+          (when (>= proof 0)
+            (set! proofs (+ proofs 1))
+            (unless (= trues (if (= proof 1) reaching 0))
+              (panic "unsound literal fact: op1 {} arm {} swapped {} c1 {} op2 {} c2 {} proof {}"
+                     op1 arm swapped c1 op2 c2 proof)))
+          (let [exact (and (not (.folded c)) (> reaching 0) (<= op2 19)
+                           (or (and (>= op1 16) (<= op1 19)) (and (= op1 14) arm)
+                               (and (= op1 15) (not arm))))
+                want (if (= trues reaching) (: 1 i32) (if (= trues 0) 0 -1))]
+            (when (and exact (!= proof want))
+              (panic "missed literal fact: op1 {} arm {} swapped {} c1 {} op2 {} c2 {} proof {} want {}"
+                     op1 arm swapped c1 op2 c2 proof want)))
+          ; The scan keeps every such proof that involves an ordering.
+          (when (and (>= proof 0) (> reaching 0) (not (.folded c)) (or (>= op1 16) (>= op2 16))
+                     (not (scan-decides? (.graph c) (.query c) a)))
+            (panic "scan missed literal fact: op1 {} arm {} swapped {} c1 {} op2 {} c2 {}"
+                   op1 arm swapped c1 op2 c2))
+          (release-chain! (mut c)))))))))
+    proofs))
+
+;;; An optional literal fact on x, a fact on the pair (x, y), then a query on
+;;; the pair, on every pair of 8-bit values.
+(defn pair-facts [] (-> i64)
+  (let [a (malloc-allocator) (mut proofs) (: 0 i64)
+        firsts [(Test :op 14 :arm true :rhs 1 :bits 0 :swapped false)
+                (Test :op 17 :arm true :rhs 0 :bits 0 :swapped false)
+                (Test :op 17 :arm true :rhs 0 :bits -1 :swapped false)
+                (Test :op 16 :arm false :rhs 0 :bits 0 :swapped false)
+                (Test :op 19 :arm true :rhs 0 :bits 5 :swapped false)
+                (Test :op 20 :arm true :rhs 0 :bits -128 :swapped false)
+                (Test :op 22 :arm true :rhs 0 :bits 100 :swapped false)
+                (Test :op 21 :arm true :rhs 0 :bits 3 :swapped false)
+                (Test :op 16 :arm true :rhs 0 :bits 0 :swapped false)
+                (Test :op 18 :arm true :rhs 0 :bits 9 :swapped true)]]
+    (for [f 0 (len firsts)] (for [op2 14 24] (for arm [true false] (for [op3 14 24]
+      (let [first (get firsts f)
+            ; The first entry stands for no literal fact.
+            none (= f 0)
+            pair (Test :op (cast i32 op2) :arm arm :rhs 1 :bits 0 :swapped false)
+            query (Test :op (cast i32 op3) :arm true :rhs 1 :bits 0 :swapped false)
+            (mut c) (if none (chain 2 [pair] query a) (chain 2 [first pair] query a))
+            proof (proof-of (.graph c) (.query c) a)]
+        (when (>= proof 0)
+          (set! proofs (+ proofs 1))
+          (for [x -128 128] (for [y -128 128]
+            (when (and (or none (= (holds? first 1 (cast i128 x) (cast i128 y)) (.arm first)))
+                       (= (holds? pair 1 (cast i128 x) (cast i128 y)) arm))
+              (unless (= (holds? query 1 (cast i128 x) (cast i128 y)) (= proof 1))
+                (panic "unsound pair fact: first {} op2 {} arm {} op3 {} x {} y {} proof {}"
+                       f op2 arm op3 x y proof))))))
+        ; The signed bounds check: 0 <= x < y decides the unsigned orders.
+        (when (and (= op2 16) arm (or (= f 1) (= f 3)))
+          (let [want (match op3 (20 (: 1 i32)) (22 1) (21 0) (23 0) (15 1) (14 0) (16 1) (18 1)
+                       (17 0) (_ 0))]
+            (unless (and (= proof want) (scan-decides? (.graph c) (.query c) a))
+              (panic "missed bounds fact: first {} op3 {} proof {} want {}" f op3 proof want))))
+        ; A repeated or implied comparison of the same pair needs no literal.
+        (when (and none (>= proof 0) (not (scan-decides? (.graph c) (.query c) a)))
+          (panic "scan missed pair fact: op2 {} arm {} op3 {}" op2 arm op3))
+        (when (and none (= op2 16) arm (>= op3 20))
+          (unless (= proof -1) (panic "signed order decided an unsigned one: op3 {}" op3)))
+        (release-chain! (mut c)))))))
+    proofs))
+
+;;; Proven literal and pair chains at both native widths, executed.
+(defn native-facts [] (-> i64)
+  (let [a (malloc-allocator) (mut runs) (: 0 i64)
+        ys [(: -3 i64) 0 6 2147483647 -2147483648]
+        xs (samples)]
+    (for ty [(: 10 i32) 11]
+      (let [width (types/size ty 8)
+            top (cast i64 (- (<< (: 1 i128) (cast i128 (- (* width 8) 1))) 1))
+            literals [(- (- 0 top) 1) -1 0 1 8 top]]
+        (for [op1 14 24] (for arm [true false] (for c1 literals
+          (for [op2 14 24] (for c2 literals
+            (for shape [(: 0 i32) 1]
+              (let [fact (Test :op (cast i32 op1) :arm arm :rhs 0 :bits c1 :swapped false)
+                    pair (Test :op (cast i32 op1) :arm arm :rhs 1 :bits 0 :swapped false)
+                    literal-query (Test :op (cast i32 op2) :arm true :rhs 0 :bits c2 :swapped false)
+                    pair-query (Test :op (cast i32 op2) :arm true :rhs 1 :bits 0 :swapped false)
+                    bound (Test :op 17 :arm true :rhs 0 :bits (if (= c2 top) 0 c2) :swapped false)
+                    (mut c) (if (= shape 0) (chain ty [fact] literal-query a)
+                                (chain ty [bound pair] pair-query a))
+                    proof (proof-of (.graph c) (.query c) a)]
+                ; Unproven graphs take the unchanged path; run a sample of them.
+                (when (or (>= proof 0) (= (% (+ op1 op2 (& c1 63) (& c2 63)) 23) 0))
+                  (let [(mut got) (native (.graph c) (slice (.exits c)) xs ys a)
+                        (mut i) 0]
+                    (set! runs (+ runs 1))
+                    (for x xs (for y ys
+                      (let [vx (cast i128 x) vy (cast i128 y)
+                            reached (if (= shape 0) (= (holds? fact width vx vy) arm)
+                                        (and (holds? bound width vx vy)
+                                             (= (holds? pair width vx vy) arm)))
+                            truth (if (= shape 0) (holds? literal-query width vx vy)
+                                      (holds? pair-query width vx vy))
+                            want (if reached (if truth (: 1 i64) 0) 7)]
+                        (when (and reached (>= proof 0) (!= truth (= proof 1)))
+                          (panic "unsound native fact: ty {} shape {} op1 {} arm {} c1 {} op2 {} c2 {} x {} y {}"
+                                 ty shape op1 arm c1 op2 c2 x y))
+                        (unless (= (get got i) want)
+                          (panic "native fact: ty {} shape {} op1 {} arm {} c1 {} op2 {} c2 {} x {} y {} got {} want {}"
+                                 ty shape op1 arm c1 op2 c2 x y (get got i) want))
+                        (set! i (+ i 1)))))
+                    (free! (mut got))))
+                (release-chain! (mut c)))))))))))
+    runs))
+
+;;; --- Expression ranges ----------------------------------------------------
+
+(defn sext32 [(x i64)] (-> i64)
+  (>> (cast i64 (<< (cast u64 x) 32)) 32))
+
+(defstruct Expression [(node i32) (ty i32)])
+
+(defn k [(graph (mut g/Graph)) (ty i32) (bits u64)] (-> i32)
+  (require (b/scalar-constant! (mut graph) ty bits 8)))
+
+(defn expression [(graph (mut g/Graph)) (kind i32) (x i32)] (-> Expression)
+  (let [low (require (b/emit! (mut graph) 35 10 [x]))
+        view (require (b/emit! (mut graph) 36 5 [x]))
+        nibble (require (b/emit! (mut graph) 47 11 [x (k (mut graph) 11 15)]))
+        byte (require (b/emit! (mut graph) 47 11 [x (k (mut graph) 11 255)]))]
+    (match kind
+      (0 (Expression :node (require (b/emit! (mut graph) 47 11 [x (k (mut graph) 11 31)])) :ty 11))
+      (1 (Expression :node (require (b/emit! (mut graph) 34 11 [low])) :ty 11))
+      (2 (Expression :node (require (b/emit! (mut graph) 50 11 [x (k (mut graph) 11 60)])) :ty 11))
+      (3 (Expression :node (require (b/emit! (mut graph) 30 5 [view (k (mut graph) 5 10) (: 0 i32)])) :ty 5))
+      (4 (Expression :node (require (b/emit! (mut graph) 26 11 [nibble (k (mut graph) 11 3)])) :ty 11))
+      (5 (Expression :node (require (b/emit! (mut graph) 27 11 [nibble (k (mut graph) 11 20)])) :ty 11))
+      (6 (Expression :node (require (b/emit! (mut graph) 33 11 [low])) :ty 11))
+      (7 (Expression :node (require (b/emit! (mut graph) 30 11 [x (k (mut graph) 11 8) (: 0 i32)])) :ty 11))
+      (8 (Expression :node (require (b/emit! (mut graph) 29 11 [byte (k (mut graph) 11 4) (: 0 i32)])) :ty 11))
+      (9 (Expression :node (require (b/emit! (mut graph) 35 10
+                             [(require (b/emit! (mut graph) 47 11 [x (k (mut graph) 11 1000)]))]))
+                     :ty 10))
+      (10 (Expression :node (require (b/emit! (mut graph) 26 11 [x (k (mut graph) 11 1)])) :ty 11))
+      (11 (Expression :node (require (b/emit! (mut graph) 27 11
+                              [(require (b/emit! (mut graph) 50 11 [x (k (mut graph) 11 1)]))
+                               (k (mut graph) 11 1)])) :ty 11))
+      (12 (Expression :node (require (b/emit! (mut graph) 30 11 [byte (k (mut graph) 11 7) (: 0 i32)])) :ty 11))
+      (13 (Expression :node (require (b/emit! (mut graph) 29 5 [view (k (mut graph) 5 10) (: 0 i32)])) :ty 5))
+      (14 (Expression :node (require (b/emit! (mut graph) 47 11
+                              [(require (b/emit! (mut graph) 26 11 [x (k (mut graph) 11 1)])) byte]))
+                      :ty 11))
+      (15 (Expression :node (require (b/emit! (mut graph) 55 11 [x])) :ty 11))
+      (_ (panic "bad expression")))))
+
+(defn value-of [(kind i32) (x i64)] (-> i64)
+  (let [u (cast u64 x)]
+    (match kind
+      (0 (& x 31))
+      (1 (cast i64 (& u 0xFFFFFFFF)))
+      (2 (cast i64 (>> u 60)))
+      (3 (cast i64 (% u 10)))
+      (4 (+ (& x 15) 3))
+      (5 (- (& x 15) 20))
+      (6 (sext32 x))
+      (7 (% x 8))
+      (8 (/ (& x 255) 4))
+      (9 (& x 1000))
+      (10 (cast i64 (primitive/iadd u 1)))
+      (11 (- (cast i64 (>> u 1)) 1))
+      (12 (% (& x 255) 7))
+      (13 (cast i64 (/ u 10)))
+      (14 (& (cast i64 (primitive/iadd u 1)) (& x 255)))
+      (15 (let [(mut bits) u (mut count) (: 0 i64)]
+            (while (!= bits 0) (set! count (+ count (cast i64 (& bits 1)))) (set! bits (>> bits 1)))
+            count))
+      (_ (panic "bad expression")))))
+
+(defn expected [(kind i32) (op i32) (width i32) (swapped bool) (x i64) (c i64)] (-> bool)
+  (if swapped
+      (eval op width (cast i128 c) (cast i128 (value-of kind x)))
+      (eval op width (cast i128 (value-of kind x)) (cast i128 c))))
+
+;;; Every comparison of each expression with boundary literals, checked on
+;;; values that reach both ends of the expression's range.
+(defn expression-ranges [] (-> i64)
+  (let [a (malloc-allocator) (mut proofs) (: 0 i64)
+        (mut xs) (ArrayList::new [i64] a)
+        literals [(: -9223372036854775808 i64) -9223372036854775807 -2147483649 -2147483648
+                  -21 -20 -8 -7 -6 -5 -2 -1 0 1 2 3 6 7 8 9 10 15 16 17 18 19 31 32 62 63 64 65
+                  254 255 256 1000 1001 2147483647 2147483648 4294967295 4294967296
+                  1152921504606846975 1152921504606846976 1844674407370955161
+                  1844674407370955162 9223372036854775806 9223372036854775807]
+        ys [(: 0 i64)]]
+    (for x (samples) (push! (mut xs) x))
+    (for [x -300 301] (push! (mut xs) x))
+    (for [top 0 16] (push! (mut xs) (cast i64 (<< (cast u64 top) 60))))
+    (for [top 0 16] (push! (mut xs) (cast i64 (| (<< (cast u64 top) 60) 0x0FFFFFFFFFFFFFFF))))
+    (for [kind 0 16] (for [op 14 24] (for c literals (for swapped [false true]
+      (let [(mut graph) (g/create a) (mut exits) (ArrayList::new [i32] a)
+            start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+            x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+            e (expression (mut graph) (cast i32 kind) x)
+            width (types/size (.ty e) 8)
+            fits (or (= width 8) (and (>= c -2147483648) (<= c 2147483647)))]
+        (when fits
+          (let [literal (require (b/scalar-constant! (mut graph) (.ty e)
+                                   (cast u64 (unsigned (cast i128 c) width)) 8))
+                test (require (b/emit! (mut graph) (cast i32 op) 1
+                       (if swapped [literal (.node e)] [(.node e) literal])))
+                split (require (b/emit! (mut graph) 116 0 [start test]))
+                yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+                no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+                one (require (b/scalar-constant! (mut graph) 11 1 8))
+                zero (require (b/scalar-constant! (mut graph) 11 0 8))]
+            (signature! (mut graph) a)
+            (push! (mut exits) (require (b/emit! (mut graph) 120 11 [yes one (: 0 i32)])))
+            (push! (mut exits) (require (b/emit! (mut graph) 120 11 [no zero (: 0 i32)])))
+            (let [proof (if (> test 0) (fold/prove graph (ArrayList::new [i32] a) false split) -1)]
+              (when (>= proof 0)
+                (set! proofs (+ proofs 1))
+                (for x xs
+                  (unless (= (expected (cast i32 kind) (cast i32 op) width swapped x c) (= proof 1))
+                    (panic "unsound range: kind {} op {} c {} swapped {} x {} proof {}"
+                           kind op c swapped x proof))))
+              ; A sum that can wrap has no range.
+              (when (and (= kind 10) (>= proof 0) (>= op 16) (<= op 19) (> c -1000) (< c 1000))
+                (panic "range of a wrapping sum: op {} c {}" op c))
+              ; Directed completeness: the checks these ranges exist for.
+              (when (not swapped)
+                (let [want (cond
+                             (and (= kind 0) (= op 16) (= c 32)) (: 1 i32)
+                             (and (= kind 0) (= op 16) (= c 0)) 0
+                             (and (= kind 0) (= op 23) (= c 31)) 0
+                             (and (= kind 1) (= op 17) (= c 0)) 1
+                             (and (= kind 1) (= op 18) (= c 4294967295)) 1
+                             (and (= kind 2) (= op 20) (= c 16)) 1
+                             (and (= kind 3) (= op 20) (= c 10)) 1
+                             (and (= kind 4) (= op 19) (= c 18)) 0
+                             (and (= kind 5) (= op 16) (= c 0)) 1
+                             (and (= kind 6) (= op 17) (= c -2147483648)) 1
+                             (and (= kind 7) (= op 19) (= c 7)) 0
+                             (and (= kind 8) (= op 18) (= c 63)) 1
+                             (and (= kind 9) (= op 16) (= c 0)) 0
+                             (and (= kind 11) (= op 17) (= c -1)) 1
+                             (and (= kind 12) (= op 16) (= c 7)) 1
+                             (and (= kind 13) (= op 22) (= c 1844674407370955161)) 1
+                             (and (= kind 14) (= op 16) (= c 256)) 1
+                             (and (= kind 15) (= op 18) (= c 64)) 1
+                             :else -2)]
+                  (when (and (!= want -2) (> test 0) (!= proof want))
+                    (panic "missed range: kind {} op {} c {} proof {} want {}" kind op c proof want))))
+              (when (or (>= proof 0) (= (% (+ kind op (cast i64 (& c 63))) 29) 0))
+                (let [(mut got) (native graph (slice exits) (slice xs) ys a) (mut i) 0]
+                  (for x xs
+                    (let [want (if (expected (cast i32 kind) (cast i32 op) width swapped x c)
+                                   (: 1 i64) 0)]
+                      (unless (= (get got i) want)
+                        (panic "native range: kind {} op {} c {} swapped {} x {} got {} want {}"
+                               kind op c swapped x (get got i) want)))
+                    (set! i (+ i 1)))
+                  (free! (mut got)))))))
+        (free! (mut exits)) (g/release! (mut graph)))))))
+    (free! (mut xs))
+    proofs))
+
+;;; --- Loop counters --------------------------------------------------------
+
+(defstruct Loop [(graph g/Graph) (exits (ArrayList i32)) (query i32) (phi i32) (next i32)])
+
+;;; Return -1 if the tested counter is negative, 0 on normal loop exit. The
+;;; comparison opcode supplies signedness even when TY is unsigned storage.
+;;; OP=0 supplies an unguarded back edge; ARM chooses the continuing projection.
+(defn counted [(ty i32) (seed i64) (step i64) (post bool) (op i32) (arm bool)
+               (merge bool) (swapped bool) (a (dyn Allocator))] (-> Loop)
+  (let [(mut graph) (g/create a) (mut exits) (ArrayList::new [i32] a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        param (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        limit (if (= ty 11) param
+                  (require (b/emit! (mut graph) (if (= (types/size ty 8) 8) 36 35) ty [param])))
+        initial (require (b/scalar-constant! (mut graph) ty (cast u64 (unsigned (cast i128 seed) (types/size ty 8))) 8))
+        delta (require (b/scalar-constant! (mut graph) ty (cast u64 (unsigned (cast i128 step) (types/size ty 8))) 8))
+        zero (require (b/scalar-constant! (mut graph) ty 0 8))
+        retzero (require (b/scalar-constant! (mut graph) 11 0 8))
+        minus (require (b/scalar-constant! (mut graph) 11 0xFFFFFFFFFFFFFFFF 8))
+        enter (require (b/emit! (mut graph) 114 0 [start]))
+        header (require (b/loop-begin! (mut graph) enter))
+        phi (require (b/loop-phi! (mut graph) header initial))
+        next (require (b/emit! (mut graph) 26 ty [phi delta]))
+        tested (if post next phi)
+        condition (if (= op 0) (require (b/scalar-constant! (mut graph) 1 (if arm 1 0) 8))
+                      (require (b/emit! (mut graph) op 1 [tested limit])))
+        guard (require (b/emit! (mut graph) 116 0 [header condition]))
+        yes (require (b/emit! (mut graph) 107 0 [guard (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [guard (: 0 i32)]))
+        negative (require (b/emit! (mut graph) 16 1 [tested zero]))
+        query (require (b/emit! (mut graph) 116 0 [(if arm yes no) negative]))
+        bad (require (b/emit! (mut graph) 107 0 [query (: 0 i32)]))
+        good (require (b/emit! (mut graph) 108 0 [query (: 0 i32)]))
+        back (require (b/emit! (mut graph) 115 0 [good]))]
+    (require (b/patch! (mut graph) header 1 (if swapped back enter)))
+    (require (b/patch! (mut graph) header 2 (if swapped enter back)))
+    (require (b/patch! (mut graph) phi 2 (if swapped next initial)))
+    (require (b/patch! (mut graph) phi 3 (if swapped initial next)))
+    (when merge
+      (let [old (get (.instructions graph) (cast i64 header))]
+        (set! (mut (.instructions graph)) (cast i64 header)
+          (n/make 112 0 (n/auxiliary old) (.op1 old) (.op2 old) (.op3 old))))
+      (g/invalidate-expressions! (mut graph)))
+    (signature! (mut graph) a)
+    (push! (mut exits) (require (b/emit! (mut graph) 120 11 [(if arm no yes) retzero (: 0 i32)])))
+    (push! (mut exits) (require (b/emit! (mut graph) 120 11 [bad minus (: 0 i32)])))
+    (Loop :graph graph :exits exits :query query :phi phi :next next)))
+
+(defn guard-holds? [(op i32) (arm bool) (x i128) (y i128) (width i32)] (-> bool)
+  (if (= op 0) true (= arm (eval op width x y))))
+
+;;; Bounded concrete execution; -2 means no exit in 300 iterations. The proof
+;;; is checked at every reached query, not just at the return.
+(defn simulate [(seed i64) (step i64) (post bool) (op i32) (arm bool)
+                (width i32) (limit i64) (proof i32)] (-> i64)
+  (let [(mut value) (signed (cast i128 seed) width) bound (signed (cast i128 limit) width)
+        (mut answer) (: -2 i64) (mut done) false (mut i) 0]
+    (while (and (not done) (< i 300))
+      (let [next (signed (+ value (cast i128 step)) width) checked (if post next value)]
+        (if (not (guard-holds? op arm checked bound width))
+            (do (set! answer 0) (set! done true))
+            (do
+              (when (and (>= proof 0) (!= (!= proof 0) (< checked 0)))
+                (panic "unsound counter: seed {} step {} post {} op {} width {} bound {} value {} proof {}"
+                  seed step post op width limit checked proof))
+              (when (< checked 0) (set! answer -1) (set! done true))))
+        (set! value next))
+      (set! i (+ i 1)))
+    answer))
+
+(defn counter-check [(ty i32) (seed i64) (step i64) (post bool) (op i32) (arm bool)
+                     (merge bool) (swapped bool) (run bool)] (-> void)
+  (let [a (malloc-allocator) (mut f) (counted ty seed step post op arm merge swapped a)
+        width (types/size ty 8)
+        proof (proof-of (.graph f) (.query f) a)
+        maximum (- (<< (: 1 i128) (cast i128 (- (* width 8) 1))) 1)
+        safe (and (= step 1) (or (and (= op 16) arm) (and (= op 17) (not arm)))
+                  (or (not post) (< (cast i128 seed) maximum)))
+        expected (and safe (if post (>= seed -1) (>= seed 0)))]
+    (unless (and (= proof (if expected 0 -1))
+                 (= expected (scan-decides? (.graph f) (.query f) a)))
+      (panic "counter proof mismatch: ty {} seed {} step {} post {} op {} arm {} merge {} swapped {} proof {}"
+        ty seed step post op arm merge swapped proof))
+    (if (= width 1)
+        (for [limit -128 128] (simulate seed step post op arm width limit proof))
+        (for [delta -2 3]
+          (simulate seed step post op arm width
+            (cast i64 (signed (+ (cast i128 seed) (cast i128 delta)) width)) proof)))
+    (when run
+      (for [delta -2 3]
+        (let [limit (cast i64 (signed (+ (cast i128 seed) (cast i128 delta)) width))
+              want (simulate seed step post op arm width limit proof)]
+          (when (!= want -2)
+            (let [(mut got) (native (.graph f) (slice (.exits f)) [limit] [(: 0 i64)] a)]
+              (unless (= (get got 0) want)
+                (panic "native counter: ty {} seed {} post {} op {} limit {} got {} want {}"
+                  ty seed post op limit (get got 0) want))
+              (free! (mut got)))))))
+    (free! (mut (.exits f))) (g/release! (mut (.graph f)))))
+
+;;; A second, unbounded back edge invalidates a recurrence even when another
+;;; incoming edge has a strict guard.
+(defn multiple-backs [] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        bound (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        one (require (b/scalar-constant! (mut graph) 5 1 8))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        enter (require (b/emit! (mut graph) 114 0 [start]))
+        header (match (g/append-inputs! (mut graph) 112 0 [enter (: 0 i32) 0])
+                 (Some [r] r) (None [] (panic "header")))
+        phi (match (g/append-inputs! (mut graph) 67 5 [header zero (: 0 i32) 0])
+              (Some [r] r) (None [] (panic "phi")))
+        next (require (b/emit! (mut graph) 26 5 [phi one]))
+        less (require (b/emit! (mut graph) 16 1 [phi bound]))
+        guard (require (b/emit! (mut graph) 116 0 [header less]))
+        yes (require (b/emit! (mut graph) 107 0 [guard (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [guard (: 0 i32)]))
+        neg (require (b/emit! (mut graph) 16 1 [phi zero]))
+        query (require (b/emit! (mut graph) 116 0 [no neg]))
+        bad (require (b/emit! (mut graph) 107 0 [query (: 0 i32)]))
+        good (require (b/emit! (mut graph) 108 0 [query (: 0 i32)]))
+        back1 (require (b/emit! (mut graph) 115 0 [yes]))
+        back2 (require (b/emit! (mut graph) 115 0 [good]))
+        ret (require (b/emit! (mut graph) 120 5 [bad phi (: 0 i32)]))]
+    (require (b/patch! (mut graph) header 2 back1))
+    (require (b/patch! (mut graph) header 3 back2))
+    (require (b/patch! (mut graph) phi 3 next))
+    (require (b/patch! (mut graph) phi 4 next))
+    (match (fold/flow-of graph 1 [] false a)
+      (Err [message] (panic "multiple backs: {}" message))
+      (Ok [flow]
+        (unless (and (= (.kind (induction/counter graph (.idom flow) phi 1048576)) 0)
+                     (= (fold/prove graph (.idom flow) true query) -1)
+                     (not (.valid (fold/value-range graph (.idom flow) true phi 4))))
+          (panic "ignored unbounded back edge {}" ret))))
+    (g/release! (mut graph))))
+
+;;; Sum of counter / 4 (or % 4) over a guarded loop. The dividend is the PHI
+;;; (guard on the PHI) or the updated value (guard on the update). The signed
+;;; rule must become the unsigned one exactly when the counter cannot be
+;;; negative, and the native sum must match for negative starts too.
+(defn counter-division [(ty i32) (seed i64) (post bool) (opcode i32)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a) (mut exits) (ArrayList::new [i32] a)
+        width (types/size ty 8)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        param (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        limit (if (= ty 11) param (require (b/emit! (mut graph) 35 ty [param])))
+        initial (require (b/scalar-constant! (mut graph) ty
+                           (cast u64 (unsigned (cast i128 seed) width)) 8))
+        one (require (b/scalar-constant! (mut graph) ty 1 8))
+        four (require (b/scalar-constant! (mut graph) ty 4 8))
+        zero (require (b/scalar-constant! (mut graph) ty 0 8))
+        enter (require (b/emit! (mut graph) 114 0 [start]))
+        header (require (b/loop-begin! (mut graph) enter))
+        phi (require (b/loop-phi! (mut graph) header initial))
+        sum (require (b/loop-phi! (mut graph) header zero))
+        next (require (b/emit! (mut graph) 26 ty [phi one]))
+        tested (if post next phi)
+        quotient (require (b/emit! (mut graph) opcode ty [tested four (: 0 i32)]))
+        total (require (b/emit! (mut graph) 26 ty [sum quotient]))
+        condition (require (b/emit! (mut graph) 16 1 [tested limit]))
+        guard (require (b/emit! (mut graph) 116 0 [header condition]))
+        yes (require (b/emit! (mut graph) 107 0 [guard (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [guard (: 0 i32)]))
+        back (require (b/emit! (mut graph) 115 0 [yes]))
+        result (if (= ty 11) total (require (b/emit! (mut graph) 33 11 [total])))]
+    (require (b/patch! (mut graph) header 2 back))
+    (require (b/patch! (mut graph) phi 3 next))
+    (require (b/patch! (mut graph) sum 3 total))
+    (signature! (mut graph) a)
+    (push! (mut exits) (require (b/emit! (mut graph) 120 11 [no result (: 0 i32)])))
+    (let [maximum (- (<< (: 1 i128) (cast i128 (- (* width 8) 1))) 1)
+          proven (if post (and (>= seed -1) (< (cast i128 seed) maximum)) (>= seed 0))
+          signed-rule (if (= opcode 29) (: 45 i32) 47)
+          rule (match (pipeline/prepare graph 1 (slice exits) a)
+                 (Err [message] (panic "prepare: {}" message))
+                 (Ok [prepared]
+                   (let [(mut prepared) prepared
+                         rule (match (matching/build-with-selects graph (.schedule prepared)
+                                       (.idom prepared) (slice exits) true false a)
+                                (Err [message] (panic "match: {}" message))
+                                (Ok [plan]
+                                  (let [(mut plan) plan
+                                        rule (.rule (get (.tiles plan) (cast i64 quotient)))]
+                                    (matching/release! (mut plan))
+                                    rule)))]
+                     (pipeline/release! (mut prepared))
+                     rule)))]
+      (unless (= rule (if proven (- signed-rule 1) signed-rule))
+        (panic "counter division rule: ty {} seed {} post {} opcode {} rule {}"
+               ty seed post opcode rule))
+      (for [delta -3 9]
+        (let [bound (signed (+ (cast i128 seed) (cast i128 delta)) width)
+              (mut value) (signed (cast i128 seed) width)
+              (mut acc) (: 0 i128) (mut done) false (mut steps) 0]
+          (while (and (not done) (< steps 100))
+            (let [following (signed (+ value 1) width)
+                  checked (if post following value)]
+              (set! acc (signed (+ acc (if (= opcode 29) (/ checked 4) (% checked 4))) width))
+              (if (< checked bound) (set! value following) (set! done true)))
+            (set! steps (+ steps 1)))
+          (when done
+            (let [(mut got) (native graph (slice exits) [(cast i64 bound)] [(: 0 i64)] a)]
+              (unless (= (cast i128 (get got 0)) acc)
+                (panic "counter division native: ty {} seed {} post {} opcode {} bound {} got {} want {}"
+                       ty seed post opcode (cast i64 bound) (get got 0) (cast i64 acc)))
+              (free! (mut got)))))))
+    (free! (mut exits)) (g/release! (mut graph))))
+
+;;; --- Guarded data and emission ---------------------------------------------
+
+;;; A DIV guarded by the projection of an IF that only the fold decides (no
+;;; value is below the signed minimum). SCCP cannot remove the guard from
+;;; under it, so the fold must leave such a function alone; without the guard
+;;; the same IF is folded. Both run correctly.
+(defn guarded-division [(pinned bool)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a) (mut exits) (ArrayList::new [i32] a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        test (require (b/emit! (mut graph) 16 1
+               [x (require (b/scalar-constant! (mut graph) 11 0x8000000000000000 8))]))
+        split (require (b/emit! (mut graph) 116 0 [start test]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        three (require (b/scalar-constant! (mut graph) 11 3 8))
+        quotient (require (b/emit! (mut graph) 29 11 [x three (if pinned yes (: 0 i32))]))
+        other (require (b/emit! (mut graph) 29 11 [x three (if pinned no (: 0 i32))]))
+        bumped (require (b/emit! (mut graph) 26 11
+                 [other (require (b/scalar-constant! (mut graph) 11 1000 8))]))]
+    (signature! (mut graph) a)
+    (push! (mut exits) (require (b/emit! (mut graph) 120 11 [yes quotient (: 0 i32)])))
+    (push! (mut exits) (require (b/emit! (mut graph) 120 11 [no bumped (: 0 i32)])))
+    (match (fold/changes graph 1 [] false a)
+      (Err [message] (panic "changes: {}" message))
+      (Ok [found]
+        (let [(mut found) found]
+          (unless (and (= (len found) 1) (not (.truth (get found 0))))
+            (panic "guarded division: the test is not decided"))
+          (free! (mut found)))))
+    (unless (= (fold/guarded-data? graph) pinned) (panic "guarded data detection"))
+    (match (fold/run graph 1 [] false a)
+      (Err [message] (panic "run: {}" message))
+      (Ok [edited]
+        (match edited
+          (None [] (unless pinned (panic "unguarded division was not folded")))
+          (Some [working]
+            (let [(mut working) working]
+              (when pinned (panic "folded under a guarded division"))
+              (g/release! (mut working)))))))
+    (let [xs (samples) (mut got) (native graph (slice exits) xs [(: 0 i64)] a) (mut i) 0]
+      (for x xs
+        (unless (= (get got i) (+ (/ x 3) 1000))
+          (panic "guarded division native: pinned {} x {} got {}" pinned x (get got i)))
+        (set! i (+ i 1)))
+      (free! (mut got)))
+    (free! (mut exits)) (g/release! (mut graph))))
+
+;;; Signed power-of-two division: two instructions for a halving, three for
+;;; other quotients and four for a remainder; results for every register
+;;; aliasing are covered by jit-binary-matrix.
+(defn division-sizes [] (-> void)
+  (for wide [false true]
+    (for [exponent 1 (if wide 63 31)]
+      (for rule [(: 45 i32) 47]
+        (let [(mut code) (ArrayList::new [u8] (malloc-allocator))
+              tile (select/Tile :rule rule :wide wide :left 1 :right 0
+                                :immediate (cast u64 exponent))
+              size (require (emit/arithmetic! (mut code) tile 3 4 0))
+              want (if (= rule 47) (: 16 i32) (if (= exponent 1) 8 12))]
+          (unless (= size want)
+            (panic "signed power division size: wide {} rule {} exponent {} bytes {} want {}"
+                   wide rule exponent size want))
+          (free! (mut code)))))))
+
+(defn main [] (-> i32)
+  (division-sizes)
+  (guarded-division true)
+  (guarded-division false)
+  (multiple-backs)
+  ; Exhaust all 8-bit initial values and bounds, including the wrapping cases.
+  (for [seed -128 128]
+    (for post [false true]
+      (for op [(: 16 i32) 18 20]
+        (counter-check 2 seed 1 post op true true false false))))
+  ; Both region spellings, reversed predecessor slots and continuing IF_FALSE.
+  (for merge [false true] (for swapped [false true] (for post [false true]
+    (counter-check 5 -1 1 post 16 true merge swapped true)
+    (counter-check 5 0 1 post 17 false merge swapped true)
+    (counter-check 4 -2 1 post 16 true merge swapped true))))
+  ; Boundary native executions and rejections of non-unit/unbounded recurrences.
+  (for ty [(: 2 i32) 4 5 11]
+    (let [width (types/size ty 8)
+          maximum (cast i64 (- (<< (: 1 i128) (cast i128 (- (* width 8) 1))) 1))
+          minimum (cast i64 (- 0 (<< (: 1 i128) (cast i128 (- (* width 8) 1)))))]
+      (for seed [minimum -1 0 (- maximum 1) maximum]
+        (for post [false true]
+          (for op [(: 16 i32) 18 20 0]
+            (counter-check ty seed 1 post op true true false true))))
+      (counter-check ty maximum 2 true 16 true true false true)
+      (counter-check ty 0 2 false 16 true true false true)
+      (counter-check ty 0 -1 false 16 true true false true)))
+  (for ty [(: 10 i32) 11]
+    (let [maximum (cast i64 (- (<< (: 1 i128) (cast i128 (- (* (types/size ty 8) 8) 1))) 1))]
+      (for seed [(: -9 i64) -2 -1 0 1 6 (- maximum 5) (- maximum 1) maximum]
+        (for post [false true]
+          (for opcode [(: 29 i32) 30]
+            (counter-division ty seed post opcode))))))
+  (let [literal (literal-facts) pairs (pair-facts) ranges (expression-ranges)
+        runs (native-facts)]
+    (when (or (< literal 1000) (< pairs 100) (< ranges 500) (< runs 200))
+      (panic "too few proofs exercised: literal {} pair {} range {} native {}"
+             literal pairs ranges runs))
+    (println "fact fold: literal proofs {} pair proofs {} range proofs {} native fact runs {}"
+             literal pairs ranges runs))
+  (println "fact fold: all checks passed")
+  0)

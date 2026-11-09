@@ -13,6 +13,7 @@
 (import "stogir.global-load-forward" :as global-loads)
 (import "stogir.if-convert" :as if-convert)
 (import "stogir.branch-facts" :as branch-facts)
+(import "stogir.fact-fold" :as fact-fold)
 (import "stogir.sccp" :as sccp)
 (import "stogir.sccp-rewrite" :as rewrite)
 (import "stogir.calls" :as calls)
@@ -475,11 +476,17 @@
                     (allocator (dyn Allocator)) (context private/Context) (embed bool)
                     (validated bool)]
   (-> (Result code/Image (slice u8)))
-  (if (not (or (private/branch-facts? context) (private/induction? context)))
-      (vector-image-selects graph entry roots symbol allocator context embed validated
-                            (None [pipeline/Prepared]))
-      (match (branch-facts/run-keeping-preparation graph entry roots allocator
+  ; The sparse fact fold always runs. Either option selects the older
+  ; whole-graph pass in its place; that pass prepares the whole graph, and
+  ; hands its preparation on when it proves nothing.
+  (match (if (or (private/branch-facts? context) (private/induction? context))
+             (branch-facts/run-keeping-preparation graph entry roots allocator
                                                    (private/induction? context))
+             (match (fact-fold/run graph entry roots validated allocator)
+               (Err [message] (Err [branch-facts/Outcome (slice u8)] message))
+               (Ok [edited]
+                   (Ok (branch-facts/Outcome :graph edited
+                                             :prepared (None [pipeline/Prepared]))))))
         (Err [message] (Err message))
         (Ok [outcome]
           (match (.graph outcome)
@@ -495,11 +502,13 @@
                   (Err [message] (Err message))
                   (Ok [rewritten]
                     (let [(mut rewritten) rewritten
+                          ; SCCP's nonzero proof says this very graph
+                          ; passed validation just now.
                           output (vector-image-selects (.graph rewritten) entry (slice (.roots rewritten))
-                                    symbol allocator context embed false
+                                    symbol allocator context embed (!= (.proof rewritten) 0)
                                     (None [pipeline/Prepared]))]
                       (rewrite/release! (mut rewritten))
-                      output))))))))))
+                      output)))))))))
 
 ;;; SEED, here and in the stages below, is pipeline/prepare of exactly this
 ;;; graph, entry and roots, or None. Each stage consumes it: it is handed on
