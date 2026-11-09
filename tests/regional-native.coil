@@ -1,0 +1,144 @@
+;;; Outer values compete with inner-loop values that survive calls. Every
+;;; value remains observable, including zero-trip inner and outer loop cases.
+(module stogir.tests.regional-native)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.fs" :as fs)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+(defn need [T] [(r (Result T (slice u8)))] (-> T)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+(defn raw [(graph (mut g/Graph)) (code u8) (ty u8) (inputs (slice i32))] (-> i32)
+  (match (g/append-inputs! (mut graph) code ty inputs) (Some [r] r) (None [] (panic "append"))))
+(defn callback :cc (cc/C) [(v u64)] (-> u64) (+ (* v 3) 7))
+
+(defn fixture [(enabled bool) (a (dyn Allocator))] (-> image/Image)
+  (let [(mut graph) (g/create a) (mut initial) (ArrayList::new [i32] a)
+        (mut outer) (ArrayList::new [i32] a) (mut inner) (ArrayList::new [i32] a)
+        (mut addresses) (ArrayList::new [i32] a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        pointer (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        outer-limit (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        inner-limit (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        function (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 3]))
+        zero (need (b/scalar-constant! (mut graph) 5 0 8))
+        one (need (b/scalar-constant! (mut graph) 5 1 8))
+        (mut effect) start]
+    (for [j 0 8]
+      (let [offset (need (b/scalar-constant! (mut graph) 5 (cast u64 (* j 8)) 8))
+            address (need (b/emit! (mut graph) 26 6 [pointer offset]))
+            value (need (b/emit! (mut graph) 91 5 [effect address]))]
+        (push! (mut addresses) address) (push! (mut initial) value) (set! effect value)))
+    (let [enter (need (b/emit! (mut graph) 114 0 [effect]))
+          oh (raw (mut graph) 113 0 [enter (: 0 i32)])
+          oi (raw (mut graph) 67 5 [oh zero (: 0 i32)])]
+      (for value initial (push! (mut outer) (raw (mut graph) 67 5 [oh value (: 0 i32)])))
+      (clear! (mut initial))
+      (let [test (need (b/emit! (mut graph) 20 1 [oi outer-limit]))
+            branch (need (b/emit! (mut graph) 116 0 [oh test]))
+            body (need (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+            exit (need (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))]
+        (set! effect body)
+        (for [j 0 8]
+          (let [offset (need (b/scalar-constant! (mut graph) 5 (cast u64 (* (+ j 8) 8)) 8))
+                address (need (b/emit! (mut graph) 26 6 [pointer offset]))
+                value (need (b/emit! (mut graph) 91 5 [effect address]))
+                initial-value (need (b/emit! (mut graph) 26 5 [value oi]))]
+            (push! (mut initial) initial-value) (set! effect value)))
+        (let [ie (need (b/emit! (mut graph) 114 0 [effect]))
+              ih (raw (mut graph) 113 0 [ie (: 0 i32)])
+              ii (raw (mut graph) 67 5 [ih zero (: 0 i32)])]
+          (for value initial (push! (mut inner) (raw (mut graph) 67 5 [ih value (: 0 i32)])))
+          (let [test (need (b/emit! (mut graph) 20 1 [ii inner-limit]))
+                branch (need (b/emit! (mut graph) 116 0 [ih test]))
+                body (need (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+                after (need (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+                (mut signature) (need (calls/create 9 5 [(: 5 u8)] a))
+                called (need (calls/emit! (mut graph) signature body function [(get inner 0)] a))
+                back (need (b/emit! (mut graph) 115 0 [called]))
+                next (need (b/emit! (mut graph) 26 5 [ii one]))]
+            (calls/release! (mut signature))
+            (need (b/patch! (mut graph) ih 2 back)) (need (b/patch! (mut graph) ii 3 next))
+            (for [j 0 8]
+              (let [delta (need (b/scalar-constant! (mut graph) 5 (cast u64 (+ j 1)) 8))
+                    amount (need (b/emit! (mut graph) 26 5 [ii delta]))
+                    value (need (b/emit! (mut graph) 26 5 [(if (= j 0) called (get inner j)) amount]))]
+                (need (b/patch! (mut graph) (get inner j) 3 value))))
+            (let [back (need (b/emit! (mut graph) 115 0 [after]))
+                  next (need (b/emit! (mut graph) 26 5 [oi one]))]
+              (need (b/patch! (mut graph) oh 2 back)) (need (b/patch! (mut graph) oi 3 next))
+              (for [j 0 8]
+                (let [value (need (b/emit! (mut graph) 26 5 [(get outer j) (get inner j)]))]
+                  (need (b/patch! (mut graph) (get outer j) 3 value)))))))
+          (set! effect exit)
+          (let [(mut sum) zero]
+            (for [j 0 8]
+              (set! effect (need (b/emit! (mut graph) 93 0 [effect (get addresses j) (get outer j)])))
+              (set! sum (need (b/emit! (mut graph) 26 5 [sum (get outer j)]))))
+            (let [ret (need (b/emit! (mut graph) 120 5 [effect sum (: 0 i32)]))
+                  (mut signature) (need (calls/create 9 5 [(: 6 u8) 5 5 6] a))]
+              (need (calls/function! (mut graph) signature a)) (calls/release! (mut signature))
+              (let [code (need (compile/image-with-private graph 1 [ret] "_stogir_regional_loop"
+                         (options/Options :level 3) a
+                         (private/with-regional (private/with-rotate (private/with-loop-reloads
+                           (private/with-loop-evict (private/no-context) true) true) true) enabled)))]
+                (g/release! (mut graph)) (free! (mut initial)) (free! (mut outer))
+                (free! (mut inner)) (free! (mut addresses)) code)))))))
+
+(defn execute [(code image/Image) (a (dyn Allocator))] (-> void)
+  (let [(mut module) (need (link/compose [code] a))
+        (mut loaded) (need (jit/map-image (.image module) a))
+        index (match (image/find-symbol (.image module) "_stogir_regional_loop")
+          (Some [i] i) (None [] (panic "symbol")))
+        function (p/cast (fnptr (cc/C) [(ptr u64) u64 u64 u64] u64)
+          (p/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))
+        target (p/cast u64 (p/cast (ptr u8) (fnptr-of callback)))]
+    (for count [(: 0 u64) 1 2 5]
+      (for trips [(: 0 u64) 1 2 7]
+        (for seed [(: 0 u64) 17 0xFFFFFFFFFFFFFF00]
+          (let [(mut cells) (ArrayList::new [u64] a) (mut expected) (ArrayList::new [u64] a)
+                (mut temporary) (ArrayList::new [u64] a) (mut sum) (: 0 u64)]
+            (for [j 0 16]
+              (push! (mut cells) (+ seed (cast u64 (* j 13)))) (push! (mut expected) (get cells j)))
+            (for [j 0 8] (push! (mut temporary) 0))
+            (for [i (: 0 u64) count]
+              (for [j 0 8] (set! (mut temporary) j (+ (get expected (+ j 8)) i)))
+              (for [k (: 0 u64) trips]
+                (for [j 0 8]
+                  (let [v (get temporary j) v (if (= j 0) (+ (* v 3) 7) v)]
+                    (set! (mut temporary) j (+ v (+ k (cast u64 (+ j 1))))))))
+              (for [j 0 8] (set! (mut expected) j (+ (get expected j) (get temporary j)))))
+            (for [j 0 8] (set! sum (+ sum (get expected j))))
+            (assert (= (function (.data cells) count trips target) sum))
+            (for [j 0 16] (assert (= (get cells j) (get expected j))))
+            (free! (mut cells)) (free! (mut expected)) (free! (mut temporary))))))
+    (jit/release-image! (mut loaded)) (link/release! (mut module))))
+
+(defn main [] (-> i32)
+  (let [a (malloc-allocator) (mut baseline) (ArrayList::new [u8] a)]
+    (for enabled [false true]
+      (let [(mut code) (fixture enabled a)]
+        (execute code a)
+        (if enabled
+          (let [(mut same) (= (len baseline) (len (.text code)))]
+            (when same
+              (for [i 0 (len baseline)] (unless (= (get baseline i) (get (.text code) i)) (set! same false))))
+            (assert (not same))
+            (let [(mut object) (need (macho/image-object code a))]
+              (match (fs/write-file a "/tmp/coil-stogir-regional-loop.o" (slice object))
+                (Err [_] (panic "write")) (Ok [_] 0)) (free! (mut object))))
+          (for byte (.text code) (push! (mut baseline) byte)))
+        (image/release! (mut code))))
+    (free! (mut baseline)))
+  (println "regional nested-loop JIT, empty paths, calls and pressure: pass") 0)
