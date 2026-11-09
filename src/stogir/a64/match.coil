@@ -9,6 +9,7 @@
 (import "stogir.schedule" :as schedule)
 (import "stogir.matched-uses" :as machine)
 (import "stogir.conditional" :as conditional)
+(import "stogir.nonnegative" :as nonnegative)
 (import "stogir.a64.select" :as select)
 (import "stogir.a64.address" :as address)
 (import "stogir.a64.memory" :as memory)
@@ -49,8 +50,11 @@
 ;;; Branch fusion mirrors IR_CMP_AND_BRANCH_INT. The optional independent
 ;;; COND extension consumes a single-use, unobserved, same-block 64-bit integer
 ;;; comparison for a word integer result. Other rules keep ordinary def/uses.
+;;; idom is indexed by block-start reference (pipeline dominators); an empty
+;;; list restricts signed power-of-two division proofs to expression structure.
 (defn build-with-selects [(graph g/Graph)
              (scheduled schedule/Schedule)
+             (idom (ArrayList i32))
              (roots (slice i32))
              (fuse bool)
              (fuse-selects bool)
@@ -137,7 +141,17 @@
         (when (scalar-tile? graph node)
           (match (select/select graph reference)
             (Err [message] (set! error message))
-            (Ok [tile] (set! (mut tiles) index tile)))))) (set! for-index-1 (+ for-index-1 1))))
+            ; A signed power-of-two DIV/MOD of a dividend proven non-negative
+            ; at this block equals the unsigned one: a single LSR or AND.
+            (Ok [tile]
+              (set! (mut tiles) index
+                    (if (and fuse (or (= (.rule tile) 45) (= (.rule tile) 47))
+                             (>= (types/scalar-size (cast i32 (n/type-id node)) 8) 4)
+                             (nonnegative/proven? graph idom block (.left tile)))
+                        (select/Tile :rule (- (.rule tile) 1) :wide (.wide tile)
+                                     :left (.left tile) :right 0
+                                     :immediate (.immediate tile))
+                        tile))))))) (set! for-index-1 (+ for-index-1 1))))
     ; Remove only each consumed Boolean edge. Shared/protected comparisons
     ; remain definitions; no new arithmetic edges are speculated.
     (for reference choices
@@ -475,7 +489,10 @@
 
 (defn build [(graph g/Graph) (scheduled schedule/Schedule) (roots (slice i32))
              (fuse bool) (a (dyn Allocator))] (-> (Result Plan (slice u8)))
-  (build-with-selects graph scheduled roots fuse false a))
+  (let [(mut idom) (ArrayList::new [i32] a)
+        result (build-with-selects graph scheduled idom roots fuse false a)]
+    (free! (mut idom))
+    result))
 
 (defn release! [(plan (mut Plan))] (-> void)
   (free! (mut (.static-sizes plan)))
