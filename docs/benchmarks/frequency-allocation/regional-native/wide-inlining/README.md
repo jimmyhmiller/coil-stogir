@@ -1,14 +1,42 @@
-# Broader inlining with regional allocation — experiment in progress
+# Broader inlining with regional allocation: runtime result
 
-The broad rotation control has built successfully. The regional host is still building from the same fixed compiler source and preserved generator. Neither broad build is a serial generation measurement: preparation overlapped other build/validation work.
+Broader inlining does not improve the regional host on the fixed compiler workload. Three serial alternating rounds show broad regional inlining **1.187% slower by median** (1.457% by minimum) than retained-small regional inlining. Load hoisting is effectively tied: +0.081% median, +0.416% minimum. Retain the small regional policy for subsequent experiments; neither addition earns promotion from these results.
 
-A one-second, 10ms-interval `sample` of the active compiler showed 83 samples in the compilation thread: 44 in the transfer-construction branch (43 directly in `allocation-transfers.build`), 39 in the scoped recoloring branch (36 directly in `run-scoped!`). This short sample is a local bottleneck clue, not a whole-build percentage estimate. Raw sampling output is archived alongside this note. Source inspection shows internal transfer discovery scans all parts at every schedule position, and scoped interference construction checks every pair, including frozen/frozen pairs. Later generation work should preserve exact transfer order, domains, search decisions and emitted bytes while improving those algorithms.
+The best median is **1.27471× LLVM**, leaving 7.433B cycles (13.706% of that host's cycles) to reach 1.10×. The joint generation/runtime goal remains unmet. These are a fresh comparison; the earlier 1.26767× observation is retained in the parent report rather than mixed into this run.
 
-The intended runtime comparison is a two-by-two test: retained-small vs broad inlining, each with rotation alone vs rotation plus regional allocation, with a fresh LLVM control. Wait for all task-owned build/test work to finish, alternate the five hosts serially for three rounds, and require the fixed seed output hash for every run.
+## Runtime
 
-The broad inline policy is `budget=4096,template=2048,small=256,small-scope=any,hoist=1,always=1,pair=1,indirect=1`. All four Stogir hosts use loop eviction/reloads, prediction and induction. Generation cost recovery is deferred until the runtime experiment supplies a result. No policy is promoted on the basis of these pending builds.
+| Host | Minimum cycles (B) | Median cycles (B) | Median / LLVM | Median instructions (B) |
+|---|---:|---:|---:|---:|
+| LLVM | 42.368 | 42.545 | 1.0000 | 139.836 |
+| Small + rotation | 54.547 | 54.915 | 1.2908 | 209.677 |
+| Small + rotation + regional | 54.039 | 54.233 | 1.2747 | 206.833 |
+| Broad + rotation | 55.856 | 56.034 | 1.3170 | 215.648 |
+| Broad + rotation + regional | 54.826 | 54.876 | 1.2898 | 208.554 |
+| Small + rotation + regional + hoisting | 54.264 | 54.277 | 1.2757 | 205.928 |
 
+All 18 output objects equal the fixed seed SHA-256 `9d775276a9d02daf921868c2bbca12344b97c4fa596a78bf0a75393ae24028cb`. Every task-owned build/test process was terminal before timing. Each host runs alone; order reverses every other round. Normal desktop activity remained. The second broad-regional observation was 57.384B cycles versus 54.876B and 54.826B in the other rounds; it remains in the archived data. No outlier is removed. Raw counters, every row, host hashes and exact command are under `runtime/`.
 
-Continuation: the original broad regional build still runs under preserved generator `f5d103…` (tool session `70232`, compiler PID `86358`). The broad rotation control is complete at integration `build/regional-native/wide-rotate/bin/coil`. All latest setup validation jobs have finished. The interrupted first-setup broad build is not the pending original build and has no completed host. Latest production setup is library `5955426` / Coil `115f3f72`, with byte-identical retained-small output and passing quick FAST; see `../indexed-setup/`.
+Regional allocation improves broad inlining's median by 2.066% relative to broad rotation alone, but cannot recover its entire deficit to small regional inlining. The broad policy still retires 1.721B more instructions than small regional. Hoisting removes 0.905B instructions without a demonstrated cycle win. The outcomes do not justify further generation tuning of either added policy as a route to this runtime target.
 
-Once the original build completes successfully, run the runtime comparison from the library worktree using `docs/benchmarks/deferred-loop-splits/compare.py`, fixed source `coil/.worktrees/stogir-branch-fusion`, and a fresh output directory. Compare `llvm` = fixed source `build/n8-full8/host-llvm/bin/coil`, `rotate` = integration `build/regional-native/rotate-control/bin/coil`, `regional` = integration `build/regional-native/host/bin/coil`, `wide-rotate` = integration `build/regional-native/wide-rotate/bin/coil`, and `wide-regional` = integration `build/regional-native/wide-regional/bin/coil`, for three alternating rounds. Require every output to hash to `9d775276a9d02daf921868c2bbca12344b97c4fa596a78bf0a75393ae24028cb`. Do not time while any task-owned build/test job remains active.
+## Policies and provenance
+
+All Stogir hosts enable loop eviction/reloads, prediction, induction and rotation. Small inlining uses `small=80,small-scope=any,hoist=1`. Broad uses `budget=4096,template=2048,small=256,small-scope=any,hoist=1,always=1,pair=1,indirect=1`. The regional variants add `COIL_STOGIR_REGIONAL=1`; the hoisting variant also adds `COIL_STOGIR_HOIST_LOADS=1`.
+
+Fixed compiler source is Coil `892641a250c5ab508134a989eec1c96167b9a250`, source tree `82558967946e5863d28704d93d37704b67d6e1a6`. Runtime hosts all compile that source. Broad regional was generated by preserved candidate `4d06a5b2a1eb9681aa4be70ce5996199200454e6ab6e4a30d86b026203044b7c`, library `59edaf4`, integration `2b02902e`. Its host object is `9c9cd3ddc273a2515e6b3ed69dab276dba18b9ab679e034ecd9eb8cdb9edcdb5`. The small regional and broad rotation objects exactly reproduce their original-generator counterparts; see `../incremental-scoring/` for the independent score oracle and identities.
+
+## Build cost and stopped experiment
+
+The newer broad-regional build completed, reporting 1394.436s of backend work. This is **concurrent preparation, not a controlled generation measurement**. Its output passed a separate fixed-seed functional check before runtime timing.
+
+The original broad-regional build under generator `f5d103…` was intentionally terminated after 71m29s elapsed, once the newer host was built and functionally checked. The exact process identity and stop record are in `original-wide-interrupted.json`; its partial generation log is preserved. It produced no completed host. Therefore no original/new broad-object byte identity or generation speedup is claimed. The earlier first-setup broad attempt was also intentionally stopped and remains incomplete. Neither stopped job is left running.
+
+The original short sample (`build-sample.txt.gz`) located repeated transfer/scoped-graph setup. Exact indexing and incremental scoring enabled the completed experiment without changing search choices. The later sample in `../incremental-scoring/wide-late.sample.gz` still finds substantial site rescoring. Those samples are local bottleneck evidence, not whole-build percentage estimates.
+
+## Validation and next work
+
+The score unit test, full-score search oracles, captured native object identity, nested-loop JIT/C-linked checks, regional-plus-hoisting native fixture and quick FAST pass. The whole standalone/linked suite has not been freshly repeated after exact scoring changes; final full FAST, live emission and repeated bootstraps remain acceptance gates. This experiment does not claim those gates or the performance goal complete.
+
+Actual disassembly still shows redundant address arithmetic in `src-mod-lookup-at`: Stogir recomputes `index*40` and the full address each iteration; LLVM advances a pointer. The evidence in `../incremental-scoring/lookup-{regional,hoist,llvm}.dis` supports a general loop strength-reduction experiment. Multiply-add selection is a separate, narrower opportunity, with memory-address sharing and all selected operands requiring explicit handling before liveness. Neither is implemented or measured by this report.
+
+Reproduce runtime with the exact `command` in `runtime/metadata.json`, choosing a fresh output directory. Nothing installed or pushed.
