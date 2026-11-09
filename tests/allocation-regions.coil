@@ -1,0 +1,66 @@
+(module stogir.tests.allocation-regions)
+(import "stogir.allocation" :as a)
+(import "stogir.allocation-regions" :as regions)
+(import "stogir.allocation-check" :as check)
+(import "stogir.interval" :as r)
+(import "stogir.constraints" :as c)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Ok Err])
+
+(defn location [(parts (ArrayList a/Part)) (parent i32) (position i64)] (-> i32)
+  (let [(mut found) (: -2 i32)]
+    (for part parts
+      (when (and (= (.parent part) parent) (a/covers? part position))
+        (assert (= found -2))
+        (set! found (.register part))))
+    found))
+
+(defn case! [(blocked i32)] (-> void)
+  (let [allocator (malloc-allocator)
+        (mut parts) (ArrayList::new [a/Part] allocator)
+        (mut sources) (ArrayList::new [i32] allocator)
+        (mut changes) (ArrayList::new [regions/Change] allocator)]
+    (for [i 0 3] (push! (mut sources) -1))
+    (for [i 0 2]
+      (let [(mut before) (a/create (cast i32 i) allocator)
+            (mut after) (a/create (cast i32 i) allocator)]
+        (r/add! (mut (.ranges before)) 0 20)
+        (set! (.register before) (cast i32 i))
+        (r/add! (mut (.ranges after)) (if (= blocked 4) 34 20) 50)
+        (set! (.register after) (if (= i 0) -1 0))
+        (set! (.spill-slot after) (* i 8))
+        (when (and (= blocked 1) (= i 1))
+          (c/add! (mut (.uses after)) 35 1 -1))
+        (push! (mut parts) before)
+        (push! (mut parts) after)))
+    (when (= blocked 2) (a/reserve! (mut parts) 2 30 40 allocator))
+    (when (= blocked 3)
+      (let [(mut missing) (a/create 2 allocator)]
+        (r/add! (mut (.ranges missing)) 30 40)
+        (set! (.register missing) 2)
+        (push! (mut parts) missing)))
+    (let [changed (regions/inherit! (mut parts) 30 40 19 (mut sources) (mut changes) allocator)]
+      (if (= blocked 0)
+          (do
+            (assert (= changed 2))
+            (assert (= (location parts 0 35) 0))
+            (assert (= (location parts 1 35) 1))
+            ; Both outside pieces retain their original assignments.
+            (assert (= (location parts 0 29) -1))
+            (assert (= (location parts 0 40) -1))
+            (assert (= (location parts 1 29) 0))
+            (assert (= (location parts 1 40) 0)))
+          (do
+            (assert (= changed 0))
+            (assert (= (location parts 0 35) -1))
+            (assert (= (location parts 1 35) 0)))))
+    (match (check/verify parts 3 7)
+      (Err [message] (panic "{}" message)) (Ok [_] 0))
+    (for [i 0 (len parts)] (a/release! (elem (mut parts) i)))
+    (free! (mut parts)) (free! (mut sources)) (free! (mut changes))))
+
+(defn main [] (-> i32)
+  (for [i 0 5] (case! (cast i32 i)))
+  (println "allocation region inheritance: pass")
+  0)
