@@ -1,0 +1,201 @@
+(module stogir.tests.general-if-conversion)
+(import "stogir.aot.macho" :as macho)
+(import "coil.fs" :as fs)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.if-convert" :as convert)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as p)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn need [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [message] (panic "{}" message))))
+(defn raw [(graph (mut g/Graph)) (code u8) (ty u8) (inputs (slice i32))] (-> i32)
+  (match (g/append-inputs! (mut graph) code ty inputs)
+    (Some [r] r) (None [] (panic "append"))))
+(defstruct Fixture [(graph g/Graph) (roots (ArrayList i32)) (phi i32) (branch i32)])
+
+;;; 0: arbitrary available values; 1: shift; 2: multiply; 3: multiple PHIs
+;;; sharing one expression; 4: division; 5: guarded load; 6: excessive work;
+;;; 7: speculation budget shared between two PHIs; 8: five available PHIs;
+;;; 9: floating conversion is not safe speculation.
+(defn build [(mode i32) (reversed bool) (a (dyn Allocator))] (-> Fixture)
+  (let [(mut graph) (g/create a) (mut roots) (ArrayList::new [i32] a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        choice (need (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        x (need (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        y (need (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        ptr (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 3]))
+        zero (need (b/scalar-constant! (mut graph) 11 0 8))
+        one (need (b/scalar-constant! (mut graph) 11 1 8))
+        condition (need (b/emit! (mut graph) 15 1 [choice zero]))
+        branch (need (b/emit! (mut graph) 116 0 [start condition]))
+        yes (need (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        no (need (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        (mut value) x]
+    (cond (= mode 1) (set! value (raw (mut graph) 49 11 [x one]))
+          (or (= mode 2) (= mode 3) (= mode 7)) (set! value (raw (mut graph) 28 11 [x y]))
+          (= mode 4) (set! value (raw (mut graph) 29 11 [x y yes]))
+          (= mode 5) (set! value (need (b/emit! (mut graph) 91 11 [yes ptr])))
+          (= mode 6)
+            (for [i 0 5] (set! value (raw (mut graph) 26 11 [value y])))
+          (= mode 9)
+            (let [floating (raw (mut graph) 36 12 [x])]
+              (set! value (raw (mut graph) 38 11 [floating])))
+          :else 0)
+    (let [end1 (need (b/emit! (mut graph) 114 0 [(if (= mode 5) value yes)]))
+          end2 (need (b/emit! (mut graph) 114 0 [no]))
+          merge (raw (mut graph) 112 0 (if reversed [end2 end1] [end1 end2]))
+          phi (raw (mut graph) 67 11 (if reversed [merge y value] [merge value y]))
+          (mut result) phi]
+      (when (or (= mode 3) (= mode 7))
+        (let [other (if (= mode 7) (raw (mut graph) 28 11 [x x]) value)
+              extra (raw (mut graph) 67 11 (if reversed [merge x other] [merge other x]))]
+          (set! result (raw (mut graph) 26 11 [phi extra]))))
+      (when (= mode 8)
+        (for [i 0 4]
+          (let [extra (raw (mut graph) 67 11 (if reversed [merge x y] [merge y x]))]
+            (set! result (raw (mut graph) 26 11 [result extra])))))
+      (push! (mut roots) (need (b/emit! (mut graph) 120 11 [merge result (: 0 i32)])))
+      ; Observe both removable arm controls and values as well as the return.
+      (for ref [end1 end2 yes no branch merge phi] (push! (mut roots) ref))
+      (let [(mut signature) (match (calls/create 0 11 [(: 11 u8) 11 11 6] a)
+                              (Ok [s] s) (Err [message] (panic "{}" message)))]
+        (need (calls/function! (mut graph) signature a)) (calls/release! (mut signature)))
+      (Fixture :graph graph :roots roots :phi phi :branch branch))))
+
+(defn structural [(f Fixture) (expected i64) (a (dyn Allocator))] (-> void)
+  (match (convert/run (.graph f) 1 (slice (.roots f)) a)
+    (Err [message] (panic "convert: {}" message))
+    (Ok [result]
+      (unless (= (.diamonds result) expected) (panic "count {} expected {}" (.diamonds result) expected))
+      (let [(mut roots) (.roots result)]
+        (match (.graph result)
+          (None [] (unless (= expected 0) (panic "missing graph")))
+          (Some [graph]
+            (let [(mut graph) graph]
+              (unless (= (n/opcode (get (.instructions graph) (cast i64 (.phi f)))) 60) (panic "missing COND"))
+              (for ref roots
+                (when (= (n/opcode (get (.instructions graph) (cast i64 ref))) 0) (panic "root was removed")))
+              (match (pipeline/prepare graph 1 (slice roots) a)
+                (Err [message] (panic "after: {}" message))
+                (Ok [prepared] (let [(mut prepared) prepared] (pipeline/release! (mut prepared)))))
+              (match (convert/run graph 1 (slice roots) a)
+                (Err [message] (panic "repeat: {}" message))
+                (Ok [again]
+                  (unless (= (.diamonds again) 0) (panic "not a fixed point"))
+                  (match (.graph again) (None [] 0) (Some [_] (panic "unexpected owned graph")))
+                  (let [(mut exits) (.roots again)] (free! (mut exits)))))
+              (g/release! (mut graph)))))
+        (free! (mut roots))))))
+
+(defn native [(f Fixture) (mode i32) (enabled bool) (a (dyn Allocator))] (-> void)
+  (match (compile/image-with-private (.graph f) 1 (slice (.roots f)) "_select_entry"
+           (options/Options :level 3) a (private/with-if-convert (private/no-context) enabled))
+    (Err [message] (panic "compile {}: {}" mode message))
+    (Ok [code]
+      (let [(mut code) code]
+        (match (link/compose [code] a)
+          (Err [message] (panic "link: {}" message))
+          (Ok [module]
+            (let [(mut module) module]
+              (match (jit/map-image (.image module) a)
+                (Err [message] (panic "map: {}" message))
+                (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        index (match (image/find-symbol (.image module) "_select_entry")
+                                (Some [id] id) (None [] (panic "symbol")))
+                        function (p/cast (fnptr (cc/C) [u64 u64 u64 (ptr u64)] u64)
+                          (p/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))]
+                    (for choice [(: 0 u64) 1 0x8000000000000000]
+                      (for x [(: 0 u64) 1 17 0x7FFFFFFFFFFFFFFF 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
+                        (for y [(: 1 u64) 3 0xFFFFFFFFFFFFFFFF]
+                          (let [(mut cell) (: 37 u64)
+                                pointer (if (= choice 0) (p/cast (ptr u64) 0) (p/cast (ptr u64) (mut cell)))
+                                value (cond (= mode 1) (<< x 1)
+                                            (or (= mode 2) (= mode 3) (= mode 7)) (* x y)
+                                            (= mode 5) cell
+                                            (= mode 6) (+ x (* 5 y))
+                                            :else x)
+                                selected (if (= choice 0) y value)
+                                expected (cond (= mode 3) (+ selected (if (= choice 0) x value))
+                                               (= mode 7) (+ selected (if (= choice 0) x (* x x)))
+                                               (= mode 8) (+ selected (* 4 (if (= choice 0) x y)))
+                                               :else selected)
+                                actual (function choice x y pointer)]
+                            (unless (= actual expected)
+                              (panic "mode {} enabled {} choose {} x {} y {} actual {} expected {}"
+                                mode enabled choice x y actual expected))))))
+                    (jit/release-image! (mut loaded)))))
+              (link/release! (mut module)))))
+        (image/release! (mut code))))))
+
+(defn adjacent [(a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        choice (need (b/emit! (mut graph) 71 1 [start (: 0 i32) 0]))
+        x (need (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        y (need (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        (mut control) start (mut value) x]
+    (for [i 0 3]
+      (let [branch (need (b/emit! (mut graph) 116 0 [control choice]))
+            yes (need (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+            no (need (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+            end1 (need (b/emit! (mut graph) 114 0 [yes]))
+            end2 (need (b/emit! (mut graph) 114 0 [no]))
+            merge (raw (mut graph) 112 0 [end1 end2])
+            phi (raw (mut graph) 67 11 [merge value y])]
+        (set! control merge) (set! value phi)))
+    (let [exit (need (b/emit! (mut graph) 120 11 [control value (: 0 i32)]))]
+      (match (convert/run graph start [exit] a)
+        (Err [message] (panic "adjacent: {}" message))
+        (Ok [result]
+          (unless (= (.diamonds result) 3) (panic "adjacent count {}" (.diamonds result)))
+          (let [(mut roots) (.roots result)] (free! (mut roots)))
+          (match (.graph result)
+            (None [] (panic "adjacent graph"))
+            (Some [owned] (let [(mut owned) owned] (g/release! (mut owned))))))))
+    (g/release! (mut graph))))
+
+;;; Save a fresh standalone Mach-O fixture for the native C ABI consumer.
+(defn aot [(a (dyn Allocator))] (-> void)
+  (let [(mut f) (build 3 true a)]
+    (match (compile/image-with-private (.graph f) 1 (slice (.roots f)) "_stogir_general_select"
+             (options/Options :level 3) a (private/with-if-convert (private/no-context) true))
+      (Err [message] (panic "AOT compile: {}" message))
+      (Ok [image]
+        (let [(mut image) image]
+          (match (macho/image-object image a)
+            (Err [message] (panic "AOT object: {}" message))
+            (Ok [bytes]
+              (let [(mut bytes) bytes]
+                (match (fs/write-file a "/tmp/coil-stogir-general-select.o" (slice bytes))
+                  (Err [_] (panic "AOT write")) (Ok [_] 0))
+                (free! (mut bytes)))))
+          (image/release! (mut image)))))
+    (g/release! (mut (.graph f))) (free! (mut (.roots f)))))
+
+(defn main [] (-> i32)
+  (let [a (malloc-allocator)]
+    (for reversed [false true]
+      (for [mode 0 10]
+        (let [(mut f) (build (cast i32 mode) reversed a)]
+          (structural f (if (< mode 4) 1 0) a)
+          (unless (= (n/opcode (get (.instructions (.graph f)) (cast i64 (.phi f)))) 67)
+            (panic "source graph was mutated"))
+          (when (and (!= mode 4) (< mode 9)) (for enabled [false true] (native f (cast i32 mode) enabled a)))
+          (g/release! (mut (.graph f))) (free! (mut (.roots f)))))))
+  (adjacent (malloc-allocator))
+  (aot (malloc-allocator))
+  (println "general if-conversion: ok") 0)
