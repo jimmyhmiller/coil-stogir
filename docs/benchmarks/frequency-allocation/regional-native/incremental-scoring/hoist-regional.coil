@@ -1,0 +1,210 @@
+(module stogir.tests.loop-load-hoist)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.loop-load-hoist" :as hoist)
+(import "stogir.loop-rotate" :as rotate)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+(defstruct Fixture [(graph g/Graph) (roots (ArrayList i32)) (header i32) (enter i32) (load i32)])
+
+;;; MODE 0: invariant header load; 1: body-only load; 2: aliasing store;
+;;; 3: volatile header load; 4: variant address; 5: dependent pointer loads;
+;;; 6: only the loaded data is a root; 7: floating invariant address; 8: call;
+;;; 9: atomic fence.
+(defn build [(mode i32) (a (dyn Allocator))] (-> Fixture)
+  (let [(mut graph) (g/create a) (mut roots) (ArrayList::new [i32] a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        pointer (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        limit (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        enter (require (b/emit! (mut graph) 114 0 [start]))
+        header (require (b/loop-begin! (mut graph) enter))
+        phi (require (b/loop-phi! (mut graph) header zero))
+        sum (require (b/loop-phi! (mut graph) header zero))
+        chain (if (= mode 5) (require (b/emit! (mut graph) 91 6 [header pointer])) header)
+        address (cond (= mode 4) (require (b/emit! (mut graph) 26 6 [pointer phi]))
+                      (= mode 5) chain
+                      (= mode 7) (require (b/emit! (mut graph) 26 6 [pointer one]))
+                      :else pointer)
+        headload (if (= mode 1) header
+                     (require (b/emit! (mut graph) (if (= mode 3) 92 91) 11 [chain address])))
+        condition (require (b/emit! (mut graph) 20 1 [phi limit]))
+        branch (require (b/emit! (mut graph) 116 0 [headload condition]))
+        yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        load (if (= mode 1) (require (b/emit! (mut graph) 91 11 [yes pointer])) headload)
+        called (if (= mode 8)
+                   (let [(mut sig) (match (calls/create 0 0 [] a)
+                                     (Err [message] (panic "{}" message)) (Ok [sig] sig))
+                         call (require (calls/emit! (mut graph) sig yes pointer [] a))]
+                     (calls/release! (mut sig)) call)
+                   (if (= mode 9) (require (b/emit! (mut graph) 130 0 [yes])) yes))
+        control (if (= mode 2) (require (b/emit! (mut graph) 93 0 [yes pointer phi]))
+                    (if (= mode 1) load called))
+        added (require (b/emit! (mut graph) 26 11 [sum load]))
+        next (require (b/emit! (mut graph) 26 11 [phi one]))
+        back (require (b/emit! (mut graph) 115 0 [control]))]
+    (let [(mut signature) (match (calls/create 0 11 [(: 6 u8) (: 11 u8)] a)
+                            (Err [message] (panic "{}" message)) (Ok [s] s))]
+      (require (calls/function! (mut graph) signature a))
+      (calls/release! (mut signature)))
+    (require (b/patch! (mut graph) header 2 back))
+    (require (b/patch! (mut graph) phi 3 next))
+    (require (b/patch! (mut graph) sum 3 added))
+    (push! (mut roots) (require (b/emit! (mut graph) 120 11 [no sum (: 0 i32)])))
+    (when (= mode 6) (clear! (mut roots)) (push! (mut roots) load))
+    (Fixture :graph graph :roots roots :header header :enter enter :load load)))
+
+(defn native [(f Fixture) (mode i32) (enabled bool) (rotated bool) (a (dyn Allocator))] (-> void)
+  (match (compile/image-with-private (.graph f) 1 (slice (.roots f)) "_lh_entry"
+           (options/Options :level 3) a
+           (private/with-regional (private/with-hoist-loads (private/with-rotate (private/no-context) rotated) enabled) true))
+    (Err [message] (panic "native compile mode {} rotate {}: {}" mode rotated message))
+    (Ok [code]
+      (let [(mut code) code]
+        (match (link/compose [code] a)
+          (Err [message] (panic "compose: {}" message))
+          (Ok [module]
+            (let [(mut module) module]
+              (match (jit/map-image (.image module) a)
+                (Err [message] (panic "map: {}" message))
+                (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        index (match (image/find-symbol (.image module) "_lh_entry")
+                                (Some [id] id) (None [] (panic "symbol")))
+                        function (primitive/cast (fnptr (cc/C) [(ptr u64) u64] u64)
+                          (primitive/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))]
+                    (when (= mode 1)
+                      (unless (= (function (primitive/cast (ptr u64) 0) 0) 0)
+                        (panic "zero-trip body load")))
+                    (for count [(: 0 u64) 1 2 3 10 101]
+                      (let [(mut cell) (: 17 u64)
+                            expected (if (and (= mode 2) (> count 0))
+                                         (+ 17 (/ (* (- count 1) (- count (if (> count 1) 2 1))) 2))
+                                         (* count 17))
+                            got (function (mut cell) count)]
+                        (unless (= got expected)
+                          (panic "mode {} enabled {} rotated {} count {} got {} expected {}"
+                            mode enabled rotated count got expected))
+                        (when (and (= mode 2) (> count 0))
+                          (unless (= cell (- count 1)) (panic "store lost")))))
+                    (jit/release-image! (mut loaded)))))
+              (link/release! (mut module)))))
+        (image/release! (mut code))))))
+
+(defn guarded-shape [(a (dyn Allocator))] (-> void)
+  (let [(mut f) (build 1 a)]
+    (match (rotate/run (.graph f) 1 (slice (.roots f)) a)
+      (Err [message] (panic "rotate: {}" message))
+      (Ok [result]
+        (let [(mut exits) (.roots result)]
+          (match (.graph result)
+            (None [] (panic "body test did not rotate"))
+            (Some [graph]
+              (let [(mut graph) graph]
+                (match (hoist/run graph 1 (slice exits) a)
+                  (Err [message] (panic "guarded hoist: {}" message))
+                  (Ok [moved]
+                    (unless (= (.loads moved) 1) (panic "guarded body load did not hoist"))
+                    (let [(mut roots) (.roots moved)] (free! (mut roots)))
+                    (match (.graph moved)
+                      (None [] (panic "missing guarded graph"))
+                      (Some [owned]
+                        (let [(mut owned) owned
+                              predecessor (.op1 (get (.instructions owned) (cast i64 (.load f))))]
+                          (unless (= (hoist/opcode owned predecessor) 107) (panic "load escaped entry guard"))
+                          (g/release! (mut owned)))))))
+                (g/release! (mut graph)))))
+          (free! (mut exits)))))
+    (g/release! (mut (.graph f))) (free! (mut (.roots f)))))
+
+(defn raw [(graph (mut g/Graph)) (code u8) (ty u8) (inputs (slice i32))] (-> i32)
+  (match (g/append-inputs! (mut graph) code ty inputs)
+    (Some [r] r) (None [] (panic "append"))))
+
+;;; Multiple back edges must all be read-only. Nested must-execute loads can
+;;; move through both entries, with fresh analyses after each move.
+(defn topology [(nested bool) (store bool) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        pointer (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        choose (require (b/emit! (mut graph) 71 1 [start (: 0 i32) 1]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        entry (require (b/emit! (mut graph) 114 0 [start]))
+        outer (if nested (raw (mut graph) 113 0 [entry (: 0 i32)]) entry)
+        inner-entry (if nested (require (b/emit! (mut graph) 114 0 [outer])) entry)
+        header (if nested (raw (mut graph) 113 0 [inner-entry (: 0 i32)])
+                   (raw (mut graph) 112 0 [entry (: 0 i32) 0]))
+        load (require (b/emit! (mut graph) 91 11 [header pointer]))
+        condition (require (b/emit! (mut graph) 15 1 [load zero]))
+        branch (require (b/emit! (mut graph) 116 0 [load condition]))
+        yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        split (require (b/emit! (mut graph) 116 0 [(if nested no yes) choose]))
+        left (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        right (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        effect (if store (require (b/emit! (mut graph) 93 0 [right pointer zero])) right)
+        back (require (b/emit! (mut graph) 115 0 [(if nested yes left)]))
+        second (require (b/emit! (mut graph) 115 0 [(if nested left effect)]))
+        exit (require (b/emit! (mut graph) 120 11 [(if nested effect no) zero (: 0 i32)]))]
+    (require (b/patch! (mut graph) header 2 back))
+    (require (b/patch! (mut graph) (if nested outer header) (if nested 2 3) second))
+    (match (hoist/run graph start [exit] a)
+      (Err [message] (panic "topology nested {} store {}: {}" nested store message))
+      (Ok [result]
+        (unless (= (.loads result) (if nested 2 (if store 0 1)))
+          (panic "topology nested {} store {} moved {}" nested store (.loads result)))
+        (let [(mut roots) (.roots result)] (free! (mut roots)))
+        (match (.graph result)
+          (None [] 0)
+          (Some [owned] (let [(mut owned) owned] (g/release! (mut owned)))))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i32)
+  (let [a (malloc-allocator)]
+    (guarded-shape a)
+    (topology false false a) (topology false true a) (topology true false a)
+    (for [mode 0 10]
+      (let [(mut f) (build (cast i32 mode) a)]
+        (match (hoist/run (.graph f) 1 (slice (.roots f)) a)
+          (Err [message] (panic "mode {}: {}" mode message))
+          (Ok [result]
+            (let [(mut roots) (.roots result)]
+              (unless (= (.loads result) (cond (= mode 5) 2 (or (= mode 0) (= mode 6) (= mode 7)) 1 :else 0))
+                (panic "mode {} moved {}" mode (.loads result)))
+              (match (.graph result)
+                (None [] 0)
+                (Some [graph]
+                  (let [(mut graph) graph]
+                    (unless (or (= mode 5) (= (.op1 (get (.instructions graph) (cast i64 (.load f)))) 1))
+                      (panic "load did not move to entry"))
+                    (unless (or (= mode 5) (= (.op1 (get (.instructions (.graph f)) (cast i64 (.load f)))) (.header f)))
+                      (panic "source mutated"))
+                    (unless (hoist/includes? roots (.header f)) (panic "lost control root"))
+                    (match (hoist/run graph 1 (slice roots) a)
+                      (Err [message] (panic "second pass: {}" message))
+                      (Ok [again]
+                        (unless (= (.loads again) 0) (panic "pass not at fixed point"))
+                        (let [(mut kept) (.roots again)] (free! (mut kept)))))
+                    (g/release! (mut graph)))))
+              (free! (mut roots)))))
+        (when (< mode 4)
+          (for enabled [false true]
+            (for rotated [false true] (native f (cast i32 mode) enabled rotated a))))
+        (g/release! (mut (.graph f))) (free! (mut (.roots f))))))
+  (println "loop-load-hoist: pass") 0)
