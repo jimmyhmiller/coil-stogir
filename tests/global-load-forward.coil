@@ -1,0 +1,301 @@
+(module stogir.tests.global-load-forward)
+(import "stogir.aot.macho" :as macho)
+(import "coil.fs" :as fs)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.global-load-forward" :as forward)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn need [T] [(r (Result T (slice u8)))] (-> T)
+  (match r (Ok [v] v) (Err [message] (panic "{}" message))))
+(defn raw [(graph (mut g/Graph)) (code u8) (ty u8) (inputs (slice i32))] (-> i32)
+  (match (g/append-inputs! (mut graph) code ty inputs) (Some [r] r) (None [] (panic "append"))))
+(defstruct Fixture [(graph g/Graph) (roots (ArrayList i32)) (target i32) (effect i32)])
+(defn release! [(f (mut Fixture))] (-> void)
+  (g/release! (mut (.graph f))) (free! (mut (.roots f))))
+(defn read-only :cc (cc/C) [(pointer (ptr u64))] (-> u64) (load pointer))
+(defn writer :cc (cc/C) [(pointer (ptr u64))] (-> u64)
+  (store! pointer (+ (load pointer) 17)) (load pointer))
+
+;;; Diamond modes: ordinary; alias store; disjoint store; unknown call;
+;;; declared readonly scalar call; volatile load; atomic fence; non-dominating
+;;; source; different address; different type; value-only observed load;
+;;; partial overlap; distinct pointer parameters that alias; volatile source.
+(defn diamond [(mode i32) (a (dyn Allocator))] (-> Fixture)
+  (let [(mut graph) (g/create a) (mut roots) (ArrayList::new [i32] a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        pointer (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        choice (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        function (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        zero (need (b/scalar-constant! (mut graph) 5 0 8))
+        eight (need (b/scalar-constant! (mut graph) 5 8 8))
+        written (need (b/scalar-constant! (mut graph) 5 77 8))
+        second (need (b/emit! (mut graph) 26 6 [pointer eight]))
+        before (if (= mode 7) start (need (b/emit! (mut graph) (if (= mode 13) 92 91) 5 [start pointer])))
+        condition (need (b/emit! (mut graph) 15 1 [choice zero]))
+        branch (need (b/emit! (mut graph) 116 0 [before condition]))
+        yes (need (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        no (need (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        (mut effect) yes]
+    (cond (or (= mode 1) (= mode 2) (= mode 10))
+            (set! effect (need (b/emit! (mut graph) 93 0 [yes (if (= mode 1) pointer second) written])))
+          (or (= mode 3) (= mode 4))
+            (let [(mut signature) (need (calls/create (if (= mode 4) 73 9) 5 [(: 6 u8)] a))]
+              (set! effect (need (calls/emit! (mut graph) signature yes function [pointer] a)))
+              (calls/release! (mut signature)))
+          (= mode 5) (set! effect (need (b/emit! (mut graph) 92 5 [yes pointer])))
+          (= mode 6) (set! effect (need (b/emit! (mut graph) 130 0 [yes])))
+          (= mode 7) (set! effect (need (b/emit! (mut graph) 91 5 [yes pointer])))
+          (= mode 11)
+            (let [four (need (b/scalar-constant! (mut graph) 5 4 8))
+                  address (need (b/emit! (mut graph) 26 6 [pointer four]))
+                  value (need (b/scalar-constant! (mut graph) 4 0xAABBCCDD 8))]
+              (set! effect (need (b/emit! (mut graph) 93 0 [yes address value]))))
+          (= mode 12) (set! effect (need (b/emit! (mut graph) 93 0 [yes function written])))
+          :else 0)
+    (let [end1 (need (b/emit! (mut graph) 114 0 [effect]))
+          end2 (need (b/emit! (mut graph) 114 0 [no]))
+          merge (raw (mut graph) 112 0 [end1 end2])
+          first (if (= mode 7) (raw (mut graph) 67 5 [merge effect zero]) before)
+          target (need (b/emit! (mut graph) 91 (if (= mode 9) 4 5)
+                         [merge (if (= mode 8) second pointer)]))
+          value (if (= mode 9) (need (b/emit! (mut graph) 34 5 [target])) target)
+          sum (need (b/emit! (mut graph) 26 5 [first value]))
+          ret (need (b/emit! (mut graph) 120 5 [target sum (: 0 i32)]))
+          (mut signature) (need (calls/create 9 5 [(: 6 u8) 5 6] a))]
+      (need (calls/function! (mut graph) signature a)) (calls/release! (mut signature))
+      (push! (mut roots) (if (= mode 10) target ret))
+      (Fixture :graph graph :roots roots :target target :effect effect))))
+
+(defn inspect [(f Fixture) (expected i64) (a (dyn Allocator))] (-> void)
+  (let [result (need (forward/run (.graph f) 1 (slice (.roots f)) a))
+        (mut roots) (.roots result)]
+    (unless (= (.loads result) expected) (panic "forwarded {} expected {}" (.loads result) expected))
+    (match (.graph result)
+      (None [] (unless (= expected 0) (panic "missing graph")))
+      (Some [owned]
+        (let [(mut owned) owned (mut prepared) (need (pipeline/prepare owned 1 (slice roots) a))
+              repeat (need (forward/run owned 1 (slice roots) a)) (mut repeated-roots) (.roots repeat)]
+          (unless (= (.loads repeat) 0) (panic "not fixed point"))
+          (match (.graph repeat) (None [] 0) (Some [_] (panic "repeat owns a graph")))
+          (when (= (get (.roots f) 0) (.target f))
+            (unless (> (len roots) (len (.roots f))) (panic "control observation lost"))
+            (let [(mut retained) false]
+              (for ref (.nodes (.schedule prepared)) (when (= ref (.effect f)) (set! retained true)))
+              (unless retained (panic "observed effect was removed"))))
+          (free! (mut repeated-roots)) (pipeline/release! (mut prepared)) (g/release! (mut owned)))))
+    (unless (= (n/opcode (get (.instructions (.graph f)) (cast i64 (.target f)))) 91)
+      (panic "source graph changed"))
+    (free! (mut roots))))
+
+(defn image-for [(f Fixture) (execution i32) (a (dyn Allocator))] (-> image/Image)
+  (if (!= execution 1)
+      (if (= execution 0)
+          (need (compile/image (.graph f) 1 (slice (.roots f)) "_global_load" a))
+          (need (compile/image-with-private (.graph f) 1 (slice (.roots f)) "_global_load"
+                  (options/Options :level 3) a (private/with-global-loads (private/no-context) true))))
+      (let [forwarded (need (forward/run (.graph f) 1 (slice (.roots f)) a))
+            (mut roots) (.roots forwarded)
+            output (match (.graph forwarded)
+              (None [] (need (compile/image (.graph f) 1 (slice roots) "_global_load" a)))
+              (Some [owned]
+                (let [(mut owned) owned result (need (compile/image owned 1 (slice roots) "_global_load" a))]
+                  (g/release! (mut owned)) result)))]
+        (free! (mut roots)) output)))
+
+(defn native-diamond [(f Fixture) (mode i32) (execution i32) (a (dyn Allocator))] (-> void)
+  (let [(mut code) (image-for f execution a)
+        (mut module) (need (link/compose [code] a))
+        (mut loaded) (need (jit/map-image (.image module) a))
+        index (match (image/find-symbol (.image module) "_global_load")
+                (Some [i] i) (None [] (panic "symbol")))
+        function (p/cast (fnptr (cc/C) [(ptr u64) u64 u64] u64)
+                    (p/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))
+        callback (if (= mode 4)
+                   (p/cast u64 (p/cast (ptr u8) (fnptr-of read-only)))
+                   (p/cast u64 (p/cast (ptr u8) (fnptr-of writer))))]
+    (for choice [(: 0 u64) 1 0x8000000000000000]
+      (for initial [(: 0 u64) 17 0x123456789ABCDEF0 0xFFFFFFFFFFFFFFFF]
+        (let [(mut cells) (ArrayList::new [u64] a)
+              first-cell (push! (mut cells) initial) second-cell (push! (mut cells) (: 99 u64))
+              after (if (= choice 0) initial
+                        (cond (or (= mode 1) (= mode 12)) (: 77 u64) (= mode 3) (+ initial 17)
+                              (= mode 11) (| (& initial 0xFFFFFFFF) 0xAABBCCDD00000000) :else initial))
+              first (if (and (= mode 7) (= choice 0)) (: 0 u64) initial)
+              second (cond (= mode 8) (: 99 u64) (= mode 9) (& after 0xFFFFFFFF) :else after)
+              got (function (.data cells) choice (if (= mode 12) (p/cast u64 (.data cells)) callback))]
+          (unless (= got (+ first second))
+            (panic "diamond mode {} enabled {} choice {} initial {} got {} expected {}"
+              mode execution choice initial got (+ first second)))
+          (unless (= (get cells 0) after) (panic "alias effect lost"))
+          (unless (= (get cells 1) (if (and (= mode 2) (!= choice 0)) (: 77 u64) 99))
+            (panic "disjoint effect lost"))
+          (free! (mut cells)))))
+    (jit/release-image! (mut loaded)) (link/release! (mut module)) (image/release! (mut code))))
+
+;;; Loop modes: invariant header; alias write on the back edge; disjoint
+;;; back-edge write; guarded body diamond (zero trips may use null); no entry
+;;; load (must retain the header load); two back edges with only one writing.
+(defn loop-fixture [(mode i32) (a (dyn Allocator))] (-> Fixture)
+  (let [(mut graph) (g/create a) (mut roots) (ArrayList::new [i32] a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        pointer (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        limit (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        zero (need (b/scalar-constant! (mut graph) 5 0 8))
+        one (need (b/scalar-constant! (mut graph) 5 1 8))
+        eight (need (b/scalar-constant! (mut graph) 5 8 8))
+        second (need (b/emit! (mut graph) 26 6 [pointer eight]))
+        before (if (or (= mode 3) (= mode 4)) start (need (b/emit! (mut graph) 91 5 [start pointer])))
+        enter (need (b/emit! (mut graph) 114 0 [before]))
+        header (raw (mut graph) 113 0 (if (= mode 5) [enter (: 0 i32) 0] [enter (: 0 i32)]))
+        phi (raw (mut graph) 67 5 (if (= mode 5) [header zero (: 0 i32) 0] [header zero (: 0 i32)]))
+        sum (raw (mut graph) 67 5 (if (= mode 5) [header zero (: 0 i32) 0] [header zero (: 0 i32)]))
+        headload (if (= mode 3) header (need (b/emit! (mut graph) 91 5 [header pointer])))
+        condition (need (b/emit! (mut graph) 20 1 [phi limit]))
+        branch (need (b/emit! (mut graph) 116 0 [headload condition]))
+        yes (need (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        no (need (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        first (if (= mode 3) (need (b/emit! (mut graph) 91 5 [yes pointer])) headload)
+        (mut target) first (mut body) (if (= mode 3) first yes)]
+    (when (= mode 3)
+      (let [test (need (b/emit! (mut graph) 14 1 [phi zero]))
+            split (need (b/emit! (mut graph) 116 0 [first test]))
+            left (need (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+            right (need (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+            lend (need (b/emit! (mut graph) 114 0 [left]))
+            rend (need (b/emit! (mut graph) 114 0 [right]))
+            merge (raw (mut graph) 112 0 [lend rend])]
+        (set! target (need (b/emit! (mut graph) 91 5 [merge pointer])))
+        (set! body target)))
+    (when (= mode 4)
+      (set! target (need (b/emit! (mut graph) 91 5 [yes pointer]))) (set! body target))
+    (let [value (if (or (= mode 3) (= mode 4)) (need (b/emit! (mut graph) 26 5 [first target])) target)
+          added (need (b/emit! (mut graph) 26 5 [sum value]))
+          next (need (b/emit! (mut graph) 26 5 [phi one]))
+          changed (need (b/emit! (mut graph) 26 5 [target one]))
+          (mut effect) body]
+      (when (or (= mode 1) (= mode 2))
+        (set! effect (need (b/emit! (mut graph) 93 0
+                             [body (if (= mode 1) pointer second) (if (= mode 1) changed phi)]))))
+      (if (= mode 5)
+          (let [test (need (b/emit! (mut graph) 14 1 [phi one]))
+                split (need (b/emit! (mut graph) 116 0 [body test]))
+                left (need (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+                right (need (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+                store (need (b/emit! (mut graph) 93 0 [right pointer changed]))
+                back1 (need (b/emit! (mut graph) 115 0 [left]))
+                back2 (need (b/emit! (mut graph) 115 0 [store]))]
+            (need (b/patch! (mut graph) header 2 back1)) (need (b/patch! (mut graph) header 3 back2))
+            (need (b/patch! (mut graph) phi 3 next)) (need (b/patch! (mut graph) phi 4 next))
+            (need (b/patch! (mut graph) sum 3 added)) (need (b/patch! (mut graph) sum 4 added)))
+          (let [back (need (b/emit! (mut graph) 115 0 [effect]))]
+            (need (b/patch! (mut graph) header 2 back))
+            (need (b/patch! (mut graph) phi 3 next)) (need (b/patch! (mut graph) sum 3 added))))
+      (let [answer (if (or (= mode 3) (= mode 4)) sum (need (b/emit! (mut graph) 26 5 [before sum])))
+            ret (need (b/emit! (mut graph) 120 5 [no answer (: 0 i32)]))
+            (mut signature) (need (calls/create 9 5 [(: 6 u8) 5] a))]
+        (need (calls/function! (mut graph) signature a)) (calls/release! (mut signature))
+        (push! (mut roots) ret)
+        (Fixture :graph graph :roots roots :target target :effect effect)))))
+
+(defn native-loop [(f Fixture) (mode i32) (execution i32) (a (dyn Allocator))] (-> void)
+  (let [(mut code) (image-for f execution a) (mut module) (need (link/compose [code] a))
+        (mut loaded) (need (jit/map-image (.image module) a))
+        index (match (image/find-symbol (.image module) "_global_load")
+                (Some [i] i) (None [] (panic "symbol")))
+        function (p/cast (fnptr (cc/C) [(ptr u64) u64] u64)
+                    (p/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))]
+    (when (= mode 3)
+      (unless (= (function (p/cast (ptr u64) 0) 0) 0) (panic "zero-trip read added")))
+    (for count [(: 0 u64) 1 2 3 8 17]
+      (for initial [(: 0 u64) 7 0xFFFFFFFFFFFFFFFF]
+        (let [(mut cells) (ArrayList::new [u64] a)
+              first-cell (push! (mut cells) initial) second-cell (push! (mut cells) (: 99 u64)) (mut value) initial
+              (mut expected) (if (or (= mode 3) (= mode 4)) (: 0 u64) initial)]
+          (for [i (: 0 u64) count]
+            (set! expected (+ expected (* value (if (or (= mode 3) (= mode 4)) 2 1))))
+            (when (or (= mode 1) (and (= mode 5) (!= i 1))) (set! value (+ value 1))))
+          (let [actual (function (.data cells) count)]
+            (unless (= actual expected)
+              (panic "loop mode {} execution {} count {} initial {} actual {} expected {}"
+                mode execution count initial actual expected)))
+          (unless (= (get cells 0) value) (panic "loop write lost"))
+          (unless (= (get cells 1) (if (and (= mode 2) (> count 0)) (- count 1) 99))
+            (panic "loop disjoint write lost"))
+          (free! (mut cells)))))
+    (jit/release-image! (mut loaded)) (link/release! (mut module)) (image/release! (mut code))))
+
+;;; The first batch equates pointer loads; only the next batch can equate the
+;;; pointed-to loads. This exercises fresh analysis and transitive remapping.
+(defn pointer-chain [(a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a) (mut roots) (ArrayList::new [i32] a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        pointer (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        first-pointer (need (b/emit! (mut graph) 91 6 [start pointer]))
+        first (need (b/emit! (mut graph) 91 5 [first-pointer first-pointer]))
+        second-pointer (need (b/emit! (mut graph) 91 6 [first pointer]))
+        second (need (b/emit! (mut graph) 91 5 [second-pointer second-pointer]))
+        sum (need (b/emit! (mut graph) 26 5 [first second]))
+        ret (need (b/emit! (mut graph) 120 5 [second sum (: 0 i32)]))
+        (mut signature) (need (calls/create 9 5 [(: 6 u8)] a))]
+    (need (calls/function! (mut graph) signature a)) (calls/release! (mut signature))
+    (push! (mut roots) ret)
+    (let [(mut f) (Fixture :graph graph :roots roots :target second :effect first)]
+      (inspect f 2 a)
+      (for [execution 0 3]
+        (let [(mut code) (image-for f (cast i32 execution) a)
+              (mut module) (need (link/compose [code] a))
+              (mut loaded) (need (jit/map-image (.image module) a))
+              index (match (image/find-symbol (.image module) "_global_load")
+                      (Some [i] i) (None [] (panic "symbol")))
+              function (p/cast (fnptr (cc/C) [(ptr u64)] u64)
+                          (p/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))]
+          (for value [(: 0 u64) 1 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
+            (let [(mut inner) (ArrayList::new [u64] a) (mut outer) (ArrayList::new [u64] a)]
+              (push! (mut inner) value) (push! (mut outer) (p/cast u64 (.data inner)))
+              (unless (= (function (.data outer)) (+ value value)) (panic "pointer chain"))
+              (free! (mut outer)) (free! (mut inner))))
+          (jit/release-image! (mut loaded)) (link/release! (mut module)) (image/release! (mut code))))
+      (release! (mut f)))))
+
+(defn aot [(a (dyn Allocator))] (-> void)
+  (for mode [(: 0 i32) 3 5]
+    (let [(mut f) (loop-fixture mode a)
+          symbol (cond (= mode 0) "_stogir_global_load" (= mode 3) "_stogir_global_guard" :else "_stogir_global_write")
+          path (cond (= mode 0) "/tmp/coil-stogir-global-load.o"
+                     (= mode 3) "/tmp/coil-stogir-global-guard.o" :else "/tmp/coil-stogir-global-write.o")
+          (mut code) (need (compile/image-with-private (.graph f) 1 (slice (.roots f)) symbol
+                            (options/Options :level 3) a (private/with-global-loads (private/no-context) true)))
+          (mut object) (need (macho/image-object code a))]
+      (match (fs/write-file a path (slice object)) (Err [_] (panic "AOT write")) (Ok [_] 0))
+      (free! (mut object)) (image/release! (mut code)) (release! (mut f)))))
+
+(defn main [] (-> i32)
+  (let [a (malloc-allocator)]
+    (for [mode 0 14]
+      (let [(mut f) (diamond (cast i32 mode) a)]
+        (inspect f (if (or (= mode 0) (= mode 2) (= mode 4) (= mode 10)) 1 0) a)
+        (unless (= mode 10) (for [execution 0 3] (native-diamond f (cast i32 mode) (cast i32 execution) a)))
+        (release! (mut f)))))
+  (let [a (malloc-allocator)]
+    (for [mode 0 6]
+      (let [(mut f) (loop-fixture (cast i32 mode) a)]
+        (inspect f (if (or (= mode 1) (= mode 5)) 0 1) a)
+        (for [execution 0 3] (native-loop f (cast i32 mode) (cast i32 execution) a))
+        (release! (mut f)))))
+  (aot (malloc-allocator))
+  (pointer-chain (malloc-allocator))
+  (println "global load forwarding: diamonds and loops ok") 0)
