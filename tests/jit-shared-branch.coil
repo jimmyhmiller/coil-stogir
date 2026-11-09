@@ -1,0 +1,160 @@
+(module stogir.tests.jit-shared-branch)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.a64.match" :as matching)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.code" :as code)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn need [T] [(result (Result T (slice u8)))] (-> T)
+  (match result (Ok [v] v) (Err [message] (panic "{}" message))))
+
+(defn truth [(opcode i32) (x u64) (y u64)] (-> bool)
+  (cond (= opcode 14) (= x y) (= opcode 15) (!= x y)
+        (= opcode 16) (< (cast i64 x) (cast i64 y))
+        (= opcode 17) (>= (cast i64 x) (cast i64 y))
+        (= opcode 18) (<= (cast i64 x) (cast i64 y))
+        (= opcode 19) (> (cast i64 x) (cast i64 y))
+        (= opcode 20) (< x y) (= opcode 21) (>= x y)
+        (= opcode 22) (<= x y) (= opcode 23) (> x y)
+        :else false))
+
+(defn bound [(literal i32) (y u64)] (-> u64)
+  (case literal 0 y 1 (: 37 u64) 2 0xFFFFFFFFFFFFFFDB (: 0 u64)))
+
+(def samples [(: 0 u64) 1 36 37 38 0x7FFFFFFFFFFFFFFF 0x8000000000000000
+              0xFFFFFFFFFFFFFFDA 0xFFFFFFFFFFFFFFDB 0xFFFFFFFFFFFFFFDC 0xFFFFFFFFFFFFFFFF])
+
+;;; One comparison placed above two IFs in different blocks. Variant 0: only
+;;; the IFs use it. Variant 1: two leaves also return its Boolean value.
+;;; Variant 2: it is a root. An immediate comparison is repeated at both IFs
+;;; and keeps a definition only for a value user; a register one stays shared.
+(defn shared [(opcode i32) (literal i32) (variant i32)] (-> i64)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        y (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        z (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        zero (need (b/scalar-constant! (mut graph) 5 0 8))
+        right (if (= literal 0) y
+                  (need (b/scalar-constant! (mut graph) 5 (bound literal 0) 8)))
+        condition (need (b/emit! (mut graph) opcode 1 [x right]))
+        side (need (b/emit! (mut graph) 15 1 [z zero]))
+        top (need (b/emit! (mut graph) 116 0 [start side]))
+        top-yes (need (b/emit! (mut graph) 107 0 [top (: 0 i32)]))
+        top-no (need (b/emit! (mut graph) 108 0 [top (: 0 i32)]))
+        first (need (b/emit! (mut graph) 116 0 [top-yes condition]))
+        first-yes (need (b/emit! (mut graph) 107 0 [first (: 0 i32)]))
+        first-no (need (b/emit! (mut graph) 108 0 [first (: 0 i32)]))
+        second (need (b/emit! (mut graph) 116 0 [top-no condition]))
+        second-yes (need (b/emit! (mut graph) 107 0 [second (: 0 i32)]))
+        second-no (need (b/emit! (mut graph) 108 0 [second (: 0 i32)]))
+        wide (need (b/emit! (mut graph) 34 5 [condition]))
+        k10 (need (b/scalar-constant! (mut graph) 5 10 8))
+        k11 (need (b/scalar-constant! (mut graph) 5 11 8))
+        k20 (need (b/scalar-constant! (mut graph) 5 20 8))
+        k31 (need (b/scalar-constant! (mut graph) 5 31 8))
+        k40 (need (b/scalar-constant! (mut graph) 5 40 8))
+        r1 (need (b/emit! (mut graph) 120 5
+             [first-yes (if (= variant 1) (need (b/emit! (mut graph) 26 5 [wide k10])) k11)
+              (: 0 i32)]))
+        r2 (need (b/emit! (mut graph) 120 5 [first-no k20 (: 0 i32)]))
+        r3 (need (b/emit! (mut graph) 120 5 [second-yes k31 (: 0 i32)]))
+        r4 (need (b/emit! (mut graph) 120 5
+             [second-no (if (= variant 1) (need (b/emit! (mut graph) 26 5 [wide k40])) k40)
+              (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a) (mut answers) (: 0 i64)]
+    (for r [r1 r2 r3 r4] (push! (mut roots) r))
+    (when (= variant 2) (push! (mut roots) condition))
+    (let [(mut prepared) (need (pipeline/prepare-native graph start (slice roots) a))
+          (mut plan) (need (matching/build-with-selects graph (.schedule prepared) (slice roots) true true a))
+          (mut emitted) (need (compile/generate-matched graph prepared plan a))
+          fused (!= literal 0)]
+      (for branch [first second]
+        (assert (= (get (.comparisons plan) (cast i64 branch)) (if fused condition 0)))
+        (when fused
+          (let [range (get (.ranges (.operands plan)) (cast i64 branch))]
+            (for [i 0 (.count range)]
+              (assert (!= (get (.inputs (.operands plan)) (+ (.offset range) i)) condition))))))
+      (assert (= (get (.omitted (.operands plan)) (cast i64 condition))
+                 (and fused (= variant 0))))
+      (let [(mut image) (need (jit/map-text (slice (.text emitted))))
+            f (p/cast (fnptr (cc/C) [u64 u64 u64] u64) (.base image))]
+        (for x samples (for y samples (for z [(: 0 u64) 1 0x8000000000000000]
+          (let [yes (truth opcode x (bound literal y))
+                expected (if (!= z 0) (if yes (: 11 u64) 20) (if yes (: 31 u64) 40))
+                actual (f x y z)]
+            (unless (= actual expected)
+              (panic "shared op {} literal {} variant {} x {} y {} z {} got {} expected {}"
+                     opcode literal variant x y z actual expected))
+            (set! answers (+ answers 1))))))
+        (jit/release! (mut image)))
+      (code/release! (mut emitted)) (matching/release! (mut plan)) (pipeline/release! (mut prepared)))
+    (free! (mut roots)) (g/release! (mut graph)) answers))
+
+;;; IF(EQ/NE(ZEXT(comparison), 0)): the branch uses the comparison's own flags,
+;;; inverted for EQ. Variant 1 also returns the extended Boolean, variant 2
+;;; makes the outer comparison a root; both keep those definitions.
+(defn inverted [(opcode i32) (outer i32) (literal i32) (variant i32)] (-> i64)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        y (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        zero (need (b/scalar-constant! (mut graph) 5 0 8))
+        right (if (= literal 0) y
+                  (need (b/scalar-constant! (mut graph) 5 (bound literal 0) 8)))
+        condition (need (b/emit! (mut graph) opcode 1 [x right]))
+        wide (need (b/emit! (mut graph) 34 5 [condition]))
+        test (need (b/emit! (mut graph) outer 1 [wide zero]))
+        split (need (b/emit! (mut graph) 116 0 [start test]))
+        yes (need (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (need (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        k5 (need (b/scalar-constant! (mut graph) 5 5 8))
+        k9 (need (b/scalar-constant! (mut graph) 5 9 8))
+        r1 (need (b/emit! (mut graph) 120 5
+             [yes (if (= variant 1) (need (b/emit! (mut graph) 26 5 [wide k5])) k5) (: 0 i32)]))
+        r2 (need (b/emit! (mut graph) 120 5 [no k9 (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a) (mut answers) (: 0 i64)]
+    (push! (mut roots) r1) (push! (mut roots) r2)
+    (when (= variant 2) (push! (mut roots) test))
+    (let [(mut prepared) (need (pipeline/prepare-native graph start (slice roots) a))
+          (mut plan) (need (matching/build-with-selects graph (.schedule prepared) (slice roots) true true a))
+          (mut emitted) (need (compile/generate-matched graph prepared plan a))
+          fused (!= literal 0)]
+      (if fused
+          (do
+            (assert (= (get (.comparisons plan) (cast i64 split)) condition))
+            (assert (= (get (.omitted (.operands plan)) (cast i64 test)) (!= variant 2)))
+            (assert (= (get (.omitted (.operands plan)) (cast i64 wide)) (= variant 0)))
+            (assert (= (get (.omitted (.operands plan)) (cast i64 condition)) (= variant 0))))
+          (assert (!= (get (.comparisons plan) (cast i64 split)) condition)))
+      (let [(mut image) (need (jit/map-text (slice (.text emitted))))
+            f (p/cast (fnptr (cc/C) [u64 u64] u64) (.base image))]
+        (for x samples (for y samples
+          (let [inner (truth opcode x (bound literal y))
+                taken (if (= outer 14) (not inner) inner)
+                expected (if taken (if (= variant 1) (if inner (: 6 u64) 5) (: 5 u64)) (: 9 u64))
+                actual (f x y)]
+            (unless (= actual expected)
+              (panic "inverted op {} outer {} literal {} variant {} x {} y {} got {} expected {}"
+                     opcode outer literal variant x y actual expected))
+            (set! answers (+ answers 1)))))
+        (jit/release! (mut image)))
+      (code/release! (mut emitted)) (matching/release! (mut plan)) (pipeline/release! (mut prepared)))
+    (free! (mut roots)) (g/release! (mut graph)) answers))
+
+(defn main [] (-> i32)
+  (let [(mut answers) (: 0 i64)]
+    (for [op 14 24] (for [literal 0 3] (for [variant 0 3]
+      (set! answers (+ answers (shared (cast i32 op) (cast i32 literal) (cast i32 variant))))
+      (for outer [(: 14 i32) 15]
+        (set! answers (+ answers (inverted (cast i32 op) outer (cast i32 literal)
+                                           (cast i32 variant))))))))
+    (println "shared and inverted branch comparisons: {} native answers" answers))
+  0)
