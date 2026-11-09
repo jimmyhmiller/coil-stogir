@@ -1,6 +1,6 @@
 # Coordinated allocation recoloring
 
-This experiment finds a verified way to retain outer values across the inner-loop bypass in the captured `primitive-providers-in` graph. It is an offline prototype, not integrated into native code generation. There is no new cycle measurement or claim that the 5× generation / 1.10× runtime target is met.
+This experiment finds a verified way to retain outer values across the inner-loop bypass in the captured `primitive-providers-in` graph. The bounded search is now also implemented as an optional native post-allocation pass; the compiler workload has not yet been timed with it. There is no new cycle measurement or claim that the 5× generation / 1.10× runtime target is met.
 
 ## Evidence and algorithm
 
@@ -68,3 +68,11 @@ The next implementation should first preserve the whole-function interval struct
 The bridge must use the real alias and PHI metadata and recognize validated constant/frame-address rematerialization. New spill homes must use each parent's actual `SpillShape` and frame allocator; the offline verifier's synthetic home identities do not validate stack geometry. Fixed and SIMD classes, required uses, lifetime holes and all existing ABI checks remain mandatory. Verify assignments before and after each accepted transaction; rebuild any assignment-derived indexes before emission. Preserve source identity and deterministic tie breaks.
 
 Then add native JIT/AOT regressions for bypass versus body execution, loop-carried values, fixed call arguments/results, spill homes, coalescing/PHIs and register pressure. Inspect the real hot function, build matched fixed-source hosts and measure alternating runtime and generation. Only after that evidence should broader inlining be revisited. Default policy, integration sources, installation and pushed state are unchanged by this experiment.
+
+## Native implementation checkpoint
+
+`allocation-recolor.coil` ports the bounded search over original allocation children. `allocation-transfers.coil` derives the logical copy set from actual schedule/CFG, canonical location indexes and PHI operands, including read-only constant/frame recipes. Whole children keep their ranges and constraints. Domain propagation honors required/fixed uses and physical reservations; search is bounded to depth 3, 100 visits per root, 8 changes and 32 rounds. Each accepted transaction strictly reduces the proxy and passes `allocation-check/verify`. Typed homes are allocated through `frame/spill-slot!`, all sibling home metadata is updated, and the compiler rebuilds its location index before callee-save layout. Errors discard the owned allocation. Static loop weights saturate at depth 6 to bound score arithmetic. The `private/with-recolor` context option defaults off.
+
+The native replay exactly matches the prototype: 14 original-child register changes, no new home, proxy 454,018, edge copies 58 (29 memory), internal copies 16 (8 memory). Reproduce against the current source with `python3 docs/benchmarks/frequency-allocation/native-replay.py "$STOGIR_TEST_COIL" build/frequency-reproduction build/native-recolor-reproduction`.
+
+Focused tests cover coordinated swaps, fixed clobbers, exact lifetime holes, GPR/SIMD masks, required uses, deduplicated copies, constant recipes, invalid endpoints, deterministic convergence and a newly allocated 16-byte aligned spill home. `tests/recolor-native.coil` executes 24 live loop-carried values through both bypass and unknown-call paths, with the option disabled and enabled, checking all outputs across zero/small/larger trip counts and wrapping values. Its emitted object also passes `tests/recolor-native-link.c` linked by Clang. Existing global-forwarding diamond/loop fixtures pass with recoloring enabled. Broad suite, compiler integration, real hot-function disassembly and matched runtime/generation measurements remain outstanding.
