@@ -1,0 +1,121 @@
+diff --git a/src/stogir/allocation.coil b/src/stogir/allocation.coil
+index aebfefc..9f19c85 100644
+--- a/src/stogir/allocation.coil
++++ b/src/stogir/allocation.coil
+@@ -284,6 +284,25 @@
+     (unless (fixed/split! events part child cut)
+       (panic "fixed-use split ownership update failed"))))
+ 
++(defn body-split-cut [(part Part) (start i64) (cut i64) (until i64)
++                      (blocks (slice split-position/Block)) (fallback i64)] (-> i64)
++  (let [origin (split-position/block-at blocks start)
++        conflict (split-position/block-at blocks until)
++        first (c/next-use (.uses part) cut 1)
++        use-block (split-position/block-at blocks first)]
++    (if (and (>= origin 0) (>= conflict 0) (>= use-block 0)
++             (> (.depth (get blocks (cast i64 origin))) 0)
++             (or (> (.depth (get blocks (cast i64 conflict)))
++                    (.depth (get blocks (cast i64 origin))))
++                 (= origin (.header (get blocks (cast i64 conflict)))))
++             (= (.header (get blocks (cast i64 use-block)))
++                (.header (get blocks (cast i64 conflict))))
++             (!= use-block (.header (get blocks (cast i64 use-block))))
++             (> (.start (get blocks (cast i64 use-block))) cut)
++             (<= (.start (get blocks (cast i64 use-block))) until))
++        (.start (get blocks (cast i64 use-block)))
++        fallback)))
++
+ ;;; Pinned ir_try_allocate_free_reg splits a partially available assignment
+ ;;; after its last register use before the conflict, at the position chosen by
+ ;;; ir_find_optimal_split_position, which moves the cut out to a loop's entry.
+@@ -293,6 +312,9 @@
+ ;;; The cut moves only when that leaves the conflict's loop for a shallower
+ ;;; block; otherwise the original availability boundary is kept. An odd block-end
+ ;;; result becomes the following block start, an edge-resolved even boundary.
++;;; Values born in an enclosing loop or in the conflict loop's header may
++;;; defer reassignment until the body's first use. The split stays at an even
++;;; block boundary; edge resolution handles all incoming edges and backedges.
+ (defn free-split-cut [(part Part) (start i64) (until i64)
+                       (blocks (slice split-position/Block))] (-> i64)
+   (if (= (len blocks) 0)
+@@ -308,13 +330,14 @@
+                   (let [chosen (split-position/choose blocks (.ranges part) minimum until false)
+                         source (split-position/block-at blocks chosen)
+                         cut (+ chosen (% chosen 2))]
+-                    (if (and (>= source 0)
+-                             (> cut start)
+-                             (< cut until)
+-                             (< (.depth (get blocks (cast i64 source)))
+-                                (.depth (get blocks (cast i64 deep)))))
+-                        cut
+-                        until))))))))
++                    (body-split-cut part start minimum until blocks
++                      (if (and (>= source 0)
++                               (> cut start)
++                               (< cut until)
++                               (< (.depth (get blocks (cast i64 source)))
++                                  (.depth (get blocks (cast i64 deep)))))
++                          cut
++                          until)))))))))
+ 
+ (defn grant-free-impl! [(parts (mut (ArrayList Part)))
+                            (unhandled (mut (ArrayList queue/Item)))
+diff --git a/tests/loop-entry-split.coil b/tests/loop-entry-split.coil
+index 5430ea4..374f025 100644
+--- a/tests/loop-entry-split.coil
++++ b/tests/loop-entry-split.coil
+@@ -198,8 +198,53 @@
+     (f/release! (mut layout))
+     failures))
+ 
++(defn nested-body-check [] (-> i64)
++  (let [allocator (malloc-allocator)
++        (mut value) (a/create 0 allocator)
++        (mut failures) 0
++        blocks [(split/Block :start 0 :end 10 :depth 0 :header -1 :idom 0)
++                (split/Block :start 10 :end 20 :depth 1 :header 1 :idom 0)
++                (split/Block :start 20 :end 30 :depth 2 :header 2 :idom 1)
++                (split/Block :start 30 :end 50 :depth 2 :header 2 :idom 2)
++                (split/Block :start 50 :end 60 :depth 1 :header 1 :idom 2)]]
++    (r/add! (mut (.ranges value)) 12 48)
++    (c/add! (mut (.uses value)) 12 1 -1)
++    (c/add! (mut (.uses value)) 34 1 -1)
++    (c/add! (mut (.uses value)) 46 1 -1)
++    (unless (= (a/free-split-cut value 12 40 blocks) 30)
++      (println "nested body-only use must split at body entry")
++      (set! failures (+ failures 1)))
++    ; A value defined in the header may also defer its next assignment.
++    (clear! (mut (.ranges value)))
++    (r/add! (mut (.ranges value)) 21 48)
++    (clear! (mut (.uses value)))
++    (c/add! (mut (.uses value)) 21 1 -1)
++    (c/add! (mut (.uses value)) 34 1 -1)
++    (c/add! (mut (.uses value)) 46 1 -1)
++    (unless (= (a/free-split-cut value 21 40 blocks) 30)
++      (println "header-defined body-only use must defer to body")
++      (set! failures (+ failures 1)))
++    ; A header use must keep the original loop-entry split.
++    (clear! (mut (.ranges value)))
++    (r/add! (mut (.ranges value)) 12 48)
++    (clear! (mut (.uses value)))
++    (c/add! (mut (.uses value)) 12 1 -1)
++    (c/add! (mut (.uses value)) 34 1 -1)
++    (c/add! (mut (.uses value)) 46 1 -1)
++    (c/add! (mut (.uses value)) 24 1 -1)
++    (unless (= (a/free-split-cut value 12 40 blocks) 20)
++      (println "nested header use must split at loop entry")
++      (set! failures (+ failures 1)))
++    ; An exact fixed requirement prevents moving the split before that use.
++    (c/add! (mut (.uses value)) 36 2 0)
++    (unless (= (a/free-split-cut value 12 40 blocks) 40)
++      (println "fixed register requirement must retain conflict boundary")
++      (set! failures (+ failures 1)))
++    (a/release! (mut value))
++    failures))
++
+ (defn main [] (-> i32)
+-  (let [failures (+ (loop-entry-check 36) (loop-entry-check 24)
++  (let [failures (+ (nested-body-check) (loop-entry-check 36) (loop-entry-check 24)
+                     (reload-check false) (reload-check true)
+                     (evict-check false) (evict-check true)
+                     (hole-check false) (hole-check true))]
