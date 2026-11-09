@@ -1,0 +1,205 @@
+(module stogir.tests.constant-hoist)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.types" :as types)
+(import "stogir.relocate" :as read)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.a64.constant-hoist" :as hoist)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+(defn need [T] [(r (Result T (slice u8)))] (-> T)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+
+(defn store :cc (cc/C) [(address u64) (value u64)] (-> void)
+  (set! (index (p/cast (ptr u64) address) 0) value))
+
+;;; Independent model of the fixture loop: every accumulator k starts at k+1
+;;; and each iteration becomes ((acc ^ index) * factor) + bias. When bounded, a
+;;; value not below bound is replaced: by a literal with literal-arm, else by
+;;; its XOR with bound. The result is the XOR of all accumulators.
+(def ARM (: 0x5555AAAA5555 u64))
+(def STORED (: 0x1122334455667788 u64))
+(defn model [(limit u64) (width i32) (factor u64) (bias u64) (bound u64) (count i64)
+             (literal-arm bool)] (-> u64)
+  (let [mask (cast u64 (- (<< (: 1 u128) (cast u128 width)) 1))
+        (mut total) (: 0 u64)]
+    (for [k 0 count]
+      (let [(mut acc) (& (cast u64 (+ k 1)) mask)]
+        (for [index (: 0 u64) limit]
+          (let [next (& (p/iadd (p/imul (^ acc (& index mask)) (& factor mask)) (& bias mask)) mask)]
+            (set! acc (if (or (= bound 0) (< next (& bound mask))) next
+                          (if literal-arm (& (^ bound ARM) mask) (^ next (& bound mask)))))))
+        (set! total (^ total acc))))
+    total))
+
+;;; Whether any MOVN/MOVZ/MOVK writes x16/x17 inside the single loop, which
+;;; spans from the target of the only backward branch to that branch.
+(defn scratch-literal-in-loop? [(bytes (ArrayList u8))] (-> bool)
+  (let [(mut first) (: -1 i64) (mut last) (: -1 i64) (mut found) false]
+    (for [i 0 (/ (len bytes) 4)]
+      (let [word (read/read32 bytes (* i 4))]
+        (when (and (= (& word 0xFF000010) 0x54000000) (!= (& word 0x00800000) 0))
+          (set! first (+ i (- (cast i64 (& (>> word 5) 0x7FFFF)) 524288)))
+          (set! last i))
+        (when (and (= (& word 0xFC000000) 0x14000000) (!= (& word 0x02000000) 0))
+          (set! first (+ i (- (cast i64 (& word 0x3FFFFFF)) 67108864)))
+          (set! last i))))
+    (assert (and (>= first 0) (> last first)))
+    (for [i first (+ last 1)]
+      (let [word (read/read32 bytes (* i 4))
+            rd (& word 31)]
+        (when (and (= (& word 0x1F800000) 0x12800000) (or (= rd 16) (= rd 17)))
+          (set! found true))))
+    found))
+
+;;; f(limit, target, cell): count accumulators of type ty. bias 0 omits the
+;;; addition; bound 0 omits the comparison. With calling, each iteration calls
+;;; target(cell, index); a literal is then never hoisted out of the loop.
+;;; Every iteration first stores a literal to cell. With merged the loop
+;;; header is a MERGE with a back END, as rotation and front ends produce,
+;;; instead of LOOP_BEGIN/LOOP_END, and a bounded COND selects a literal arm.
+;;; Returns native answers checked.
+(defn fixture [(ty i32) (factor u64) (bias u64) (bound u64) (count i64) (spare bool)
+               (calling bool) (merged bool)] (-> i64)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        width (* 8 (types/scalar-size ty 8))
+        mask (cast u64 (- (<< (: 1 u128) (cast u128 width)) 1))
+        literal (& factor mask)
+        ; Powers of two and 2^k+1 select shifts; they have no literal register.
+        clean (and spare (not calling) (!= (& literal (- literal 1)) 0)
+                   (!= (& (- literal 1) (- literal 2)) 0))
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        limit (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        target (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        cell (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        (mut prototype) (need (calls/create 0 0 [(: 6 u8) 5] a))
+        entry (need (b/emit! (mut graph) 114 0 [start]))
+        loop (if merged (need (b/emit! (mut graph) 112 0 [entry entry]))
+                 (need (b/loop-begin! (mut graph) entry)))
+        zero (need (b/scalar-constant! (mut graph) 5 0 8))
+        one (need (b/scalar-constant! (mut graph) 5 1 8))
+        k-factor (need (b/scalar-constant! (mut graph) ty (& factor mask) 8))
+        k-bias (need (b/scalar-constant! (mut graph) ty (& bias mask) 8))
+        k-bound (need (b/scalar-constant! (mut graph) ty (& bound mask) 8))
+        k-arm (need (b/scalar-constant! (mut graph) ty (& (^ bound ARM) mask) 8))
+        k-stored (need (b/scalar-constant! (mut graph) 5 STORED 8))
+        index (if merged (need (b/emit! (mut graph) 67 5 [loop zero zero]))
+                  (need (b/loop-phi! (mut graph) loop zero)))
+        (mut phis) (ArrayList::new [i32] a)
+        (mut roots) (ArrayList::new [i32] a)
+        (mut answers) (: 0 i64)]
+    (for [k 0 count]
+      (let [initial (need (b/scalar-constant! (mut graph) ty (& (cast u64 (+ k 1)) mask) 8))]
+        (push! (mut phis) (if merged (need (b/emit! (mut graph) 67 ty [loop initial initial]))
+                              (need (b/loop-phi! (mut graph) loop initial))))))
+    (let [condition (need (b/emit! (mut graph) 20 1 [index limit]))
+          split (need (b/emit! (mut graph) 116 0 [loop condition]))
+          body (need (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+          exit (need (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+          next-index (need (b/emit! (mut graph) 26 5 [index one]))
+          narrow (if (= ty 5) index
+                     (need (b/emit! (mut graph) (if (= width 64) 36 35) ty [index])))
+          (mut total) (: 0 i32)
+          (mut product) (: 0 i32)]
+      (for [k 0 count]
+        (let [acc (get phis k)
+              mixed (need (b/emit! (mut graph) 48 ty [acc narrow]))
+              scaled (need (b/emit! (mut graph) 28 ty [mixed k-factor]))
+              biased (if (= bias 0) scaled (need (b/emit! (mut graph) 26 ty [scaled k-bias])))
+              next (if (= bound 0) biased
+                       (need (b/emit! (mut graph) 60 ty
+                               [(need (b/emit! (mut graph) 20 1 [biased k-bound]))
+                                biased
+                                (if merged k-arm
+                                    (need (b/emit! (mut graph) 48 ty [biased k-bound])))])))]
+          (set! product scaled)
+          (b/patch! (mut graph) acc 3 next)
+          (let [wide (if (= ty 5) acc
+                         (need (b/emit! (mut graph) (if (= width 64) 36 34) 5 [acc])))]
+            (set! total (if (= total 0) wide (need (b/emit! (mut graph) 48 5 [total wide])))))))
+      (let [stored (need (b/emit! (mut graph) 93 0 [body cell k-stored]))
+            control (if calling
+                        (need (calls/emit! (mut graph) prototype stored target [cell index] a))
+                        stored)
+            back (need (b/emit! (mut graph) (if merged 114 115) 0 [control]))
+            ret (need (b/emit! (mut graph) 120 5 [exit total (: 0 i32)]))]
+        (b/patch! (mut graph) loop 2 back)
+        (b/patch! (mut graph) index 3 next-index)
+        (push! (mut roots) ret))
+      ; Structure: one shared definition outside the loop; the caller's graph
+      ; is intact; a fresh preparation of the result places it identically.
+      (let [(mut prepared) (need (pipeline/prepare graph start (slice roots) a))
+            before (len (.nodes (.schedule prepared)))
+            cells (len (.instructions graph))
+            (mut hoisted) (need (hoist/run graph (mut prepared) true a))]
+        (assert (= (len (.instructions graph)) cells))
+        (assert (= (.op2 (get (.instructions graph) (cast i64 product))) k-factor))
+        (when calling (assert (= (len (.nodes hoisted)) 0)))
+        (when clean
+          (assert (>= (len (.nodes hoisted)) 1))
+          (let [definition (.op2 (get (.instructions (.graph hoisted)) (cast i64 product)))
+                node (get (.instructions (.graph hoisted)) (cast i64 definition))
+                (mut seen) (: 0 i64)]
+            (assert (>= (cast i64 definition) cells))
+            (assert (and (= (n/opcode node) 68) (= (.op1 node) k-factor)
+                         (= (cast i32 (n/type-id node)) ty)))
+            (assert (= (len (.nodes (.schedule prepared))) (+ before (len (.nodes hoisted)))))
+            (for block (.starts (.blocks prepared))
+              (let [range (get (.ranges (.schedule prepared)) (cast i64 block))]
+                (for [i (.offset range) (+ (.offset range) (.count range))]
+                  (when (= (get (.nodes (.schedule prepared)) i) definition)
+                    (assert (= (get (.depths prepared) (cast i64 block)) 0))
+                    (assert (= block start))
+                    (set! seen (+ seen 1))))))
+            (assert (= seen 1))
+            (let [(mut fresh) (need (pipeline/prepare (.graph hoisted) start (slice roots) a))]
+              (assert (= (len (.nodes (.schedule fresh))) (len (.nodes (.schedule prepared)))))
+              (for block (.starts (.blocks prepared))
+                (assert (= (.count (get (.ranges (.schedule fresh)) (cast i64 block)))
+                           (.count (get (.ranges (.schedule prepared)) (cast i64 block))))))
+              (assert (= (len (.edges (.users fresh))) (len (.edges (.users prepared)))))
+              (pipeline/release! (mut fresh)))))
+        (hoist/release! (mut hoisted))
+        (pipeline/release! (mut prepared))))
+    (let [(mut text) (need (compile/text graph start (slice roots) a))
+          (mut mapped) (need (jit/map-text (slice text)))
+          f (p/cast (fnptr (cc/C) [u64 u64 (ptr u64)] u64) (.base mapped))
+          callee (p/cast u64 (p/cast (ptr u8) (fnptr-of store)))
+          (mut stored) (: 0xDEAD u64)]
+      ; With registers to spare every literal is built before the loop.
+      (when clean (assert (not (scratch-literal-in-loop? text))))
+      (for limit [(: 0 u64) 1 2 3 7 64 1000]
+        (set! stored 0xDEAD)
+        (assert (= (f limit callee (mut stored))
+                   (model limit width factor bias bound count merged)))
+        (assert (= stored (if (= limit 0) 0xDEAD (if calling (- limit 1) STORED))))
+        (set! answers (+ answers 1)))
+      (jit/release! (mut mapped)) (free! (mut text)))
+    (free! (mut phis)) (free! (mut roots)) (calls/release! (mut prototype))
+    (g/release! (mut graph))
+    answers))
+
+(defn main [] (-> i32)
+  (let [(mut fixtures) (: 0 i64) (mut answers) (: 0 i64)]
+    (for ty [(: 5 i32) 11 4 10]
+      (for factor [(: 0x9DDFEA08EB382D69 u64) 240 0xFFFFFFFFFFFFFFFB 0x7FFFFFFFFFFFFFFF
+                   0x8000000000000001 100003]
+        (for bias [(: 0 u64) 0x123456789 0xFFFFFFFFFFFF0001]
+          (for bound [(: 0 u64) 0x80000000FFFFF001]
+            ; One and three accumulators leave registers free. Forty exceed
+            ; them: hoisted literals are withdrawn and rebuilt at their uses.
+            (for count [(: 1 i64) 3 40]
+              (for calling [false true]
+                (for merged [false true]
+                  (set! answers (+ answers (fixture ty factor bias bound count (<= count 3)
+                                                    calling merged)))
+                  (set! fixtures (+ fixtures 1)))))))))
+    (println "constant-hoist: {} fixtures; {} native answers" fixtures answers))
+  0)
