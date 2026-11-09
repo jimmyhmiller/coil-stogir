@@ -133,7 +133,7 @@
     (a/reserve! (mut parts) 1 30 31 allocator)
     (match (a/run-shaped-with-tuning! (mut parts) (mut layout) 3 0x7
              [(a/SpillShape :size 8 :alignment 8) (a/SpillShape :size 8 :alignment 8)] [] blocks
-             (a/Tuning :late (a/no-late) :loop-reloads false :loop-evict-mask (if evict (: 4 u64) (: 0 u64)))
+             (a/Tuning :late (a/no-late) :loop-reloads false :loop-evict-mask (if evict (: 4 u64) (: 0 u64)) :call-holes false)
              allocator)
       (Err [msg] (do (println "allocation failed: {}" msg) (set! failures (+ failures 1))))
       (Ok [_] 0))
@@ -157,9 +157,51 @@
     (f/release! (mut layout))
     failures))
 
+;;; Register 1 is reserved throughout; a call clobbers register 0
+;;; at 31. The value used before and after the call: with call holes it is back
+;;; in register 0 right after the call (position 34) and in its slot only at
+;;; the call; without them it waits in its slot until its next use.
+(defn hole-check [(holes bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut parts) (ArrayList::new [a/Part] allocator)
+        (mut value) (a/create 0 allocator)
+        (mut layout) (f/create allocator)
+        (mut failures) 0]
+    (r/add! (mut (.ranges value)) 2 50)
+    (c/add! (mut (.uses value)) 2 1 -1)
+    (c/add! (mut (.uses value)) 20 1 -1)
+    (c/add! (mut (.uses value)) 40 1 -1)
+    (push! (mut parts) value)
+    (a/reserve! (mut parts) 1 1 60 allocator)
+    (a/reserve! (mut parts) 0 31 32 allocator)
+    (match (a/run-shaped-with-tuning! (mut parts) (mut layout) 2 0x3
+             [(a/SpillShape :size 8 :alignment 8)] [] []
+             (a/Tuning :late (a/no-late) :loop-reloads false :loop-evict-mask 0 :call-holes holes)
+             allocator)
+      (Err [msg] (do (println "allocation failed: {}" msg) (set! failures (+ failures 1))))
+      (Ok [_] 0))
+    (match (verify/verify parts 2 0x3)
+      (Err [msg] (do (println "allocation invalid: {}" msg) (set! failures (+ failures 1))))
+      (Ok [_] 0))
+    (let [before (register-at parts 0 20) at-call (register-at parts 0 31)
+          after (register-at parts 0 34) use (register-at parts 0 40)]
+      (if holes
+          (unless (and (= before 0) (< at-call 0) (= after 0) (= use 0))
+            (println "holes: {} {} {} {}" before at-call after use) (set! failures (+ failures 1)))
+          (unless (and (= before 0) (< at-call 0) (< after 0))
+            (println "no holes: {} {} {} {}" before at-call after use) (set! failures (+ failures 1)))))
+    (let [(mut i) 0]
+      (while (< i (len parts))
+        (a/release! (elem (mut parts) i))
+        (set! i (+ i 1))))
+    (free! (mut parts))
+    (f/release! (mut layout))
+    failures))
+
 (defn main [] (-> i32)
   (let [failures (+ (loop-entry-check 36) (loop-entry-check 24)
                     (reload-check false) (reload-check true)
-                    (evict-check false) (evict-check true))]
+                    (evict-check false) (evict-check true)
+                    (hole-check false) (hole-check true))]
     (println "loop-entry split checks: {} failures" failures)
     (if (= failures 0) 0 1)))
