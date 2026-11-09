@@ -1,0 +1,113 @@
+(module stogir.tests.multiply-accumulate)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.types" :as types)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.a64.match" :as matching)
+(import "stogir.a64.select" :as select)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+(defn need [T] [(r (Result T (slice u8)))] (-> T)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+
+;;; Wide arithmetic models the wrapped product and sum independently of the
+;;; selector: no MADD/MSUB helper participates in this oracle.
+(defn model [(a u64) (m u64) (c u64) (width i32) (shape i32)] (-> u64)
+  (let [modulus (<< (: 1 u128) (cast u128 width))
+        product (% (* (% (cast u128 a) modulus) (% (cast u128 m) modulus)) modulus)
+        addend (% (cast u128 c) modulus)]
+    (cast u64 (% (if (<= shape 1) (+ addend product)
+                     (if (= shape 2) (- (+ addend modulus) product)
+                         (- (+ product modulus) addend)))
+                 modulus))))
+
+;;; shape 0: c + a*m, 1: a*m + c, 2: c - a*m, 3: a*m - c (never fused).
+;;; multiplier 0 is the second argument; otherwise a literal of the type.
+;;; variant 0: plain, 1: rooted product, 2: shared product (XOR), 3: addend
+;;; is also the multiplicand.
+(defn fixture [(ty i32) (shape i32) (multiplier u64) (variant i32)] (-> i64)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        width (* 8 (types/scalar-size ty 8))
+        full (cast u64 (- (<< (: 1 u128) (cast u128 width)) 1))
+        literal (& multiplier full)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        arg0 (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        arg1 (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        arg2 (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        narrow (if (= width 64) (: 36 i32) 35)
+        x (if (= ty 5) arg0 (need (b/emit! (mut graph) narrow ty [arg0])))
+        y (if (= ty 5) arg1 (need (b/emit! (mut graph) narrow ty [arg1])))
+        z0 (if (= ty 5) arg2 (need (b/emit! (mut graph) narrow ty [arg2])))
+        z (if (= variant 3) x z0)
+        m (if (= multiplier 0) y (need (b/scalar-constant! (mut graph) ty literal 8)))
+        product (need (b/emit! (mut graph) 28 ty [x m]))
+        sum (need (b/emit! (mut graph) (if (<= shape 1) 26 27) ty
+                           (if (or (= shape 0) (= shape 2)) [z product] [product z])))
+        combined (if (= variant 2) (need (b/emit! (mut graph) 48 ty [sum product])) sum)
+        value (if (= ty 5) combined
+                  (need (b/emit! (mut graph) (if (= width 64) 36 34) 5 [combined])))
+        ret (need (b/emit! (mut graph) 120 5 [start value (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)
+        register-multiply (or (= multiplier 0)
+                              (not (or (= literal 0) (= (& literal (- literal 1)) 0)
+                                       (= (& (- literal 1) (- literal 2)) 0))))
+        expected-fuse (and (or (= width 32) (= width 64)) (<= shape 2)
+                           (or (= variant 0) (= variant 3)) register-multiply)
+        (mut answers) (: 0 i64)]
+    (push! (mut roots) ret)
+    (when (= variant 1) (push! (mut roots) product))
+    (let [(mut prepared) (need (pipeline/prepare graph start (slice roots) a))]
+      (for fuse [false true]
+        (let [(mut plan) (need (matching/build graph (.schedule prepared) (slice roots) fuse a))
+              tile (get (.tiles plan) (cast i64 sum))
+              fused (and expected-fuse fuse)]
+          (assert (= (or (= (.rule tile) 53) (= (.rule tile) 54)) fused))
+          (when fused
+            (let [range (get (.ranges (.operands plan)) (cast i64 sum))]
+              (assert (= (.rule tile) (if (= shape 2) 54 53)))
+              (assert (= (.count range) 3))
+              (assert (= (get (.inputs (.operands plan)) (.offset range)) z))
+              (assert (= (get (.inputs (.operands plan)) (+ (.offset range) 1)) x))
+              (assert (= (get (.inputs (.operands plan)) (+ (.offset range) 2)) m))
+              (assert (= (select/multiplier tile) m))))
+          ; Power-of-two and 2^k+1 products belong to the shifted-ADD rules.
+          (when register-multiply
+            (assert (= (get (.omitted (.operands plan)) (cast i64 product)) fused)))
+          (matching/release! (mut plan))))
+      (pipeline/release! (mut prepared)))
+    (let [(mut text) (need (compile/text graph start (slice roots) a))
+          (mut mapped) (need (jit/map-text (slice text)))
+          f (p/cast (fnptr (cc/C) [u64 u64 u64] u64) (.base mapped))
+          (mut seed) (: 0x123456789ABCDEF0 u64)
+          edges [(: 0 u64) 1 0xFFFFFFFFFFFFFFFF 0x8000000000000000 0x80000000
+                 0x7FFFFFFF 0xFFFFFFFF 0x7FFFFFFFFFFFFFFF]]
+      (for [i 0 96]
+        (set! seed (+ (* seed 6364136223846793005) 1442695040888963407))
+        (let [va (if (< i 64) (get edges (% i 8)) seed)
+              vb (if (< i 64) (get edges (/ i 8)) (^ seed (>> seed 29)))
+              vc (if (< i 64) (get edges (% (* i 5) 8)) (* seed 0x9E3779B97F4A7C15))
+              vm (if (= multiplier 0) vb literal)
+              addend (if (= variant 3) va vc)
+              raw (model va vm addend width shape)
+              expected (if (= variant 2) (^ raw (model va vm 0 width 0)) raw)]
+          (assert (= (f va vb vc) expected))
+          (set! answers (+ answers 1))))
+      (jit/release! (mut mapped)) (free! (mut text)))
+    (free! (mut roots)) (g/release! (mut graph))
+    answers))
+
+(defn main [] (-> i32)
+  (let [(mut fixtures) (: 0 i64) (mut answers) (: 0 i64)]
+    (for ty [(: 4 i32) 10 5 11 2 3]
+      (for [shape (: 0 i32) 4]
+        (for multiplier [(: 0 u64) 240 7 0x9DDFEA08EB382D69 0xFFFFFFFFFFFFFFFB 8 9 1]
+          (for [variant (: 0 i32) 4]
+            (set! answers (+ answers (fixture ty shape multiplier variant)))
+            (set! fixtures (+ fixtures 1))))))
+    (println "multiply-accumulate: {} fixtures; {} native answers" fixtures answers))
+  0)

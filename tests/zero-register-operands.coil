@@ -1,0 +1,102 @@
+(module stogir.tests.zero-register-operands)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.types" :as types)
+(import "stogir.relocate" :as read)
+(import "stogir.a64.constants" :as constants)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+(defn need [T] [(r (Result T (slice u8)))] (-> T)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+
+;;; The value as a signed number of the given width.
+(defn signed [(value u64) (width i32)] (-> i64)
+  (if (= width 64) (p/cast i64 value)
+      (let [low (& value 0xFFFFFFFF)]
+        (if (>= low 0x80000000) (- (cast i64 low) 0x100000000) (cast i64 low)))))
+
+;;; shape 0: MIN(x, 0); 1: MAX(0, x); 2: COND(x < y, x, 0); 3: COND(x < y, 0, x).
+(defn model [(x u64) (y u64) (width i32) (signed? bool) (shape i32)] (-> u64)
+  (let [mask (cast u64 (- (<< (: 1 u128) (cast u128 width)) 1))
+        a (& x mask) c (& y mask)
+        below-zero (and signed? (< (signed a width) 0))
+        less (if signed? (< (signed a width) (signed c width)) (< a c))]
+    (case shape
+      0 (if below-zero a 0)
+      1 (if below-zero 0 a)
+      2 (if less a 0)
+      (if less 0 a))))
+
+;;; No MOVZ/MOVN of an all-zero or all-one halfword pattern feeds x16/x17: a
+;;; literal zero operand reads WZR/XZR.
+(defn scratch-zero? [(bytes (ArrayList u8))] (-> bool)
+  (let [(mut found) false]
+    (for [i 0 (/ (len bytes) 4)]
+      (let [word (read/read32 bytes (* i 4))
+            rd (& word 31)]
+        (when (and (= (& word 0x7F800000) 0x52800000) (= (& word 0x001FFFE0) 0)
+                   (or (= rd 16) (= rd 17)))
+          (set! found true))))
+    found))
+
+(defn fixture [(ty i32) (shape i32)] (-> i64)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        width (* 8 (types/scalar-size ty 8))
+        signed? (types/signed? ty)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        arg0 (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        arg1 (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        narrow (if (= width 64) (: 36 i32) 35)
+        x (if (= ty 5) arg0 (need (b/emit! (mut graph) narrow ty [arg0])))
+        y (if (= ty 5) arg1 (need (b/emit! (mut graph) narrow ty [arg1])))
+        zero (need (b/scalar-constant! (mut graph) ty 0 8))
+        chosen
+          (case shape
+            0 (need (b/emit! (mut graph) 58 ty [x zero]))
+            1 (need (b/emit! (mut graph) 59 ty [zero x]))
+            2 (need (b/emit! (mut graph) 60 ty
+                      [(need (b/emit! (mut graph) (if signed? 16 20) 1 [x y])) x zero]))
+            (need (b/emit! (mut graph) 60 ty
+                    [(need (b/emit! (mut graph) (if signed? 16 20) 1 [x y])) zero x])))
+        value (if (= ty 5) chosen
+                  (need (b/emit! (mut graph) (if (= width 64) 36 34) 5 [chosen])))
+        ret (need (b/emit! (mut graph) 120 5 [start value (: 0 i32)]))
+        (mut answers) (: 0 i64)]
+    (let [(mut text) (need (compile/text graph start [ret] a))
+          (mut mapped) (need (jit/map-text (slice text)))
+          f (p/cast (fnptr (cc/C) [u64 u64] u64) (.base mapped))
+          edges [(: 0 u64) 1 0xFFFFFFFFFFFFFFFF 0x8000000000000000 0x80000000
+                 0x7FFFFFFF 0xFFFFFFFF 0x7FFFFFFFFFFFFFFF]]
+      (assert (not (scratch-zero? text)))
+      (for vx edges
+        (for vy edges
+          (assert (= (f vx vy) (model vx vy width signed? shape)))
+          (set! answers (+ answers 1))))
+      (jit/release! (mut mapped)) (free! (mut text)))
+    (g/release! (mut graph))
+    answers))
+
+;;; Zero and all-ones use the canonical single MOVZ/MOVN of halfword zero, and
+;;; a 64-bit value with a clear upper word uses the W form.
+(defn canonical [(bits u64) (expected u32)] (-> void)
+  (let [(mut output) (ArrayList::new [u8] (malloc-allocator))]
+    (assert (= (need (constants/emit! (mut output) true 9 bits)) 1))
+    (assert (= (read/read32 output 0) expected))
+    (free! (mut output))))
+
+(defn main [] (-> i32)
+  (let [(mut answers) (: 0 i64)]
+    (for ty [(: 4 i32) 10 5 11]
+      (for [shape (: 0 i32) 4]
+        (set! answers (+ answers (fixture ty shape)))))
+    (canonical 0 0x52800009)
+    (canonical 0xFFFFFFFFFFFFFFFF 0x92800009)
+    (canonical 0xFFFFFFFF 0x12800009)
+    (canonical 0xFFFF0000 0x52BFFFE9)
+    (println "zero-register-operands: 16 fixtures; {} native answers" answers))
+  0)
