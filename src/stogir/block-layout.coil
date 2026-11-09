@@ -1,4 +1,4 @@
-;;; Post-allocation physical block order. The compact graph and allocation
+;;; CFG branch predictions and post-allocation physical block order. The compact graph and allocation
 ;;; subpositions stay unchanged. Algorithm reference: pinned ir_cfg.c; see NOTICE.
 (module stogir.block-layout)
 (import "stogir.fill" :as fill)
@@ -10,8 +10,10 @@
 (import "stogir.pipeline" :as pipeline)
 (import "stogir.schedule" :as schedule)
 (import "stogir.bitset" :as bits)
+(import "stogir.flow-frequency" :as flow)
 (import "coil.alloc" :use [Allocator])
 (import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Option Some None])
 
 (defstruct Block
   [(reference i32)
@@ -405,6 +407,34 @@
                    0))))))
 
 (defstruct Chain [(head i32) (next i32) (previous i32)])
+
+;;; Allocation needs expected visits, not the layout algorithm's ranking
+;;; frequencies. Share the same explicit/static branch weights, but conserve
+;;; flow through loops. Result indices are dense Facts ranks (zero is unused).
+;;; None means a reachable recurrent component or unreliable numeric solve;
+;;; callers must retain a bounded fallback rather than inventing a profile.
+(defn expected-frequencies [(facts Facts) (allocator (dyn Allocator))]
+  (-> (Result (Option (ArrayList f64)) (slice u8)))
+  (if (<= (len (.items facts)) 1)
+    (let [(mut result) (ArrayList::new [f64] allocator)]
+      (for [i 0 (len (.items facts))] (push! (mut result) 0.0))
+      (Ok (Some result)))
+    (let [(mut edges) (ArrayList::new [flow/Edge] allocator)]
+      (for [rank 1 (len (.items facts))]
+        (let [source (cast i32 rank) count (degree facts source)
+              conditional (and (= count 2) (= (.end-op (get (.items facts) rank)) 116))
+              weight (if conditional (if-weight facts source) (Weight :first 0 :second 0 :total 100))]
+          (for [i 0 count]
+            (let [target (successor facts source i)
+                  p (if conditional (if (= i 0) (.first weight) (.second weight))
+                      (if (= count 1) 100 (probability facts target count false)))]
+              ; Explicit zero-probability arms carry no estimated flow. For a
+              ; many-way branch with more than 100 arms, integer percentages
+              ; round to zero; retain its nonzero uniform fallback weight.
+              (when (or (> p 0) (not conditional))
+                (push! (mut edges) (flow/Edge :from source :to target :weight (if (> p 0) p 1))))))))
+      (let [result (flow/estimate (cast i32 (len (.items facts))) 1 (slice edges) allocator)]
+        (free! (mut edges)) result))))
 
 (defstruct Edge [(from i32) (to i32) (frequency f32)])
 

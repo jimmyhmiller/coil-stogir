@@ -1,0 +1,49 @@
+(module stogir.tests.flow-frequency)
+(import "stogir.flow-frequency" :as flow)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Ok Err Some None])
+
+(defn edge [(from i32) (to i32) (weight i32)] (-> flow/Edge)
+  (flow/Edge :from from :to to :weight weight))
+(defn expect [(count i32) (entry i32) (edges (slice flow/Edge)) (want (slice f64))] (-> void)
+  (match (flow/estimate count entry edges (malloc-allocator))
+    (Err [e] (panic "{}" e))
+    (Ok [r] (match r
+      (None [] (panic "expected finite frequencies"))
+      (Some [values] (let [(mut values) values]
+        (assert (= (len values) (len want)))
+        (for [i 0 (len want)]
+          (unless (< (flow/absolute (- (get values i) (get want i))) 0.0000001)
+            (panic "frequency mismatch at {}" i)))
+        (free! (mut values))))))))
+(defn decline [(count i32) (edges (slice flow/Edge))] (-> void)
+  (match (flow/estimate count 0 edges (malloc-allocator))
+    (Err [e] (panic "{}" e))
+    (Ok [r] (match r (None [] 0) (Some [_] (panic "expected infinite visits"))))))
+(defn invalid [(count i32) (entry i32) (edges (slice flow/Edge))] (-> void)
+  (match (flow/estimate count entry edges (malloc-allocator))
+    (Err [_] 0) (Ok [_] (panic "expected invalid input"))))
+(defn main [] (-> i32)
+  (expect 1 0 [] [(: 1.0 f64)])
+  (expect 4 0 [(edge 0 1 25) (edge 0 2 75) (edge 1 3 100) (edge 2 3 100)]
+    [(: 1.0 f64) 0.25 0.75 1.0])
+  ; Loop body repeats nine times, exit executes once. Duplicate edges and
+  ; rounded percentages normalize by source rather than creating extra flow.
+  (expect 3 0 [(edge 0 1 1) (edge 1 1 45) (edge 1 1 45) (edge 1 2 10)]
+    [(: 1.0 f64) 10.0 1.0])
+  (expect 4 0 [(edge 0 1 33) (edge 0 2 33) (edge 0 3 33)]
+    [(: 1.0 f64) (/ 1.0 3.0) (/ 1.0 3.0) (/ 1.0 3.0)])
+  ; Two entries into a cyclic component (irreducible CFG).
+  (expect 4 0 [(edge 0 1 1) (edge 0 2 1) (edge 1 2 1) (edge 1 3 1)
+               (edge 2 1 1) (edge 2 3 1)]
+    [(: 1.0 f64) 1.0 1.0 1.0])
+  ; No numbering/RPO assumption; entry can have a larger index than its loop.
+  (expect 3 2 [(edge 2 1 1) (edge 1 1 9) (edge 1 0 1)]
+    [(: 1.0 f64) 10.0 1.0])
+  (expect 4 0 [(edge 0 1 1) (edge 2 3 1) (edge 3 2 1)]
+    [(: 1.0 f64) 1.0 0.0 0.0])
+  (decline 1 [(edge 0 0 1)])
+  (decline 3 [(edge 0 1 1) (edge 1 2 1) (edge 2 1 1)])
+  (invalid 0 0 []) (invalid 1 1 [])
+  (invalid 1 0 [(edge 0 1 1)]) (invalid 1 0 [(edge 0 0 0)])
+  (println "flow frequency checks passed") 0)
