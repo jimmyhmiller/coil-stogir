@@ -1,0 +1,170 @@
+(module stogir.tests.x64-registers)
+(import "stogir.x64.registers" :as r)
+(import "stogir.types" :as types)
+
+(defn expect [(condition bool) (what (slice u8))] (-> i64)
+  (if condition
+      0
+      (do
+        (println "x64 registers: {}" what)
+        1)))
+
+(defn bit [(register i32)] (-> u64)
+  (<< (: 1 u64) (cast u64 register)))
+
+(defn mask-of [(registers (slice i32))] (-> u64)
+  (let [(mut mask) (: 0 u64)]
+    (for register registers (set! mask (| mask (bit register))))
+    mask))
+
+;;; Register classes are disjoint ranges and `physical` is the hardware number.
+(defn numbering [] (-> i64)
+  (let [(mut failures) 0]
+    (for register (range 0 64)
+      (let [n (cast i32 register)
+            general (< n 16)
+            vector (and (>= n 32) (< n 48))]
+        (set! failures
+              (+ failures
+                 (expect (= (r/gpr? n) general) "gpr? range")
+                 (expect (= (r/simd? n) vector) "simd? range")
+                 (expect (= (r/physical n)
+                            (if general n (if vector (- n 32) -1)))
+                         "physical number")))))
+    (+ failures
+       (expect (and (not (r/gpr? -1)) (not (r/simd? -1)) (= (r/physical -1) -1))
+               "negative register")
+       (expect (and (= r/RAX 0)
+                    (= r/RCX 1)
+                    (= r/RDX 2)
+                    (= r/RBX 3)
+                    (= r/RSP 4)
+                    (= r/RBP 5)
+                    (= r/RSI 6)
+                    (= r/RDI 7)
+                    (= r/R8 8)
+                    (= r/R9 9)
+                    (= r/R10 10)
+                    (= r/R11 11)
+                    (= r/R12 12)
+                    (= r/R13 13)
+                    (= r/R14 14)
+                    (= r/R15 15))
+               "hardware numbering")
+       (expect (and (= r/XMM0 32)
+                    (= r/XMM1 33)
+                    (= r/XMM14 46)
+                    (= r/XMM15 47)
+                    (= (r/xmm 0) 32)
+                    (= (r/xmm 15) 47)
+                    (= (r/xmm 16) -1)
+                    (= (r/xmm -1) -1))
+               "XMM numbering"))))
+
+(defn masks [] (-> i64)
+  (let [caller (mask-of [r/RAX r/RCX r/RDX r/RSI r/RDI r/R8 r/R9 r/R10 r/R11])
+        callee (mask-of [r/RBX r/RBP r/R12 r/R13 r/R14 r/R15])
+        allocatable
+          (mask-of [r/RAX r/RCX r/RDX r/RBX r/RSI r/RDI r/R8 r/R9 r/R12 r/R13
+                    r/R14 r/R15])
+        setup (mask-of [r/RDI r/RSI r/RDX r/RCX r/R8 r/R9 r/RAX])
+        all-simd (<< (: 0xFFFF u64) 32)
+        scratch-simd (| (bit r/SCRATCH-SIMD) (bit r/SCRATCH-SIMD-2))
+        scratch-gpr (| (bit r/SCRATCH-GPR) (bit r/SCRATCH-GPR-2))]
+    (+ (expect (= (r/caller-gpr-mask) caller) "caller-saved general registers")
+       (expect (= (r/callee-gpr-mask) callee) "callee-saved general registers")
+       (expect (= (| (r/caller-gpr-mask) (r/callee-gpr-mask) (bit r/RSP))
+                  0xFFFF)
+               "every general register is caller-saved, callee-saved or rsp")
+       (expect (= (& (r/caller-gpr-mask) (r/callee-gpr-mask)) 0)
+               "caller-saved and callee-saved are disjoint")
+       (expect (= (r/gpr-mask) allocatable) "allocatable general registers")
+       (expect (= (& (r/gpr-mask) (| (bit r/RSP) (bit r/RBP) scratch-gpr)) 0)
+               "rsp, rbp and the scratches are not allocatable")
+       (expect (and (= r/SCRATCH-GPR r/R10) (= r/SCRATCH-GPR-2 r/R11))
+               "general scratches are r10 and r11")
+       (expect (= (& scratch-gpr (r/caller-gpr-mask)) scratch-gpr)
+               "general scratches are caller-saved")
+       (expect (= (& scratch-gpr (r/call-setup-gpr-mask)) 0)
+               "general scratches carry no argument")
+       (expect (= (r/call-setup-gpr-mask) setup) "call setup registers")
+       (expect (= (& (r/call-setup-gpr-mask) (r/caller-gpr-mask))
+                  (r/call-setup-gpr-mask))
+               "call setup registers are caller-saved")
+       (expect (= (r/caller-simd-mask) all-simd)
+               "every XMM register is caller-saved")
+       (expect (= (r/simd-mask) (^ all-simd scratch-simd))
+               "allocatable XMM registers")
+       (expect (and (= r/SCRATCH-SIMD r/XMM14) (= r/SCRATCH-SIMD-2 r/XMM15))
+               "XMM scratches are xmm14 and xmm15")
+       (expect (= (& (r/gpr-mask) (r/simd-mask)) 0) "classes are disjoint"))))
+
+(defn arguments [] (-> i64)
+  (let [(mut failures) 0
+        (mut seen) (: 0 u64)
+        order [(: r/RDI i32) r/RSI r/RDX r/RCX r/R8 r/R9]]
+    (for i (range 0 6)
+      (set! failures
+            (+ failures
+               (expect (= (r/gpr-argument (cast i32 i)) (get order i))
+                       "integer argument order")))
+      (set! seen (| seen (bit (r/gpr-argument (cast i32 i))))))
+    (for i (range 0 8)
+      (set! failures
+            (+ failures
+               (expect (= (r/simd-argument (cast i32 i)) (+ 32 (cast i32 i)))
+                       "floating argument order"))))
+    (+ failures
+       (expect (= (& seen (r/call-setup-gpr-mask)) seen)
+               "argument registers are call setup registers")
+       (expect (and (= r/GPR-ARGUMENTS 6) (= r/SIMD-ARGUMENTS 8))
+               "argument counts")
+       (expect (and (= (r/gpr-argument 6) -1)
+                    (= (r/gpr-argument -1) -1)
+                    (= (r/simd-argument 8) -1)
+                    (= (r/simd-argument -1) -1))
+               "argument ordinals out of range"))))
+
+(defn classes [] (-> i64)
+  (let [i64-type (: 11 i32)
+        u8-type (: 1 i32)
+        f64-type (: 12 i32)
+        f32-type (: 13 i32)
+        vector (types/vector-type 13 4)
+        wide (types/vector-type 12 4)
+        (mut failures) 0]
+    (for register (range -1 65)
+      (let [n (cast i32 register)
+            general
+              (and (>= n 0) (< n 16) (!= n 4) (!= n 5) (!= n 10) (!= n 11))
+            simd (and (>= n 32) (< n 46))]
+        (set! failures
+              (+ failures
+                 (expect (= (r/allocatable? i64-type n) general)
+                         "integer allocatable")
+                 (expect (= (r/allocatable? u8-type n) general)
+                         "byte allocatable")
+                 (expect (= (r/allocatable? f64-type n) simd)
+                         "double allocatable")
+                 (expect (= (r/allocatable? f32-type n) simd)
+                         "float allocatable")
+                 (expect (= (r/allocatable? vector n) simd)
+                         "128-bit vector allocatable")
+                 (expect (not (r/allocatable? wide n))
+                         "256-bit vector has no class")
+                 (expect (not (r/allocatable? 0 n)) "void has no class")))))
+    (+ failures
+       (expect (= (r/class-mask i64-type) (r/gpr-mask)) "integer class")
+       (expect (= (r/class-mask f64-type) (r/simd-mask)) "floating class")
+       (expect (= (r/class-mask vector) (r/simd-mask)) "vector class")
+       (expect (= (r/class-mask wide) 0) "oversized vector class")
+       (expect (and (r/simd-type? f32-type)
+                    (r/simd-type? vector)
+                    (not (r/simd-type? i64-type))
+                    (not (r/simd-type? wide)))
+               "simd-type?"))))
+
+(defn main [] (-> i64)
+  (let [failures (+ (numbering) (masks) (arguments) (classes))]
+    (println "x64 registers: {} failures" failures)
+    (if (= failures 0) 0 1)))
