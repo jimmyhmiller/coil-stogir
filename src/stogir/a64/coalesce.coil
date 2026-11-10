@@ -150,13 +150,14 @@
         (when (> (.parent part) 0)
           (set! (mut indices) (cast i64 (.parent part)) (cast i32 i)))))))
 
-;;; A widening view (convert/widening-view?) whose source has no other consumer
-;;; takes over the source's lifetime: the source's definition already leaves
-;;; the whole widened value in its register, so the pair is one value of the
-;;; wide type from that definition on. The wide member owns the group, and
-;;; every later move and spill of it has the wide type's size. The source must
-;;; be an unshared, non-Phi singleton that dies at the view at position; both
-;;; members keep their own uses, which never coincide. Returns whether joined.
+;;; A widening view (convert/widening-view?) shares its source's lifetime: the
+;;; source's definition already leaves the whole widened value in its register,
+;;; so the pair is one value of the wide type from that definition on. The wide
+;;; member owns the group, so every move and spill of it has the wide type's
+;;; size and keeps those bits; the source's other consumers read its low part.
+;;; The source must be an unshared, non-Phi singleton (its definition needs a
+;;; register, never a narrow memory home) whose coincident fixed uses agree.
+;;; Returns whether joined.
 (defn widen! [(parents (mut (ArrayList i32)))
               (groups (HashMap i32 bool))
               (parts (mut (ArrayList allocation/Part)))
@@ -164,7 +165,6 @@
               (heads (ArrayList i32))
               (graph g/Graph)
               (reference i32)
-              (position i64)
               (a (dyn Allocator))] (-> bool)
   (let [input (.op1 (get (.instructions graph) (cast i64 reference)))
         source (get indices (cast i64 input))
@@ -182,16 +182,10 @@
         false
         (let [s (at parts (cast i64 source))
               t (at parts (cast i64 target))
-              (mut alone) (and (= (.allowed s) (.allowed t))
-                               (= (len (.ranges s)) 1)
-                               (> (len (.ranges t)) 0)
-                               (phi/compatible? (.uses s) (.uses t)))]
-          (when alone
-            (let [range (get (.ranges s) 0)]
-              (when (> (.end range) (+ position 1)) (set! alone false))
-              (for use (.uses s)
-                (unless (or (= (.position use) (.start range)) (= (.position use) position))
-                  (set! alone false)))))
+              alone (and (= (.allowed s) (.allowed t))
+                         (> (len (.ranges s)) 0)
+                         (> (len (.ranges t)) 0)
+                         (phi/compatible? (.uses s) (.uses t)))]
           (if (not alone)
               false
               (let [ranges (phi/union-ranges (.ranges s) (.ranges t) a)
@@ -234,12 +228,11 @@
         (mut fixed-ready) false]
     ; One schedule walk. Index only on a reusable node, fixed uses only on a
     ; contained candidate, and group storage only after a successful proof.
-    (for [ordinal 0 (len (.nodes scheduled))]
-     (let [reference (get (.nodes scheduled) ordinal)]
+    (for reference (.nodes scheduled)
+     (do
       (when (convert/widening-view? graph reference)
         (index-parts! (mut indices) parts graph)
-        (when (and (widen! (mut parents) groups (mut parts) indices heads graph reference
-                           (* ordinal 2) a)
+        (when (and (widen! (mut parents) groups (mut parts) indices heads graph reference a)
                    fixed-ready)
           ; The owner's fixed uses now include its source's definition.
           (for use (.uses (at parts (cast i64 (get indices (cast i64 reference)))))
