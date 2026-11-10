@@ -63,6 +63,10 @@
 ;;; 11 = a frame object that is graph reference 16 with alignment 16, used on
 ;;; the slow arm only: its alignment operand is a number, not a use of itself,
 ;;; so the fast path is frameless with or without frame splitting.
+;;; 12 = a frame object used on the slow arm only, and a merge that writes and
+;;; reads a caller's cell through y, a parameter: no pointer into the frame
+;;; can equal an address the caller formed, so the merge runs after the
+;;; frame's release and the fast path never builds it.
 (defn model [(shape i32) (x i64) (y i64) (n i64)] (-> i64)
   (cond (= shape 0) (if (< x 100) (+ (* x 2) y) (+ (clobbered x) x y))
         (= shape 1) (let [t (+ x y)
@@ -86,6 +90,7 @@
         (= shape 9) (+ (if (< x 100) x (+ (clobbered x) x)) y)
         (= shape 11) (if (< x 100) (+ x y) (+ (clobbered (+ x 4)) 1))
         (= shape 10) (+ (if (< x 100) CELL (clobbered x)) x)
+        (= shape 12) (+ (if (< x 100) x (clobbered x)) 1 x)
         :else (let [(mut total) (+ x n y) (mut k) (: 1 i64)]
                 (while (<= k n) (set! total (+ total k y)) (set! k (+ k 1)))
                 total)))
@@ -263,6 +268,26 @@
               join (emit (mut graph) 112 [fast-end slow-end])
               address (require (b/emit! (mut graph) 67 6 [join cell inner]))
               loaded (require (b/emit! (mut graph) 91 11 [join address]))]
+          (ret! (mut graph) (mut roots) loaded (binary (mut graph) 26 loaded x)))
+      (= shape 12)
+        (let [sixteen (require (b/scalar-constant! (mut graph) 5 16 8))
+              eight (require (b/scalar-constant! (mut graph) 5 8 8))
+              object (require (b/frame-object! (mut graph) start sixteen (: 8 i32)))
+              small (compare (mut graph) 16 x hundred)
+              split (emit (mut graph) 116 [object small])
+              fast (emit (mut graph) 107 [split (: 0 i32)])
+              slow (emit (mut graph) 108 [split (: 0 i32)])
+              cell (require (b/emit! (mut graph) 36 6 [y]))
+              r (call! (mut graph) slow target x a)
+              inner (require (b/emit! (mut graph) 26 6 [object eight]))
+              stored (emit (mut graph) 93 [r inner r])
+              kept (require (b/emit! (mut graph) 91 11 [stored inner]))
+              fast-end (emit (mut graph) 114 [fast])
+              slow-end (emit (mut graph) 114 [kept])
+              join (emit (mut graph) 112 [fast-end slow-end])
+              v (require (b/emit! (mut graph) 67 11 [join x kept]))
+              written (emit (mut graph) 93 [join cell (binary (mut graph) 26 v one)])
+              loaded (require (b/emit! (mut graph) 91 11 [written cell]))]
           (ret! (mut graph) (mut roots) loaded (binary (mut graph) 26 loaded x)))
       (= shape 11)
         (do
@@ -475,7 +500,7 @@
               (mut graph) (build shape (mut roots) a)
               ; Shapes whose call-free path can run without the frame.
               frameless (or (= shape 0) (= shape 1) (= shape 4) (= shape 5) (= shape 8)
-                            (= shape 9))
+                            (= shape 9) (= shape 12))
               (mut cell) CELL
               (mut loaded) (load-shape graph (slice roots) level (= mode 1) frameless shape a)
               f (p/cast (fnptr (cc/C) [u64 i64 i64 i64] i64) (.entry loaded))]
@@ -485,12 +510,20 @@
               (for n [(: 0 i64) 1 2 9 40 20000]
                 (when (or (= n 0) (= shape 3) (= shape 8))
                   (let [got (call-ptr f target x
-                                      (if (= shape 10) (p/cast i64 (p/cast (ptr i64) (mut cell))) y) n)
+                                      (if (or (= shape 10) (= shape 12))
+                                          (p/cast i64 (p/cast (ptr i64) (mut cell))) y) n)
                         want (model shape x y n)]
                     (unless (= got want)
                       (println "shape {} level {} split {} x {} y {} n {}: got {} want {}"
                                shape level mode x y n got want)
-                      (set! failures (+ failures 1))))))))
+                      (set! failures (+ failures 1)))
+                    ; Shape 12 leaves its sum, less x, in the caller's cell.
+                    (when (= shape 12)
+                      (unless (= cell (- want x))
+                        (println "shape 12 level {} split {} x {}: cell holds {} want {}"
+                                 level mode x cell (- want x))
+                        (set! failures (+ failures 1)))
+                      (set! cell CELL)))))))
           (unload (mut loaded))
           (free! (mut roots))
           (g/release! (mut graph)))))
@@ -526,7 +559,7 @@
       (Ok [owned]
           (let [(mut native) owned
                 target (p/cast u64 (.base native))]
-            (for shape [(: 0 i32) 1 2 3 4 5 6 8 9 10 11]
+            (for shape [(: 0 i32) 1 2 3 4 5 6 8 9 10 11 12]
               (set! failures (+ failures (check-shape shape target))))
             (set! failures (+ failures (check-float target)))
             (jit/release! (mut native)))))
