@@ -8,6 +8,8 @@
 (import "stogir.atomic" :as atomic)
 (import "stogir.terminal" :as terminal)
 (import "stogir.switch" :as switch)
+(import "stogir.calls" :as calls)
+(import "stogir.noted" :as noted)
 (import "stogir.stack" :as stack)
 (import "stogir.locals" :as locals)
 (import "stogir.conversion" :as conversion)
@@ -51,7 +53,44 @@
                   (Err [message] (Err [i32 (slice u8)] message))
                   (Ok [_] (v/phis graph)))))]
     (same pair (v/operations-and-phis-target graph width))
-    (same triple (v/operations-constants-and-phis-target graph width))))
+    (same triple (v/operations-constants-and-phis-target graph width))
+    (noted-check graph width pair triple)))
+
+;;; The noting forms give the same answers, and each later check gives the
+;;; same answer from the notes as from its own walk over every node.
+(defn noted-check [(graph g/Graph) (width i32)
+                   (pair (Result i32 (slice u8))) (triple (Result i32 (slice u8)))] (-> void)
+  (let [a (malloc-allocator)
+        (mut first) (noted/create a)
+        (mut second) (noted/create a)
+        (mut third) (noted/create a)]
+    (same pair (v/operations-and-phis-target-noting graph width (mut first)))
+    (same triple (v/operations-constants-and-phis-target-noting graph width (mut second)))
+    (same (v/structure graph) (v/structure-noting graph (mut third) true))
+    (match (v/structure graph)
+      (Err [_] 0)
+      (Ok [_]
+          ; The notes are exactly the nodes with a later role, in order.
+          (let [(mut expected) (ArrayList::new [i32] a)
+                (mut r) (: 1 i64)]
+            (while (< r (len (.instructions graph)))
+              (let [opcode (cast i32 (n/opcode (get (.instructions graph) r)))]
+                (when (or (= opcode 67) (= opcode 40) (= opcode 79) (= opcode 80)
+                          (= opcode 117) (= opcode 104) (terminal/chain? opcode))
+                  (push! (mut expected) (cast i32 r))))
+              (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+            (assert (= (len expected) (len (.nodes third))))
+            (for [i 0 (len expected)]
+              (assert (= (get expected i) (get (.nodes third) i))))
+            (free! (mut expected)))
+          (same (v/phis-structured graph) (v/phis-among graph (slice (.nodes third))))
+          (same (terminal/verify-chains graph a)
+                (terminal/verify-chains-among graph (slice (.nodes third)) a))
+          (same (calls/verify graph) (calls/verify-among graph (slice (.nodes third))))
+          (same (switch/verify graph a) (switch/verify-among graph third a))))
+    (noted/release! (mut first))
+    (noted/release! (mut second))
+    (noted/release! (mut third))))
 
 (defn composite-cases [] (-> void)
   (for mode (range 0 12)
