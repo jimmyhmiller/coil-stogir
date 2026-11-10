@@ -44,6 +44,15 @@
 ;;;         EQ(parameter, COUNT); the other side returns 99.
 ;;; mode 2: as 1 on the false side of NE(COUNT, parameter).
 ;;; mode 3: the true side of NE: nothing is known, the runtime is called.
+;;; mode 5: the true side of AND(EQ(parameter, COUNT), NE(extra, 0)).
+;;; mode 6: the true side of EQ(parameter, COUNT), then the true side of a
+;;;         second IF on NE(extra, 0): the fact lies two projections up.
+;;; mode 7: the false side of OR(NE(parameter, COUNT), EQ(extra, 0)).
+;;; mode 8: the true side of OR(EQ(parameter, COUNT), NE(extra, 0)): either
+;;;         operand may be the true one, so nothing is known.
+;;; Every function is called with extra = 1.
+;;; Odd counts declare the result as a U64 word container of the C int, even
+;;; counts as I32; the caller reads the low word either way.
 ;;; mode 4: EQ of a different value (parameter + 0 is folded away, so the
 ;;;         count is parameter ^ 1 ^ 1 built unfolded): nothing is known about
 ;;;         the count itself.
@@ -62,29 +71,52 @@
                   parameter)
         compared (if (= mode 0) literal other)
         runtime (require (symbols/function! (mut graph) "_block_compare_runtime" 0))
-        ninety-nine (require (b/scalar-constant! (mut graph) 10 99 8))
+        result-type (if (= (% count 2) 0) (: 10 i32) 5)
+        ninety-nine (require (b/scalar-constant! (mut graph) result-type 99 8))
         (mut exits) (ArrayList::new [i32] a)
         (mut failures) 0]
-    (match (calls/create-builtin-compare 0 10 5 a)
+    (match (calls/create-builtin-compare 0 (cast u8 result-type) 5 a)
       (Err [e] (panic "{}" e))
       (Ok [proto]
         (let [(mut proto) proto]
           (if (= mode 0)
               (let [call (require (calls/emit! (mut graph) proto start runtime
                                                [left right compared] a))]
-                (push! (mut exits) (require (b/emit! (mut graph) 120 10 [call call (: 0 i32)]))))
-              (let [test (require (b/emit! (mut graph) (if (or (= mode 1) (= mode 4)) 14 15) 1
-                                           (if (= mode 2) [literal parameter] [parameter literal])))
+                (push! (mut exits) (require (b/emit! (mut graph) 120 result-type [call call (: 0 i32)]))))
+              (let [extra (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 3]))
+                    zero (require (b/scalar-constant! (mut graph) 5 0 8))
+                    equal (require (b/emit! (mut graph) 14 1 [parameter literal]))
+                    differs (require (b/emit! (mut graph) 15 1
+                                              (if (= mode 2) [literal parameter] [parameter literal])))
+                    extra-set (require (b/emit! (mut graph) 15 1 [extra zero]))
+                    extra-clear (require (b/emit! (mut graph) 14 1 [extra zero]))
+                    test (cond (or (= mode 1) (= mode 4) (= mode 6)) equal
+                               (or (= mode 2) (= mode 3)) differs
+                               (= mode 5) (require (b/emit! (mut graph) 47 1 [equal extra-set]))
+                               (= mode 7) (require (b/emit! (mut graph) 46 1 [differs extra-clear]))
+                               :else (require (b/emit! (mut graph) 46 1 [equal extra-set])))
+                    false-side? (or (= mode 2) (= mode 7))
                     split (require (b/emit! (mut graph) 116 0 [start test]))
                     yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
                     no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
-                    taken (if (= mode 2) no yes)
+                    first-taken (if false-side? no yes)
+                    inner (if (= mode 6)
+                              (require (b/emit! (mut graph) 116 0 [first-taken extra-set]))
+                              (: 0 i32))
+                    taken (if (= mode 6)
+                              (require (b/emit! (mut graph) 107 0 [inner (: 0 i32)]))
+                              first-taken)
                     call (require (calls/emit! (mut graph) proto taken runtime
                                                [left right compared] a))]
-                (push! (mut exits) (require (b/emit! (mut graph) 120 10 [call call (: 0 i32)])))
+                (push! (mut exits) (require (b/emit! (mut graph) 120 result-type [call call (: 0 i32)])))
+                (when (= mode 6)
+                  (let [skipped (require (b/emit! (mut graph) 108 0 [inner (: 0 i32)]))]
+                    (push! (mut exits)
+                           (require (b/emit! (mut graph) 120 result-type
+                                             [skipped ninety-nine (: 0 i32)])))))
                 (push! (mut exits)
-                       (require (b/emit! (mut graph) 120 10
-                                         [(if (= mode 2) yes no) ninety-nine (: 0 i32)])))))
+                       (require (b/emit! (mut graph) 120 result-type
+                                         [(if false-side? yes no) ninety-nine (: 0 i32)])))))
           (calls/release! (mut proto)))))
     ; No function prototype is declared, so the comparison in return position
     ; stays an ordinary call rather than becoming a tail jump to the runtime.
@@ -103,7 +135,7 @@
             (Err [e] (panic "mode {} count {}: {}" mode count e))
             (Ok [mapped]
               (let [(mut mapped) mapped
-                    f (p/cast (fnptr (cc/C) [(ptr u8) (ptr u8) u64] i32) (.base (.memory mapped)))
+                    f (p/cast (fnptr (cc/C) [(ptr u8) (ptr u8) u64 u64] i32) (.base (.memory mapped)))
                     before (get runtime-calls)
                     (mut cases) 0
                     ; mode 3 reaches the comparison only with another count
@@ -147,7 +179,7 @@
                           (let [p1 (load (at one-range i)) p2 (load (at two-range i))]
                             (when (!= p1 p2) (set! wanted (if (< p1 p2) (: -1 i32) 1))))
                           (set! i (+ i 1)))
-                        (let [actual (call-ptr f one-range two-range passed)]
+                        (let [actual (call-ptr f one-range two-range passed 1)]
                           (set! cases (+ cases 1))
                           (when (!= (sign actual) wanted)
                             (when (= failures 0)
@@ -155,14 +187,18 @@
                                        mode count placement variant wanted actual))
                             (set! failures (+ failures 1))))))))
                 ; A parameter that fails the test never reaches the comparison.
-                (when (or (= mode 1) (= mode 2) (= mode 4))
-                  (when (!= (call-ptr f (at first 0) (at second 0) (+ passed 1)) 99)
+                (when (or (= mode 1) (= mode 2) (>= mode 4))
+                  (when (!= (call-ptr f (at first 0) (at second 0) (+ passed 1) 0) 99)
+                    (set! failures (+ failures 1))))
+                (when (and (>= mode 5) (<= mode 7))
+                  (when (!= (call-ptr f (at first 0) (at second 0) passed 0) 99)
                     (set! failures (+ failures 1))))
                 (when (= mode 3)
-                  (when (!= (call-ptr f (at first 0) (at second 0) (cast u64 count)) 99)
+                  (when (!= (call-ptr f (at first 0) (at second 0) (cast u64 count) 1) 99)
                     (set! failures (+ failures 1))))
                 (let [calls (- (get runtime-calls) before)
-                      inline (and (block-compare/inline? count) (<= mode 2))]
+                      inline (and (block-compare/inline? count)
+                                  (or (<= mode 2) (and (>= mode 5) (<= mode 7))))]
                   (when (!= calls (if inline 0 cases))
                     (println "mode {} count {}: {} runtime calls in {} comparisons"
                              mode count calls cases)
@@ -185,7 +221,7 @@
               (!= (protect (at two page) page 3) 0))
       (panic "cannot reserve the guarded regions"))
     (assert (= (block-compare/maximum) 16))
-    (for mode [(: 0 i32) 1 2 3 4]
+    (for mode [(: 0 i32) 1 2 3 4 5 6 7 8]
       (for [count 0 25]
         (set! failures (+ failures (check mode count (at one page) (at two page) page)))))
     (println "native block compare checks: {} failures" failures)
