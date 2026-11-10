@@ -249,11 +249,17 @@
                          (or (select/word-extension? graph (.left tile))
                              (select/word-extension? graph (.right tile))))
                 (push! (mut narrowable) reference))
-              ; EQ/NE(AND(...), 0) may be a bit test of the AND's input.
+              ; EQ/NE(AND(...), 0) may be a bit test of the AND's input; so
+              ; may one of a word extension of the AND, once it is narrowed.
               (when (and fuse (or (= (.rule tile) 20) (= (.rule tile) 21))
-                         (= (.right tile) 0) (= (.immediate tile) 0) (> (.left tile) 0)
-                         (= (n/opcode (get (.instructions graph) (cast i64 (.left tile)))) 47))
-                (push! (mut bit-tests) reference))))))) (set! for-index-1 (+ for-index-1 1))))
+                         (= (.right tile) 0) (= (.immediate tile) 0) (> (.left tile) 0))
+                (let [operand (get (.instructions graph) (cast i64 (.left tile)))]
+                  (when (or (= (n/opcode operand) 47)
+                            (and (select/word-extension? graph (.left tile))
+                                 (> (.op1 operand) 0)
+                                 (= (n/opcode (get (.instructions graph) (cast i64 (.op1 operand))))
+                                    47)))
+                    (push! (mut bit-tests) reference))))))))) (set! for-index-1 (+ for-index-1 1))))
     ; Remove only each consumed Boolean edge. Shared/protected comparisons
     ; remain definitions; no new arithmetic edges are speculated.
     (for reference choices
@@ -393,6 +399,30 @@
           (when (and (or selection (= (n/opcode node) 116)) (> source 0))
             (let [index (cast i64 source)
                   tile (get tiles index)]
+              ; An IF on an AND that nothing else reads is NE(AND, 0): the
+              ; same bit test, with the IF holding the flags recipe.
+              (match (if (and (not selection)
+                              (or (= (.rule tile) 7) (= (.rule tile) 42))
+                              (= (get counts index) 1)
+                              (not (get protected index))
+                              (not (get omitted index)))
+                         (select/bit-test graph
+                           (select/Tile :rule 21 :wide (.wide tile) :left source :right 0
+                                        :immediate 0))
+                         (None))
+               (Some [test]
+                 (set! (mut tiles) (cast i64 reference) test)
+                 (set! (mut comparisons) (cast i64 reference) source)
+                 (push! (mut bit-users) reference)
+                 (set! (mut counts) index 0)
+                 (push! (mut retired) source)
+                 (when (> (.left test) 0)
+                   (set! (mut counts) (cast i64 (.left test))
+                         (+ (get counts (cast i64 (.left test))) 1)))
+                 (when (> (.right test) 0)
+                   (set! (mut counts) (cast i64 (.right test))
+                         (+ (get counts (cast i64 (.right test))) 1))))
+               (None []
               (let [inner (if selection 0 (truth-source graph tiles tile))
                     inverted (and (> inner 0)
                                   (immediate-comparison? graph (get tiles (cast i64 inner)) inner))]
@@ -454,7 +484,7 @@
                           (if (and (= (get counts index) 0) (not (get protected index)))
                               (set! (mut omitted) index true)
                               (set! (mut counts) (cast i64 (.left tile))
-                                    (+ (get counts (cast i64 (.left tile))) 1))))))))))) (set! for-index-2 (+ for-index-2 1)))))
+                                    (+ (get counts (cast i64 (.left tile))) 1))))))))))))) (set! for-index-2 (+ for-index-2 1)))))
     ; TRUNC(SHR/SAR) extracts a field; SHL(SHR/SAR) with matching counts
     ; clears low bits with one AND; SEXT/ZEXT of a word TRUNC view extends the
     ; low word of the view's source. Each selects a single machine input.
@@ -640,6 +670,9 @@
                                   (= (n/opcode node) 50) (= (n/opcode node) 51)))
                          ; A TRUNC whose extensions all read its source.
                          (and (= (n/opcode node) 35)
+                              (types/integer? (cast i32 (n/type-id node))))
+                         ; A constant register nothing reads any more.
+                         (and (= (n/opcode node) 68) (< (.op1 node) 0)
                               (types/integer? (cast i32 (n/type-id node))))))
             (set! (mut omitted) index true)
             ; Fused unary and shifted ADD/SUB tiles already replaced their
@@ -648,8 +681,10 @@
             (let [tile (get tiles index)
                   unary (get extractions index)
                   shifted? (or (= (.rule tile) 50) (= (.rule tile) 51))]
-             (for [j 1 (+ (cast i64 (if (> unary 0) 1
-                                       (if shifted? 2 (get (.arities graph) index)))) 1)]
+             ; A COPY of a literal holds no value edge.
+             (for [j 1 (+ (cast i64 (if (= (n/opcode node) 68) 0
+                                      (if (> unary 0) 1
+                                       (if shifted? 2 (get (.arities graph) index))))) 1)]
               (match (if (> unary 0) (Some unary)
                          (if shifted?
                              (Some (if (= j 1) (.left tile) (.right tile)))

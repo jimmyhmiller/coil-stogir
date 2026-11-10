@@ -58,8 +58,13 @@
 ;;;      3: AND(TRUNC32(SHL64(1, n)), literal), ty is the 32-bit type.
 ;;; mode 0: the Boolean is returned. 1: IF. 2: IF, and the Boolean is rooted.
 ;;;      3: COND of two arguments. 4: IF, and the AND is also returned.
+;;;      5: IF on the AND itself (opcode is then NE).
+;;;      6: IF on the comparison of the zero extension of a 32-bit AND.
+;;; copied holds the literal one and the literal mask in COPY registers, as
+;;; loop-invariant constant hoisting does.
 ;;; The oracle is the unsimplified expression, with machine count masking.
-(defn fixture [(ty i32) (form i32) (literal u64) (opcode i32) (flip bool) (mode i32)] (-> i64)
+(defn fixture [(ty i32) (form i32) (literal u64) (opcode i32) (flip bool) (mode i32)
+               (copied bool)] (-> i64)
   (let [a (malloc-allocator)
         (mut graph) (g/create a)
         (mut roots) (ArrayList::new [i32] a)
@@ -71,8 +76,14 @@
         narrow (if (= width 64) (: 36 i32) 35)
         x (if (= ty 5) arg0 (need (b/emit! (mut graph) narrow ty [arg0])))
         y (if (= ty 5) arg1 (need (b/emit! (mut graph) narrow ty [arg1])))
-        constant (need (b/scalar-constant! (mut graph) ty (& literal full) 8))
-        one (need (b/scalar-constant! (mut graph) (if (= form 3) 5 ty) 1 8))
+        raw-constant (need (b/scalar-constant! (mut graph) ty (& literal full) 8))
+        constant (if (and copied (!= form 0))
+                     (need (b/emit! (mut graph) 68 ty [raw-constant (: 1 i32)]))
+                     raw-constant)
+        raw-one (need (b/scalar-constant! (mut graph) (if (= form 3) 5 ty) 1 8))
+        one (if copied
+                (need (b/emit! (mut graph) 68 (if (= form 3) 5 ty) [raw-one (: 1 i32)]))
+                raw-one)
         zero (need (b/scalar-constant! (mut graph) ty 0 8))
         bit (cond (= form 0) constant
                   (= form 3) (need (b/emit! (mut graph) 35 ty
@@ -80,7 +91,11 @@
                   :else (need (b/emit! (mut graph) 49 ty [one x])))
         other (cond (= form 0) x (= form 1) y :else constant)
         mask (need (b/emit! (mut graph) 47 ty (if flip [other bit] [bit other])))
-        comparison (need (b/emit! (mut graph) opcode 1 (if flip [zero mask] [mask zero])))
+        wide-zero (need (b/scalar-constant! (mut graph) 5 0 8))
+        compared (if (= mode 6) (need (b/emit! (mut graph) 34 5 [mask])) mask)
+        compared-zero (if (= mode 6) wide-zero zero)
+        comparison (need (b/emit! (mut graph) opcode 1
+                                  (if flip [compared-zero compared] [compared compared-zero])))
         seven (need (b/scalar-constant! (mut graph) 5 7 8))
         nine (need (b/scalar-constant! (mut graph) 5 9 8))
         (mut checked) 0]
@@ -92,7 +107,7 @@
                                   [start (need (b/emit! (mut graph) 60 5 [comparison arg1 arg0]))
                                    (: 0 i32)])))
           :else
-            (let [split (need (b/emit! (mut graph) 116 0 [start comparison]))
+            (let [split (need (b/emit! (mut graph) 116 0 [start (if (= mode 5) mask comparison)]))
                   yes (need (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
                   no (need (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
                   wide (if (= mode 4)
@@ -127,8 +142,8 @@
                               got (function first second)]
                           (set! checked (+ checked 1))
                           (when (!= got want)
-                            (panic "type={} form={} literal={} op={} flip={} mode={} inputs={},{} expected={} got={}"
-                                   ty form literal opcode flip mode first second want got)))))
+                            (panic "type={} form={} literal={} op={} flip={} mode={} copied={} inputs={},{} expected={} got={}"
+                                   ty form literal opcode flip mode copied first second want got)))))
                     (jit/release! (mut image)))))
             ; The AND and its SHL leave the code unless the AND is shared.
             (let [branches (words (slice text) 0)
@@ -143,10 +158,11 @@
                                 ; A rooted Boolean repeats an immediate test at
                                 ; the IF; a two-register test is done once and
                                 ; the IF reads the Boolean.
-                                (!= branches (if (or (= mode 1) (and (= mode 2) (= form 0))) 1 0))
-                                (!= tests (case mode 0 1 1 0 2 1 1)))))
-                (panic "type={} form={} literal={} op={} flip={} mode={}: tbz={} and={} lslv={} tst={} lsrv={}"
-                       ty form literal opcode flip mode branches ands left-shifts tests
+                                (!= branches (if (or (= mode 1) (= mode 5) (= mode 6)
+                                                     (and (= mode 2) (= form 0))) 1 0))
+                                (!= tests (case mode 0 1 1 0 2 1 5 0 6 0 1)))))
+                (panic "type={} form={} literal={} op={} flip={} mode={} copied={}: tbz={} and={} lslv={} tst={} lsrv={}"
+                       ty form literal opcode flip mode copied branches ands left-shifts tests
                        right-shifts)))
             (free! (mut text)))))
     (free! (mut roots))
@@ -239,19 +255,22 @@
       (let [width (* 8 (types/scalar-size ty 8))]
         (for opcode [(: 14 i32) 15]
           (for flip [false true]
-            (for [mode (: 0 i32) 5]
+            (for [mode (: 0 i32) 7]
+             (when (and (or (!= mode 5) (= opcode 15)) (or (!= mode 6) (= width 32)))
               (for [k 0 (cast i64 width)]
-                (set! answers (+ answers (fixture ty 0 (<< (: 1 u64) (cast u64 k)) opcode flip mode)))
+                (set! answers (+ answers (fixture ty 0 (<< (: 1 u64) (cast u64 k)) opcode flip mode
+                                                  false)))
                 (set! fixtures (+ fixtures 1)))
-              (set! answers (+ answers (fixture ty 1 0 opcode flip mode)))
-              (set! fixtures (+ fixtures 1))
-              (for literal [(: 0x5E1C u64) 1 0x80000000 0x100002600 0xFFFFFFFFFFFFFFFE 0x13F]
-                (when (!= (& literal (if (= width 64) (: 0xFFFFFFFFFFFFFFFF u64) 0xFFFFFFFF)) 0)
-                  (set! answers (+ answers (fixture ty 2 literal opcode flip mode)))
-                  (set! fixtures (+ fixtures 1))
-                  (when (= width 32)
-                    (set! answers (+ answers (fixture ty 3 literal opcode flip mode)))
-                    (set! fixtures (+ fixtures 1))))))))))
+              (for copied [false true]
+                (set! answers (+ answers (fixture ty 1 0 opcode flip mode copied)))
+                (set! fixtures (+ fixtures 1))
+                (for literal [(: 0x5E1C u64) 1 0x80000000 0x100002600 0xFFFFFFFFFFFFFFFE 0x13F]
+                  (when (!= (& literal (if (= width 64) (: 0xFFFFFFFFFFFFFFFF u64) 0xFFFFFFFF)) 0)
+                    (set! answers (+ answers (fixture ty 2 literal opcode flip mode copied)))
+                    (set! fixtures (+ fixtures 1))
+                    (when (= width 32)
+                      (set! answers (+ answers (fixture ty 3 literal opcode flip mode copied)))
+                      (set! fixtures (+ fixtures 1))))))))))))
     (println "bit tests: {} fixtures; {} native answers; {} dispatch answers"
              fixtures answers (dispatches)))
   0)
