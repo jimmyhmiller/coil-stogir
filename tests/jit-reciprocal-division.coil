@@ -1,0 +1,229 @@
+(module stogir.tests.jit-reciprocal-division)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.types" :as types)
+(import "stogir.node" :as n)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.reciprocal" :as reciprocal)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+;;; Independent oracle in wider arithmetic: truncating DIV (29) or MOD (30) of
+;;; the WIDTH-bit patterns a and b in type ty.
+(defn expected [(opcode i32) (ty i32) (a u64) (b u64)] (-> u64)
+  (let [width (* 8 (types/scalar-size ty 8))
+        modulus (<< (: 1 i128) (cast i128 width))
+        mask (cast u64 (- modulus 1))
+        x (& a mask)
+        y (& b mask)
+        sign (cast u64 (/ modulus 2))]
+    (if (types/signed? ty)
+        (let [sx (if (>= x sign) (- (cast i128 x) modulus) (cast i128 x))
+              sy (if (>= y sign) (- (cast i128 y) modulus) (cast i128 y))
+              quotient (/ sx sy)
+              result (if (= opcode 29) quotient (- sx (* quotient sy)))]
+          (& (cast u64 result) mask))
+        (if (= opcode 29) (/ x y) (- x (* (/ x y) y))))))
+
+;;; One compiled function f(a) = a OP divisor, or with halved? the dividend
+;;; a >> 1 (logical), whose clear sign bit selects the non-negative signed form.
+;;; Checked on boundary dividends, the neighbours of multiples of the divisor
+;;; and a pseudo-random sequence.
+;;; With built? the function is (a / d) ^ (a % d) through checked construction,
+;;; which derives the remainder from the one shared quotient: the graph then
+;;; holds a single DIV and no MOD.
+(defn check [(opcode i32) (ty u8) (divisor u64) (halved? bool) (built? bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (require (b/emit! (mut graph) 71 (cast i32 ty) [start (: 0 i32) 0]))
+        width (* 8 (types/scalar-size (cast i32 ty) 8))
+        mask (cast u64 (- (<< (: 1 u128) (cast u128 width)) 1))
+        d (& divisor mask)
+        left
+          (if halved?
+              (require (b/emit! (mut graph) 50 (cast i32 ty)
+                                [p (require (b/scalar-constant! (mut graph) (cast i32 ty) 1 8))]))
+              p)
+        right (require (b/scalar-constant! (mut graph) (cast i32 ty) d 8))
+        result
+          (if built?
+              (require (b/emit! (mut graph) 48 (cast i32 ty)
+                                [(require (b/integer-division! (mut graph) 30 (cast i32 ty) 8
+                                                               left right 0))
+                                 (require (b/integer-division! (mut graph) 29 (cast i32 ty) 8
+                                                               left right 0))]))
+              (require (b/emit! (mut graph) opcode (cast i32 ty) [left right (: 0 i32)])))
+        ret (require (b/emit! (mut graph) 120 (cast i32 ty) [start result (: 0 i32)]))
+        (mut failures) 0]
+    (when (and built? (>= d 2) (!= (& d (- d 1)) 0)
+               (or (not (types/signed? (cast i32 ty))) (!= d mask)))
+      (let [(mut quotients) 0 (mut remainders) 0]
+        (for [index 1 (len (.instructions graph))]
+          (let [opcode (n/opcode (get (.instructions graph) index))]
+            (when (= opcode 29) (set! quotients (+ quotients 1)))
+            (when (= opcode 30) (set! remainders (+ remainders 1)))))
+        (when (or (!= quotients 1) (!= remainders 0))
+          (println "ty={} d={}: built remainder has {} DIV and {} MOD" ty d quotients remainders)
+          (set! failures (+ failures 1)))))
+    (match (calls/create 0 ty [ty] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype]
+            (require (calls/function! (mut graph) owned allocator))
+            (calls/release! (mut owned)))))
+    (match (compile/text graph start [ret] allocator)
+      (Err [msg]
+           (do
+             (println "compile op={} ty={} d={}: {}" opcode ty d msg)
+             (set! failures (+ failures 1))))
+      (Ok [compiled]
+          (let [(mut code) compiled
+                (mut divides) 0
+                (mut at) (: 0 i64)]
+            ; A reciprocal sequence holds no UDIV/SDIV instruction.
+            (while (< (+ at 3) (len code))
+              (let [word (| (cast u32 (get code at))
+                            (<< (cast u32 (get code (+ at 1))) 8)
+                            (<< (cast u32 (get code (+ at 2))) 16)
+                            (<< (cast u32 (get code (+ at 3))) 24))]
+                (when (= (& word 0x7FE0F800) 0x1AC00800)
+                  (set! divides (+ divides 1))))
+              (set! at (+ at 4)))
+            (when (and (> divides 0) (>= d 2) (!= (& d (- d 1)) 0)
+                       (or (not (types/signed? (cast i32 ty))) (!= d mask)))
+              (when (= failures 0)
+                (println "op={} ty={} d={}: machine divide for a literal divisor" opcode ty d))
+              (set! failures (+ failures 1)))
+            (match (jit/map-text (slice code))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [loaded]
+                  (let [(mut owned) loaded
+                        f (primitive/cast (fnptr (cc/C) [u64] u64) (.base owned))
+                        (mut state) (+ (* d 0x9E3779B97F4A7C15) (cast u64 opcode))
+                        (mut index) (: 0 i64)]
+                    (while (< index 120)
+                      (let [a (cond (= index 0) (: 0 u64)
+                                    (= index 1) 1
+                                    (= index 2) 2
+                                    (= index 3) mask
+                                    (= index 4) (- mask 1)
+                                    (= index 5) (>> mask 1)
+                                    (= index 6) (+ (>> mask 1) 1)
+                                    (= index 7) (+ (>> mask 1) 2)
+                                    (= index 8) (- (>> mask 1) 1)
+                                    (= index 9) 0x7FFFFFFF
+                                    (= index 10) 0x80000000
+                                    (= index 11) 0xFFFFFFFF
+                                    (= index 12) 0x100000000
+                                    (= index 13) (- d 1)
+                                    (= index 14) d
+                                    (= index 15) (+ d 1)
+                                    (= index 16) (- 0 d)
+                                    (= index 17) (- 1 d)
+                                    (= index 18) (- (: 0xFFFFFFFFFFFFFFFF u64) d)
+                                    (= index 19) (* d 2)
+                                    (= index 20) (- (* d 2) 1)
+                                    ; neighbours of the largest multiples below
+                                    ; the unsigned and signed maxima
+                                    (< index 27) (+ (- (* (/ mask d) d) 3) (cast u64 (- index 21)))
+                                    (< index 33) (+ (- (* (/ (>> mask 1) d) d) 3) (cast u64 (- index 27)))
+                                    (< index 39) (- 0 (+ (- (* (/ (>> mask 1) d) d) 3) (cast u64 (- index 33))))
+                                    :else
+                                      (do (set! state (+ (* state 6364136223846793005) 1442695040888963407))
+                                          (if (= (% index 3) 0)
+                                              (>> state (& (>> state 58) 63))
+                                              (^ state (>> state 29)))))
+                            x (if halved? (>> (& a mask) 1) (& a mask))
+                            wanted (if built?
+                                       (^ (expected 29 (cast i32 ty) x d)
+                                          (expected 30 (cast i32 ty) x d))
+                                       (expected opcode (cast i32 ty) x d))
+                            actual (& (call-ptr f a) mask)]
+                        (when (!= actual wanted)
+                          (when (= failures 0)
+                            (println "op={} ty={} d={} halved={} a={} expected={} actual={}"
+                                     opcode ty d halved? x wanted actual))
+                          (set! failures (+ failures 1))))
+                      (set! index (+ index 1)))
+                    (jit/release! (mut owned)))))
+            (free! (mut code)))))
+    (g/release! (mut graph))
+    failures))
+
+;;; The recipes themselves, exhaustively at eight bits against plain division,
+;;; with the multiplications and shifts the emitted sequences perform.
+(defn recipes [] (-> i64)
+  (let [(mut failures) 0]
+    (for [d (: 2 i64) 256]
+      (for [lz (: 0 i32) 2]
+        (when (or (= lz 0) (< d 128))
+          (let [r (reciprocal/unsigned-recipe (cast u64 d) 8 lz)]
+            (when (and (.add r) (or (> (.pre r) 0) (> lz 0)))
+              (set! failures (+ failures 1)))
+            (for [n (: 0 i64) (if (= lz 0) 256 128)]
+              (let [high (>> (* (>> (cast u64 n) (cast u64 (.pre r))) (.magic r)) 8)
+                    q (if (.add r)
+                          (& (+ (>> (& (- (cast u64 n) high) 255) 1) high) 255)
+                          high)]
+                (when (!= (>> q (cast u64 (.post r))) (cast u64 (/ n d)))
+                  (set! failures (+ failures 1)))))))))
+    (for [d (: -128 i64) 128]
+      (when (and (!= d 0) (!= d 1) (!= d -1))
+        (let [r (reciprocal/signed-recipe (& (cast u64 d) 255) 8)
+              magic (if (>= (.magic r) 128) (- (cast i64 (.magic r)) 256) (cast i64 (.magic r)))]
+          (for [n (: -128 i64) 128]
+            (let [(mut q) (>> (* n magic) 8)]
+              (when (and (> d 0) (< magic 0)) (set! q (+ q n)))
+              (when (and (< d 0) (> magic 0)) (set! q (- q n)))
+              ; wrap to eight bits, as the register does
+              (set! q (- (& (+ q 128) 255) 128))
+              (set! q (>> q (cast i64 (.shift r))))
+              (set! q (+ q (& (>> q 7) 1)))
+              (set! q (- (& (+ q 128) 255) 128))
+              (when (!= q (- (& (+ (/ n d) 128) 255) 128))
+                (set! failures (+ failures 1))))))))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) (recipes)
+        (mut functions) 0]
+    (for ty [(: 4 u8) 5 10 11]
+      (let [width (* 8 (types/scalar-size (cast i32 ty) 8))
+            mask (cast u64 (- (<< (: 1 u128) (cast u128 width)) 1))
+            signed? (types/signed? (cast i32 ty))]
+        (for opcode [(: 29 i32) 30]
+          ; every divisor of small magnitude, both signs for signed types
+          (for [k (: 1 i64) 131]
+            (set! failures (+ failures (check opcode ty (cast u64 k) false false)))
+            (set! failures (+ failures (check opcode ty (cast u64 k) true false)))
+            (set! failures (+ failures (check opcode ty (cast u64 k) (= opcode 29) true)))
+            (set! functions (+ functions 3))
+            (when signed?
+              (set! failures (+ failures (check opcode ty (cast u64 (- 0 k)) false false)))
+              (set! failures (+ failures (check opcode ty (cast u64 (- 0 k)) true false)))
+              (set! failures (+ failures (check opcode ty (cast u64 (- 0 k)) (= opcode 29) true)))
+              (set! functions (+ functions 3))))
+          ; boundary and structured divisors
+          (for special [(: 641 u64) 1000 10000 100000 1000000007 0x55555555 0xAAAAAAAB
+                        0x7FFFFFFF 0x80000001 0xFFFFFFFD 0xFFFFFFFF 0x100000001
+                        0x5555555555555555 0xAAAAAAAAAAAAAAAB 0x7FFFFFFFFFFFFFFF
+                        0x8000000000000001 0xFFFFFFFFFFFFFFFD 0xFFFFFFFFFFFFFFFE
+                        0xCCCCCCCCCCCCCCCD 0x6666666666666667 6700417 274177
+                        0x7FFFFFFE 0x7FFFFFFFFFFFFFFE 0x80000003 0x8000000000000003]
+            (let [d (& special mask)]
+              (when (and (!= d 0) (or (not signed?) (!= d mask)))
+                (set! failures (+ failures (check opcode ty d false false)))
+                (set! failures (+ failures (check opcode ty d true false)))
+                (set! failures (+ failures (check opcode ty d (= opcode 29) true)))
+                (set! functions (+ functions 3))))))))
+    (println "native reciprocal division/remainder checks: {} functions, {} failures"
+             functions failures)
+    (if (= failures 0) 0 1)))
