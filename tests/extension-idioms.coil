@@ -1,0 +1,451 @@
+;;; Extensions that selection removes: a narrow AND whose mask already bounds
+;;; the result, loads accessed in the form their only readers want, and shift
+;;; counts read through conversions. Every case runs natively on memory and
+;;; arguments with set upper bits, negative fields and width boundaries.
+(module stogir.tests.extension-idioms)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [x] x) (Err [e] (panic "{}" e))))
+
+(defstruct Built [(code image/Image) (mapped jit/Loaded)])
+
+(defn build [(graph g/Graph) (start i32) (ret i32) (level i32)] (-> Built)
+  (let [a (malloc-allocator)]
+    (match (compile/image-with-options graph start [ret] "_extension_idiom"
+                                       (options/Options :level level) a)
+      (Err [e] (panic "{}" e))
+      (Ok [code]
+          (match (jit/map-image code a)
+            (Err [e] (panic "{}" e))
+            (Ok [mapped] (Built :code code :mapped mapped)))))))
+
+(defn drop! [(built (mut Built))] (-> void)
+  (jit/release-image! (mut (.mapped built)))
+  (image/release! (mut (.code built))))
+
+;;; Instructions of the image whose bits under MASK equal PATTERN.
+(defn words [(built Built) (mask u32) (pattern u32)] (-> i64)
+  (let [text (slice (.text (.code built)))
+        (mut count) 0
+        (mut at) 0]
+    (while (< (+ at 3) (len text))
+      (let [word (| (cast u32 (get text at))
+                    (<< (cast u32 (get text (+ at 1))) 8)
+                    (<< (cast u32 (get text (+ at 2))) 16)
+                    (<< (cast u32 (get text (+ at 3))) 24))]
+        (when (= (& word mask) pattern) (set! count (+ count 1))))
+      (set! at (+ at 4)))
+    count))
+
+(def FIELD (: 0xFFFFFC00 u32))
+(def SXTW (: 0x93407C00 u32))
+(def SXTB-X (: 0x93401C00 u32))
+(def SXTH-X (: 0x93403C00 u32))
+(def SXTB-W (: 0x13001C00 u32))
+(def UXTB-W (: 0x53001C00 u32))
+(def UXTH-W (: 0x53003C00 u32))
+(def UXTB-X (: 0xD3401C00 u32))
+(def UXTH-X (: 0xD3403C00 u32))
+(def UXTW-X (: 0xD3407C00 u32))
+(def AND-BYTE (: 0x92401C00 u32))
+(def AND-HALF (: 0x92403C00 u32))
+(def AND-WORD (: 0x92407C00 u32))
+
+(defn sext [(value u64) (bits u64)] (-> u64)
+  (let [shift (- 64 bits)]
+    (p/cast u64 (>> (p/cast i64 (<< value shift)) (p/cast i64 shift)))))
+
+(defn zext [(value u64) (bits u64)] (-> u64)
+  (if (= bits 64) value (& value (- (<< (: 1 u64) bits) 1))))
+
+(defn bytes-at [(bytes (ArrayList u8)) (offset i64) (width i64)] (-> u64)
+  (let [(mut value) (: 0 u64)]
+    (for [i 0 width]
+      (set! value (| value (<< (cast u64 (get bytes (+ offset i))) (cast u64 (* i 8))))))
+    value))
+
+(defn mix [(sum u64) (value u64)] (-> u64)
+  (p/iadd (p/imul sum 31) value))
+
+;;; Graph form of mix.
+(defn mix! [(graph (mut g/Graph)) (sum i32) (value i32)] (-> i32)
+  (let [k (require (b/scalar-constant! (mut graph) 5 31 8))
+        scaled (require (b/emit! (mut graph) 28 5 [sum k]))]
+    (require (b/emit! (mut graph) 26 5 [scaled value]))))
+
+(defn address! [(graph (mut g/Graph)) (base i32) (offset u64)] (-> i32)
+  (if (= offset 0)
+      base
+      (let [k (require (b/scalar-constant! (mut graph) 5 offset 8))]
+        (require (b/emit! (mut graph) 26 6 [base k])))))
+
+(def patterns
+  [(: 0x00 u8) 0x01 0x7F 0x80 0x81 0xFE 0xFF 0x3C 0xC3 0x55 0xAA 0x10 0xF0 0x0F 0x9D 0x62])
+
+(defn fill! [(bytes (mut (ArrayList u8))) (size i64) (seed i64)] (-> void)
+  (clear! (mut bytes))
+  (for [i 0 size]
+    (push! (mut bytes) (get patterns (% (+ (* i 7) (* seed 5) (/ i 3)) 16)))))
+
+;;; AND of a byte with a literal: the mask bounds an unsigned result and a
+;;; signed one below the sign bit, so only the 0xF0 mask of a signed byte
+;;; needs its result extended again.
+(defn narrow-and [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        base (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        one (address! (mut graph) base 1)
+        first (require (b/emit! (mut graph) 91 2 [start base]))
+        second (require (b/emit! (mut graph) 91 8 [first one]))
+        low (require (b/scalar-constant! (mut graph) 2 0x3C 8))
+        positive (require (b/scalar-constant! (mut graph) 8 0x7F 8))
+        high (require (b/scalar-constant! (mut graph) 8 0xF0 8))
+        m0 (require (b/emit! (mut graph) 47 2 [first low]))
+        m1 (require (b/emit! (mut graph) 47 8 [second positive]))
+        m2 (require (b/emit! (mut graph) 47 8 [second high]))
+        z0 (require (b/emit! (mut graph) 34 5 [m0]))
+        s1 (require (b/emit! (mut graph) 33 5 [m1]))
+        s2 (require (b/emit! (mut graph) 33 5 [m2]))
+        sum (mix! (mut graph) (mix! (mut graph) z0 s1) s2)
+        ret (require (b/emit! (mut graph) 120 5 [second sum (: 0 i32)]))
+        (mut bytes) (ArrayList::new [u8] a)]
+    (for level [(: 1 i32) 3]
+      (let [(mut built) (build graph start ret level)
+            f (p/cast (fnptr (cc/C) [(ptr u8)] u64) (.base (.memory (.mapped built))))]
+        (when (= level 3)
+          (assert (= (words built FIELD UXTB-W) 0))
+          (assert (= (words built FIELD SXTB-W) 1)))
+        (for x patterns
+          (for y patterns
+            (clear! (mut bytes))
+            (push! (mut bytes) x)
+            (push! (mut bytes) y)
+            (let [first (cast u64 x)
+                  second (cast u64 y)
+                  expected (mix (mix (& first 0x3C) (sext (& second 0x7F) 8))
+                                (sext (& second 0xF0) 8))]
+              (assert (= (f (.data bytes)) expected)))))
+        (drop! (mut built))))
+    (free! (mut bytes))
+    (g/release! (mut graph))))
+
+;;; A wide load read only through a TRUNC accesses just the truncated bytes:
+;;; zero-extending, or sign-extending for a sole SEXT of the TRUNC. A TRUNC
+;;; with two readers and a load with a second reader keep explicit extensions.
+(defn narrow-loads [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        base (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        l1 (require (b/emit! (mut graph) 91 5 [start base]))
+        l2 (require (b/emit! (mut graph) 91 5 [l1 (address! (mut graph) base 8)]))
+        l3 (require (b/emit! (mut graph) 91 5 [l2 (address! (mut graph) base 16)]))
+        l4 (require (b/emit! (mut graph) 91 5 [l3 (address! (mut graph) base 24)]))
+        l5 (require (b/emit! (mut graph) 91 11 [l4 (address! (mut graph) base 32)]))
+        l6 (require (b/emit! (mut graph) 91 5 [l5 (address! (mut graph) base 40)]))
+        l7 (require (b/emit! (mut graph) 91 10 [l6 (address! (mut graph) base 48)]))
+        l8 (require (b/emit! (mut graph) 91 5 [l7 (address! (mut graph) base 56)]))
+        l9 (require (b/emit! (mut graph) 91 5 [l8 (address! (mut graph) base 64)]))
+        l10 (require (b/emit! (mut graph) 91 4 [l9 (address! (mut graph) base 72)]))
+        t1 (require (b/emit! (mut graph) 35 2 [l1]))
+        t2 (require (b/emit! (mut graph) 35 3 [l2]))
+        t3 (require (b/emit! (mut graph) 35 4 [l3]))
+        t4 (require (b/emit! (mut graph) 35 10 [l4]))
+        t5 (require (b/emit! (mut graph) 35 8 [l5]))
+        t6 (require (b/emit! (mut graph) 35 9 [l6]))
+        t7 (require (b/emit! (mut graph) 35 2 [l7]))
+        t8 (require (b/emit! (mut graph) 35 10 [l8]))
+        t9 (require (b/emit! (mut graph) 35 2 [l9]))
+        t10 (require (b/emit! (mut graph) 35 9 [l10]))
+        z1 (require (b/emit! (mut graph) 34 5 [t1]))
+        z2 (require (b/emit! (mut graph) 34 5 [t2]))
+        z3 (require (b/emit! (mut graph) 34 5 [t3]))
+        s4 (require (b/emit! (mut graph) 33 5 [t4]))
+        s5 (require (b/emit! (mut graph) 33 5 [t5]))
+        s6 (require (b/emit! (mut graph) 33 5 [t6]))
+        z7 (require (b/emit! (mut graph) 34 5 [t7]))
+        s8 (require (b/emit! (mut graph) 33 5 [t8]))
+        z8 (require (b/emit! (mut graph) 34 5 [t8]))
+        z9 (require (b/emit! (mut graph) 34 5 [t9]))
+        k32 (require (b/scalar-constant! (mut graph) 5 32 8))
+        h9 (require (b/emit! (mut graph) 50 5 [l9 k32]))
+        s10 (require (b/emit! (mut graph) 33 5 [t10]))
+        (mut sum) z1
+        (mut bytes) (ArrayList::new [u8] a)]
+    (for value [z2 z3 s4 s5 s6 z7 s8 z8 z9 h9 s10]
+      (set! sum (mix! (mut graph) sum value)))
+    (let [ret (require (b/emit! (mut graph) 120 5 [l10 sum (: 0 i32)]))]
+      (for level [(: 1 i32) 3]
+        (let [(mut built) (build graph start ret level)
+              f (p/cast (fnptr (cc/C) [(ptr u8)] u64) (.base (.memory (.mapped built))))]
+          (when (= level 3)
+            ; Only the two readers of t8 and the TRUNC of the shared l9 remain.
+            (assert (= (words built FIELD SXTW) 1))
+            (assert (= (words built FIELD UXTW-X) 1))
+            (assert (= (words built FIELD UXTB-W) 1))
+            (assert (= (words built FIELD UXTH-W) 0))
+            (assert (= (words built FIELD SXTB-X) 0))
+            (assert (= (words built FIELD SXTH-X) 0)))
+          (for [seed 0 16]
+            (fill! (mut bytes) 80 seed)
+            (let [(mut expected) (zext (bytes-at bytes 0 8) 8)]
+              (for value [(zext (bytes-at bytes 8 8) 16)
+                          (zext (bytes-at bytes 16 8) 32)
+                          (sext (bytes-at bytes 24 8) 32)
+                          (sext (bytes-at bytes 32 8) 8)
+                          (sext (bytes-at bytes 40 8) 16)
+                          (zext (bytes-at bytes 48 4) 8)
+                          (sext (bytes-at bytes 56 8) 32)
+                          (zext (bytes-at bytes 56 8) 32)
+                          (zext (bytes-at bytes 64 8) 8)
+                          (>> (bytes-at bytes 64 8) 32)
+                          (sext (bytes-at bytes 72 4) 16)]
+                (set! expected (mix expected value)))
+              (assert (= (f (.data bytes)) expected))))
+          (drop! (mut built)))))
+    (free! (mut bytes))
+    (g/release! (mut graph))))
+
+;;; The narrowed access keeps its address: a scaled index selected for the
+;;; wide load, and a displacement only the wide access form can encode.
+(defn narrow-load-addresses [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        base (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        index (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        eight (require (b/scalar-constant! (mut graph) 5 8 8))
+        scaled (require (b/emit! (mut graph) 28 5 [index eight]))
+        word (require (b/emit! (mut graph) 36 5 [base]))
+        sum (require (b/emit! (mut graph) 26 5 [scaled word]))
+        indexed (require (b/emit! (mut graph) 36 6 [sum]))
+        l1 (require (b/emit! (mut graph) 91 5 [start indexed]))
+        l2 (require (b/emit! (mut graph) 91 5 [l1 (address! (mut graph) base 32760)]))
+        l3 (require (b/emit! (mut graph) 91 5 [l2 (address! (mut graph) base 257)]))
+        t1 (require (b/emit! (mut graph) 35 2 [l1]))
+        t2 (require (b/emit! (mut graph) 35 9 [l2]))
+        t3 (require (b/emit! (mut graph) 35 4 [l3]))
+        z1 (require (b/emit! (mut graph) 34 5 [t1]))
+        s2 (require (b/emit! (mut graph) 33 5 [t2]))
+        z3 (require (b/emit! (mut graph) 34 5 [t3]))
+        total (mix! (mut graph) (mix! (mut graph) z1 s2) z3)
+        ret (require (b/emit! (mut graph) 120 5 [l3 total (: 0 i32)]))
+        (mut bytes) (ArrayList::new [u8] a)]
+    (for level [(: 1 i32) 3]
+      (let [(mut built) (build graph start ret level)
+            f (p/cast (fnptr (cc/C) [(ptr u8) u64] u64) (.base (.memory (.mapped built))))]
+        (for [seed 0 4]
+          (fill! (mut bytes) 32776 seed)
+          (for i [(: 0 i64) 1 5 4000]
+            (let [expected (mix (mix (zext (bytes-at bytes (* i 8) 8) 8)
+                                     (sext (bytes-at bytes 32760 8) 16))
+                                (zext (bytes-at bytes 257 8) 32))]
+              (assert (= (f (.data bytes) (cast u64 i)) expected)))))
+        (drop! (mut built))))
+    (free! (mut bytes))
+    (g/release! (mut graph))))
+
+;;; A signed load read only as a zero extension is accessed zero-extending.
+;;; Masks other than the loaded width, a SEXT with a second reader and a load
+;;; that is also sign-extended keep the sign-extending access.
+(defn zero-extending-loads [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        base (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        l1 (require (b/emit! (mut graph) 91 10 [start base]))
+        l2 (require (b/emit! (mut graph) 91 8 [l1 (address! (mut graph) base 4)]))
+        l3 (require (b/emit! (mut graph) 91 9 [l2 (address! (mut graph) base 6)]))
+        l4 (require (b/emit! (mut graph) 91 10 [l3 (address! (mut graph) base 8)]))
+        l5 (require (b/emit! (mut graph) 91 8 [l4 (address! (mut graph) base 12)]))
+        l6 (require (b/emit! (mut graph) 91 8 [l5 (address! (mut graph) base 13)]))
+        l7 (require (b/emit! (mut graph) 91 10 [l6 (address! (mut graph) base 16)]))
+        l8 (require (b/emit! (mut graph) 91 9 [l7 (address! (mut graph) base 20)]))
+        l9 (require (b/emit! (mut graph) 91 10 [l8 (address! (mut graph) base 24)]))
+        byte (require (b/scalar-constant! (mut graph) 5 0xFF 8))
+        half (require (b/scalar-constant! (mut graph) 5 0xFFFF 8))
+        full (require (b/scalar-constant! (mut graph) 5 0xFFFFFFFF 8))
+        z1 (require (b/emit! (mut graph) 34 5 [l1]))
+        z2 (require (b/emit! (mut graph) 34 5 [l2]))
+        z3 (require (b/emit! (mut graph) 34 5 [l3]))
+        s4 (require (b/emit! (mut graph) 33 5 [l4]))
+        a4 (require (b/emit! (mut graph) 47 5 [s4 full]))
+        s5 (require (b/emit! (mut graph) 33 5 [l5]))
+        a5 (require (b/emit! (mut graph) 47 5 [s5 byte]))
+        s6 (require (b/emit! (mut graph) 33 5 [l6]))
+        a6 (require (b/emit! (mut graph) 47 5 [s6 half]))
+        s7 (require (b/emit! (mut graph) 33 5 [l7]))
+        z7 (require (b/emit! (mut graph) 34 5 [l7]))
+        s8 (require (b/emit! (mut graph) 33 5 [l8]))
+        a8 (require (b/emit! (mut graph) 47 5 [s8 half]))
+        z9 (require (b/emit! (mut graph) 34 5 [l9]))
+        y9 (require (b/emit! (mut graph) 34 5 [l9]))
+        (mut sum) z1
+        (mut bytes) (ArrayList::new [u8] a)]
+    (for value [z2 z3 a4 a5 a6 s7 z7 s8 a8 z9 y9]
+      (set! sum (mix! (mut graph) sum value)))
+    (let [ret (require (b/emit! (mut graph) 120 5 [l9 sum (: 0 i32)]))]
+      (for level [(: 1 i32) 3]
+        (let [(mut built) (build graph start ret level)
+              f (p/cast (fnptr (cc/C) [(ptr u8)] u64) (.base (.memory (.mapped built))))]
+          (when (= level 3)
+            ; z7 extends a load that is also sign-extended; a6 and a8 keep
+            ; their masks. No other zero extension or mask is left.
+            (assert (= (words built FIELD UXTW-X) 1))
+            (assert (= (words built FIELD UXTB-X) 0))
+            (assert (= (words built FIELD UXTH-X) 0))
+            (assert (= (words built FIELD AND-WORD) 0))
+            (assert (= (words built FIELD AND-BYTE) 0))
+            (assert (= (words built FIELD AND-HALF) 2)))
+          (for [seed 0 16]
+            (fill! (mut bytes) 28 seed)
+            (let [(mut expected) (zext (bytes-at bytes 0 4) 32)]
+              (for value [(zext (bytes-at bytes 4 1) 8)
+                          (zext (bytes-at bytes 6 2) 16)
+                          (zext (bytes-at bytes 8 4) 32)
+                          (zext (bytes-at bytes 12 1) 8)
+                          (& (sext (bytes-at bytes 13 1) 8) 0xFFFF)
+                          (sext (bytes-at bytes 16 4) 32)
+                          (zext (bytes-at bytes 16 4) 32)
+                          (sext (bytes-at bytes 20 2) 16)
+                          (zext (bytes-at bytes 20 2) 16)
+                          (zext (bytes-at bytes 24 4) 32)
+                          (zext (bytes-at bytes 24 4) 32)]
+                (set! expected (mix expected value)))
+              (assert (= (f (.data bytes)) expected))))
+          (drop! (mut built)))))
+    (free! (mut bytes))
+    (g/release! (mut graph))))
+
+;;; Clobbers every caller-saved register a caller could have kept a value in.
+(defn clobber :cc (cc/C) [(x i32)] (-> i64) (+ (cast i64 x) 7))
+
+;;; Reformed loads whose values, or whose views, live across a call: the
+;;; allocator moves or reloads them at the width of their own type.
+(defn across-call [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        base (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        l1 (require (b/emit! (mut graph) 91 5 [start base]))
+        l2 (require (b/emit! (mut graph) 91 5 [l1 (address! (mut graph) base 8)]))
+        l3 (require (b/emit! (mut graph) 91 10 [l2 (address! (mut graph) base 16)]))
+        l4 (require (b/emit! (mut graph) 91 5 [l3 (address! (mut graph) base 24)]))
+        t1 (require (b/emit! (mut graph) 35 10 [l1]))
+        t2 (require (b/emit! (mut graph) 35 10 [l2]))
+        t4 (require (b/emit! (mut graph) 35 8 [l4]))
+        (mut types) (ArrayList::new [u8] a)
+        (mut arguments) (ArrayList::new [i32] a)
+        (mut bytes) (ArrayList::new [u8] a)]
+    (push! (mut types) 10)
+    (push! (mut arguments) t1)
+    (match (calls/create 0 11 (slice types) a)
+      (Err [e] (panic "{}" e))
+      (Ok [prototype]
+          (let [(mut prototype) prototype
+                call (require (calls/emit! (mut graph) prototype l4 target (slice arguments) a))
+                returned (require (b/emit! (mut graph) 36 5 [call]))
+                s1 (require (b/emit! (mut graph) 33 5 [t1]))
+                s2 (require (b/emit! (mut graph) 33 5 [t2]))
+                z3 (require (b/emit! (mut graph) 34 5 [l3]))
+                s4 (require (b/emit! (mut graph) 33 5 [t4]))
+                sum (mix! (mut graph)
+                          (mix! (mut graph) (mix! (mut graph) (mix! (mut graph) returned s1) s2) z3)
+                          s4)
+                ret (require (b/emit! (mut graph) 120 5 [call sum (: 0 i32)]))]
+            (for level [(: 1 i32) 3]
+              (let [(mut built) (build graph start ret level)
+                    f (p/cast (fnptr (cc/C) [(ptr u8) (ptr u8)] u64)
+                              (.base (.memory (.mapped built))))]
+                (for [seed 0 16]
+                  (fill! (mut bytes) 32 seed)
+                  (let [first (sext (bytes-at bytes 0 8) 32)
+                        expected (mix (mix (mix (mix (p/cast u64 (+ (p/cast i64 first) 7)) first)
+                                                (sext (bytes-at bytes 8 8) 32))
+                                           (zext (bytes-at bytes 16 4) 32))
+                                      (sext (bytes-at bytes 24 8) 8))]
+                    (assert (= (f (.data bytes) (p/cast (ptr u8) (fnptr-of clobber))) expected))))
+                (drop! (mut built))))
+            (calls/release! (mut prototype)))))
+    (free! (mut types))
+    (free! (mut arguments))
+    (free! (mut bytes))
+    (g/release! (mut graph))))
+
+(def words64
+  [(: 0 u64) 1 0x8000000000000000 0xFFFFFFFFFFFFFFFF 0x0123456789ABCDEF
+   0xFEDCBA9876543210 0x00000000FFFFFFFF 0xFFFFFFFF00000000 0x7FFFFFFF80000000])
+
+(def counts
+  [(: 0 u64) 1 5 31 32 33 63 64 69 127 128 255 256 0xFFFF 0x10003
+   0xFFFFFFFF00000003 0xFFFFFFFFFFFFFFFF 0x8000000000000020 0x00000001000000BF])
+
+;;; A shift reads only the low bits of its count, so the count is read
+;;; through ZEXT/SEXT/TRUNC. A conversion with a second reader stays.
+(defn shift-counts [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        c (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        c32 (require (b/emit! (mut graph) 35 4 [c]))
+        cz (require (b/emit! (mut graph) 34 5 [c32]))
+        r1 (require (b/emit! (mut graph) 49 5 [x cz]))
+        c8 (require (b/emit! (mut graph) 35 8 [c]))
+        cs (require (b/emit! (mut graph) 33 5 [c8]))
+        r2 (require (b/emit! (mut graph) 50 5 [x cs]))
+        cb (require (b/emit! (mut graph) 35 2 [c]))
+        cw (require (b/emit! (mut graph) 34 4 [cb]))
+        xw (require (b/emit! (mut graph) 35 4 [x]))
+        r3 (require (b/emit! (mut graph) 50 4 [xw cw]))
+        z3 (require (b/emit! (mut graph) 34 5 [r3]))
+        c16 (require (b/emit! (mut graph) 35 3 [c]))
+        ch (require (b/emit! (mut graph) 34 11 [c16]))
+        xs (require (b/emit! (mut graph) 36 11 [x]))
+        r4 (require (b/emit! (mut graph) 51 11 [xs ch]))
+        r4w (require (b/emit! (mut graph) 36 5 [r4]))
+        chw (require (b/emit! (mut graph) 36 5 [ch]))
+        (mut sum) r1]
+    (for value [r2 z3 r4w chw]
+      (set! sum (mix! (mut graph) sum value)))
+    (let [ret (require (b/emit! (mut graph) 120 5 [start sum (: 0 i32)]))]
+      (for level [(: 1 i32) 3]
+        (let [(mut built) (build graph start ret level)
+              f (p/cast (fnptr (cc/C) [u64 u64] u64) (.base (.memory (.mapped built))))]
+          (when (= level 3)
+            (assert (= (words built FIELD UXTW-X) 0))
+            (assert (= (words built FIELD SXTB-X) 0)))
+          (for value words64
+            (for count counts
+              (let [r1 (<< value (& count 63))
+                    r2 (>> value (& count 63))
+                    r3 (>> (& value 0xFFFFFFFF) (& count 31))
+                    r4 (p/cast u64 (>> (p/cast i64 value) (p/cast i64 (& count 63))))
+                    expected (mix (mix (mix (mix r1 r2) r3) r4) (& count 0xFFFF))]
+                (assert (= (f value count) expected)))))
+          (drop! (mut built)))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (narrow-and)
+  (narrow-loads)
+  (narrow-load-addresses)
+  (zero-extending-loads)
+  (across-call)
+  (shift-counts)
+  (println "extension idioms: narrow masks, load forms and shift counts hold")
+  0)

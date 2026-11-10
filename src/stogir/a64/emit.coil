@@ -70,9 +70,11 @@
           (and (not (or (= (.rule tile) 4) (= (.rule tile) 5)))
                (not (source-register? (.rule tile) rm))))
       (Err "invalid arithmetic physical register")
-      (if (and (>= (.rule tile) 38) (<= (.rule tile) 40) (= (.immediate tile) 0))
+      (if (or (= (.rule tile) 56)
+              (and (>= (.rule tile) 38) (<= (.rule tile) 40) (= (.immediate tile) 0)))
       ; A zero-count shift (selection also turns a multiply by one into LSL #0)
       ; is the source itself. A W result still zero-extends, as LSL W #0 would.
+      ; Rule 56 is the same X-form move of an already extended source.
       (if (and (.wide tile) (= rd rn))
           (Ok 0)
           (match (encode/logical-register (.wide tile) 1 rd 31 rn)
@@ -270,10 +272,26 @@
     (match (arithmetic! (mut output) tile rd rn rm)
       (Err [message] (set! error message))
       (Ok [_] 0))
-    (word! (mut output)
-           (mut error)
-           (encode/extend false (types/signed? ty) bits rd rd))
+    (unless (masked-within? tile ty bits)
+      (word! (mut output)
+             (mut error)
+             (encode/extend false (types/signed? ty) bits rd rd)))
     (if (= error "") (Ok (cast i32 (- (len output) start))) (Err error))))
+
+;;; A W-form AND with a logical immediate leaves a result no greater than the
+;;; immediate. When that mask lies within the value bits of the narrow type
+;;; (below the sign bit of a signed one), the result is already its own zero-
+;;; and sign-extension and needs no normalizing. The mask is decoded from the
+;;; tile's N:immr:imms fields: a 32-bit element is a rotated run of ones.
+(defn masked-within? [(tile select/Tile) (ty i32) (bits i32)] (-> bool)
+  (let [fields (.immediate tile)
+        imms (& fields 63)
+        rotation (& (>> fields 6) 63)]
+    (and (= (.rule tile) 42) (not (.wide tile)) (= (.right tile) 0)
+         (< fields 4096) (< imms 32) (< rotation 32) (>= bits 8) (< bits 32)
+         (let [run (- (<< (: 1 u64) (+ imms 1)) 1)
+               mask (& (| (>> run rotation) (<< run (- 32 rotation))) 0xFFFFFFFF)]
+           (< mask (<< (: 1 u64) (cast u64 (if (types/signed? ty) (- bits 1) bits))))))))
 
 ;;; MADD/MSUB: rd = addend +/- multiplicand * multiplier. Matching admits at
 ;;; most two sources that need a scratch register; a third is a hard error.
@@ -363,7 +381,7 @@
                                                                    17))
                     (Err [message] (Err message))
                     (Ok [right]
-                        (if (< bits 32)
+                        (if (and (< bits 32) (!= (.rule tile) 56))
                             (narrow! (mut (.text output))
                                      tile
                                      opcode
