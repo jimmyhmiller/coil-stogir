@@ -60,6 +60,9 @@
 ;;; 10 = the slow arm stores through a frame object's address and the merge
 ;;; reads through a PHI of that address and a caller's cell (y is its address
 ;;; and holds CELL): the merge must still run with the frame.
+;;; 11 = a frame object that is graph reference 16 with alignment 16, used on
+;;; the slow arm only: its alignment operand is a number, not a use of itself,
+;;; so the fast path is frameless with or without frame splitting.
 (defn model [(shape i32) (x i64) (y i64) (n i64)] (-> i64)
   (cond (= shape 0) (if (< x 100) (+ (* x 2) y) (+ (clobbered x) x y))
         (= shape 1) (let [t (+ x y)
@@ -81,6 +84,7 @@
         (= shape 5) (+ x y)
         (= shape 6) (+ (if (< x 100) x (clobbered x)) (* 24 x) 300 y)
         (= shape 9) (+ (if (< x 100) x (+ (clobbered x) x)) y)
+        (= shape 11) (if (< x 100) (+ x y) (+ (clobbered (+ x 4)) 1))
         (= shape 10) (+ (if (< x 100) CELL (clobbered x)) x)
         :else (let [(mut total) (+ x n y) (mut k) (: 1 i64)]
                 (while (<= k n) (set! total (+ total k y)) (set! k (+ k 1)))
@@ -260,6 +264,26 @@
               address (require (b/emit! (mut graph) 67 6 [join cell inner]))
               loaded (require (b/emit! (mut graph) 91 11 [join address]))]
           (ret! (mut graph) (mut roots) loaded (binary (mut graph) 26 loaded x)))
+      (= shape 11)
+        (do
+          ; Unused sums, until the next node is reference 16.
+          (let [(mut k) (: 1000 i64)]
+            (while (< (len (.instructions graph)) 16)
+              (binary (mut graph) 26 x (word (mut graph) k))
+              (set! k (+ k 1))))
+          (let [sixteen (require (b/scalar-constant! (mut graph) 5 16 8))
+                object (require (b/frame-object! (mut graph) start sixteen (: 16 i32)))
+                small (compare (mut graph) 16 x hundred)
+                split (emit (mut graph) 116 [object small])
+                fast (emit (mut graph) 107 [split (: 0 i32)])
+                slow (emit (mut graph) 108 [split (: 0 i32)])
+                shifted (binary (mut graph) 26 x (word (mut graph) 4))
+                stored (emit (mut graph) 93 [slow object shifted])
+                loaded (require (b/emit! (mut graph) 91 11 [stored object]))
+                r (call! (mut graph) loaded target loaded a)]
+            (unless (= object 16) (panic "frame object is reference {}, not 16" object))
+            (ret! (mut graph) (mut roots) fast (binary (mut graph) 26 x y))
+            (ret! (mut graph) (mut roots) r (binary (mut graph) 26 r one))))
       (= shape 5)
         (let [never (compare (mut graph) 14 x (word (mut graph) 123456789))
               split (emit (mut graph) 116 [start never])
@@ -418,7 +442,7 @@
     (when (> (.faults walked) 0)
       (println "shape {} level {} split {}: {} frame-state faults" label level split (.faults walked)))
     ; With frame splitting the path that makes no call never builds the frame.
-    (when (and split frameless (not (.frameless-return walked)))
+    (when (and (or (= label 11) (and split frameless)) (not (.frameless-return walked)))
       (println "shape {} level {}: no return is reached without the frame" label level)
       (set! failures (+ failures 1)))
     ; Shapes 9 and 10 hold addresses of frame storage.
@@ -502,7 +526,7 @@
       (Ok [owned]
           (let [(mut native) owned
                 target (p/cast u64 (.base native))]
-            (for shape [(: 0 i32) 1 2 3 4 5 6 8 9 10]
+            (for shape [(: 0 i32) 1 2 3 4 5 6 8 9 10 11]
               (set! failures (+ failures (check-shape shape target))))
             (set! failures (+ failures (check-float target)))
             (jit/release! (mut native)))))
