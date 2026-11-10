@@ -99,6 +99,33 @@
                (and (> base 0)
                     (stack/frame-object? (get (.instructions graph) (cast i64 base)))))))))
 
+;;; EXTENSION (SEXT/ZEXT to an integer) is the only reader of a 32-bit TRUNC
+;;; in its own block, and that TRUNC the only reader of a 64-bit integer LOAD
+;;; whose access form may change.
+(defn word-view-load? [(graph g/Graph) (counts (ArrayList i64)) (protected (ArrayList bool))
+                       (omitted (ArrayList bool)) (blocks (ArrayList i32)) (extension i32)]
+  (-> bool)
+  (let [node (get (.instructions graph) (cast i64 extension))
+        view (.op1 node)]
+    (and (> view 0)
+         (types/integer? (cast i32 (n/type-id node))) (!= (n/type-id node) 1)
+         (= (get blocks (cast i64 extension)) (get blocks (cast i64 view)))
+         (let [truncation (get (.instructions graph) (cast i64 view))
+               load (.op1 truncation)]
+           (and (= (n/opcode truncation) 35)
+                (or (= (n/type-id truncation) 4) (= (n/type-id truncation) 10))
+                (= (get counts (cast i64 view)) 1)
+                (not (get protected (cast i64 view)))
+                (not (get omitted (cast i64 view)))
+                (> load 0)
+                (let [source (get (.instructions graph) (cast i64 load))]
+                  (and (= (n/opcode source) 91)
+                       (or (= (n/type-id source) 5) (= (n/type-id source) 11))
+                       (= (get counts (cast i64 load)) 2)
+                       (not (get protected (cast i64 load)))
+                       (not (get omitted (cast i64 load)))
+                       (not (frame-load? graph load)))))))))
+
 ;;; The signed LOAD that REFERENCE reads as a zero extension, or zero.
 ;;; REFERENCE is ZEXT of the LOAD, or AND(SEXT(LOAD), mask) whose mask is
 ;;; exactly the loaded width and whose SEXT has no other reader. The AND and
@@ -525,10 +552,12 @@
                     (select/Tile :rule (.rule tile) :wide (.wide tile) :left (.left tile)
                                  :right count :immediate (.immediate tile)))))))
     ; Access forms of integer LOADs, chosen by the conversions that read them.
-    ;   A LOAD whose only reader is a TRUNC to a narrower integer accesses
+    ;   A LOAD whose only reader is a TRUNC to a byte or halfword accesses
     ;   just those low bytes (little-endian), zero-extended; the TRUNC is its
     ;   register. A sole SEXT of that TRUNC later makes the access
-    ;   sign-extending instead.
+    ;   sign-extending instead. A word TRUNC of a 64-bit LOAD is already a
+    ;   free view (and the wide access can pair), so that LOAD is narrowed
+    ;   only for a sole extension of the view, below.
     ;   A signed LOAD read only by ZEXT, or by AND(SEXT, all bits of the
     ;   loaded width), is accessed zero-extending; each reader is its register.
     ; The LOAD keeps its place, address and type. Its control successor holds
@@ -539,8 +568,7 @@
           (let [reference (get load-views i)
                 index (cast i64 reference)
                 node (get (.instructions graph) index)
-                opcode (n/opcode node)
-                (mut kept) false]
+                opcode (n/opcode node)]
             (unless (get omitted index)
               (cond (= opcode 35)
                       (let [load (get (.instructions graph) (cast i64 (.op1 node)))
@@ -548,6 +576,7 @@
                         (when (and (select/narrowable-load-type? (n/type-id load))
                                    (select/narrow-view-type? (n/type-id node))
                                    (< width (types/scalar-size (cast i32 (n/type-id load)) 8))
+                                   (< width 4)
                                    (= (get counts (cast i64 (.op1 node))) 2)
                                    (not (get protected (cast i64 (.op1 node))))
                                    (not (get omitted (cast i64 (.op1 node))))
@@ -556,19 +585,16 @@
                                 (select/Tile :rule 57 :wide false :left 0 :right 0
                                              :immediate (cast u64 width)))
                           (set! (mut tiles) index (select/extended-copy (.op1 node)))
-                          (set! (mut extractions) index (.op1 node))
-                          (set! kept true)))
+                          (set! (mut extractions) index (.op1 node))))
                     :else
                       (let [load (zero-view-load graph counts protected omitted reference)]
                         (when (> load 0)
                           (when (= (len zero-views) 0)
                             (extend-zeroed! (mut zero-views) (len (.instructions graph))))
                           (set! (mut zero-views) (cast i64 load)
-                                (+ (get zero-views (cast i64 load)) 1))
-                          (set! kept true)))))
-            (unless kept (set! (mut load-views) i 0))))
+                                (+ (get zero-views (cast i64 load)) 1))))))))
         (for reference load-views
-          (when (> reference 0)
+          (when (> (len zero-views) 0)
             (let [index (cast i64 reference)
                   node (get (.instructions graph) index)
                   load (zero-view-load graph counts protected omitted reference)
@@ -645,6 +671,15 @@
                                                                           :immediate (cast u64 (| form 256))))
                                                        (Some (select/extended-copy load)))))
                                          :else (None))
+                                 ; The sole extension of a word view of a
+                                 ; 64-bit LOAD nothing else reads: the LOAD
+                                 ; accesses the word in the extended form.
+                                 (word-view-load? graph counts protected omitted blocks reference)
+                                   (let [load (.op1 (get (.instructions graph) (cast i64 view)))]
+                                     (set! (mut tiles) (cast i64 load)
+                                           (select/Tile :rule 57 :wide false :left 0 :right 0
+                                                        :immediate (if (= opcode 33) 260 4)))
+                                     (Some (select/extended-copy load)))
                                  :else (select/word-view-extension graph reference))))
             (None [] 0)
             (Some [tile]
@@ -851,10 +886,12 @@
     ; The register of a LOAD with a selected access form is not the loaded
     ; word, so no later rule may supply that value from elsewhere.
     (for reference load-views
-      (when (> reference 0)
-        (let [load (get extractions (cast i64 reference))]
-          (when (and (> load 0) (= (.rule (get tiles (cast i64 load))) 57))
-            (set! (mut protected) (cast i64 load) true)))))
+      (let [node (get (.instructions graph) (cast i64 reference))
+            load (if (= (n/opcode node) 47)
+                     (.op1 (get (.instructions graph) (cast i64 (.op1 node))))
+                     (.op1 node))]
+        (when (and (> load 0) (= (.rule (get tiles (cast i64 load))) 57))
+          (set! (mut protected) (cast i64 load) true))))
     (free! (mut load-views))
     (if (!= error "")
         (do
