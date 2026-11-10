@@ -7,7 +7,8 @@
 (import "stogir.a64.compile" :as compile)
 (import "stogir.image" :as image)
 (import "coil.alloc" :use [malloc-allocator])
-(import "coil.result" :use [Result Ok Err])
+(import "coil.result" :use [Result Ok Err Option Some None])
+(import "coil.mem" :as memory)
 (import "coil.arraylist" :use [ArrayList])
 
 (defn require [(r (Result i32 (slice u8)))] (-> i32)
@@ -22,6 +23,19 @@
           (for byte (.text code) (push! (mut copy) byte))
           (image/release! (mut code))
           (slice copy)))))
+
+(defn same-cells? [(first g/Graph) (second g/Graph)] (-> bool)
+  (and (= (len (.instructions first)) (len (.instructions second)))
+       (= (len (.arities first)) (len (.arities second)))
+       (memory/eql (.data (.instructions first)) (.data (.instructions second))
+                   (len (.instructions first)))
+       (memory/eql (.data (.arities first)) (.data (.arities second)) (len (.arities first)))
+       (= (len (.constants first)) (len (.constants second)))))
+
+(defn refused? [(result (Option compact/Compacted))] (-> bool)
+  (match result
+    (None [] true)
+    (Some [packed] (let [(mut packed) packed] (compact/release! (mut packed)) false))))
 
 ;;; Dead NOPs between live nodes disappear; live references, a branch's
 ;;; projections and the roots are renumbered; the code is byte-identical.
@@ -71,7 +85,45 @@
           (assert (= (n/opcode node) 120))))
       (let [after (text-of dense (slice (.roots packed)))]
         (assert (= before after)))
+      ; The checked entry decides as compactable? and the START test do, and
+      ; builds the same graph and roots as compact, cell for cell.
+      (match (compact/compact-checked graph [left right] a)
+        (None [] (panic "compact-checked refused a compactable graph"))
+        (Some [checked]
+          (let [(mut checked) checked]
+            (assert (same-cells? dense (.graph checked)))
+            (assert (= (len (.roots checked)) (len (.roots packed))))
+            (for [i 0 (len (.roots packed))]
+              (assert (= (get (.roots checked) i) (get (.roots packed) i))))
+            (compact/release! (mut checked)))))
       (compact/release! (mut packed)))
+    (let [(mut dangling) (g/duplicate graph a)]
+      (assert (g/set-operand! (mut dangling) doubled 1 100000))
+      (assert (refused? (compact/compact-checked dangling [left right] a)))
+      (g/release! (mut dangling)))
+    (let [(mut marked) (g/duplicate graph a)
+          (mut node) (get (.instructions marked) (cast i64 dead1))]
+      (set! (.op1 node) 7)
+      (set! (mut (.instructions marked)) (cast i64 dead1) node)
+      (assert (refused? (compact/compact-checked marked [left right] a)))
+      (g/release! (mut marked)))
+    (assert (refused? (compact/compact-checked graph [left (: 100000 i32)] a)))
+    ; A NOP that a root or a live operand names is kept by both entries; a
+    ; graph whose first node is not START is refused.
+    (let [(mut named) (g/duplicate graph a)]
+      (match (compact/compact-checked named [left right dead1] a)
+        (None [] (panic "compact-checked refused a root naming a NOP"))
+        (Some [checked]
+          (let [(mut checked) checked
+                (mut plain) (compact/compact named [left right dead1] a)]
+            (assert (same-cells? (.graph plain) (.graph checked)))
+            (assert (= (len (.instructions (.graph checked))) (- (len (.instructions graph)) 1)))
+            (for [i 0 3] (assert (= (get (.roots checked) i) (get (.roots plain) i))))
+            (compact/release! (mut plain))
+            (compact/release! (mut checked)))))
+      (assert (g/make-nop! (mut named) start))
+      (assert (refused? (compact/compact-checked named [left right] a)))
+      (g/release! (mut named)))
     (g/release! (mut graph))
     (println "compaction removes dead cells and keeps code identical")
     0))
