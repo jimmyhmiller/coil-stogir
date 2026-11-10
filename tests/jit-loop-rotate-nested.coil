@@ -1,0 +1,426 @@
+;;; Rotation of a loop nested in another loop (jump-thread/rotate-with!): the
+;;; header's reads and test are copied onto the entry edge as a guard and onto
+;;; each back edge as the latch test. Every shape is executed plain and
+;;; optimized against a model over zero-trip, one-trip and many-trip inner
+;;; loops, and the optimized graph is checked for the shape it must have.
+(module stogir.tests.jit-loop-rotate-nested)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.calls" :as calls)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.fact-fold" :as fact-fold)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+;;; bound 0: the inner bound is read from data[r & 3] in the inner header, and
+;;;   the body stores to data[4], which keeps that read in the header.
+;;; bound 1: the inner bound is r & 3, no read.
+;;; bound 2: the inner bound is the literal 4 (the guard is decided).
+;;; bound 3: the inner bound is x, and the whole function is under x > 0 (the
+;;;   guard follows from a dominating test).
+;;; cell 0: the body reads nothing through q. 1: it reads *q first thing.
+;;;   2: and stores to *q on every path. 3: and stores to *q when j is odd.
+;;; exits 0: one back edge, one exit. 1: the body ends in `if j == 5 break`,
+;;;   so the back edge leaves a test. 2: `continue` when j is even, two back
+;;;   edges. 3: three back edges. With 2 and 3 every path to a back edge
+;;;   stores j to data[5], so no back edge leaves a test directly.
+;;; checks 1: the body first returns -99 unless 0 <= j < bound, as a checked
+;;;   element access does. 2: the same with the counter kept one behind, as
+;;;   `for` loops are built: p starts at -1, j is p + 1, and p takes j.
+(defstruct Shape [(bound i32) (cell i32) (exits i32) (checks i32)])
+
+(defstruct Built [(graph g/Graph) (roots (ArrayList i32))])
+
+(defn k [(graph (mut g/Graph)) (value i64)] (-> i32)
+  (require (b/scalar-constant! (mut graph) 11 (cast u64 value) 8)))
+
+(defn node [(graph (mut g/Graph)) (opcode i32) (ty i32) (inputs (slice i32))] (-> i32)
+  (require (b/emit! (mut graph) opcode ty inputs)))
+
+(defn patch! [(graph (mut g/Graph)) (reference i32) (index i32) (value i32)] (-> void)
+  (require (b/patch! (mut graph) reference index value))
+  0)
+
+;;; acc = 0
+;;; for r in 0..x:
+;;;   n = bound(r); j = 0
+;;;   while j < n:
+;;;     t = cell != 0 ? *q : 0
+;;;     acc = acc + j + r + t
+;;;     cell 2, or cell 3 and j odd: *q = acc
+;;;     bound 0: data[4] = acc
+;;;     exits 1: if j == 5: break (with j not advanced)
+;;;     exits 2, 3: data[5] = j
+;;;     exits 2, 3: if j even: j += 1; continue
+;;;     exits 3: if j % 4 == 1: acc += 7; j += 1; continue
+;;;     exits 2, 3: acc += 100
+;;;     j += 1
+;;;   acc = acc + j
+;;; return acc
+(defn build [(shape Shape) (a (dyn Allocator))] (-> Built)
+  (let [(mut graph) (g/create a)
+        (mut roots) (ArrayList::new [i32] a)
+        start (node (mut graph) 104 0 [(: 0 i32)])
+        data (node (mut graph) 71 6 [start (: 0 i32) 0])
+        q (node (mut graph) 71 6 [start (: 0 i32) 1])
+        x (node (mut graph) 71 11 [start (: 0 i32) 2])
+        (mut signature) (match (calls/create 0 11 [(: 6 u8) 6 11] a)
+                          (Err [message] (panic "{}" message)) (Ok [s] s))
+        zero (k (mut graph) 0)
+        one (k (mut graph) 1)
+        ; bound 3 wraps everything in x > 0.
+        wrap (if (= (.bound shape) 3)
+                 (node (mut graph) 116 0 [start (node (mut graph) 19 1 [x zero])])
+                 0)
+        top (if (= (.bound shape) 3) (node (mut graph) 107 0 [wrap (: 0 i32)]) start)
+        entry (node (mut graph) 114 0 [top])
+        outer (node (mut graph) 112 0 [entry entry])
+        r (node (mut graph) 67 11 [outer zero zero])
+        acc (node (mut graph) 67 11 [outer zero zero])
+        outer-if (node (mut graph) 116 0 [outer (node (mut graph) 16 1 [r x])])
+        outer-body (node (mut graph) 107 0 [outer-if (: 0 i32)])
+        outer-exit (node (mut graph) 108 0 [outer-if (: 0 i32)])
+        slot (node (mut graph) 47 11 [r (k (mut graph) 3)])
+        address (node (mut graph) 26 6 [data (node (mut graph) 28 11 [slot (k (mut graph) 8)])])
+        pre (node (mut graph) 114 0 [outer-body])
+        back-edges (cond (= (.exits shape) 2) 2 (= (.exits shape) 3) 3 :else 1)
+        inner (cond (= back-edges 1) (node (mut graph) 112 0 [pre pre])
+                    (= back-edges 2) (node (mut graph) 112 0 [pre pre pre])
+                    :else (node (mut graph) 112 0 [pre pre pre pre]))
+        behind (= (.checks shape) 2)
+        seed (if behind (k (mut graph) -1) zero)
+        counter (cond (= back-edges 1) (node (mut graph) 67 11 [inner seed seed])
+                      (= back-edges 2) (node (mut graph) 67 11 [inner seed seed seed])
+                      :else (node (mut graph) 67 11 [inner seed seed seed seed]))
+        j (if behind (node (mut graph) 26 11 [counter one]) counter)
+        acc2 (cond (= back-edges 1) (node (mut graph) 67 11 [inner acc acc])
+                   (= back-edges 2) (node (mut graph) 67 11 [inner acc acc acc])
+                   :else (node (mut graph) 67 11 [inner acc acc acc acc]))
+        limit (cond (= (.bound shape) 0) (node (mut graph) 91 11 [inner address])
+                    (= (.bound shape) 1) slot
+                    (= (.bound shape) 2) (k (mut graph) 4)
+                    :else x)
+        inner-if (node (mut graph) 116 0 [(if (= (.bound shape) 0) limit inner)
+                                          (node (mut graph) 16 1 [j limit])])
+        entered (node (mut graph) 107 0 [inner-if (: 0 i32)])
+        inner-exit (node (mut graph) 108 0 [inner-if (: 0 i32)])
+        low (if (!= (.checks shape) 0)
+                (node (mut graph) 116 0 [entered (node (mut graph) 16 1 [j zero])])
+                0)
+        high (if (!= (.checks shape) 0)
+                 (node (mut graph) 116 0 [(node (mut graph) 108 0 [low (: 0 i32)])
+                                          (node (mut graph) 17 1 [j limit])])
+                 0)
+        body (if (!= (.checks shape) 0) (node (mut graph) 108 0 [high (: 0 i32)]) entered)
+        read (if (!= (.cell shape) 0) (node (mut graph) 91 11 [body q]) 0)
+        term (if (!= (.cell shape) 0) read zero)
+        acc3 (node (mut graph) 26 11 [(node (mut graph) 26 11 [acc2 j])
+                                      (node (mut graph) 26 11 [r term])])
+        after-read (if (!= (.cell shape) 0) read body)
+        ; cell 2: a store on every path. cell 3: a store when j is odd.
+        after-cell
+          (cond (= (.cell shape) 2) (node (mut graph) 93 0 [after-read q acc3])
+                (= (.cell shape) 3)
+                  (let [odd (node (mut graph) 15 1 [(node (mut graph) 47 11 [j one]) zero])
+                        test (node (mut graph) 116 0 [after-read odd])
+                        yes (node (mut graph) 107 0 [test (: 0 i32)])
+                        no (node (mut graph) 108 0 [test (: 0 i32)])
+                        stored (node (mut graph) 93 0 [yes q acc3])]
+                    (node (mut graph) 112 0 [(node (mut graph) 114 0 [stored])
+                                             (node (mut graph) 114 0 [no])]))
+                :else after-read)
+        after-store (if (= (.bound shape) 0)
+                        (node (mut graph) 93 0
+                              [after-cell (node (mut graph) 26 6 [data (k (mut graph) 32)]) acc3])
+                        after-cell)
+        j1 (if behind j (node (mut graph) 26 11 [j one]))]
+    (require (calls/function! (mut graph) signature a))
+    (when (!= (.checks shape) 0)
+      (push! (mut roots)
+             (node (mut graph) 120 11 [(node (mut graph) 107 0 [low (: 0 i32)])
+                                       (k (mut graph) -99) (: 0 i32)]))
+      (push! (mut roots)
+             (node (mut graph) 120 11 [(node (mut graph) 107 0 [high (: 0 i32)])
+                                       (k (mut graph) -99) (: 0 i32)])))
+    (calls/release! (mut signature))
+    (cond
+      (= (.exits shape) 1)
+        ; if j == 5 break: the back edge leaves the test's false projection.
+        (let [stop (node (mut graph) 116 0 [after-store (node (mut graph) 14 1 [j (k (mut graph) 5)])])
+              broke (node (mut graph) 107 0 [stop (: 0 i32)])
+              going (node (mut graph) 108 0 [stop (: 0 i32)])
+              back (node (mut graph) 114 0 [going])
+              leave (node (mut graph) 112 0 [(node (mut graph) 114 0 [inner-exit])
+                                             (node (mut graph) 114 0 [broke])])
+              acc-out (node (mut graph) 67 11 [leave acc2 acc3])
+              j-out (node (mut graph) 67 11 [leave j j])
+              outer-back (node (mut graph) 114 0 [leave])]
+          (patch! (mut graph) inner 2 back)
+          (patch! (mut graph) counter 3 j1)
+          (patch! (mut graph) acc2 3 acc3)
+          (patch! (mut graph) outer 2 outer-back)
+          (patch! (mut graph) r 3 (node (mut graph) 26 11 [r one]))
+          (patch! (mut graph) acc 3 (node (mut graph) 26 11 [acc-out j-out])))
+      (>= (.exits shape) 2)
+        (let [even (node (mut graph) 14 1 [(node (mut graph) 47 11 [j one]) zero])
+              skip (node (mut graph) 116 0 [after-store even])
+              mark (node (mut graph) 26 6 [data (k (mut graph) 40)])
+              back1 (node (mut graph) 114 0
+                          [(node (mut graph) 93 0
+                                 [(node (mut graph) 107 0 [skip (: 0 i32)]) mark j])])
+              rest (node (mut graph) 108 0 [skip (: 0 i32)])
+              outer-back (node (mut graph) 114 0 [inner-exit])]
+          (patch! (mut graph) inner 2 back1)
+          (patch! (mut graph) counter 3 j1)
+          (patch! (mut graph) acc2 3 acc3)
+          (if (= (.exits shape) 2)
+              (let [back2 (node (mut graph) 114 0 [(node (mut graph) 93 0 [rest mark j])])]
+                (patch! (mut graph) inner 3 back2)
+                (patch! (mut graph) counter 4 j1)
+                (patch! (mut graph) acc2 4 (node (mut graph) 26 11 [acc3 (k (mut graph) 100)])))
+              (let [first (node (mut graph) 14 1 [(node (mut graph) 47 11 [j (k (mut graph) 3)]) one])
+                    again (node (mut graph) 116 0 [rest first])
+                    back2 (node (mut graph) 114 0
+                                [(node (mut graph) 93 0
+                                       [(node (mut graph) 107 0 [again (: 0 i32)]) mark j])])
+                    back3 (node (mut graph) 114 0
+                                [(node (mut graph) 93 0
+                                       [(node (mut graph) 108 0 [again (: 0 i32)]) mark j])])]
+                (patch! (mut graph) inner 3 back2)
+                (patch! (mut graph) counter 4 j1)
+                (patch! (mut graph) acc2 4 (node (mut graph) 26 11 [acc3 (k (mut graph) 7)]))
+                (patch! (mut graph) inner 4 back3)
+                (patch! (mut graph) counter 5 j1)
+                (patch! (mut graph) acc2 5 (node (mut graph) 26 11 [acc3 (k (mut graph) 100)]))))
+          (patch! (mut graph) outer 2 outer-back)
+          (patch! (mut graph) r 3 (node (mut graph) 26 11 [r one]))
+          (patch! (mut graph) acc 3 (node (mut graph) 26 11 [acc2 j])))
+      :else
+        (let [back (node (mut graph) 114 0 [after-store])
+              outer-back (node (mut graph) 114 0 [inner-exit])]
+          (patch! (mut graph) inner 2 back)
+          (patch! (mut graph) counter 3 j1)
+          (patch! (mut graph) acc2 3 acc3)
+          (patch! (mut graph) outer 2 outer-back)
+          (patch! (mut graph) r 3 (node (mut graph) 26 11 [r one]))
+          (patch! (mut graph) acc 3 (node (mut graph) 26 11 [acc2 j]))))
+    (push! (mut roots) (node (mut graph) 120 11 [outer-exit acc (: 0 i32)]))
+    (when (= (.bound shape) 3)
+      (push! (mut roots)
+             (node (mut graph) 120 11 [(node (mut graph) 108 0 [wrap (: 0 i32)]) zero (: 0 i32)])))
+    (Built :graph graph :roots roots)))
+
+(defn model [(shape Shape) (data (ptr u64)) (q (ptr u64)) (x i64)] (-> i64)
+  (let [(mut acc) (: 0 i64) (mut r) (: 0 i64)]
+    (when (or (!= (.bound shape) 3) (> x 0))
+      (while (< r x)
+        (let [(mut j) (: 0 i64) (mut going) true]
+          (while (and going
+                      (< j (cond (= (.bound shape) 0)
+                                   (cast i64 (load (p/index data (p/iand r 3))))
+                                 (= (.bound shape) 1) (p/iand r 3)
+                                 (= (.bound shape) 2) 4
+                                 :else x)))
+            (let [t (if (!= (.cell shape) 0) (cast i64 (load q)) 0)]
+              (set! acc (p/iadd (p/iadd acc j) (p/iadd r t)))
+              (when (or (= (.cell shape) 2) (and (= (.cell shape) 3) (= (p/iand j 1) 1)))
+                (store! q (cast u64 acc)))
+              (when (= (.bound shape) 0) (store! (p/index data 4) (cast u64 acc)))
+              (cond (= (.exits shape) 1)
+                      (if (= j 5) (set! going false) (set! j (+ j 1)))
+                    (>= (.exits shape) 2)
+                      (do (store! (p/index data 5) (cast u64 j))
+                          (cond (= (p/iand j 1) 0) 0
+                                (and (= (.exits shape) 3) (= (p/iand j 3) 1))
+                                  (set! acc (p/iadd acc 7))
+                                :else (set! acc (p/iadd acc 100)))
+                          (set! j (+ j 1)))
+                    :else (set! j (+ j 1)))))
+          (set! acc (p/iadd acc j)))
+        (set! r (+ r 1))))
+    acc))
+
+(defn count-of [(graph g/Graph) (opcode u8)] (-> i64)
+  (let [(mut count) (: 0 i64) (mut at) (: 1 i64)]
+    (while (< at (len (.instructions graph)))
+      (when (= (n/opcode (get (.instructions graph) at)) opcode) (set! count (+ count 1)))
+      (set! at (+ at (/ (+ (cast i64 (get (.arities graph) at)) 4) 4))))
+    count))
+
+;;; Opcode of the control predecessor of the one LOAD of a PARAM address (the
+;;; read of *q), or zero when there is no such single read.
+(defn cell-read-above [(graph g/Graph)] (-> i32)
+  (let [(mut found) (: 0 i32) (mut several) false (mut at) (: 1 i64)]
+    (while (< at (len (.instructions graph)))
+      (let [node (get (.instructions graph) at)]
+        (when (and (= (n/opcode node) 91) (> (.op2 node) 0)
+                   (= (n/opcode (get (.instructions graph) (cast i64 (.op2 node)))) 71))
+          (if (= found 0)
+              (set! found (cast i32 (n/opcode (get (.instructions graph) (cast i64 (.op1 node))))))
+              (set! several true))))
+      (set! at (+ at (/ (+ (cast i64 (get (.arities graph) at)) 4) 4))))
+    (if several 0 found)))
+
+;;; rows: the four inner bounds bound 0 reads. With null, q is the null
+;;; pointer, which only runs whose inner loop never runs may be given. Only
+;;; x up to most is run.
+(defn execute [(graph g/Graph) (roots (slice i32)) (shape Shape) (rows (slice u64)) (null bool)
+               (most i64) (label (slice u8))] (-> i64)
+  (let [(mut failures) (: 0 i64)]
+    (match (compile/text graph 1 roots (malloc-allocator))
+      (Err [message] (panic "{} compile: {}" label message))
+      (Ok [text]
+          (let [(mut text) text]
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "{} map: {}" label message))
+              (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        f (p/cast (fnptr (cc/C) [(ptr u64) (ptr u64) i64] i64) (.base loaded))]
+                    (for x [(: 0 i64) 1 2 3 4 5 9 -1 -7]
+                     (when (<= x most)
+                      (let [(mut mine) [(: 0 u64) 0 0 0 0 0]
+                            (mut theirs) [(: 0 u64) 0 0 0 0 0]
+                            (mut my-cell) (: 11 u64)
+                            (mut their-cell) (: 11 u64)]
+                        (for [i 0 4]
+                          (set! (mut mine) i (get rows i))
+                          (set! (mut theirs) i (get rows i)))
+                        (let [want (model shape (p/cast (ptr u64) (mut mine))
+                                          (if null (cast (ptr u64) 0) (p/cast (ptr u64) (mut my-cell))) x)
+                              got (f (p/cast (ptr u64) (mut theirs))
+                                     (if null (cast (ptr u64) 0) (p/cast (ptr u64) (mut their-cell))) x)]
+                          (unless (and (= got want) (= my-cell their-cell)
+                                       (= (get mine 4) (get theirs 4))
+                                       (= (get mine 5) (get theirs 5)))
+                            (println "{} bound {} cell {} exits {} x {}: got {} want {} cell {} {} data {} {}"
+                                     label (.bound shape) (.cell shape) (.exits shape) x got want
+                                     their-cell my-cell (get theirs 4) (get mine 4))
+                            (set! failures (+ failures 1)))))))
+                    (jit/release! (mut loaded)))))
+            (free! (mut text)))))
+    failures))
+
+(defn run-all [(graph g/Graph) (roots (slice i32)) (shape Shape) (label (slice u8))] (-> i64)
+  (cond (= (.bound shape) 0)
+          (+ (execute graph roots shape [(: 0 u64) 0 0 0] false 9 label)
+             (execute graph roots shape [(: 1 u64) 0 1 0] false 9 label)
+             (execute graph roots shape [(: 0 u64) 3 9 1] false 9 label)
+             (execute graph roots shape [(: 7 u64) 2 0 6] false 9 label)
+             ; The inner loop never runs: nothing may be read through null.
+             (execute graph roots shape [(: 0 u64) 0 0 0] true 9 label))
+        (= (.bound shape) 1)
+          ; The inner bound is r & 3: with x at most one it never runs.
+          (+ (execute graph roots shape [(: 0 u64) 0 0 0] false 9 label)
+             (execute graph roots shape [(: 0 u64) 0 0 0] true 1 label))
+        :else (execute graph roots shape [(: 0 u64) 0 0 0] false 9 label)))
+
+;;; ifs: IF nodes of the optimized graph (negative: not checked). above: opcode above the read of *q
+;;; (107/108 a projection: the read sits behind the guard; 112: it heads the
+;;; rotated body), or zero for no check. With facts the graph is also folded
+;;; by fact-fold and optimized again, and must then hold `folded` IF nodes.
+(defn check [(shape Shape) (ifs i64) (above i32) (folded i64)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut built) (build shape a)
+        (mut failures) (run-all (.graph built) (slice (.roots built)) shape "plain")]
+    (match (sccp/optimize (.graph built) 8 (slice (.roots built)) a)
+      (Err [message] (panic "optimize: {}" message))
+      (Ok [result]
+          (let [(mut result) result
+                graph (.graph result)
+                seen (cell-read-above graph)]
+            (unless (or (< ifs 0) (= (count-of graph 116) ifs))
+              (println "bound {} cell {} exits {}: {} IF, want {}" (.bound shape) (.cell shape)
+                       (.exits shape) (count-of graph 116) ifs)
+              (set! failures (+ failures 1)))
+            (unless (or (= above 0) (= seen above)
+                        (and (= above 107) (= seen 108)))
+              (println "bound {} cell {} exits {}: read of the cell sits under opcode {}, want {}"
+                       (.bound shape) (.cell shape) (.exits shape) seen above)
+              (set! failures (+ failures 1)))
+            (set! failures
+                  (+ failures (run-all graph (slice (.roots result)) shape "optimized")))
+            (when (> folded 0)
+              (match (fact-fold/run graph 1 (slice (.roots result)) false a)
+                (Err [message] (panic "fact fold: {}" message))
+                (Ok [edited]
+                    (match edited
+                      (None []
+                            (println "bound {}: no fact folded the guard" (.bound shape))
+                            (set! failures (+ failures 1)))
+                      (Some [working]
+                            (let [(mut working) working]
+                              (match (sccp/optimize working 8 (slice (.roots result)) a)
+                                (Err [message] (panic "optimize after facts: {}" message))
+                                (Ok [again]
+                                    (let [(mut again) again]
+                                      (unless (= (count-of (.graph again) 116) folded)
+                                        (println "bound {}: {} IF after facts, want {}" (.bound shape)
+                                                 (count-of (.graph again) 116) folded)
+                                        (set! failures (+ failures 1)))
+                                      (set! failures
+                                            (+ failures (run-all (.graph again) (slice (.roots again))
+                                                                 shape "after facts")))
+                                      (rewrite/release! (mut again)))))
+                              (g/release! (mut working))))))))
+            (rewrite/release! (mut result)))))
+    (free! (mut (.roots built)))
+    (g/release! (mut (.graph built)))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) (: 0 i64)]
+    ; A read in the inner header: outer test, guard and latch test. The body
+    ; stores to data[4], which may be *q, so the read of *q stays at the head
+    ; of the rotated body, as it does with a store to *q itself on every path
+    ; or on one.
+    (set! failures (+ failures (check (Shape :bound 0 :cell 0 :exits 0 :checks 0) 3 0 0)))
+    (set! failures (+ failures (check (Shape :bound 0 :cell 1 :exits 0 :checks 0) 3 112 0)))
+    (set! failures (+ failures (check (Shape :bound 0 :cell 2 :exits 0 :checks 0) 3 112 0)))
+    (set! failures (+ failures (check (Shape :bound 0 :cell 3 :exits 0 :checks 0) 4 112 0)))
+    ; No read in the header and none in the body, and no call: nothing the
+    ; guard could keep off the outer loop, so the loop is left as it is.
+    (set! failures (+ failures (check (Shape :bound 1 :cell 0 :exits 0 :checks 0) 2 0 0)))
+    ; A read heading the body is reason enough, and with no store in the loop
+    ; it moves behind the guard: never read when the inner loop does not run.
+    (set! failures (+ failures (check (Shape :bound 1 :cell 1 :exits 0 :checks 0) 3 107 0)))
+    (set! failures (+ failures (check (Shape :bound 1 :cell 2 :exits 0 :checks 0) 3 112 0)))
+    ; A literal bound: the entry test is decided, so there is no guard and the
+    ; loop is bottom-tested.
+    (set! failures (+ failures (check (Shape :bound 2 :cell 1 :exits 0 :checks 0) 2 0 0)))
+    ; The bound is x under x > 0: the guard 0 < x is rotated in, then follows
+    ; from the dominating test and folds away.
+    (set! failures (+ failures (check (Shape :bound 3 :cell 1 :exits 0 :checks 0) 4 107 3)))
+    ; The back edge leaves the break test: left unrotated, the read stays
+    ; under the header test's projection inside the loop.
+    (set! failures (+ failures (check (Shape :bound 0 :cell 1 :exits 1 :checks 0) 3 107 0)))
+    ; continue: two back edges, each with its own latch test.
+    (set! failures (+ failures (check (Shape :bound 0 :cell 1 :exits 2 :checks 0) 5 112 0)))
+    ; Three back edges are over the bound: left unrotated.
+    (set! failures (+ failures (check (Shape :bound 0 :cell 1 :exits 3 :checks 0) 4 107 0)))
+    ; A range check of the counter in the body is decided by the header test.
+    ; Rotated, the body is entered from the guard and from the latch test,
+    ; which between them establish the same bound, and the counter's range
+    ; follows from the latch test of the following iteration: both checks
+    ; still fold, whether the bound is read in the header or not and whichever
+    ; way the counter is kept.
+    (set! failures (+ failures (check (Shape :bound 0 :cell 1 :exits 0 :checks 1) -1 0 3)))
+    (set! failures (+ failures (check (Shape :bound 0 :cell 1 :exits 0 :checks 2) -1 0 3)))
+    (set! failures (+ failures (check (Shape :bound 1 :cell 1 :exits 0 :checks 1) -1 0 3)))
+    (set! failures (+ failures (check (Shape :bound 1 :cell 1 :exits 0 :checks 2) -1 0 3)))
+    ; Here the range check heads the body until the facts fold it, so the
+    ; loop is rotated only by the cleanup after them: its guard 0 < x arrives
+    ; too late for the facts and stays beside the wrapping test, the outer
+    ; test and the latch test.
+    (set! failures (+ failures (check (Shape :bound 3 :cell 1 :exits 0 :checks 2) -1 0 4)))
+    (println "nested loop rotation: {} failures" failures)
+    (if (= failures 0) 0 1)))

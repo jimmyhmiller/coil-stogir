@@ -110,6 +110,50 @@ edges to that one enter below the test. Entry edges may enter below the test
 only when the MERGE keeps no entry edge or no back edge, so each cycle keeps
 one entry; a constant entry test then leaves the loop bottom-tested.
 
+## Loop rotation
+
+`jump-thread/rotate-with!` runs in `sccp/finish-with-uses!` after the first
+cleanup, which has already moved a header's invariant reads onto its entry
+edge, and is followed by a second cleanup when it rotated anything. It reuses
+the threading machinery with every incoming edge split: a candidate is a MERGE
+whose block holds its PHIs, at most four plain scalar LOADs and one IF, at
+most three incoming edges, and a condition built from the PHIs and the reads.
+Each edge gets its own copy of the reads and of the test (at most twelve
+floating values copied per edge), so the test runs once before the loop, as a
+guard, and once on each back edge; the body projection becomes the loop
+header and the exit projection the join of the guard's and the latches' exits.
+Values are repaired exactly as for threading: PHIs at the two joins, a header
+read being the PHI of its copies. A comparison equal or complementary to the
+condition is decided on both sides, as the condition itself is.
+
+A loop is rotated only when all of this holds:
+
+- it lies inside another loop: the MERGE and all its inputs are on one
+  cycle-bearing component of the control predecessor relation (one iterative
+  Tarjan pass over control operands per cleanup, built on first need);
+- one projection stays in the loop and the other leaves it, at least one edge
+  enters and one returns (decided by walks over control predecessors that stop
+  at the MERGE and at the component's boundary);
+- no back edge leaves an IF projection directly. A rotated loop's back edges
+  do, so rotation never repeats; a loop whose body ends in a `break` test is
+  left alone for the same reason;
+- the body needs something the guard can keep off the outer loop: a read in
+  the header, a read heading the body, or a call in the body.
+
+What it buys: reads heading the rotated body are header reads to
+`entry-load`, which moves the invariant ones into the guard's true arm, where
+they run only if the body will; and the allocator can spill a value around
+the inner loop behind the guard (see `allocation/bypass-cut`: the value
+resumes in its register at the start of the join, so the guard's edge moves
+nothing and only the loop's own exit edge reloads). A guard whose condition
+folds to a literal disappears in the following cleanup; one that follows from
+a dominating test is folded by `fact-fold`.
+
+Facts survive rotation: `fact-fold/joined` gives a query at a two-input MERGE
+the union of what its two edges' tests establish about the values each edge
+carries, and `induction` recognizes a counter whose back edge is guarded by
+`next + 1 < other` (kind 3).
+
 ## AArch64 dispatch
 
 Case intervals are heapsorted in O(n log n) time with bounded extra sorting
