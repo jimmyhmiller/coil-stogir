@@ -1,0 +1,260 @@
+(module stogir.tests.elf-basic)
+(import "stogir.image" :as image)
+(import "stogir.aot.elf" :as elf)
+(import "stogir.aot.native" :as aot)
+(import "stogir.symbol-name" :as symbol-name)
+(import "stogir.bytes" :as bytes)
+(import "coil.fs" :as fs)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+;;; Writes /tmp/stogir-x64-elf-basic.o for tests/elf-basic-link.coil:
+;;;   stogir_x64_elf_basic(a, b) = labs(a + b) + k, with k = 1000 a local data
+;;;     word read through PC32 and labs called through PLT32;
+;;;   stogir_x64_elf_basic_via() = the address stored in the global data word
+;;;     stogir_x64_elf_basic_ptr, an ABS64 slot holding stogir_x64_elf_basic.
+;;; Also checks the object's fixed structure byte by byte.
+
+(defn id [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [msg] (panic "symbol: {}" msg))))
+
+(defn c-symbol! [(code (mut image/Image))
+                 (identifier (slice u8))
+                 (section i32)
+                 (offset i64)
+                 (allocator (dyn Allocator))] (-> i32)
+  (let [(mut name) (symbol-name/c-name identifier allocator)
+        symbol (id (image/symbol! (mut code) (slice name) section offset))]
+    (free! (mut name))
+    symbol))
+
+(defn fix! [(code (mut image/Image))
+            (section i32)
+            (offset i64)
+            (kind i32)
+            (symbol i32)
+            (addend i64)] (-> void)
+  (when (not (image/relocate! (mut code)
+                              (image/Relocation
+                                :section section
+                                :offset offset
+                                :kind kind
+                                :symbol symbol
+                                :addend addend)))
+    (panic "relocation at {} rejected" offset)))
+
+(defn build [(allocator (dyn Allocator))] (-> image/Image)
+  (let [(mut code) (image/create-x64 allocator)
+        labs (c-symbol! (mut code) "labs" 0 0 allocator)
+        basic (c-symbol! (mut code) "stogir_x64_elf_basic" 1 0 allocator)
+        k (id (image/local-symbol! (mut code) "stogir_x64_elf_basic_k" 2 0))
+        via (c-symbol! (mut code) "stogir_x64_elf_basic_via" 1 32 allocator)
+        slot (c-symbol! (mut code) "stogir_x64_elf_basic_ptr" 2 8 allocator)]
+    ; sub rsp, 8; add rdi, rsi; call labs; add rax, [rip+k]; add rsp, 8; ret
+    (for byte [(: 0x48 u8)
+               0x83
+               0xEC
+               0x08
+               0x48
+               0x01
+               0xF7
+               0xE8
+               0
+               0
+               0
+               0
+               0x48
+               0x03
+               0x05
+               0
+               0
+               0
+               0
+               0x48
+               0x83
+               0xC4
+               0x08
+               0xC3]
+      (push! (mut (.text code)) byte))
+    (while (< (len (.text code)) 32) (push! (mut (.text code)) 0xCC))
+    ; mov rax, [rip+ptr]; ret
+    (for byte [(: 0x48 u8) 0x8B 0x05 0 0 0 0 0xC3]
+      (push! (mut (.text code)) byte))
+    (match (image/data-space! (mut code) 16 8)
+      (Err [msg] (panic "{}" msg))
+      (Ok [_] 0))
+    (bytes/patch32! (mut (.data code)) 0 1000)
+    ; Stale bytes in a relocated field must not reach the object.
+    (bytes/patch32! (mut (.data code)) 8 0x55555555)
+    (fix! (mut code) 1 8 image/X64-PLT32 labs -4)
+    (fix! (mut code) 1 15 image/X64-PC32 k -4)
+    (fix! (mut code) 1 35 image/X64-PC32 slot -4)
+    (fix! (mut code) 2 8 image/ABS64 basic 0)
+    code))
+
+(defn u16 [(object (ArrayList u8)) (offset i64)] (-> i64)
+  (| (cast i64 (get object offset)) (<< (cast i64 (get object (+ offset 1))) 8)))
+
+(defn u32 [(object (ArrayList u8)) (offset i64)] (-> i64)
+  (| (u16 object offset) (<< (u16 object (+ offset 2)) 16)))
+
+(defn u64 [(object (ArrayList u8)) (offset i64)] (-> i64)
+  (| (u32 object offset) (<< (u32 object (+ offset 4)) 32)))
+
+;;; Field `field` (byte offset within the header) of section header `index`.
+(defn header [(object (ArrayList u8)) (index i64) (field i64)] (-> i64)
+  (+ (u64 object 40) (* index 64) field))
+
+(defn structure-failures [(object (ArrayList u8))] (-> i64)
+  (let [(mut failures) 0
+        text (u64 object (header object 1 24))
+        data (u64 object (header object 2 24))
+        rela-text (u64 object (header object 3 24))
+        rela-data (u64 object (header object 4 24))
+        symbols (u64 object (header object 5 24))]
+    ; ELF64 little-endian ET_REL for EM_X86_64 with nine sections.
+    (when (or (!= (u32 object 0) 0x464C457F)
+              (!= (get object 4) 2)
+              (!= (get object 5) 1)
+              (!= (u16 object 16) 1)
+              (!= (u16 object 18) 62)
+              (!= (u16 object 52) 64)
+              (!= (u16 object 58) 64)
+              (!= (u16 object 60) 9)
+              (!= (u16 object 62) 7)
+              (!= (len object) (+ (u64 object 40) (* 9 64))))
+      (set! failures (+ failures 1)))
+    ; .text: PROGBITS, AX, 40 bytes, 16-aligned in the file and in memory.
+    (when (or (!= (u32 object (header object 1 4)) 1)
+              (!= (u64 object (header object 1 8)) 6)
+              (!= (u64 object (header object 1 32)) 40)
+              (!= (u64 object (header object 1 48)) 16)
+              (!= (% text 16) 0)
+              (!= (get object text) 0x48)
+              (!= (get object (+ text 39)) 0xC3))
+      (set! failures (+ failures 1)))
+    ; .data: PROGBITS, WA; k is present and the relocated slot is zeroed.
+    (when (or (!= (u32 object (header object 2 4)) 1)
+              (!= (u64 object (header object 2 8)) 3)
+              (!= (u64 object (header object 2 32)) 16)
+              (!= (u64 object (header object 2 48)) 8)
+              (!= (u64 object data) 1000)
+              (!= (u64 object (+ data 8)) 0))
+      (set! failures (+ failures 1)))
+    ; .rela.text: three records in ascending offset order, linked to .symtab
+    ; and applying to .text. Symbol indices: 1 = k (the only local), then
+    ; labs 2, basic 3, via 4, ptr 5.
+    (when (or (!= (u32 object (header object 3 4)) 4)
+              (!= (u64 object (header object 3 32)) 72)
+              (!= (u32 object (header object 3 40)) 5)
+              (!= (u32 object (header object 3 44)) 1)
+              (!= (u64 object (header object 3 56)) 24)
+              (!= (u64 object rela-text) 8)
+              (!= (u64 object (+ rela-text 8)) 0x200000004)
+              (!= (u64 object (+ rela-text 16)) -4)
+              (!= (u64 object (+ rela-text 24)) 15)
+              (!= (u64 object (+ rela-text 32)) 0x100000002)
+              (!= (u64 object (+ rela-text 40)) -4)
+              (!= (u64 object (+ rela-text 48)) 35)
+              (!= (u64 object (+ rela-text 56)) 0x500000002)
+              (!= (u64 object (+ rela-text 64)) -4))
+      (set! failures (+ failures 1)))
+    ; .rela.data: one R_X86_64_64 against the function.
+    (when (or (!= (u32 object (header object 4 4)) 4)
+              (!= (u64 object (header object 4 32)) 24)
+              (!= (u32 object (header object 4 40)) 5)
+              (!= (u32 object (header object 4 44)) 2)
+              (!= (u64 object rela-data) 8)
+              (!= (u64 object (+ rela-data 8)) 0x300000001)
+              (!= (u64 object (+ rela-data 16)) 0))
+      (set! failures (+ failures 1)))
+    ; .symtab: null + 5 symbols, first global at index 2, strings in .strtab.
+    (when (or (!= (u32 object (header object 5 4)) 2)
+              (!= (u64 object (header object 5 32)) 144)
+              (!= (u32 object (header object 5 40)) 6)
+              (!= (u32 object (header object 5 44)) 2)
+              (!= (u64 object (header object 5 56)) 24))
+      (set! failures (+ failures 1)))
+    ; info/shndx/value of: k (local object in .data), labs (global undefined),
+    ; basic (global function at 0), via (global function at 32), ptr (global
+    ; object at 8).
+    (when (or (!= (get object (+ symbols 24 4)) 0x01)
+              (!= (u16 object (+ symbols 24 6)) 2)
+              (!= (u64 object (+ symbols 24 8)) 0)
+              (!= (get object (+ symbols 48 4)) 0x10)
+              (!= (u16 object (+ symbols 48 6)) 0)
+              (!= (get object (+ symbols 72 4)) 0x12)
+              (!= (u16 object (+ symbols 72 6)) 1)
+              (!= (u64 object (+ symbols 72 8)) 0)
+              (!= (get object (+ symbols 96 4)) 0x12)
+              (!= (u64 object (+ symbols 96 8)) 32)
+              (!= (get object (+ symbols 120 4)) 0x11)
+              (!= (u16 object (+ symbols 120 6)) 2)
+              (!= (u64 object (+ symbols 120 8)) 8))
+      (set! failures (+ failures 1)))
+    ; .strtab and .shstrtab are string tables; .note.GNU-stack is an empty
+    ; PROGBITS section without the executable flag.
+    (when (or (!= (u32 object (header object 6 4)) 3)
+              (!= (u32 object (header object 7 4)) 3)
+              (!= (u32 object (header object 8 4)) 1)
+              (!= (u64 object (header object 8 8)) 0)
+              (!= (u64 object (header object 8 32)) 0))
+      (set! failures (+ failures 1)))
+    failures))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut code) (build allocator)
+        (mut failures) 0]
+    (match (aot/image-object code allocator)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [object]
+          (let [(mut owned) object]
+            (set! failures (+ failures (structure-failures owned)))
+            ; The neutral entry and the ELF writer produce the same bytes.
+            (match (elf/image-object code allocator)
+              (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+              (Ok [direct]
+                  (let [(mut same) direct
+                        (mut i) 0]
+                    (when (!= (len same) (len owned))
+                      (set! failures (+ failures 1)))
+                    (while (and (< i (len same)) (< i (len owned)))
+                      (when (!= (get same i) (get owned i))
+                        (set! failures (+ failures 1)))
+                      (set! i (+ i 1)))
+                    (free! (mut same)))))
+            (match (fs/write-file allocator
+                                  "/tmp/stogir-x64-elf-basic.o"
+                                  (slice owned))
+              (Err [_] (panic "ELF object write failed"))
+              (Ok [_] 0))
+            (free! (mut owned)))))
+    ; The writer changed neither the image's bytes nor its records.
+    (when (or (!= (get (.data code) 8) 0x55) (!= (len (.relocations code)) 4))
+      (set! failures (+ failures 1)))
+    ; text-object: one global function, no relocations, same section shape.
+    (match (elf/text-object [(: 0xB8 u8) 0x2A 0 0 0 0xC3] "forty_two" allocator)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [object]
+          (let [(mut owned) object]
+            (when (or (!= (u16 owned 60) 9)
+                      (!= (u64 owned (header owned 1 32)) 6)
+                      (!= (u64 owned (header owned 3 32)) 0)
+                      (!= (u64 owned (header owned 5 32)) 48)
+                      (!= (u32 owned (header owned 5 44)) 1))
+              (set! failures (+ failures 1)))
+            (match (fs/write-file allocator
+                                  "/tmp/stogir-x64-elf-text.o"
+                                  (slice owned))
+              (Err [_] (panic "ELF text object write failed"))
+              (Ok [_] 0))
+            (free! (mut owned)))))
+    (match (elf/text-object [] "empty" allocator)
+      (Err [msg]
+           (when (!= msg "empty function text") (set! failures (+ failures 1))))
+      (Ok [_] (set! failures (+ failures 1))))
+    (image/release! (mut code))
+    (println "x86-64 ELF object checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

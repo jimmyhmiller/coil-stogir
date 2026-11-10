@@ -1,0 +1,100 @@
+(module stogir.tests.elf-validation)
+(import "stogir.image" :as image)
+(import "stogir.aot.elf" :as elf)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+;;; Images the ELF writer refuses. Pure serialization: runs on every host.
+
+(defn error [(source image/Image) (allocator (dyn Allocator))] (-> (slice u8))
+  (match (elf/image-object source allocator)
+    (Err [message] message)
+    (Ok [object] (let [(mut owned) object] (free! (mut owned)) ""))))
+
+(defn sample [(allocator (dyn Allocator))] (-> image/Image)
+  (let [(mut code) (image/create-x64 allocator)]
+    (image/symbol! (mut code) "f" 1 0)
+    (image/symbol! (mut code) "g" 0 0)
+    (for byte [(: 0xE8 u8) 0 0 0 0 0xE9 0 0 0 0]
+      (push! (mut (.text code)) byte))
+    (image/relocate! (mut code)
+                     (image/Relocation
+                       :section 1
+                       :offset 1
+                       :kind image/X64-PLT32
+                       :symbol 1
+                       :addend -4))
+    code))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut failures) 0]
+    (let [(mut code) (sample allocator)]
+      (when (!= (error code allocator) "") (set! failures (+ failures 1)))
+      ; An empty x86-64 image is still a well-formed object.
+      (let [(mut empty) (image/create-x64 allocator)]
+        (when (!= (error empty allocator) "") (set! failures (+ failures 1)))
+        (image/release! (mut empty)))
+      (set! (.text-alignment code) 24)
+      (when (!= (error code allocator) "invalid ELF section alignment")
+        (set! failures (+ failures 1)))
+      (set! (.text-alignment code) 16)
+      (set! (.data-alignment code) 4)
+      (when (!= (error code allocator) "invalid ELF section alignment")
+        (set! failures (+ failures 1)))
+      (set! (.data-alignment code) 8)
+      ; Records stored without relocate! are revalidated.
+      (push! (mut (.relocations code))
+             (image/Relocation
+               :section 1
+               :offset 3
+               :kind image/X64-PC32
+               :symbol 0
+               :addend -4))
+      (when (!= (error code allocator) "overlapping image relocations")
+        (set! failures (+ failures 1)))
+      (pop! (mut (.relocations code)))
+      (push! (mut (.relocations code))
+             (image/Relocation
+               :section 1
+               :offset 6
+               :kind image/A64-PAGE21
+               :symbol 0
+               :addend 0))
+      (when (!= (error code allocator)
+                "relocation kind does not belong to the image machine")
+        (set! failures (+ failures 1)))
+      (pop! (mut (.relocations code)))
+      (push! (mut (.relocations code))
+             (image/Relocation
+               :section 2
+               :offset 0
+               :kind image/ABS64
+               :symbol 0
+               :addend 0))
+      (when (!= (error code allocator)
+                "invalid image relocation bounds or symbol")
+        (set! failures (+ failures 1)))
+      (pop! (mut (.relocations code)))
+      ; Symbol records are revalidated too.
+      (let [(mut symbol) (get (.symbols code) 0)]
+        (set! (.offset symbol) 11)
+        (set! (mut (.symbols code)) 0 symbol)
+        (when (!= (error code allocator) "invalid input image symbol")
+          (set! failures (+ failures 1)))
+        (set! (.offset symbol) 0)
+        (set! (mut (.symbols code)) 0 symbol))
+      (push! (mut (.symbols code)) (get (.symbols code) 0))
+      (when (!= (error code allocator) "duplicate input symbol name")
+        (set! failures (+ failures 1)))
+      (pop! (mut (.symbols code)))
+      (when (!= (error code allocator) "") (set! failures (+ failures 1)))
+      (image/release! (mut code)))
+    ; AArch64 images belong to the Mach-O writer.
+    (let [(mut code) (image/create allocator)]
+      (when (!= (error code allocator) "ELF writer accepts only x86-64 images")
+        (set! failures (+ failures 1)))
+      (image/release! (mut code)))
+    (println "ELF writer validation: {} failures" failures)
+    (if (= failures 0) 0 1)))

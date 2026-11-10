@@ -1,0 +1,235 @@
+(module stogir.tests.x64-jit-image)
+(import "stogir.image" :as image)
+(import "stogir.jit.native" :as jit)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+;;; A hand-built x86-64 image through the image loader (Linux x86-64 host):
+;;; a PLT32 call to an undefined symbol (veneer), PC32 data references with
+;;; addends -4 and -8, ABS64 slots, and the loader's error paths.
+
+(defn plus100 :cc (cc/C) [(x i64)] (-> i64)
+  (+ x 100))
+
+(defn id [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [msg] (panic "symbol: {}" msg))))
+
+(defn text! [(code (mut image/Image)) (values (slice u8))] (-> void)
+  (for byte values (push! (mut (.text code)) byte)))
+
+(defn fix! [(code (mut image/Image))
+            (section i32)
+            (offset i64)
+            (kind i32)
+            (symbol i32)
+            (addend i64)] (-> void)
+  (when (not (image/relocate! (mut code)
+                              (image/Relocation
+                                :section section
+                                :offset offset
+                                :kind kind
+                                :symbol symbol
+                                :addend addend)))
+    (panic "relocation at {} rejected" offset)))
+
+(defn external [] (-> u64)
+  (primitive/cast u64 (primitive/cast (ptr u8) (fnptr-of plus100))))
+
+(defn read64 [(base (ptr u8)) (offset i64)] (-> u64)
+  (let [(mut value) (: 0 u64)
+        (mut i) 7]
+    (while (>= i 0)
+      (set! value
+            (| (<< value 8)
+               (cast u64 (load (primitive/index base (+ offset i))))))
+      (set! i (- i 1)))
+    value))
+
+(defn entry [(loaded jit/Loaded) (symbol i32)] (-> (ptr u8))
+  (primitive/cast (ptr u8) (get (.addresses loaded) (cast i64 symbol))))
+
+(defn working [(allocator (dyn Allocator))] (-> i64)
+  (let [(mut code) (image/create-x64 allocator)
+        (mut failures) 0
+        ext (id (image/symbol! (mut code) "plus100" 0 0))
+        f (id (image/symbol! (mut code) "f" 1 0))
+        g (id (image/symbol! (mut code) "g" 1 21))
+        h (id (image/symbol! (mut code) "h" 1 32))
+        k (id (image/symbol! (mut code) "k" 1 49))
+        m (id (image/symbol! (mut code) "m" 1 58))
+        value (id (image/symbol! (mut code) "value" 2 0))
+        pointer (id (image/symbol! (mut code) "pointer" 2 8))
+        counter (id (image/local-symbol! (mut code) "counter" 2 16))
+        fptr (id (image/symbol! (mut code) "fptr" 2 24))
+        beyond (id (image/symbol! (mut code) "beyond" 2 32))]
+    ; f(x) = plus100(x) + value
+    ;   sub rsp, 8; call plus100; add rax, [rip+value]; add rsp, 8; ret
+    (text! (mut code) [(: 0x48 u8) 0x83 0xEC 0x08])
+    (text! (mut code) [(: 0xE8 u8) 0 0 0 0])
+    (text! (mut code) [(: 0x48 u8) 0x03 0x05 0 0 0 0])
+    (text! (mut code) [(: 0x48 u8) 0x83 0xC4 0x08 0xC3])
+    ; g() = *pointer:  mov rax, [rip+pointer]; mov rax, [rax]; ret
+    (text! (mut code) [(: 0x48 u8) 0x8B 0x05 0 0 0 0 0x48 0x8B 0x00 0xC3])
+    ; h(): mov dword [rip+counter], 77; mov eax, [rip+counter]; ret
+    (text! (mut code) [(: 0xC7 u8) 0x05 0 0 0 0 77 0 0 0])
+    (text! (mut code) [(: 0x8B u8) 0x05 0 0 0 0 0xC3])
+    ; k(): mov rax, [rip+fptr]; jmp rax
+    (text! (mut code) [(: 0x48 u8) 0x8B 0x05 0 0 0 0 0xFF 0xE0])
+    ; m(x): jmp f
+    (text! (mut code) [(: 0xE9 u8) 0 0 0 0])
+    (match (image/data-space! (mut code) 40 8)
+      (Err [msg] (panic "{}" msg))
+      (Ok [_] 0))
+    (bytes/patch32! (mut (.data code)) 0 1000)
+    (fix! (mut code) 1 5 image/X64-PLT32 ext -4)
+    (fix! (mut code) 1 12 image/X64-PC32 value -4)
+    (fix! (mut code) 1 24 image/X64-PC32 pointer -4)
+    ; An immediate follows the displacement, so the field ends 8 bytes
+    ; before the next instruction.
+    (fix! (mut code) 1 34 image/X64-PC32 counter -8)
+    (fix! (mut code) 1 44 image/X64-PC32 counter -4)
+    (fix! (mut code) 1 52 image/X64-PC32 fptr -4)
+    (fix! (mut code) 1 59 image/X64-PLT32 f -4)
+    (fix! (mut code) 2 8 image/ABS64 value 0)
+    (fix! (mut code) 2 24 image/ABS64 g 0)
+    (fix! (mut code) 2 32 image/ABS64 value 16)
+    (when (!= (len (.text code)) 63) (set! failures (+ failures 1)))
+    (match (jit/map-image-resolved code [(external)] [true] allocator)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [loaded]
+          (let [(mut owned) loaded
+                base (.base (.memory owned))
+                call-f (primitive/cast (fnptr (cc/C) [i64] i64) (entry owned f))
+                call-g (primitive/cast (fnptr (cc/C) [] i64) (entry owned g))
+                call-h (primitive/cast (fnptr (cc/C) [] i64) (entry owned h))
+                call-k (primitive/cast (fnptr (cc/C) [] i64) (entry owned k))
+                call-m (primitive/cast (fnptr (cc/C) [i64] i64) (entry owned m))
+                data (primitive/index base (.data-offset owned))
+                (mut x) -100]
+            (while (<= x 100)
+              (when (!= (call-ptr call-f x) (+ x 1100))
+                (set! failures (+ failures 1)))
+              (when (!= (call-ptr call-m x) (+ x 1100))
+                (set! failures (+ failures 1)))
+              (set! x (+ x 1)))
+            (when (!= (call-ptr call-g) 1000) (set! failures (+ failures 1)))
+            (when (!= (call-ptr call-h) 77) (set! failures (+ failures 1)))
+            (when (!= (load (primitive/index data 16)) 77)
+              (set! failures (+ failures 1)))
+            (when (!= (call-ptr call-k) 1000) (set! failures (+ failures 1)))
+            ; One veneer follows the 63 text bytes: jmp [rip+0]; target; int3s.
+            (when (!= (.text-size (.memory owned)) 79)
+              (set! failures (+ failures 1)))
+            (when (or (!= (load (primitive/index base 63)) 0xFF)
+                      (!= (load (primitive/index base 64)) 0x25)
+                      (!= (read64 base 69) (external))
+                      (!= (load (primitive/index base 77)) 0xCC)
+                      (!= (load (primitive/index base 78)) 0xCC))
+              (set! failures (+ failures 1)))
+            (when (or (!= (read64 data 8)
+                          (get (.addresses owned) (cast i64 value)))
+                      (!= (read64 data 24)
+                          (get (.addresses owned) (cast i64 g)))
+                      (!= (read64 data 32)
+                          (get (.addresses owned) (cast i64 counter)))
+                      (!= (get (.addresses owned) (cast i64 beyond))
+                          (+ (primitive/cast u64 data) 32)))
+              (set! failures (+ failures 1)))
+            (when (not (jit/release-image! (mut owned)))
+              (set! failures (+ failures 1))))))
+    ; The source image is untouched: relocated fields are still zero.
+    (when (or (!= (get (.text code) 5) 0) (!= (get (.data code) 8) 0))
+      (set! failures (+ failures 1)))
+    ; Without the external address the image does not load.
+    (match (jit/map-image code allocator)
+      (Err [msg]
+           (when (!= msg "unresolved image symbol")
+             (set! failures (+ failures 1))))
+      (Ok [_] (set! failures (+ failures 1))))
+    (image/release! (mut code))
+    failures))
+
+;;; mov rax, [rip+far]; ret, where `far` resolves to `address`.
+(defn far-load [(kind i32) (address u64) (allocator (dyn Allocator))]
+  (-> (Result jit/Loaded (slice u8)))
+  (let [(mut code) (image/create-x64 allocator)
+        far (id (image/symbol! (mut code) "far" 0 0))]
+    (text! (mut code) [(: 0x48 u8) 0x8B 0x05 0 0 0 0 0xC3])
+    (fix! (mut code) 1 3 kind far -4)
+    (let [result (jit/map-image-resolved code [address] [true] allocator)]
+      (image/release! (mut code))
+      result)))
+
+(defn rejected [(result (Result jit/Loaded (slice u8))) (expected (slice u8))]
+  (-> i64)
+  (match result
+    (Err [msg]
+         (if (= msg expected) 0 (do (println "unexpected error: {}" msg) 1)))
+    (Ok [loaded]
+        (let [(mut owned) loaded]
+          (jit/release-image! (mut owned))
+          (println "accepted; expected: {}" expected)
+          1))))
+
+(defn failing [(allocator (dyn Allocator))] (-> i64)
+  (let [(mut failures) 0]
+    ; A PC32 field must reach the symbol itself; nothing maps near address 16.
+    (set! failures
+          (+ failures
+             (rejected (far-load image/X64-PC32 16 allocator)
+                       "PC-relative relocation target is out of signed 32-bit range")))
+    (set! failures
+          (+ failures
+             (rejected (far-load image/X64-PC32
+                                 0xFFFFFFFFFFFFFFF0
+                                 allocator)
+                       "PC-relative relocation target is out of signed 32-bit range")))
+    ; The same reference as PLT32 goes through a veneer and loads.
+    (match (far-load image/X64-PLT32 16 allocator)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [loaded]
+          (let [(mut owned) loaded]
+            (when (!= (.text-size (.memory owned)) 24)
+              (set! failures (+ failures 1)))
+            (jit/release-image! (mut owned)))))
+    ; An AArch64 kind in an x86-64 image: refused by relocate!, and refused
+    ; by the loader when the record was stored directly.
+    (let [(mut code) (image/create-x64 allocator)
+          far (id (image/symbol! (mut code) "far" 0 0))
+          record
+            (image/Relocation
+              :section 1
+              :offset 0
+              :kind image/A64-BRANCH26
+              :symbol far
+              :addend 0)]
+      (text! (mut code) [(: 0x90 u8) 0x90 0x90 0x90 0xC3])
+      (when (image/relocate! (mut code) record) (set! failures (+ failures 1)))
+      (push! (mut (.relocations code)) record)
+      (set! failures
+            (+ failures
+               (rejected (jit/map-image-resolved code
+                                                 [(external)]
+                                                 [true]
+                                                 allocator)
+                         "relocation kind does not belong to the image machine")))
+      (image/release! (mut code)))
+    ; An AArch64 image does not load on this host.
+    (let [(mut code) (image/create allocator)]
+      (bytes/append32! (mut (.text code)) 0xD65F03C0)
+      (set! failures
+            (+ failures
+               (rejected (jit/map-image code allocator)
+                         "image machine does not match the JIT host")))
+      (image/release! (mut code)))
+    failures))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        failures (+ (working allocator) (failing allocator))]
+    (println "x86-64 image JIT checks: {} failures" failures)
+    (if (= failures 0) 0 1)))
