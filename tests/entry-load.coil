@@ -17,11 +17,22 @@
 (import "coil.alloc" :use [malloc-allocator Allocator])
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.result" :use [Result Ok Err Some None])
+(import "coil.var" :use [var-static])
 
 (defn require [(value (Result i32 (slice u8)))] (-> i32)
   (match value (Ok [r] r) (Err [message] (panic "{}" message))))
 
 (defstruct Fixture [(graph g/Graph) (roots (ArrayList i32))])
+
+;;; Modes 18 to 21: the generic loop headed by a MERGE.
+(defn merge-headed? [(mode i32)] (-> bool)
+  (and (>= mode 18) (<= mode 21)))
+
+;;; The cells of mode 24, whose address the graph holds as a literal.
+(def FIXED (var-static (array u64 6) [0 0 0 0 0 0]))
+
+(defn fixed-cells [] (-> (ptr u64))
+  (primitive/cast (ptr u64) (.cell FIXED)))
 
 ;;; The callee of modes 3 and 14 writes the cell it is handed.
 (defn clobber [(cell (ptr u64))] (-> u64) (store! cell 2) 0)
@@ -29,7 +40,7 @@
 ;;; The callee of modes 16 and 17 only reads it, as its PURE_FUNC declaration says.
 (defn peek [(cell (ptr u64))] (-> u64) (load cell))
 
-(def MODES 24)
+(def MODES 25)
 
 ;;; f(p, q, k, callee) -> i64 over 64-bit cells. In the loop modes i counts
 ;;; from zero and sum adds what the read in question returned each iteration.
@@ -60,6 +71,8 @@
 ;;; 22 MERGE-headed loop whose return leaves a test: {if i = 3 leave; sum += p[0]; i += 1;
 ;;;    if not i < k leave}                                     (rotated once more: the read leaves)
 ;;; 23 as 22, the body then stores 2 through q                (kept in the loop: q may be p)
+;;; 24 as 0, the header reads cell 0 of FIXED through its literal address  (moved: a constant
+;;;                                                            address has no use list)
 (defn build [(mode i32) (a (dyn Allocator))] (-> Fixture)
   (let [(mut graph) (g/create a) (mut roots) (ArrayList::new [i32] a)
         start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
@@ -149,29 +162,34 @@
                          (require (b/emit! (mut graph) 91 11 [start p]))
                          start)
               enter (require (b/emit! (mut graph) 114 0 [before]))
-              header (if (>= mode 18)
+              header (if (merge-headed? mode)
                          (require (b/emit! (mut graph) 112 0 [enter enter]))
                          (require (b/loop-begin! (mut graph) enter)))
-              i (if (>= mode 18)
+              i (if (merge-headed? mode)
                     (require (b/emit! (mut graph) 67 11 [header zero zero]))
                     (require (b/loop-phi! (mut graph) header zero)))
-              sum (if (>= mode 18)
+              sum (if (merge-headed? mode)
                       (require (b/emit! (mut graph) 67 11 [header zero zero]))
                       (require (b/loop-phi! (mut graph) header zero)))
               cursor (if (= mode 6) (require (b/loop-phi! (mut graph) header p)) (: 0 i32))
               ; The read in question, and the control node the branch follows.
               (mut read) (: 0 i32)
               top (cond
-                    (or (= mode 5) (= mode 12) (= mode 13) (>= mode 18)) header
+                    (or (= mode 5) (= mode 12) (= mode 13) (merge-headed? mode)) header
                     (= mode 6)
                       (do (set! read (require (b/emit! (mut graph) 91 11 [header cursor]))) read)
                     (or (= mode 7) (= mode 8))
                       (let [data (require (b/emit! (mut graph) 91 6 [header p]))]
                         (set! read (require (b/emit! (mut graph) 91 11 [data data])))
                         read)
+                    (= mode 24)
+                      (let [literal (require (b/scalar-constant!
+                                               (mut graph) 6 (primitive/cast u64 (fixed-cells)) 8))]
+                        (set! read (require (b/emit! (mut graph) 91 11 [header literal])))
+                        read)
                     :else (do (set! read (require (b/emit! (mut graph) 91 11 [header p]))) read))
               condition (cond
-                          (or (= mode 5) (= mode 12) (= mode 13) (>= mode 18))
+                          (or (= mode 5) (= mode 12) (= mode 13) (merge-headed? mode))
                             (require (b/emit! (mut graph) 16 1 [i k]))
                           (= mode 6) (require (b/emit! (mut graph) 15 1 [read zero]))
                           :else (require (b/emit! (mut graph) 16 1 [i read])))
@@ -242,7 +260,7 @@
                         (require (b/emit! (mut graph) 112 0 [left right]))))
                   :else yes)
               added (require (b/emit! (mut graph) 26 11 [sum read]))
-              back (require (b/emit! (mut graph) (if (>= mode 18) 114 115) 0 [body]))
+              back (require (b/emit! (mut graph) (if (merge-headed? mode) 114 115) 0 [body]))
               result (if (or (= mode 12) (= mode 13))
                          (require (b/emit! (mut graph) 26 11 [sum before]))
                          sum)]
@@ -322,13 +340,14 @@
     (21 (Shape :loads 1 :under-join -1 :in-loop 0))
     (22 (Shape :loads 1 :under-join -1 :in-loop 0))
     (23 (Shape :loads 1 :under-join -1 :in-loop 1))
+    (24 (Shape :loads 1 :under-join 0 :in-loop 0))
     (_ (Shape :loads -1 :under-join -1 :in-loop -1))))
 
 (defstruct Answer [(result u64) (cells (array u64 6))])
 
 (defn initial-cells [(mode i32) (k u64)] (-> (array u64 6))
   (let [first (if (or (= mode 0) (= mode 1) (= mode 3) (= mode 4) (= mode 7) (= mode 8) (= mode 9)
-                      (= mode 16) (= mode 17))
+                      (= mode 16) (= mode 17) (= mode 24))
                   k
                   6)]
     [first (: 9 u64) 0x33 0x44 0 0x55]))
@@ -364,7 +383,7 @@
           (while (!= (get c at) 0)
             (set! sum (+ sum (get c at))) (set! at (+ at 1)))
           (set! result sum))
-      (or (= mode 5) (= mode 12) (= mode 13) (>= mode 18))
+      (or (= mode 5) (= mode 12) (= mode 13) (merge-headed? mode))
         (let [v (get c 0)]
           (while (< (cast i64 i) (cast i64 k))
             (cond (= mode 19) (set! sum (+ sum (get c (cast i64 i))))
@@ -374,7 +393,7 @@
             (when (= mode 12) (set! (mut c) 1 i))
             (when (and (= mode 13) (= i 1)) (set! (mut c) qi 2))
             (set! i (+ i 1)))
-          (set! result (if (or (= mode 5) (>= mode 18)) sum (+ sum v))))
+          (set! result (if (or (= mode 5) (merge-headed? mode)) sum (+ sum v))))
       :else
         (do
           (while (< (cast i64 i) (cast i64 (get c 0)))
@@ -417,6 +436,8 @@
                                     (or (= mode 7) (= mode 8)) (primitive/cast (ptr u64) (mut box))
                                     :else base)
                         other (if aliased base (primitive/index base 2))
+                        _ (when (= mode 24)
+                            (for [i 0 6] (store! (primitive/index (fixed-cells) i) (get cells i))))
                         result (function first other k
                                          (if (or (= mode 16) (= mode 17))
                                              (fnptr-of peek) (fnptr-of clobber)))]
@@ -469,7 +490,7 @@
                              (get (.cells wanted) 2)))))))))
         ; A loop that runs zero times never reads through its body's pointer:
         ; with no object behind p the function must still return.
-        (when (or (= mode 5) (and (>= mode 18) (<= mode 21)))
+        (when (or (= mode 5) (merge-headed? (cast i32 mode)))
           (for level [(: 1 i32) 3]
             (let [got (run-native (.graph f) (slice (.roots f)) (cast i32 mode) level false true 0 a)]
               (set! native (+ native 1))
