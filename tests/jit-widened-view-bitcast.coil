@@ -1,0 +1,82 @@
+;;; A sign-extending narrow load and its SEXT share one register (the widening
+;;; view). A same-width BITCAST of the loaded value to the unsigned type is
+;;; emitted as a zero-extension, so it must not reuse that register while the
+;;; sign-extended value is still read: here by the comparison fused into the
+;;; select that follows. |x| of an i8/i16 as u8/u16, every value of each width.
+(module stogir.tests.jit-widened-view-bitcast)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [msg] (do (println "{}" msg) 0))))
+
+;;; SIGNED/UNSIGNED are the narrow type pair (8/2 or 9/3); WIDE is the type the
+;;; loaded value is sign-extended to for the comparison (11 or 5).
+(defn check [(signed i32) (unsigned i32) (wide i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut graph) (g/create allocator)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        pointer (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        loaded (require (b/emit! (mut graph) 91 signed [start pointer]))
+        extended (require (b/emit! (mut graph) 33 wide [loaded]))
+        zero (require (b/scalar-constant! (mut graph) wide 0 8))
+        negative? (require (b/integer-compare! (mut graph) 16 8 extended zero))
+        narrow-zero (require (b/scalar-constant! (mut graph) signed 0 8))
+        negated (require (b/emit! (mut graph) 27 signed [narrow-zero loaded]))
+        yes (require (b/emit! (mut graph) 36 unsigned [negated]))
+        no (require (b/emit! (mut graph) 36 unsigned [loaded]))
+        chosen (require (b/conditional! (mut graph) unsigned negative? yes no))
+        result (require (b/emit! (mut graph) 34 5 [chosen]))
+        ret (require (b/emit! (mut graph) 120 5 [loaded result (: 0 i32)]))
+        bits (if (= signed 8) 8 16)
+        (mut failures) 0]
+    (match (calls/create 0 5 [(: 6 u8)] allocator)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [prototype]
+          (let [(mut owned) prototype]
+            (require (calls/function! (mut graph) owned allocator))
+            (calls/release! (mut owned)))))
+    (match (compile/text graph start [ret] allocator)
+      (Err [msg]
+           (do
+             (println "widened view bitcast {}: {}" bits msg)
+             (set! failures (+ failures 1))))
+      (Ok [text]
+          (let [(mut code) text]
+            (match (jit/map-text (slice code))
+              (Err [_] (set! failures (+ failures 1)))
+              (Ok [loaded-image]
+                  (let [(mut image) loaded-image
+                        f (primitive/cast (fnptr (cc/C) [(ptr u64)] u64)
+                                          (.base image))
+                        limit (<< (: 1 i64) bits)]
+                    (for [raw 0 limit]
+                      ; bytes beyond the narrow value are all ones: the load
+                      ; must not read them
+                      (let [(mut cell) (| (cast u64 raw)
+                                         (^ (: 0xFFFFFFFFFFFFFFFF u64)
+                                            (cast u64 (- limit 1))))
+                            value (if (>= raw (/ limit 2)) (- raw limit) raw)
+                            wanted (cast u64 (if (< value 0) (- 0 value) value))
+                            actual (call-ptr f (mut cell))]
+                        (when (!= actual wanted)
+                          (when (= failures 0)
+                            (println "widened view bitcast {} wide={} value={} wanted={} actual={}"
+                                     bits wide value wanted actual))
+                          (set! failures (+ failures 1)))))
+                    (jit/release! (mut image)))))
+            (free! (mut code)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures (+ (check 8 2 5) (check 8 2 11) (check 9 3 5) (check 9 3 11))]
+    (println "native widened-view narrow bitcast: {} failures" failures)
+    (if (= failures 0) 0 1)))
