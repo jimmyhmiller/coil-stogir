@@ -1,0 +1,155 @@
+(module stogir.tests.jit-repeated-expressions)
+;;; Expressions that arrive as copies of one another (inline expansion clones
+;;; a callee once per call site, without construction CSE) are shared by the
+;;; SCCP pipeline: stogir.iter-fold/seed-repeats! queues every repeat, and the
+;;; ordinary CSE then merges whole chains level by level.
+;;;
+;;; The fixture builds `pattern(x) = (x * 37 + 19) / 251` COPIES times with raw
+;;; appends, bypassing the builder's CSE, and returns the sum of
+;;; (pattern_k(x) << k) with y added to the first; optimized, one MUL, one ADD
+;;; of the literal and one DIV remain. A second graph repeats an expression
+;;; over literals only: the address of a symbol plus an offset.
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.symbols" :as symbols)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn need [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+;;; A node appended as it is: no folding, no CSE.
+(defn raw! [(graph (mut g/Graph)) (opcode u8) (ty u8) (inputs (slice i32))] (-> i32)
+  (match (g/append-inputs! (mut graph) opcode ty inputs)
+    (None [] (panic "raw append failed"))
+    (Some [created] created)))
+
+;;; Nodes of OPCODE whose second operand is OPERAND (any when zero).
+(defn count [(graph g/Graph) (opcode u8) (operand i32)] (-> i64)
+  (let [(mut found) (: 0 i64) (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (let [arity (get (.arities graph) r)
+            node (get (.instructions graph) r)]
+        (when (and (>= arity 0) (= (n/opcode node) opcode)
+                   (or (= operand 0) (= (.op2 node) operand)))
+          (set! found (+ found 1)))
+        (set! r (+ r (if (< arity 0) 1 (/ (+ (cast i64 arity) 4) 4))))))
+    found))
+
+(defn mask [(ty i32)] (-> u64)
+  (if (= (types/scalar-size ty 8) 8) 0xFFFFFFFFFFFFFFFF 0xFFFFFFFF))
+
+;;; Truncating division of the bit patterns in ty.
+(defn quotient [(ty i32) (a u64) (d u64)] (-> u64)
+  (if (types/signed? ty)
+      (if (= (types/scalar-size ty 8) 8)
+          (cast u64 (/ (cast i64 a) (cast i64 d)))
+          (cast u64 (cast u32 (/ (cast i32 (cast u32 a)) (cast i32 (cast u32 d))))))
+      (/ (& a (mask ty)) (& d (mask ty)))))
+
+(defn model [(ty i32) (copies i64) (x u64) (y u64)] (-> u64)
+  (let [value (quotient ty (& (p/iadd (p/imul x 37) 19) (mask ty)) 251)
+        (mut total) (& y (mask ty))]
+    (for [k 0 copies]
+      (set! total (p/iadd total (<< value (cast u64 k)))))
+    (& total (mask ty))))
+
+(defn arithmetic [(ty i32) (copies i64)] (-> i64)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        (mut roots) (ArrayList::new [i32] a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        y (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 1]))
+        scale (need (b/scalar-constant! (mut graph) ty 37 8))
+        bias (need (b/scalar-constant! (mut graph) ty 19 8))
+        divisor (need (b/scalar-constant! (mut graph) ty 251 8))
+        (mut total) y
+        (mut answers) (: 0 i64)]
+    (for [k 0 copies]
+      (let [product (raw! (mut graph) 28 (cast u8 ty) [x scale])
+            sum (raw! (mut graph) 26 (cast u8 ty) [product bias])
+            value (raw! (mut graph) 29 (cast u8 ty) [sum divisor (: 0 i32)])
+            shifted (if (= k 0) value
+                        (need (b/emit! (mut graph) 49 ty
+                                       [value (need (b/scalar-constant! (mut graph) ty
+                                                                        (cast u64 k) 8))])))]
+        (set! total (need (b/emit! (mut graph) 26 ty [total shifted])))))
+    (push! (mut roots) (need (b/emit! (mut graph) 120 ty [start total (: 0 i32)])))
+    (assert (= (count graph 28 scale) copies))
+    (assert (= (count graph 29 divisor) copies))
+    (match (sccp/optimize graph 8 (slice roots) a)
+      (Err [message] (panic "optimize: {}" message))
+      (Ok [optimized]
+        (let [(mut optimized) optimized]
+          ; The whole chain is shared: one product, one sum, one quotient.
+          (assert (= (count (.graph optimized) 28 scale) 1))
+          (assert (= (count (.graph optimized) 26 bias) 1))
+          (assert (= (count (.graph optimized) 29 divisor) 1))
+          (match (compile/text (.graph optimized) start (slice (.roots optimized)) a)
+            (Err [message] (panic "compile: {}" message))
+            (Ok [text]
+              (let [(mut text) text]
+                (match (jit/map-text (slice text))
+                  (Err [message] (panic "map: {}" message))
+                  (Ok [loaded]
+                    (let [(mut loaded) loaded
+                          f (p/cast (fnptr (cc/C) [u64 u64] u64) (.base loaded))]
+                      (for xv [(: 0 u64) 1 2 6 7 250 251 252 0x7FFFFFFF 0x80000000 0xFFFFFFFF
+                               0x100000000 0x7FFFFFFFFFFFFFFF 0x8000000000000000
+                               0xFFFFFFFFFFFFFFFF 0x0375A7F0D1B24F23 0xFC8A580F2E4DB0DD]
+                        (for yv [(: 0 u64) 5 0xFFFFFFFFFFFFFFFF]
+                          (assert (= (& (f xv yv) (mask ty)) (model ty copies xv yv)))
+                          (set! answers (+ answers 1))))
+                      (jit/release! (mut loaded)))))
+                (free! (mut text)))))
+          (rewrite/release! (mut optimized)))))
+    (free! (mut roots)) (g/release! (mut graph))
+    answers))
+
+;;; COPIES reads of the cell at `symbol + 16`, each through its own copy of
+;;; the address: an expression with no instruction input. One address remains.
+(defn literal-only [(copies i64)] (-> i64)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        (mut roots) (ArrayList::new [i32] a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        value (need (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        symbol (need (symbols/symbol! (mut graph) "_repeated_expressions_cell"))
+        offset (need (b/scalar-constant! (mut graph) 6 16 8))
+        (mut control) start
+        (mut total) value]
+    (for [k 0 copies]
+      (let [address (raw! (mut graph) 26 6 [symbol offset])
+            stored (need (b/emit! (mut graph) 93 0 [control address total]))
+            loaded (need (b/emit! (mut graph) 91 11 [stored address]))]
+        (set! control loaded)
+        (set! total (need (b/emit! (mut graph) 26 11 [loaded value])))))
+    (push! (mut roots) (need (b/emit! (mut graph) 120 11 [control total (: 0 i32)])))
+    (assert (= (count graph 26 offset) copies))
+    (match (sccp/optimize graph 8 (slice roots) a)
+      (Err [message] (panic "optimize: {}" message))
+      (Ok [optimized]
+        (let [(mut optimized) optimized]
+          (assert (= (count (.graph optimized) 26 offset) 1))
+          (rewrite/release! (mut optimized)))))
+    (free! (mut roots)) (g/release! (mut graph))
+    1))
+
+(defn main [] (-> i32)
+  (let [(mut answers) (: 0 i64) (mut graphs) (: 0 i64)]
+    (for ty [(: 11 i32) 5 10 4]
+      (for copies [(: 1 i64) 2 3 9]
+        (set! answers (+ answers (arithmetic ty copies)))
+        (set! graphs (+ graphs 1))))
+    (for copies [(: 2 i64) 5 130]
+      (set! graphs (+ graphs (literal-only copies))))
+    (println "repeated expressions: {} graphs, {} native answers" graphs answers))
+  0)
