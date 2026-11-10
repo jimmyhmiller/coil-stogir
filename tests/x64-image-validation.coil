@@ -1,0 +1,280 @@
+(module stogir.tests.x64-image-validation)
+(import "stogir.image" :as image)
+(import "stogir.image-order" :as order)
+(import "stogir.relocate" :as relocate)
+(import "stogir.link" :as link)
+(import "stogir.jit.layout" :as layout)
+(import "stogir.jit.native" :as jit)
+(import "stogir.aot.macho" :as macho)
+(import "stogir.aot.elf" :as elf)
+(import "stogir.aot.native" :as aot)
+(import "stogir.symbol-name" :as symbol-name)
+(import "stogir.target" :as target)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+;;; Machine identity and per-machine rules of the neutral image layers. Nothing
+;;; here executes generated code, so the test runs on every host.
+
+(defn record [(section i32) (offset i64) (kind i32) (addend i64)]
+  (-> image/Relocation)
+  (image/Relocation
+    :section section
+    :offset offset
+    :kind kind
+    :symbol 0
+    :addend addend))
+
+(defn check-error [(source image/Image) (relocation image/Relocation)]
+  (-> (slice u8))
+  (match (image/check-relocation source relocation)
+    (Err [message] message)
+    (Ok [_] "")))
+
+(defn order-error [(source image/Image) (allocator (dyn Allocator))]
+  (-> (slice u8))
+  (match (order/relocations source allocator)
+    (Err [message] message)
+    (Ok [records] (let [(mut owned) records] (free! (mut owned)) ""))))
+
+(defn object-error [(result (Result (ArrayList u8) (slice u8)))] (-> (slice u8))
+  (match result
+    (Err [message] message)
+    (Ok [object] (let [(mut owned) object] (free! (mut owned)) ""))))
+
+(defn compose-error [(sources (slice image/Image)) (allocator (dyn Allocator))]
+  (-> (slice u8))
+  (match (link/compose sources allocator)
+    (Err [message] message)
+    (Ok [module] (let [(mut owned) module] (link/release! (mut owned)) ""))))
+
+(defn plan-rejected? [(result (Result layout/Plan (slice u8)))] (-> bool)
+  (match result (Err [_] true) (Ok [_] false)))
+
+;;; Relocate a 16-byte x86-64 text against one symbol at `address`, with the
+;;; text at `text-base`; returns the error or "" and the patched field.
+(defn apply-error [(kind i32)
+                   (addend i64)
+                   (address u64)
+                   (text-base u64)
+                   (field (mut u32))
+                   (allocator (dyn Allocator))] (-> (slice u8))
+  (let [(mut code) (image/create-x64 allocator)
+        (mut addresses) (ArrayList::new [u64] allocator)
+        (mut i) 0]
+    (image/symbol! (mut code) "target" 0 0)
+    (while (< i 16) (push! (mut (.text code)) 0x90) (set! i (+ i 1)))
+    (push! (mut addresses) address)
+    (image/relocate! (mut code) (record 1 3 kind addend))
+    (let [message
+            (match (relocate/apply! (mut code) addresses text-base 0 allocator)
+              (Err [message] message)
+              (Ok [_] ""))]
+      (set! field (relocate/read32 (.text code) 3))
+      ; A rejected relocation writes nothing; an applied one only its field.
+      (when (or (!= (get (.text code) 2) 0x90) (!= (get (.text code) 7) 0x90))
+        (set! field 0xDEADBEEF))
+      (free! (mut addresses))
+      (image/release! (mut code))
+      message)))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut a64) (image/create allocator)
+        (mut x64) (image/create-x64 allocator)
+        (mut failures) 0
+        (mut field) (: 0 u32)]
+    ; Identity and defaults.
+    (when (or (!= (.machine a64) image/AARCH64)
+              (!= (.machine x64) image/X86-64)
+              (!= (.text-alignment a64) 4)
+              (!= (.text-alignment x64) 16)
+              (!= (image/text-unit image/AARCH64) 4)
+              (!= (image/text-unit image/X86-64) 1)
+              (not (image/valid-alignments? a64))
+              (not (image/valid-alignments? x64)))
+      (set! failures (+ failures 1)))
+    ; x86-64 text alignment may be as low as one byte; AArch64 not below 4.
+    (set! (.text-alignment x64) 1)
+    (when (not (image/valid-alignments? x64)) (set! failures (+ failures 1)))
+    (match (image/require-alignments! (mut x64) 2 8)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [_]
+          (when (!= (.text-alignment x64) 2) (set! failures (+ failures 1)))))
+    (match (image/require-alignments! (mut a64) 2 8)
+      (Err [_] 0)
+      (Ok [_] (set! failures (+ failures 1))))
+    (set! (.text-alignment a64) 2)
+    (when (image/valid-alignments? a64) (set! failures (+ failures 1)))
+    (set! (.text-alignment a64) 4)
+    ; Relocation kinds belong to machines. Seven text bytes each: no word
+    ; granularity is required of x86-64 text.
+    (image/symbol! (mut a64) "target" 0 0)
+    (image/symbol! (mut x64) "target" 0 0)
+    (bytes/append32! (mut (.text a64)) 0x14000000)
+    (bytes/append32! (mut (.text a64)) 0xD65F03C0)
+    (for byte [(: 0xE8 u8) 0 0 0 0 0xC3 0x90] (push! (mut (.text x64)) byte))
+    (for kind [(: image/A64-BRANCH26 i32) image/A64-PAGE21 image/A64-PAGEOFF12]
+      (when (or (!= (check-error a64 (record 1 0 kind 0)) "")
+                (!= (check-error x64 (record 1 0 kind 0))
+                    "relocation kind does not belong to the image machine")
+                (image/relocate! (mut x64) (record 1 0 kind 0)))
+        (set! failures (+ failures 1))))
+    (for kind [(: image/X64-PC32 i32) image/X64-PLT32]
+      (when (or (!= (check-error x64 (record 1 1 kind -4)) "")
+                (!= (check-error a64 (record 1 0 kind -4))
+                    "relocation kind does not belong to the image machine")
+                (image/relocate! (mut a64) (record 1 0 kind -4)))
+        (set! failures (+ failures 1))))
+    (for kind [(: 0 i32) 7 -1]
+      (when (or (!= (check-error a64 (record 1 0 kind 0))
+                    "unknown image relocation kind")
+                (!= (check-error x64 (record 1 0 kind 0))
+                    "unknown image relocation kind"))
+        (set! failures (+ failures 1))))
+    (when (or (!= (check-error a64 (record 1 0 image/ABS64 0)) "")
+              (!= (check-error x64 (record 1 0 image/ABS64 0))
+                  "invalid image relocation bounds or symbol")
+              (!= (check-error x64 (record 1 3 image/X64-PC32 0)) "")
+              (!= (check-error x64 (record 1 4 image/X64-PC32 0))
+                  "invalid image relocation bounds or symbol"))
+      (set! failures (+ failures 1)))
+    ; Consumers revalidate records that bypassed relocate!.
+    (push! (mut (.relocations x64)) (record 1 0 image/A64-BRANCH26 0))
+    (push! (mut (.relocations a64)) (record 1 0 image/X64-PLT32 -4))
+    (for source [x64 a64]
+      (when (or (!= (order-error source allocator)
+                    "relocation kind does not belong to the image machine")
+                (!= (compose-error [source] allocator)
+                    "relocation kind does not belong to the image machine")
+                (!= (object-error (aot/image-object source allocator))
+                    "relocation kind does not belong to the image machine"))
+        (set! failures (+ failures 1))))
+    (clear! (mut (.relocations x64)))
+    (clear! (mut (.relocations a64)))
+    (image/relocate! (mut x64) (record 1 1 image/X64-PLT32 -4))
+    (image/relocate! (mut a64) (record 1 0 image/A64-BRANCH26 0))
+    (when (or (!= (order-error x64 allocator) "")
+              (!= (order-error a64 allocator) ""))
+      (set! failures (+ failures 1)))
+    ; Composition: one machine per module; AArch64 text stays word-sized.
+    (when (or (!= (compose-error [x64 x64] allocator) "")
+              (!= (compose-error [a64 a64] allocator) "")
+              (!= (compose-error [a64 x64] allocator)
+                  "cannot compose images for different machines")
+              (!= (compose-error [x64 a64] allocator)
+                  "cannot compose images for different machines"))
+      (set! failures (+ failures 1)))
+    (push! (mut (.text a64)) 0)
+    (when (!= (compose-error [a64] allocator)
+              "input text must be instruction aligned")
+      (set! failures (+ failures 1)))
+    (pop! (mut (.text a64)))
+    ; Object writers accept only their machine; the neutral entry dispatches.
+    (when (or (!= (object-error (macho/image-object x64 allocator))
+                  "Mach-O writer accepts only AArch64 images")
+              (!= (object-error (elf/image-object a64 allocator))
+                  "ELF writer accepts only x86-64 images")
+              (!= (object-error (aot/image-object a64 allocator)) "")
+              (!= (object-error (aot/image-object x64 allocator)) ""))
+      (set! failures (+ failures 1)))
+    ; An unknown machine is refused everywhere.
+    (let [(mut unknown) (image/empty 3 allocator)]
+      (push! (mut (.text unknown)) 0xC3)
+      (when (or (image/valid-alignments? unknown)
+                (!= (order-error unknown allocator) "unknown image machine")
+                (!= (compose-error [unknown] allocator) "unknown image machine")
+                (!= (object-error (aot/image-object unknown allocator))
+                    "unknown image machine")
+                (!= (match (jit/map-image unknown allocator)
+                      (Err [message] message)
+                      (Ok [_] ""))
+                    "unknown image machine"))
+        (set! failures (+ failures 1)))
+      (image/release! (mut unknown)))
+    ; The loader takes only images for the machine it runs on.
+    (when (!= (match (jit/map-image (target/arch-pick x64 a64) allocator)
+                (Err [message] message)
+                (Ok [_] ""))
+              "image machine does not match the JIT host")
+      (set! failures (+ failures 1)))
+    ; JIT layout: byte-granular x86-64 text, word-granular AArch64 text.
+    (match (layout/plan-for image/X86-64 7 8 2 4096 1 8)
+      (Err [_] (set! failures (+ failures 1)))
+      (Ok [plan]
+          (when (or (!= (.text-size plan) 39) (!= (.data-offset plan) 4096))
+            (set! failures (+ failures 1)))))
+    (when (or (not (plan-rejected? (layout/plan-for image/AARCH64
+                                                    7
+                                                    8
+                                                    0
+                                                    4096
+                                                    4
+                                                    8)))
+              (not (plan-rejected? (layout/plan-for image/AARCH64
+                                                    8
+                                                    8
+                                                    0
+                                                    4096
+                                                    2
+                                                    8)))
+              (not (plan-rejected? (layout/plan-for 3 8 8 0 4096 4 8)))
+              (not (plan-rejected? (layout/plan 7 8 0 4096 4 8)))
+              (plan-rejected? (layout/plan 8 8 0 4096 4 8))
+              (!= (layout/veneer-size image/X86-64) 16)
+              (!= (layout/veneer-size image/AARCH64) 16))
+      (set! failures (+ failures 1)))
+    ; PC32/PLT32 arithmetic: int32(S + A - P) with P = text base + 3.
+    (for kind [(: image/X64-PC32 i32) image/X64-PLT32]
+      (when (or (!= (apply-error kind -4 0x2000 0x1000 (mut field) allocator)
+                    "")
+                (!= field 0xFF9))
+        (set! failures (+ failures 1)))
+      (when (or (!= (apply-error kind -8 0x1000 0x2000 (mut field) allocator)
+                    "")
+                (!= field 0xFFFFEFF5))
+        (set! failures (+ failures 1)))
+      ; Exactly the int32 limits fit; one past either does not.
+      (when (or (!= (apply-error kind 0 0x80001002 0x1000 (mut field) allocator)
+                    "")
+                (!= field 0x7FFFFFFF))
+        (set! failures (+ failures 1)))
+      (when (or (!= (apply-error kind
+                                 0
+                                 0x80001003
+                                 0x1000
+                                 (mut field)
+                                 allocator)
+                    "PC-relative relocation target is out of signed 32-bit range")
+                (!= field 0x90909090))
+        (set! failures (+ failures 1)))
+      (when (or (!= (apply-error kind 0 0x1003 0x80001000 (mut field) allocator)
+                    "")
+                (!= field 0x80000000))
+        (set! failures (+ failures 1)))
+      (when (or (!= (apply-error kind
+                                 0
+                                 0x1002
+                                 0x80001000
+                                 (mut field)
+                                 allocator)
+                    "PC-relative relocation target is out of signed 32-bit range")
+                (!= field 0x90909090))
+        (set! failures (+ failures 1)))
+      ; A negative S + A is still a valid PC-relative target.
+      (when (or (!= (apply-error kind -4 0 0 (mut field) allocator) "")
+                (!= field 0xFFFFFFF9))
+        (set! failures (+ failures 1))))
+    ; C linker names follow the target system.
+    (let [(mut name) (symbol-name/c-name "labs" allocator)]
+      (when (or (!= (slice name) (target/os-pick "_labs" "labs"))
+                (!= (symbol-name/c-prefix) (target/os-pick "_" "")))
+        (set! failures (+ failures 1)))
+      (free! (mut name)))
+    (image/release! (mut a64))
+    (image/release! (mut x64))
+    (println "machine identity and x86-64 image validation: {} failures"
+             failures)
+    (if (= failures 0) 0 1)))

@@ -180,6 +180,26 @@ coil run tests/aot-sccp-rewrite-link.coil --debug-checks --link-flag /tmp/coil-s
 The first command generates all four objects for the linked consumer. These are
 component checks; the optimizer remains disabled in the delivered Coil backend.
 
+x86-64 Linux host layers (image identity, relocation, composition, JIT mapping
+and the ELF writer), checked with hand-assembled text on an x86-64 Linux host.
+`x64-image-validation` and `elf-validation` execute no generated code and run on
+every host:
+
+```sh
+coil run tests/x64-image-validation.coil
+coil run tests/elf-validation.coil
+coil run tests/x64-jit-text.coil
+coil run tests/x64-jit-image.coil
+coil run tests/x64-link.coil
+coil run tests/elf-basic.coil
+coil run tests/elf-basic-link.coil --link-flag /tmp/stogir-x64-elf-basic.o --link-flag /tmp/stogir-x64-elf-text.o
+```
+
+`elf-basic` writes both objects used by `elf-basic-link`. Images carry symbol
+names exactly as the object file spells them; `stogir.symbol-name/c-name` gives a
+C identifier's linker name for the target system (`_foo` on macOS, `foo` on
+Linux).
+
 Tail-call checks (native macOS AArch64):
 
 ```sh

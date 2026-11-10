@@ -1,0 +1,169 @@
+(module stogir.tests.x64-link)
+(import "stogir.image" :as image)
+(import "stogir.image-order" :as order)
+(import "stogir.link" :as link)
+(import "stogir.jit.native" :as jit)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; Composition of two x86-64 images whose text lengths are not multiples of
+;;; four: a cross-part PLT32 call, a cross-part PC32 data reference, a local
+;;; symbol, and int3 padding between the parts. Runs the result (Linux x86-64).
+
+(defn id [(result (Result i32 (slice u8)))] (-> i32)
+  (match result (Ok [value] value) (Err [msg] (panic "symbol: {}" msg))))
+
+(defn fix! [(code (mut image/Image))
+            (section i32)
+            (offset i64)
+            (kind i32)
+            (symbol i32)
+            (addend i64)] (-> void)
+  (when (not (image/relocate! (mut code)
+                              (image/Relocation
+                                :section section
+                                :offset offset
+                                :kind kind
+                                :symbol symbol
+                                :addend addend)))
+    (panic "relocation at {} rejected" offset)))
+
+;;; caller(x) = callee(x) + 1, and the data word `bias` = 5.
+(defn first-part [(allocator (dyn Allocator))] (-> image/Image)
+  (let [(mut code) (image/create-x64 allocator)
+        caller (id (image/symbol! (mut code) "caller" 1 0))
+        callee (id (image/symbol! (mut code) "callee" 0 0))
+        bias (id (image/symbol! (mut code) "bias" 2 0))]
+    ; call callee; add rax, 1; ret
+    (for byte [(: 0xE8 u8) 0 0 0 0 0x48 0x83 0xC0 0x01 0xC3]
+      (push! (mut (.text code)) byte))
+    (match (image/data-space! (mut code) 8 8)
+      (Err [msg] (panic "{}" msg))
+      (Ok [_] 0))
+    (bytes/patch32! (mut (.data code)) 0 5)
+    (fix! (mut code) 1 1 image/X64-PLT32 callee -4)
+    code))
+
+;;; callee(x) = x + bias + scale, with `scale` = 300 in a private data word.
+(defn second-part [(allocator (dyn Allocator))] (-> image/Image)
+  (let [(mut code) (image/create-x64 allocator)
+        callee (id (image/symbol! (mut code) "callee" 1 0))
+        bias (id (image/symbol! (mut code) "bias" 0 0))
+        scale (id (image/local-symbol! (mut code) "scale" 2 0))]
+    ; mov rax, rdi; add rax, [rip+bias]; add rax, [rip+scale]; ret
+    (for byte [(: 0x48 u8)
+               0x89
+               0xF8
+               0x48
+               0x03
+               0x05
+               0
+               0
+               0
+               0
+               0x48
+               0x03
+               0x05
+               0
+               0
+               0
+               0
+               0xC3]
+      (push! (mut (.text code)) byte))
+    (match (image/data-space! (mut code) 8 8)
+      (Err [msg] (panic "{}" msg))
+      (Ok [_] 0))
+    (bytes/patch32! (mut (.data code)) 0 300)
+    (fix! (mut code) 1 6 image/X64-PC32 bias -4)
+    (fix! (mut code) 1 13 image/X64-PC32 scale -4)
+    code))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut first) (first-part allocator)
+        (mut second) (second-part allocator)
+        (mut failures) 0]
+    (when (or (!= (len (.text first)) 10) (!= (len (.text second)) 18))
+      (set! failures (+ failures 1)))
+    (match (link/compose [first second] allocator)
+      (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+      (Ok [composed]
+          (let [(mut module) composed
+                text (.text (.image module))]
+            (when (or (!= (.machine (.image module)) image/X86-64)
+                      (!= (.text-alignment (.image module)) 16)
+                      (!= (len text) 34)
+                      (!= (.text (get (.parts module) 1)) 16)
+                      (!= (.data (get (.parts module) 1)) 8))
+              (set! failures (+ failures 1)))
+            ; The gap between the parts is int3, and the parts are intact.
+            (let [(mut i) 10]
+              (while (< i 16)
+                (when (!= (get text i) 0xCC) (set! failures (+ failures 1)))
+                (set! i (+ i 1))))
+            (when (or (!= (get text 0) 0xE8) (!= (get text 16) 0x48))
+              (set! failures (+ failures 1)))
+            ; Rebased records keep kind and addend; order is by section with
+            ; offsets descending.
+            (match (order/relocations (.image module) allocator)
+              (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+              (Ok [records]
+                  (let [(mut sorted) records]
+                    (when (or (!= (len sorted) 3)
+                              (!= (.offset (get sorted 0)) 29)
+                              (!= (.offset (get sorted 1)) 22)
+                              (!= (.offset (get sorted 2)) 1)
+                              (!= (.kind (get sorted 1)) image/X64-PC32)
+                              (!= (.kind (get sorted 2)) image/X64-PLT32)
+                              (!= (.addend (get sorted 0)) -4)
+                              (!= (.addend (get sorted 2)) -4))
+                      (set! failures (+ failures 1)))
+                    (free! (mut sorted)))))
+            ; Both calls bind inside the module, so no veneer is needed.
+            (match (jit/map-image (.image module) allocator)
+              (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
+              (Ok [loaded]
+                  (let [(mut owned) loaded
+                        caller
+                          (match (image/find-symbol (.image module) "caller")
+                            (Some [symbol] symbol)
+                            (None [] (panic "caller is not bound")))
+                        f
+                          (primitive/cast (fnptr (cc/C) [i64] i64)
+                                          (primitive/cast (ptr u8)
+                                                          (get (.addresses owned)
+                                                               (cast i64 caller))))
+                        (mut x) -100]
+                    (when (!= (.text-size (.memory owned)) 34)
+                      (set! failures (+ failures 1)))
+                    (while (<= x 100)
+                      (when (!= (call-ptr f x) (+ x 306))
+                        (set! failures (+ failures 1)))
+                      (set! x (+ x 1)))
+                    (when (not (jit/release-image! (mut owned)))
+                      (set! failures (+ failures 1))))))
+            (link/release! (mut module)))))
+    ; An overlapping x86-64 record is caught by the ordering pass.
+    (push! (mut (.relocations second))
+           (image/Relocation
+             :section 1
+             :offset 8
+             :kind image/X64-PC32
+             :symbol 1
+             :addend -4))
+    (match (link/compose [first second] allocator)
+      (Err [msg]
+           (when (!= msg "overlapping image relocations")
+             (set! failures (+ failures 1))))
+      (Ok [composed]
+          (let [(mut module) composed]
+            (set! failures (+ failures 1))
+            (link/release! (mut module)))))
+    (image/release! (mut first))
+    (image/release! (mut second))
+    (println "x86-64 image composition checks: {} failures" failures)
+    (if (= failures 0) 0 1)))
