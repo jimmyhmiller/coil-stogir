@@ -196,9 +196,11 @@
     roots))
 
 (defn compiled [(graph g/Graph) (roots (slice i32)) (name (slice u8)) (shrink bool)
-                (a (dyn Allocator))] (-> image/Image)
+                (retry bool) (a (dyn Allocator))] (-> image/Image)
   (match (compile/image-with-private graph 1 roots name (options/Options :level 1) a
-                                     (private/with-shrink-wrap (private/no-context) shrink))
+                                     (private/with-shrink-retry
+                                       (private/with-shrink-wrap (private/no-context) shrink)
+                                       retry))
     (Ok [code] code)
     (Err [message] (panic "compile {}: {}" name message))))
 
@@ -288,21 +290,23 @@
 (defn check-shape [(shape i32)] (-> i64)
   (let [a (malloc-allocator) (mut failures) (: 0 i64)
         (mut slow) (slow-graph a)]
-    (for shrink [false true]
-      (let [(mut graph) (entry-graph shape a)
+    ; Without shrink-wrapping, with it, and with its second allocation.
+    (for mode [(: 0 i32) 1 2]
+      (let [shrink (> mode 0)
+            (mut graph) (entry-graph shape a)
             (mut roots) (returns graph a)
-            (mut code) (compiled graph (slice roots) "_sw_entry" shrink a)
+            (mut code) (compiled graph (slice roots) "_sw_entry" shrink (= mode 2) a)
             (mut slow-roots) (returns slow a)
             (mut leaf) (match (compile/image slow 1 (slice slow-roots) "_sw_slow" a)
                          (Ok [c] c) (Err [message] (panic "slow: {}" message)))
             word (first-word code "_sw_entry")]
         ; Shapes 0, 2 and 3 have a RETURN reachable without the frame.
         (when (and shrink (!= shape 1) (frame-entry? word))
-          (println "shape {}: shrink-wrapped entry still builds the frame (0x{:x})" shape word)
+          (println "shape {} mode {}: shrink-wrapped entry still builds the frame (0x{:x})" shape mode word)
           (set! failures (+ failures 1)))
         (let [faults (frame-faults code "_sw_entry")]
           (when (> faults 0)
-            (println "shape {} shrink {}: {} frame-state faults" shape shrink faults)
+            (println "shape {} mode {}: {} frame-state faults" shape mode faults)
             (set! failures (+ failures faults))))
         (when (and (not shrink) (not (frame-entry? word)))
           (println "shape {}: reference entry has no frame (0x{:x})" shape word)
@@ -323,7 +327,7 @@
                         (for x [(: 0 i64) 1 2 5 99 100 101 1000 -7]
                           (let [got (function x) want (model shape x)]
                             (unless (= got want)
-                              (println "shape {} shrink {} x {}: got {} want {}" shape shrink x got want)
+                              (println "shape {} mode {} x {}: got {} want {}" shape mode x got want)
                               (set! failures (+ failures 1)))))
                         (jit/release-image! (mut loaded)))))
                 (link/release! (mut module)))))
