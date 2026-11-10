@@ -16,6 +16,8 @@
 (import "stogir.symbols" :as symbols)
 (import "stogir.a64.result-emission" :as result-emit)
 (import "stogir.a64.argument-copy" :as argcopy)
+(import "stogir.a64.block-move" :as block-move)
+(import "stogir.copy-forward" :as copy-forward)
 (import "stogir.a64.code" :as buffer)
 (import "stogir.a64.encode" :as encode)
 (import "stogir.bytes" :as bytes)
@@ -194,6 +196,25 @@
                                       (.offset arg)
                                       false
                                       17))))))))
+
+;;; Byte count of a direct CALL declared BUILTIN-MOVE whose literal count is in
+;;; the inline range and whose destination and source are the first two
+;;; register arguments; zero for every other call. Such a call is emitted as
+;;; straight-line vector accesses (see stogir.a64.block-move).
+(defn inline-move-size [(graph g/Graph) (reference i32) (layout abi/Layout)] (-> i64)
+  (let [node (get (.instructions graph) (cast i64 reference))]
+    (if (or (!= (n/opcode node) 79)
+            (!= (get (.arities graph) (cast i64 reference)) 5)
+            (!= (len (.arguments layout)) 3)
+            (!= (.register (get (.arguments layout) 0)) 0)
+            (!= (.register (get (.arguments layout) 1)) 1)
+            (match (g/operand graph reference 5)
+              (None [] true)
+              (Some [count] (>= count 0))))
+        0
+        (match (copy-forward/move graph reference)
+          (None [] 0)
+          (Some [move] (if (block-move/inline? (.size move)) (.size move) 0))))))
 
 (defn emit-selected-call-at-with-locations! [(output (mut buffer/Buffer))
                                          (graph g/Graph)
@@ -404,7 +425,12 @@
                 (Ok [_] 0)))) (set! for-index-101 (+ for-index-101 1))))
           (when (and (= error "") (!= mode 1))
             (match (if direct?
-                       (buffer/direct-call! (mut code) graph (.op2 node))
+                       (let [move-size (if (= mode 0)
+                                           (inline-move-size graph reference layout)
+                                           (: 0 i64))]
+                         (if (> move-size 0)
+                             (block-move/emit! (mut (.text code)) move-size)
+                             (buffer/direct-call! (mut code) graph (.op2 node))))
                        (word! (mut code) (encode/call-register target-register)))
               (Err [message] (set! error message))
               (Ok [_] 0)))
