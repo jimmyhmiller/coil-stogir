@@ -1,0 +1,355 @@
+(module stogir.tests.entry-load)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.entry-load" :as entry-load)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.node" :as n)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defstruct Fixture [(graph g/Graph) (roots (ArrayList i32))])
+
+;;; The callee of modes 3 and 14 writes the cell it is handed.
+(defn clobber [(cell (ptr u64))] (-> u64) (store! cell 2) 0)
+
+(def MODES 16)
+
+;;; f(p, q, k, callee) -> i64 over 64-bit cells. In the loop modes i counts
+;;; from zero and sum adds what the read in question returned each iteration.
+;;;  0 header reads p[0], loop runs while i < p[0]            (moved)
+;;;  1 as 0, body stores 2 through q every iteration          (kept: q may be p)
+;;;  2 as 0, body stores 2 through q only when i = k          (kept: one path, a later iteration)
+;;;  3 as 0, body calls callee(q), which writes               (kept)
+;;;  4 as 0, body stores i to p[1]                            (moved: disjoint)
+;;;  5 loop runs while i < k, the BODY reads p[0]             (kept: zero trips never read p)
+;;;  6 header reads through a pointer the loop advances       (kept: address varies)
+;;;  7 header reads data = p[0], then data[0] as the bound    (both moved, in order)
+;;;  8 as 7, body stores 2 through q                          (both kept)
+;;;  9 countdown: while p[0] != 0, p[0] -= 1; returns p[0] + 100 read again after the loop
+;;; 10 v = p[0]; if k: x = q[0]; w = p[0]                     (w is v on both paths)
+;;; 11 v = p[0]; if k: q[0] = 2; w = p[0]                     (kept: one path writes)
+;;; 12 v = p[0] before a loop whose body reads p[0] and stores i to p[1]  (body read is v)
+;;; 13 as 12, body stores 2 through q when i = 1              (kept: a later iteration)
+;;; 14 as 10 with a call to callee(q) on the k path           (kept: the call writes)
+;;; 15 as 0, body stores i to p[1] only when i = k            (moved: disjoint on either path)
+(defn build [(mode i32) (a (dyn Allocator))] (-> Fixture)
+  (let [(mut graph) (g/create a) (mut roots) (ArrayList::new [i32] a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        q (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        k (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        callee (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 3]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        two (require (b/scalar-constant! (mut graph) 11 2 8))
+        three (require (b/scalar-constant! (mut graph) 11 3 8))
+        eight (require (b/scalar-constant! (mut graph) 11 8 8))
+        hundred (require (b/scalar-constant! (mut graph) 11 100 8))
+        next-cell (require (b/emit! (mut graph) 26 6 [p eight]))]
+    (let [(mut signature) (match (calls/create 0 11 [(: 6 u8) (: 6 u8) (: 11 u8) (: 6 u8)] a)
+                            (Err [message] (panic "{}" message)) (Ok [s] s))]
+      (require (calls/function! (mut graph) signature a))
+      (calls/release! (mut signature)))
+    (cond
+      (or (= mode 10) (= mode 11) (= mode 14))
+        (let [v (require (b/emit! (mut graph) 91 11 [start p]))
+              condition (require (b/emit! (mut graph) 15 1 [k zero]))
+              branch (require (b/emit! (mut graph) 116 0 [v condition]))
+              yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+              no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+              (mut x) one
+              taken (cond (= mode 10)
+                            (do (set! x (require (b/emit! (mut graph) 91 11 [yes q]))) x)
+                          (= mode 11) (require (b/emit! (mut graph) 93 0 [yes q two]))
+                          :else
+                            (let [(mut sig) (match (calls/create 0 11 [(: 6 u8)] a)
+                                              (Err [message] (panic "{}" message)) (Ok [sig] sig))
+                                  call (require (calls/emit! (mut graph) sig yes callee [q] a))]
+                              (calls/release! (mut sig)) call))
+              left (require (b/emit! (mut graph) 114 0 [taken]))
+              right (require (b/emit! (mut graph) 114 0 [no]))
+              merge (require (b/emit! (mut graph) 112 0 [left right]))
+              extra (require (b/emit! (mut graph) 67 11 [merge x zero]))
+              w (require (b/emit! (mut graph) 91 11 [merge p]))
+              scaled (require (b/emit! (mut graph) 28 11 [w three]))
+              partial (require (b/emit! (mut graph) 26 11 [v scaled]))
+              total (require (b/emit! (mut graph) 26 11 [partial extra]))]
+          (push! (mut roots) (require (b/emit! (mut graph) 120 11 [w total (: 0 i32)]))))
+      (= mode 9)
+        (let [enter (require (b/emit! (mut graph) 114 0 [start]))
+              header (require (b/loop-begin! (mut graph) enter))
+              v (require (b/emit! (mut graph) 91 11 [header p]))
+              condition (require (b/emit! (mut graph) 15 1 [v zero]))
+              branch (require (b/emit! (mut graph) 116 0 [v condition]))
+              yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+              no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+              less (require (b/emit! (mut graph) 27 11 [v one]))
+              write (require (b/emit! (mut graph) 93 0 [yes p less]))
+              back (require (b/emit! (mut graph) 115 0 [write]))
+              again (require (b/emit! (mut graph) 91 11 [no p]))
+              total (require (b/emit! (mut graph) 26 11 [again hundred]))]
+          (require (b/patch! (mut graph) header 2 back))
+          (push! (mut roots) (require (b/emit! (mut graph) 120 11 [again total (: 0 i32)]))))
+      :else
+        (let [before (if (or (= mode 12) (= mode 13))
+                         (require (b/emit! (mut graph) 91 11 [start p]))
+                         start)
+              enter (require (b/emit! (mut graph) 114 0 [before]))
+              header (require (b/loop-begin! (mut graph) enter))
+              i (require (b/loop-phi! (mut graph) header zero))
+              sum (require (b/loop-phi! (mut graph) header zero))
+              cursor (if (= mode 6) (require (b/loop-phi! (mut graph) header p)) (: 0 i32))
+              ; The read in question, and the control node the branch follows.
+              (mut read) (: 0 i32)
+              top (cond
+                    (or (= mode 5) (= mode 12) (= mode 13)) header
+                    (= mode 6)
+                      (do (set! read (require (b/emit! (mut graph) 91 11 [header cursor]))) read)
+                    (or (= mode 7) (= mode 8))
+                      (let [data (require (b/emit! (mut graph) 91 6 [header p]))]
+                        (set! read (require (b/emit! (mut graph) 91 11 [data data])))
+                        read)
+                    :else (do (set! read (require (b/emit! (mut graph) 91 11 [header p]))) read))
+              condition (cond
+                          (or (= mode 5) (= mode 12) (= mode 13))
+                            (require (b/emit! (mut graph) 16 1 [i k]))
+                          (= mode 6) (require (b/emit! (mut graph) 15 1 [read zero]))
+                          :else (require (b/emit! (mut graph) 16 1 [i read])))
+              branch (require (b/emit! (mut graph) 116 0 [top condition]))
+              yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+              no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+              next (require (b/emit! (mut graph) 26 11 [i one]))
+              body
+                (cond
+                  (or (= mode 1) (= mode 8)) (require (b/emit! (mut graph) 93 0 [yes q two]))
+                  (or (= mode 2) (= mode 15))
+                    (let [hit (require (b/emit! (mut graph) 14 1 [i k]))
+                          inner (require (b/emit! (mut graph) 116 0 [yes hit]))
+                          on (require (b/emit! (mut graph) 107 0 [inner (: 0 i32)]))
+                          off (require (b/emit! (mut graph) 108 0 [inner (: 0 i32)]))
+                          write (if (= mode 2)
+                                    (require (b/emit! (mut graph) 93 0 [on q two]))
+                                    (require (b/emit! (mut graph) 93 0 [on next-cell i])))
+                          left (require (b/emit! (mut graph) 114 0 [write]))
+                          right (require (b/emit! (mut graph) 114 0 [off]))]
+                      (require (b/emit! (mut graph) 112 0 [left right])))
+                  (= mode 3)
+                    (let [(mut sig) (match (calls/create 0 11 [(: 6 u8)] a)
+                                      (Err [message] (panic "{}" message)) (Ok [sig] sig))
+                          call (require (calls/emit! (mut graph) sig yes callee [q] a))]
+                      (calls/release! (mut sig)) call)
+                  (= mode 4) (require (b/emit! (mut graph) 93 0 [yes next-cell i]))
+                  (= mode 5)
+                    (do (set! read (require (b/emit! (mut graph) 91 11 [yes p]))) read)
+                  (= mode 12)
+                    (do (set! read (require (b/emit! (mut graph) 91 11 [yes p])))
+                        (require (b/emit! (mut graph) 93 0 [read next-cell i])))
+                  (= mode 13)
+                    (do
+                      (set! read (require (b/emit! (mut graph) 91 11 [yes p])))
+                      (let [hit (require (b/emit! (mut graph) 14 1 [i one]))
+                            inner (require (b/emit! (mut graph) 116 0 [read hit]))
+                            on (require (b/emit! (mut graph) 107 0 [inner (: 0 i32)]))
+                            off (require (b/emit! (mut graph) 108 0 [inner (: 0 i32)]))
+                            write (require (b/emit! (mut graph) 93 0 [on q two]))
+                            left (require (b/emit! (mut graph) 114 0 [write]))
+                            right (require (b/emit! (mut graph) 114 0 [off]))]
+                        (require (b/emit! (mut graph) 112 0 [left right]))))
+                  :else yes)
+              added (require (b/emit! (mut graph) 26 11 [sum read]))
+              back (require (b/emit! (mut graph) 115 0 [body]))
+              result (if (or (= mode 12) (= mode 13))
+                         (require (b/emit! (mut graph) 26 11 [sum before]))
+                         sum)]
+          (require (b/patch! (mut graph) header 2 back))
+          (require (b/patch! (mut graph) i 3 next))
+          (require (b/patch! (mut graph) sum 3 added))
+          (when (= mode 6)
+            (let [advanced (require (b/emit! (mut graph) 26 6 [cursor eight]))]
+              (require (b/patch! (mut graph) cursor 3 advanced))))
+          (push! (mut roots) (require (b/emit! (mut graph) 120 11 [no result (: 0 i32)])))))
+    (Fixture :graph graph :roots roots)))
+
+(defstruct Shape [(loads i64) (under-join i64)])
+
+;;; Plain reads in the graph, and how many of them are still sequenced directly
+;;; under a join (possibly behind other such reads).
+(defn shape [(graph g/Graph)] (-> Shape)
+  (let [(mut result) (Shape :loads 0 :under-join 0) (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (when (= (n/opcode (get (.instructions graph) r)) 91)
+        (set! (.loads result) (+ (.loads result) 1))
+        (when (!= (.header (entry-load/chain graph (cast i32 r))) 0)
+          (set! (.under-join result) (+ (.under-join result) 1))))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    result))
+
+;;; -1 leaves a count unchecked.
+(defn wanted-shape [(mode i32)] (-> Shape)
+  (match mode
+    (0 (Shape :loads 1 :under-join 0))
+    (1 (Shape :loads 1 :under-join 1))
+    (2 (Shape :loads 1 :under-join 1))
+    (3 (Shape :loads 1 :under-join 1))
+    (4 (Shape :loads 1 :under-join 0))
+    (5 (Shape :loads 1 :under-join 0))
+    (6 (Shape :loads 1 :under-join 1))
+    (7 (Shape :loads 2 :under-join 0))
+    (8 (Shape :loads 2 :under-join 2))
+    (10 (Shape :loads 2 :under-join 0))
+    (11 (Shape :loads 2 :under-join 1))
+    (12 (Shape :loads 1 :under-join 0))
+    (13 (Shape :loads 2 :under-join 0))
+    (14 (Shape :loads 2 :under-join 1))
+    (15 (Shape :loads 1 :under-join 0))
+    (_ (Shape :loads -1 :under-join -1))))
+
+(defstruct Answer [(result u64) (cells (array u64 6))])
+
+(defn initial-cells [(mode i32) (k u64)] (-> (array u64 6))
+  (let [first (if (or (= mode 0) (= mode 1) (= mode 3) (= mode 4) (= mode 7) (= mode 8) (= mode 9))
+                  k
+                  6)]
+    [first (: 9 u64) 0x33 0x44 0 0x55]))
+
+;;; What the program computes, statement by statement, on the same cells.
+(defn expected [(mode i32) (aliased bool) (k u64)] (-> Answer)
+  (let [(mut c) (initial-cells mode k)
+        qi (if aliased 0 2)
+        (mut sum) (: 0 u64) (mut i) (: 0 u64) (mut result) (: 0 u64)]
+    (cond
+      (or (= mode 10) (= mode 11) (= mode 14))
+        (let [v (get c 0) (mut x) (: 0 u64)]
+          (when (!= k 0)
+            (if (= mode 10)
+                (set! x (get c qi))
+                (do (set! (mut c) qi 2) (set! x 1))))
+          (set! result (primitive/iadd (primitive/iadd v (primitive/imul (get c 0) 3)) x)))
+      (= mode 9)
+        (do (while (!= (get c 0) 0) (set! (mut c) 0 (- (get c 0) 1)))
+            (set! result (+ (get c 0) 100)))
+      (= mode 6)
+        (let [(mut at) (: 0 i64)]
+          (while (!= (get c at) 0)
+            (set! sum (+ sum (get c at))) (set! at (+ at 1)))
+          (set! result sum))
+      (or (= mode 5) (= mode 12) (= mode 13))
+        (let [v (get c 0)]
+          (while (< (cast i64 i) (cast i64 k))
+            (set! sum (+ sum (get c 0)))
+            (when (= mode 12) (set! (mut c) 1 i))
+            (when (and (= mode 13) (= i 1)) (set! (mut c) qi 2))
+            (set! i (+ i 1)))
+          (set! result (if (= mode 5) sum (+ sum v))))
+      :else
+        (do
+          (while (< (cast i64 i) (cast i64 (get c 0)))
+            (set! sum (+ sum (get c 0)))
+            (when (or (= mode 1) (= mode 3) (= mode 8)) (set! (mut c) qi 2))
+            (when (and (= mode 2) (= i k)) (set! (mut c) qi 2))
+            (when (= mode 4) (set! (mut c) 1 i))
+            (when (and (= mode 15) (= i k)) (set! (mut c) 1 i))
+            (set! i (+ i 1)))
+          (set! result sum)))
+    (Answer :result result :cells c)))
+
+;;; Compile at LEVEL and run on fresh cells. p names cells[0] (through a box in
+;;; modes 7 and 8, or nothing at all when ABSENT); q names cells[0] when ALIASED,
+;;; else cells[2].
+(defn run-native [(graph g/Graph) (roots (slice i32)) (mode i32) (level i32)
+                  (aliased bool) (absent bool) (k u64) (a (dyn Allocator))] (-> Answer)
+  (match (compile/image-with-private graph 1 roots "_el_entry" (options/Options :level level) a
+                                     (private/no-context))
+    (Err [message] (panic "native compile mode {} level {}: {}" mode level message))
+    (Ok [code]
+      (let [(mut code) code (mut answer) (Answer :result 0 :cells (zeroed (array u64 6)))]
+        (match (link/compose [code] a)
+          (Err [message] (panic "compose: {}" message))
+          (Ok [module]
+            (let [(mut module) module]
+              (match (jit/map-image (.image module) a)
+                (Err [message] (panic "map: {}" message))
+                (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        index (match (image/find-symbol (.image module) "_el_entry")
+                                (Some [id] id) (None [] (panic "symbol")))
+                        function (primitive/cast
+                                   (fnptr (cc/C) [(ptr u64) (ptr u64) u64 (fnptr (cc/C) [(ptr u64)] u64)] u64)
+                                   (primitive/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))
+                        (mut cells) (initial-cells mode k)
+                        base (primitive/cast (ptr u64) (mut cells))
+                        (mut box) [(primitive/cast u64 base)]
+                        first (cond absent (primitive/cast (ptr u64) 0)
+                                    (or (= mode 7) (= mode 8)) (primitive/cast (ptr u64) (mut box))
+                                    :else base)
+                        other (if aliased base (primitive/index base 2))
+                        result (function first other k (fnptr-of clobber))]
+                    (set! answer (Answer :result result :cells cells))
+                    (unless (= (get box 0) (primitive/cast u64 base))
+                      (panic "mode {} wrote the box" mode))
+                    (jit/release-image! (mut loaded)))))
+              (link/release! (mut module)))))
+        (image/release! (mut code))
+        answer))))
+
+(defn same? [(left Answer) (right Answer)] (-> bool)
+  (let [(mut good) (= (.result left) (.result right))]
+    (for [i 0 6] (unless (= (get (.cells left) i) (get (.cells right) i)) (set! good false)))
+    good))
+
+(defn main [] (-> i32)
+  (let [a (malloc-allocator) (mut native) 0]
+    (for [mode 0 MODES]
+      (let [(mut f) (build (cast i32 mode) a)]
+        ; The memory optimisation leaves exactly the reads the proofs allow.
+        (match (sccp/optimize-memory (.graph f) 8 (slice (.roots f)) true a)
+          (Err [message] (panic "mode {} optimize: {}" mode message))
+          (Ok [optimized]
+            (let [(mut optimized) optimized
+                  got (shape (.graph optimized))
+                  want (wanted-shape (cast i32 mode))]
+              (unless (and (or (< (.loads want) 0) (= (.loads got) (.loads want)))
+                           (or (< (.under-join want) 0) (= (.under-join got) (.under-join want))))
+                (panic "mode {}: {} reads, {} under a join; expected {} and {}"
+                       mode (.loads got) (.under-join got) (.loads want) (.under-join want)))
+              (rewrite/release! (mut optimized)))))
+        ; Native answers at the unoptimised and the fully optimised level both
+        ; equal the statement-by-statement result, cells included.
+        (for aliased [false true]
+          (for k [(: 0 u64) 1 3 5 6 100]
+            (unless (and (= k 100) (not (or (= mode 2) (= mode 10) (= mode 11) (= mode 14) (= mode 15))))
+              (let [wanted (expected (cast i32 mode) aliased k)]
+                (for level [(: 1 i32) 3]
+                  (let [got (run-native (.graph f) (slice (.roots f)) (cast i32 mode) level
+                                        aliased false k a)]
+                    (set! native (+ native 1))
+                    (unless (same? got wanted)
+                      (panic "mode {} level {} aliased {} k {}: got {} [{} {} {}], expected {} [{} {} {}]"
+                             mode level aliased k (.result got) (get (.cells got) 0)
+                             (get (.cells got) 1) (get (.cells got) 2) (.result wanted)
+                             (get (.cells wanted) 0) (get (.cells wanted) 1)
+                             (get (.cells wanted) 2)))))))))
+        ; A loop that runs zero times never reads through its body's pointer:
+        ; with no object behind p the function must still return.
+        (when (= mode 5)
+          (for level [(: 1 i32) 3]
+            (let [got (run-native (.graph f) (slice (.roots f)) 5 level false true 0 a)]
+              (set! native (+ native 1))
+              (unless (= (.result got) 0) (panic "mode 5 zero trips returned {}" (.result got))))))
+        (g/release! (mut (.graph f))) (free! (mut (.roots f)))))
+    (println "entry-load: {} shapes, {} native answers pass" MODES native)
+    0))
