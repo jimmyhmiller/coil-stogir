@@ -128,17 +128,30 @@ condition is decided on both sides, as the condition itself is.
 
 A loop is rotated only when all of this holds:
 
-- it lies inside another loop: the MERGE and all its inputs are on one
-  cycle-bearing component of the control predecessor relation (one iterative
-  Tarjan pass over control operands per cleanup, built on first need);
 - one projection stays in the loop and the other leaves it, at least one edge
   enters and one returns (decided by walks over control predecessors that stop
-  at the MERGE and at the component's boundary);
-- no back edge leaves an IF projection directly. A rotated loop's back edges
-  do, so rotation never repeats; a loop whose body ends in a `break` test is
-  left alone for the same reason;
-- the body needs something the guard can keep off the outer loop: a read in
-  the header, a read heading the body, or a call in the body.
+  at the MERGE and at the boundary of its cycle-bearing component; one
+  iterative Tarjan pass over control operands per cleanup, built on first
+  need);
+- it pays, by one of two rules.
+  - Inside another loop (the MERGE and all its inputs are on one component)
+    with no back edge leaving an IF projection directly: the body needs
+    something the guard can keep off the outer loop, namely a read in the
+    header, a read heading the body, or a call in the body.
+  - Inside no other loop (one input enters from outside the component), or
+    with a back edge that leaves an IF projection directly (a loop rotated
+    before, or one whose body ends in a test): the MERGE has one entry and one
+    return, and one of the at most four plain reads heading the body already
+    meets `entry-load`'s proofs as the graph stands, so the following cleanup
+    moves it onto the guarded entry edge (`body-read-leaves?`: its address is
+    computed from nothing defined in the header's or the body's leading block,
+    and every path back from the return reaches it without a possible write).
+
+Rotation cannot repeat without end: a loop whose return leaves a test is
+rotated only for a read that then leaves the loop for good. A MERGE is tried
+by a rotating pass only if the cycle facts can admit it; a function with a
+single MERGE asks for them only when a plain read heads one side of that
+MERGE's branch.
 
 What it buys: reads heading the rotated body are header reads to
 `entry-load`, which moves the invariant ones into the guard's true arm, where
@@ -231,3 +244,31 @@ or termination of the test runner. JIT and linked AOT checks cover IF paths,
 dense/sparse exhaustive-match defaults, never-returning functions and aligned
 dynamic frames. These policies do not establish the still-open compiler backend
 integration or performance comparisons.
+
+## Reads needed on one side of a branch
+
+`load-sink/run!` is the last step of `sccp/finish-with-uses!`, after the
+loop-entry moves, rotation and the equality chains, so that it never takes a
+read out of their reach. A plain scalar LOAD moves directly under an IF_TRUE
+or IF_FALSE when:
+
+- only plain reads (at most six) are sequenced between it and the IF, so
+  nothing can write between its old and its new place;
+- no other LOAD or STORE names its address node, and the address is computed
+  from a PHI, a read or a call (an address made of parameters, storage and
+  constants alone stays where a loop-entry move can still serve it, here or
+  after inlining);
+- every use of its value happens under that projection: a sequenced user
+  where it is sequenced, a PHI at the end of the matching join input, a
+  floating comparison, arithmetic, conversion or COPY wherever its own users
+  do (at most 24 uses), each proven by a backward walk on which every path
+  reaches the projection before the read, the IF or the function entry (at
+  most 16 joins per walk, 96 steps per read).
+
+The read then runs on a subset of the paths that ran it before and is moved
+again while the side it landed on branches (at most eight times). Observed
+reads stay. `tests/load-sink.coil` covers the shapes natively, including a
+write between the read and the branch, uses on both sides or after the join,
+a read above the branch that uses the value, a loop whose location changes
+between iterations and a pointer with no object behind it on the path that
+never read it.

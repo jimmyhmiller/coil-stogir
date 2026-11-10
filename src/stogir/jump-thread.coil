@@ -1203,7 +1203,9 @@
 ;;; latch, and the body arm becomes the header. It pays where the loop sits inside another loop:
 ;;; work that only the body needs then stays off the outer loop's path when the
 ;;; inner loop does not run. A back edge that already leaves a test is the
-;;; bottom of a rotated loop and is left alone, so rotation cannot repeat.
+;;; bottom of a rotated loop and is left alone unless a read heading the body
+;;; is proven to leave the loop (body-read-leaves?), so rotation cannot repeat
+;;; without end.
 ;;; rotation-loop! has classified the edges and found the enclosing loop.
 (defn rotation? [(s State) (graph g/Graph) (edges uses/Uses)] (-> bool)
   (let [(mut entries) (: 0 i64)
@@ -1216,10 +1218,13 @@
               (set! returns (+ returns 1))
               (when (or (= above 107) (= above 108)) (set! tested true)))
             (set! entries (+ entries 1)))))
-    (and (> entries 0) (> returns 0) (not tested)
-         (if (.outer s)
-             ; Inside no other loop only a read that will leave the loop pays
-             ; for the copies of the test.
+    (and (> entries 0) (> returns 0)
+         (if (or (.outer s) tested)
+             ; Inside no other loop, or where the return already leaves a
+             ; test (a loop rotated before, or one whose body ends in a test),
+             ; only a read that will leave the loop pays for the copies of the
+             ; test. Each such rotation takes a read out of the loop for good,
+             ; so it cannot repeat without end.
              (and (= entries 1) (= returns 1) (body-read-leaves? s graph edges))
              ; Something only the body needs: a read in the header or heading the
              ; body, which may move behind the guard, or a call, around which
@@ -1778,12 +1783,14 @@
 (defn rotating-header? [(s (mut State)) (graph g/Graph) (roots (ArrayList i32)) (merge i32)
                         (loadful bool) (a (dyn Allocator))] (-> bool)
   (let [count (cast i64 (arity graph merge))
-        ; A loop to rotate has a back edge that does not leave a test.
+        ; A loop to rotate has a back edge that does not leave a test, or a
+        ; read heading one side of its branch.
         (mut untested) false]
     (for [k 1 (+ count 1)]
       (let [above (opcode graph (input graph (input graph merge (cast i32 k)) 1))]
         (unless (or (= above 107) (= above 108)) (set! untested true))))
-    (if (or (< count 2) (> count MAX-ROTATE-EDGES) (not untested)
+    (if (or (< count 2) (> count MAX-ROTATE-EDGES)
+            (not (or untested (and loadful (= count 2))))
             ; A loop inside another needs two MERGEs.
             (and (< (len (.merges s)) 2) (not (and loadful (= count 2)))))
         false

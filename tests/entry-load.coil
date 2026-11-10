@@ -29,7 +29,7 @@
 ;;; The callee of modes 16 and 17 only reads it, as its PURE_FUNC declaration says.
 (defn peek [(cell (ptr u64))] (-> u64) (load cell))
 
-(def MODES 22)
+(def MODES 24)
 
 ;;; f(p, q, k, callee) -> i64 over 64-bit cells. In the loop modes i counts
 ;;; from zero and sum adds what the read in question returned each iteration.
@@ -57,6 +57,9 @@
 ;;; 20 as 21, the body reads p[0] only when i != 1            (kept in the loop: not on every trip)
 ;;; 21 as 5                                                   (the loop is rotated and the read
 ;;;                                                            leaves it behind the zero-trip guard)
+;;; 22 MERGE-headed loop whose return leaves a test: {if i = 3 leave; sum += p[0]; i += 1;
+;;;    if not i < k leave}                                     (rotated once more: the read leaves)
+;;; 23 as 22, the body then stores 2 through q                (kept in the loop: q may be p)
 (defn build [(mode i32) (a (dyn Allocator))] (-> Fixture)
   (let [(mut graph) (g/create a) (mut roots) (ArrayList::new [i32] a)
         start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
@@ -100,6 +103,32 @@
               partial (require (b/emit! (mut graph) 26 11 [v scaled]))
               total (require (b/emit! (mut graph) 26 11 [partial extra]))]
           (push! (mut roots) (require (b/emit! (mut graph) 120 11 [w total (: 0 i32)]))))
+      (or (= mode 22) (= mode 23))
+        (let [enter (require (b/emit! (mut graph) 114 0 [start]))
+              header (require (b/emit! (mut graph) 112 0 [enter enter]))
+              i (require (b/emit! (mut graph) 67 11 [header zero zero]))
+              sum (require (b/emit! (mut graph) 67 11 [header zero zero]))
+              going (require (b/emit! (mut graph) 15 1 [i three]))
+              top (require (b/emit! (mut graph) 116 0 [header going]))
+              body (require (b/emit! (mut graph) 107 0 [top (: 0 i32)]))
+              stopped (require (b/emit! (mut graph) 108 0 [top (: 0 i32)]))
+              read (require (b/emit! (mut graph) 91 11 [body p]))
+              tail (if (= mode 23) (require (b/emit! (mut graph) 93 0 [read q two])) read)
+              added (require (b/emit! (mut graph) 26 11 [sum read]))
+              next (require (b/emit! (mut graph) 26 11 [i one]))
+              more (require (b/emit! (mut graph) 16 1 [next k]))
+              latch (require (b/emit! (mut graph) 116 0 [tail more]))
+              again (require (b/emit! (mut graph) 107 0 [latch (: 0 i32)]))
+              finished (require (b/emit! (mut graph) 108 0 [latch (: 0 i32)]))
+              back (require (b/emit! (mut graph) 114 0 [again]))
+              out-early (require (b/emit! (mut graph) 114 0 [stopped]))
+              out-late (require (b/emit! (mut graph) 114 0 [finished]))
+              leave (require (b/emit! (mut graph) 112 0 [out-early out-late]))
+              result (require (b/emit! (mut graph) 67 11 [leave sum added]))]
+          (require (b/patch! (mut graph) header 2 back))
+          (require (b/patch! (mut graph) i 3 next))
+          (require (b/patch! (mut graph) sum 3 added))
+          (push! (mut roots) (require (b/emit! (mut graph) 120 11 [leave result (: 0 i32)]))))
       (= mode 9)
         (let [enter (require (b/emit! (mut graph) 114 0 [start]))
               header (require (b/loop-begin! (mut graph) enter))
@@ -291,6 +320,8 @@
     (19 (Shape :loads 1 :under-join -1 :in-loop 1))
     (20 (Shape :loads 1 :under-join -1 :in-loop 1))
     (21 (Shape :loads 1 :under-join -1 :in-loop 0))
+    (22 (Shape :loads 1 :under-join -1 :in-loop 0))
+    (23 (Shape :loads 1 :under-join -1 :in-loop 1))
     (_ (Shape :loads -1 :under-join -1 :in-loop -1))))
 
 (defstruct Answer [(result u64) (cells (array u64 6))])
@@ -315,6 +346,16 @@
                 (set! x (get c qi))
                 (do (set! (mut c) qi 2) (set! x 1))))
           (set! result (primitive/iadd (primitive/iadd v (primitive/imul (get c 0) 3)) x)))
+      (or (= mode 22) (= mode 23))
+        (let [(mut going) true]
+          (while going
+            (if (= i 3)
+                (set! going false)
+                (do (set! sum (+ sum (get c 0)))
+                    (when (= mode 23) (set! (mut c) qi 2))
+                    (set! i (+ i 1))
+                    (unless (< (cast i64 i) (cast i64 k)) (set! going false)))))
+          (set! result sum))
       (= mode 9)
         (do (while (!= (get c 0) 0) (set! (mut c) 0 (- (get c 0) 1)))
             (set! result (+ (get c 0) 100)))
@@ -428,7 +469,7 @@
                              (get (.cells wanted) 2)))))))))
         ; A loop that runs zero times never reads through its body's pointer:
         ; with no object behind p the function must still return.
-        (when (or (= mode 5) (>= mode 18))
+        (when (or (= mode 5) (and (>= mode 18) (<= mode 21)))
           (for level [(: 1 i32) 3]
             (let [got (run-native (.graph f) (slice (.roots f)) (cast i32 mode) level false true 0 a)]
               (set! native (+ native 1))
