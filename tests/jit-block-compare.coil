@@ -1,0 +1,192 @@
+(module stogir.tests.jit-block-compare)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.symbols" :as symbols)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.block-compare" :as block-compare)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.var" :use [var-static])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(extern reserve :as "mmap" :cc (cc/C) [(ptr u8) i64 i32 i32 i32 i64] (-> (ptr u8)))
+(extern protect :as "mprotect" :cc (cc/C) [(ptr u8) i64 i32] (-> i32))
+(extern page-size :as "getpagesize" :cc (cc/C) [] (-> i32))
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [x] x) (Err [e] (panic "{}" e))))
+
+(defn at [(base (ptr u8)) (offset i64)] (-> (ptr u8))
+  (p/cast (ptr u8) (+ (p/cast u64 base) (cast u64 offset))))
+
+(def runtime-calls (var-static i64 0))
+
+;;; The runtime routine a comparison outside the inline range still calls.
+(defn runtime-compare :cc (cc/C) [(first (ptr u8)) (second (ptr u8)) (count u64)] (-> i32)
+  (set runtime-calls (+ (get runtime-calls) 1))
+  (let [(mut i) (: 0 i64) (mut answer) (: 0 i32)]
+    (while (and (= answer 0) (< i (cast i64 count)))
+      (let [x (load (at first i)) y (load (at second i))]
+        (when (!= x y) (set! answer (if (< x y) (: -1 i32) 1))))
+      (set! i (+ i 1)))
+    answer))
+
+(defn sign [(value i32)] (-> i32)
+  (if (< value 0) (: -1 i32) (if (> value 0) 1 0)))
+
+;;; mode 0: the count is the literal COUNT.
+;;; mode 1: the count is a parameter, compared on the true side of
+;;;         EQ(parameter, COUNT); the other side returns 99.
+;;; mode 2: as 1 on the false side of NE(COUNT, parameter).
+;;; mode 3: the true side of NE: nothing is known, the runtime is called.
+;;; mode 4: EQ of a different value (parameter + 0 is folded away, so the
+;;;         count is parameter ^ 1 ^ 1 built unfolded): nothing is known about
+;;;         the count itself.
+(defn check [(mode i32) (count i64) (first (ptr u8)) (second (ptr u8)) (page i64)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        left (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        right (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        literal (require (b/scalar-constant! (mut graph) 5 (cast u64 count) 8))
+        parameter (if (= mode 0) literal (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2])))
+        one (require (b/scalar-constant! (mut graph) 5 1 8))
+        other (if (= mode 4)
+                  (require (b/emit! (mut graph) 48 5
+                                    [(require (b/emit! (mut graph) 48 5 [parameter one])) one]))
+                  parameter)
+        compared (if (= mode 0) literal other)
+        runtime (require (symbols/function! (mut graph) "_block_compare_runtime" 0))
+        ninety-nine (require (b/scalar-constant! (mut graph) 10 99 8))
+        (mut exits) (ArrayList::new [i32] a)
+        (mut failures) 0]
+    (match (calls/create-builtin-compare 0 10 5 a)
+      (Err [e] (panic "{}" e))
+      (Ok [proto]
+        (let [(mut proto) proto]
+          (if (= mode 0)
+              (let [call (require (calls/emit! (mut graph) proto start runtime
+                                               [left right compared] a))]
+                (push! (mut exits) (require (b/emit! (mut graph) 120 10 [call call (: 0 i32)]))))
+              (let [test (require (b/emit! (mut graph) (if (or (= mode 1) (= mode 4)) 14 15) 1
+                                           (if (= mode 2) [literal parameter] [parameter literal])))
+                    split (require (b/emit! (mut graph) 116 0 [start test]))
+                    yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+                    no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+                    taken (if (= mode 2) no yes)
+                    call (require (calls/emit! (mut graph) proto taken runtime
+                                               [left right compared] a))]
+                (push! (mut exits) (require (b/emit! (mut graph) 120 10 [call call (: 0 i32)])))
+                (push! (mut exits)
+                       (require (b/emit! (mut graph) 120 10
+                                         [(if (= mode 2) yes no) ninety-nine (: 0 i32)])))))
+          (calls/release! (mut proto)))))
+    ; No function prototype is declared, so the comparison in return position
+    ; stays an ordinary call rather than becoming a tail jump to the runtime.
+    (match (compile/image graph start (slice exits) "_block_compare" a)
+      (Err [e] (panic "mode {} count {}: {}" mode count e))
+      (Ok [code]
+        (let [(mut code) code
+              (mut values) (ArrayList::new [u64] a)
+              (mut found) (ArrayList::new [bool] a)]
+          (for symbol (.symbols code)
+            (let [external (image/same-name? code symbol "_block_compare_runtime")]
+              (push! (mut values)
+                     (if external (p/cast u64 (p/cast (ptr u8) (fnptr-of runtime-compare))) 0))
+              (push! (mut found) external)))
+          (match (jit/map-image-resolved code (slice values) (slice found) a)
+            (Err [e] (panic "mode {} count {}: {}" mode count e))
+            (Ok [mapped]
+              (let [(mut mapped) mapped
+                    f (p/cast (fnptr (cc/C) [(ptr u8) (ptr u8) u64] i32) (.base (.memory mapped)))
+                    before (get runtime-calls)
+                    (mut cases) 0
+                    ; mode 3 reaches the comparison only with another count
+                    passed (cast u64 (if (= mode 3) (+ count 1) count))
+                    length (if (= mode 3) (+ count 1) count)]
+                ; Placements: each range against the start and the end of its
+                ; readable page (inaccessible pages on both sides), and at
+                ; every small misalignment from either end.
+                (for [placement 0 20]
+                  (let [x (cond (= placement 0) 0
+                                (= placement 1) (- page length)
+                                (< placement 11) (- placement 1)
+                                :else (- (- page length) (- placement 10)))
+                        y (cond (= placement 0) (- page length)
+                                (= placement 1) 0
+                                (< placement 11) (- (- page length) (- placement 1))
+                                :else (- placement 10))
+                        one-range (at first x)
+                        two-range (at second y)]
+                    ; variant 0: equal. Then for each position k: the first
+                    ; range lower, higher, a difference across the sign bit
+                    ; (unsigned order), and a later opposite difference that
+                    ; must not matter.
+                    (for [variant 0 (+ 1 (* 4 length))]
+                      (for [i 0 length]
+                        (store! (at one-range i) (cast u8 (+ (* i 7) 3)))
+                        (store! (at two-range i) (cast u8 (+ (* i 7) 3))))
+                      (when (> variant 0)
+                        (let [k (/ (- variant 1) 4) kind (% (- variant 1) 4)]
+                          (cond (= kind 0) (store! (at two-range k) (+ (load (at one-range k)) 1))
+                                (= kind 1) (store! (at one-range k) (+ (load (at two-range k)) 1))
+                                (= kind 2) (do (store! (at one-range k) 0x7F)
+                                               (store! (at two-range k) 0x80))
+                                :else (do (store! (at one-range k) 0xFF)
+                                          (store! (at two-range k) 0x01)
+                                          (when (< (+ k 1) length)
+                                            (store! (at one-range (+ k 1)) 0x00)
+                                            (store! (at two-range (+ k 1)) 0xEE))))))
+                      (let [(mut wanted) (: 0 i32) (mut i) (: 0 i64)]
+                        (while (and (= wanted 0) (< i length))
+                          (let [p1 (load (at one-range i)) p2 (load (at two-range i))]
+                            (when (!= p1 p2) (set! wanted (if (< p1 p2) (: -1 i32) 1))))
+                          (set! i (+ i 1)))
+                        (let [actual (call-ptr f one-range two-range passed)]
+                          (set! cases (+ cases 1))
+                          (when (!= (sign actual) wanted)
+                            (when (= failures 0)
+                              (println "mode {} count {} placement {} variant {}: expected {} got {}"
+                                       mode count placement variant wanted actual))
+                            (set! failures (+ failures 1))))))))
+                ; A parameter that fails the test never reaches the comparison.
+                (when (or (= mode 1) (= mode 2) (= mode 4))
+                  (when (!= (call-ptr f (at first 0) (at second 0) (+ passed 1)) 99)
+                    (set! failures (+ failures 1))))
+                (when (= mode 3)
+                  (when (!= (call-ptr f (at first 0) (at second 0) (cast u64 count)) 99)
+                    (set! failures (+ failures 1))))
+                (let [calls (- (get runtime-calls) before)
+                      inline (and (block-compare/inline? count) (<= mode 2))]
+                  (when (!= calls (if inline 0 cases))
+                    (println "mode {} count {}: {} runtime calls in {} comparisons"
+                             mode count calls cases)
+                    (set! failures (+ failures 1))))
+                (jit/release-image! (mut mapped)))))
+          (free! (mut values))
+          (free! (mut found))
+          (image/release! (mut code)))))
+    (free! (mut exits))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [page (cast i64 (page-size))
+        one (reserve (p/cast (ptr u8) 0) (* 3 page) 0 0x1002 -1 0)
+        two (reserve (p/cast (ptr u8) 0) (* 3 page) 0 0x1002 -1 0)
+        (mut failures) 0]
+    (when (or (= (p/cast i64 one) -1) (= (p/cast i64 two) -1)
+              (!= (protect (at one page) page 3) 0)
+              (!= (protect (at two page) page 3) 0))
+      (panic "cannot reserve the guarded regions"))
+    (assert (= (block-compare/maximum) 16))
+    (for mode [(: 0 i32) 1 2 3 4]
+      (for [count 0 25]
+        (set! failures (+ failures (check mode count (at one page) (at two page) page)))))
+    (println "native block compare checks: {} failures" failures)
+    (if (= failures 0) 0 1)))
