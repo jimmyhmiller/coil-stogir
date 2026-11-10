@@ -1,0 +1,375 @@
+(module stogir.tests.inline-call-exemptions)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.symbols" :as symbols)
+(import "stogir.call-inline" :as inlining)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as p)
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; Inline exemptions for callees that contain calls: call-cells, sparse-cells
+;;; and forwarders. Every expansion is validated, linked with the functions it
+;;; still calls, and executed natively. The pointer called through is a run
+;;; time argument in every case but one, where it is the address of the
+;;; function being compiled, so the call recurses through the pointer.
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn signature [(parameters (slice u8)) (a (dyn Allocator))] (-> calls/Prototype)
+  (match (calls/create 0 11 parameters a)
+    (Err [message] (panic "signature: {}" message))
+    (Ok [owned] owned)))
+
+;;; name(x) = x OPCODE 3, for a commutative or subtracting OPCODE.
+(defn unary [(opcode i32) (a (dyn Allocator))] (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        three (require (b/scalar-constant! (mut graph) 11 3 8))
+        value (require (b/emit! (mut graph) opcode 11 [x three]))
+        (mut one) (signature [(: 11 u8)] a)]
+    (require (calls/function! (mut graph) one a))
+    (calls/release! (mut one))
+    (require (b/emit! (mut graph) 120 11 [start value (: 0 i32)]))
+    graph))
+
+;;; _ce_apply(f, x) = f(x) + 1: one call, through its pointer parameter.
+(defn apply-graph [(a (dyn Allocator))] (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        f (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        (mut own) (signature [(: 6 u8) (: 11 u8)] a)
+        (mut target) (signature [(: 11 u8)] a)
+        _ (require (calls/function! (mut graph) own a))
+        attached (require (calls/attach! (mut graph) target f a))
+        called (require (calls/emit! (mut graph) target start attached [x] a))
+        value (require (b/emit! (mut graph) 26 11 [called one]))]
+    (calls/release! (mut own))
+    (calls/release! (mut target))
+    (require (b/emit! (mut graph) 120 11 [called value (: 0 i32)]))
+    graph))
+
+;;; _ce_twice(f, x) = let r = _ce_apply(f, x) in r + _ce_apply(f, r).
+(defn twice-graph [(a (dyn Allocator))] (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        f (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        (mut own) (signature [(: 6 u8) (: 11 u8)] a)
+        _ (require (calls/function! (mut graph) own a))
+        target (require (symbols/function! (mut graph) "_ce_apply" 0))
+        first (require (calls/emit! (mut graph) own start target [f x] a))
+        second (require (calls/emit! (mut graph) own first target [f first] a))
+        value (require (b/emit! (mut graph) 26 11 [first second]))]
+    (calls/release! (mut own))
+    (require (b/emit! (mut graph) 120 11 [second value (: 0 i32)]))
+    graph))
+
+;;; _ce_forward(f, x) = _ce_apply(f, x): its only call.
+(defn forward-graph [(a (dyn Allocator))] (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        f (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        (mut own) (signature [(: 6 u8) (: 11 u8)] a)
+        _ (require (calls/function! (mut graph) own a))
+        target (require (symbols/function! (mut graph) "_ce_apply" 0))
+        called (require (calls/emit! (mut graph) own start target [f x] a))]
+    (calls/release! (mut own))
+    (require (b/emit! (mut graph) 120 11 [called called (: 0 i32)]))
+    graph))
+
+;;; RECURSIVE: _ce_fact(x) = if 1 < x then x * _ce_fact(x - 1) else 1.
+;;; Otherwise: _ce_tri(x) = if 0 < x then x + _ce_apply(&_ce_tri, x - 1) - 1
+;;; else 0, which reaches itself only through the wrapper's pointer call.
+(defn guarded-graph [(recursive bool) (a (dyn Allocator))] (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        (mut own) (signature [(: 11 u8)] a)
+        (mut apply) (signature [(: 6 u8) (: 11 u8)] a)
+        _ (require (calls/function! (mut graph) own a))
+        positive (require (b/emit! (mut graph) 16 1 [(if recursive one zero) x]))
+        split (require (b/emit! (mut graph) 116 0 [start positive]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        less (require (b/emit! (mut graph) 27 11 [x one]))
+        called
+          (if recursive
+              (let [self (require (symbols/function! (mut graph) "_ce_fact" 0))]
+                (require (calls/emit! (mut graph) own yes self [less] a)))
+              (let [self (require (symbols/function! (mut graph) "_ce_tri" 0))
+                    target (require (symbols/function! (mut graph) "_ce_apply" 0))]
+                (require (calls/emit! (mut graph) apply yes target [self less] a))))
+        value
+          (if recursive
+              (require (b/emit! (mut graph) 28 11 [x called]))
+              (let [sum (require (b/emit! (mut graph) 26 11 [x called]))]
+                (require (b/emit! (mut graph) 27 11 [sum one]))))
+        yes-end (require (b/emit! (mut graph) 114 0 [called]))
+        no-end (require (b/emit! (mut graph) 114 0 [no]))
+        join (require (b/emit! (mut graph) 112 0 [yes-end no-end]))
+        result (require (b/emit! (mut graph) 67 11 [join value (if recursive one zero)]))]
+    (calls/release! (mut own))
+    (calls/release! (mut apply))
+    (require (b/emit! (mut graph) 120 11 [join result (: 0 i32)]))
+    graph))
+
+;;; _ce_factorial(x) = _ce_fact(x): the only call of a forwarder.
+(defn factorial-graph [(a (dyn Allocator))] (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        (mut own) (signature [(: 11 u8)] a)
+        _ (require (calls/function! (mut graph) own a))
+        target (require (symbols/function! (mut graph) "_ce_fact" 0))
+        called (require (calls/emit! (mut graph) own start target [x] a))]
+    (calls/release! (mut own))
+    (require (b/emit! (mut graph) 120 11 [called called (: 0 i32)]))
+    graph))
+
+(defn find-return [(graph g/Graph)] (-> i32)
+  (let [(mut found) (: 0 i32) (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (when (= (n/opcode (get (.instructions graph) r)) 120) (set! found (cast i32 r)))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    found))
+
+;;; Counts of [direct calls, calls through a PROTO pointer] in GRAPH.
+(defn call-shape [(graph g/Graph)] (-> (array i64 2))
+  (let [(mut direct) (: 0 i64) (mut indirect) (: 0 i64) (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (let [node (get (.instructions graph) r)]
+        (when (= (n/opcode node) 79)
+          (match (g/lookup graph (.op2 node))
+            (None [] (panic "call target missing"))
+            (Some [target]
+                  (if (= (n/opcode target) 40)
+                      (set! indirect (+ indirect 1))
+                      (set! direct (+ direct 1)))))))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    [direct indirect]))
+
+(defn sites [(graph g/Graph) (target inlining/Callee) (a (dyn Allocator))]
+  (-> (ArrayList inlining/Site))
+  (let [(mut found) (ArrayList::new [inlining/Site] a) (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (let [node (get (.instructions graph) r)]
+        (when (= (n/opcode node) 79)
+          (match (g/lookup graph (.op2 node))
+            (None [] (panic "call target missing"))
+            (Some [function]
+                  (when (= (n/opcode function) 74)
+                    (push! (mut found)
+                           (inlining/Site :reference (cast i32 r) :target target)))))))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    found))
+
+(defn policy [(budget i32) (cells i32) (sparse i32) (forwarders bool)] (-> inlining/Policy)
+  (inlining/Policy :budget budget :small-cells 0 :small-anywhere false :small-leaf false
+                   :indirect-calls false :pair-result-calls false :honor-always false
+                   :hoist-frames false :call-cells cells :sparse-cells sparse
+                   :forwarders forwarders))
+
+(defn compiled [(graph g/Graph) (roots (slice i32)) (name (slice u8)) (a (dyn Allocator))]
+  (-> image/Image)
+  (match (compile/image graph 1 roots name a)
+    (Err [message] (panic "compile {}: {}" name message))
+    (Ok [code] code)))
+
+(defstruct Program
+  [(module link/Module) (loaded jit/Loaded)])
+
+(defn address [(program Program) (name (slice u8))] (-> (ptr u8))
+  (match (image/find-symbol (.image (.module program)) name)
+    (None [] (panic "symbol {} missing" name))
+    (Some [id] (p/cast (ptr u8) (get (.addresses (.loaded program)) (cast i64 id))))))
+
+;;; MAIN (already expanded or not) linked with the functions it may call.
+(defn load-program [(main g/Graph) (roots (slice i32)) (name (slice u8))
+                    (support (slice image/Image)) (a (dyn Allocator))] (-> Program)
+  (let [(mut images) (ArrayList::new [image/Image] a)
+        (mut code) (compiled main roots name a)]
+    (push! (mut images) code)
+    (for extra support (push! (mut images) extra))
+    (match (link/compose (slice images) a)
+      (Err [message] (panic "compose {}: {}" name message))
+      (Ok [module]
+          (match (jit/map-image (.image module) a)
+            (Err [message] (panic "map {}: {}" name message))
+            (Ok [loaded]
+                (image/release! (mut code))
+                (free! (mut images))
+                (Program :module module :loaded loaded)))))))
+
+(defn release-program! [(program (mut Program))] (-> void)
+  (jit/release-image! (mut (.loaded program)))
+  (link/release! (mut (.module program))))
+
+;;; Expand SITES of GRAPH under POLICY and check the number of changes and the
+;;; remaining [direct, indirect] calls. Returns the expansion for execution,
+;;; or the unchanged graph when nothing was expected to change.
+(defn expand [(label (slice u8)) (graph g/Graph) (target inlining/Callee)
+              (policy inlining/Policy) (changes i32) (direct i64) (indirect i64)
+              (failures (mut i64)) (a (dyn Allocator))] (-> rewrite/Rewritten)
+  (let [(mut found) (sites graph target a)
+        ret (find-return graph)]
+    (match (inlining/optimize-sites-policy graph [ret] (slice found) 8 policy a)
+      (Err [message] (panic "{}: {}" label message))
+      (Ok [expanded]
+          (let [shape (call-shape (.graph expanded))]
+            (free! (mut found))
+            (unless (= (.changes expanded) changes)
+              (println "{}: {} changes, want {}" label (.changes expanded) changes)
+              (set! failures (+ failures 1)))
+            (unless (and (= (get shape 0) direct) (= (get shape 1) indirect))
+              (println "{}: {} direct and {} indirect calls, want {} and {}"
+                       label (get shape 0) (get shape 1) direct indirect)
+              (set! failures (+ failures 1)))
+            (match (rewrite/validate (.graph expanded) 8 a)
+              (Err [message] (println "{}: invalid graph: {}" label message)
+                             (set! failures (+ failures 1)))
+              (Ok [_] 0))
+            expanded)))))
+
+(defn main [] (-> i32)
+  (let [a (malloc-allocator) (mut failures) (: 0 i64)
+        (mut add) (unary 26 a) (mut subtract) (unary 27 a)
+        (mut apply) (apply-graph a) (mut twice) (twice-graph a)
+        (mut forward) (forward-graph a)
+        (mut fact) (guarded-graph true a) (mut tri) (guarded-graph false a)
+        (mut factorial) (factorial-graph a)
+        apply-return (find-return apply)
+        fact-return (find-return fact)
+        (mut add-code) (compiled add [(find-return add)] "_ce_add" a)
+        (mut subtract-code) (compiled subtract [(find-return subtract)] "_ce_subtract" a)
+        (mut apply-code) (compiled apply [apply-return] "_ce_apply" a)
+        (mut fact-code) (compiled fact [fact-return] "_ce_fact" a)
+        values [(: 0 i64) 1 -1 7 -40 1000000007 -1099511627776 9223372036854775807
+                -9223372036854775808]]
+    (for sparse [false true]
+      (let [target (inlining/Callee :name "_ce_apply" :graph apply :entry 1
+                                    :roots [apply-return] :observed [apply-return]
+                                    :never false :always false :sparse sparse)
+            ; [label policy changes direct indirect] per case: the wrapper's
+            ; pointer call is not clonable by default; call-cells clones it at
+            ; any budget above zero, sparse-cells only for a sparse callee, and
+            ; neither when the clone is over the size or the budget is zero.
+            cases [(policy 512 0 0 false) (policy 1 40 0 false) (policy 1 2 0 false)
+                   (policy 0 40 40 false) (policy 1 0 40 false) (policy 1 2 40 false)
+                   (policy 512 0 0 true)]
+            inlined [false true false false sparse sparse false]]
+        (for [i 0 (len cases)]
+          (let [expected (get inlined i)
+                (mut expanded) (expand "twice" twice target (get cases i)
+                                       (if expected 2 0) (if expected 0 2) (if expected 2 0)
+                                       (mut failures) a)
+                (mut program) (load-program (.graph expanded) (slice (.roots expanded))
+                                            "_ce_twice" [add-code subtract-code apply-code] a)
+                function (p/cast (fnptr (cc/C) [(ptr u8) i64] i64) (address program "_ce_twice"))]
+            ; The pointer is a run time value: both targets through one body.
+            (for x values
+              ; r = f(x) + 1; r + f(r) + 1
+              (let [up (p/iadd (p/iadd x 3) 1)
+                    down (p/iadd (p/isub x 3) 1)
+                    want-add (p/iadd up (p/iadd (p/iadd up 3) 1))
+                    want-subtract (p/iadd down (p/iadd (p/isub down 3) 1))
+                    got-add (function (address program "_ce_add") x)
+                    got-subtract (function (address program "_ce_subtract") x)]
+                (unless (and (= got-add want-add) (= got-subtract want-subtract))
+                  (println "twice case {} sparse {} x {}: got {} and {}, want {} and {}"
+                           i sparse x got-add got-subtract want-add want-subtract)
+                  (set! failures (+ failures 1)))))
+            (release-program! (mut program))
+            (rewrite/release! (mut expanded))))
+        ; A forwarder takes the wrapper, charged; without the setting, with a
+        ; budget below the clone, or with a zero budget it keeps its call.
+        (let [cases [(policy 512 0 0 true) (policy 512 0 0 false) (policy 1 0 0 true)
+                     (policy 0 0 0 true)]
+              inlined [true false false false]]
+          (for [i 0 (len cases)]
+            (let [expected (get inlined i)
+                  (mut expanded) (expand "forward" forward target (get cases i)
+                                         (if expected 1 0) (if expected 0 1) (if expected 1 0)
+                                         (mut failures) a)
+                  (mut program) (load-program (.graph expanded) (slice (.roots expanded))
+                                              "_ce_forward" [add-code subtract-code apply-code] a)
+                  function (p/cast (fnptr (cc/C) [(ptr u8) i64] i64)
+                                   (address program "_ce_forward"))]
+              (for x values
+                (let [got-add (function (address program "_ce_add") x)
+                      got-subtract (function (address program "_ce_subtract") x)]
+                  (unless (and (= got-add (p/iadd (p/iadd x 3) 1))
+                               (= got-subtract (p/iadd (p/isub x 3) 1)))
+                    (println "forward case {} x {}: got {} and {}" i x got-add got-subtract)
+                    (set! failures (+ failures 1)))))
+              (release-program! (mut program))
+              (rewrite/release! (mut expanded)))))))
+    ; Recursion through the pointer: _ce_tri passes its own address to the
+    ; wrapper. The wrapper's clone calls that address; _ce_tri is not a site.
+    (let [target (inlining/Callee :name "_ce_apply" :graph apply :entry 1
+                                  :roots [apply-return] :observed [apply-return]
+                                  :never false :always false :sparse false)]
+      (for cells [(: 0 i32) 40]
+        (let [(mut expanded) (expand "tri" tri target (policy 1 cells 0 false)
+                                     (if (= cells 0) 0 1) (if (= cells 0) 1 0)
+                                     (if (= cells 0) 0 1) (mut failures) a)
+              (mut program) (load-program (.graph expanded) (slice (.roots expanded))
+                                          "_ce_tri" [apply-code] a)
+              function (p/cast (fnptr (cc/C) [i64] i64) (address program "_ce_tri"))]
+          (for x [(: -5 i64) 0 1 2 10 100 1000]
+            (let [want (if (< x 0) 0 (/ (* x (+ x 1)) 2)) got (function x)]
+              (unless (= got want)
+                (println "tri cells {} x {}: got {} want {}" cells x got want)
+                (set! failures (+ failures 1)))))
+          (release-program! (mut program))
+          (rewrite/release! (mut expanded)))))
+    ; A recursive callee in a forwarder: one level is cloned and its call of
+    ; itself stays a call. Inside the recursive function the same call is
+    ; refused when its target is marked never.
+    (let [target (inlining/Callee :name "_ce_fact" :graph fact :entry 1
+                                  :roots [fact-return] :observed [fact-return]
+                                  :never false :always false :sparse false)
+          never (inlining/Callee :name "_ce_fact" :graph fact :entry 1
+                                 :roots [fact-return] :observed [fact-return]
+                                 :never true :always false :sparse false)]
+      (for forwarders [false true]
+        (let [(mut expanded) (expand "factorial" factorial target (policy 512 0 0 forwarders)
+                                     1 1 0 (mut failures) a)
+              (mut program) (load-program (.graph expanded) (slice (.roots expanded))
+                                          "_ce_factorial" [fact-code] a)
+              function (p/cast (fnptr (cc/C) [i64] i64) (address program "_ce_factorial"))
+              inputs [(: -3 i64) 0 1 2 5 10 20]
+              wants [(: 1 i64) 1 1 2 120 3628800 2432902008176640000]]
+          (for [i 0 (len inputs)]
+            (let [got (function (get inputs i))]
+              (unless (= got (get wants i))
+                (println "factorial forwarders {} x {}: got {} want {}"
+                         forwarders (get inputs i) got (get wants i))
+                (set! failures (+ failures 1)))))
+          (release-program! (mut program))
+          (rewrite/release! (mut expanded))))
+      (let [(mut expanded) (expand "factorial never" factorial never (policy 512 40 40 true)
+                                   0 1 0 (mut failures) a)]
+        (rewrite/release! (mut expanded))))
+    (image/release! (mut add-code)) (image/release! (mut subtract-code))
+    (image/release! (mut apply-code)) (image/release! (mut fact-code))
+    (g/release! (mut add)) (g/release! (mut subtract)) (g/release! (mut apply))
+    (g/release! (mut twice)) (g/release! (mut forward)) (g/release! (mut fact))
+    (g/release! (mut tri)) (g/release! (mut factorial))
+    (println "inline call exemptions: {} failures" failures)
+    (if (= failures 0) 0 1)))
