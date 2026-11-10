@@ -1,0 +1,160 @@
+;;; The register that holds a value saved to break a parallel-copy cycle
+;;; (stogir.a64.typed-transfers/cycle-holder): x17 for a cycle of general
+;;; registers when no move of the group needs x17 as memory data scratch, v31
+;;; otherwise. Each group runs natively against a model of the simultaneous
+;;; copy, and the emitted words are checked for the expected holder.
+(module stogir.tests.a64-cycle-holder)
+(import "stogir.a64.typed-transfers" :as typed)
+(import "stogir.a64.encode" :as e)
+(import "stogir.a64.frame-address" :as frame)
+(import "stogir.locations" :as loc)
+(import "stogir.relocate" :as read)
+(import "stogir.bytes" :as bytes)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn reg [(number i32)] (-> loc/Location)
+  (loc/Location :kind 0 :value (cast i64 number)))
+
+(defn slot [(offset i64)] (-> loc/Location)
+  (loc/Location :kind 1 :value offset))
+
+(defn copy [(source loc/Location) (destination loc/Location) (size i32)] (-> typed/Copy)
+  (typed/Copy
+    :transfer (loc/Transfer :position 0 :parent 0 :source source :destination destination)
+    :size size))
+
+(defn word! [(out (mut (ArrayList u8))) (value (Result u32 (slice u8)))] (-> void)
+  (match value
+    (Ok [word] (bytes/append32! (mut out) word))
+    (Err [message] (panic "{}" message))))
+
+;;; Cells of the harness: x4..x7 are 0..3, d0/d1 (registers 32/33) are 4/5 and
+;;; the stack slots at 0, 8 and 16 are 6..8.
+(defn cell [(location loc/Location)] (-> i64)
+  (if (= (.kind location) 1)
+      (+ 6 (/ (.value location) 8))
+      (if (>= (.value location) 32) (+ 4 (- (.value location) 32)) (- (.value location) 4))))
+
+;;; A scalar FMOV between a general and a SIMD register, either direction.
+(defn crossing? [(word u32)] (-> bool)
+  (= (& word 0x7FBEFC00) 0x1E260000))
+
+;;; A write of x17: a general register move (ORR x17, zr, rm) or a load
+;;; (LDR x17/w17, [base, #offset]).
+(defn holds-x17? [(word u32)] (-> bool)
+  (or (= (& word 0x7FE0FFFF) 0x2A0003F1)
+      (= (& word 0xBFC0001F) 0xB9400011)))
+
+;;; holder: 17 when the group must keep its cycle in x17 without a crossing,
+;;; 63 when it must use v31 through crossings (x17 being the group's memory
+;;; data scratch), 0 when it must use v31 without one and leave x17 untouched,
+;;; -1 when only the result is checked. words: the exact
+;;; length of the group's code, or -1.
+(defn run [(name (slice u8)) (copies (slice typed/Copy)) (holder i32) (words i64)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut code) (ArrayList::new [u8] allocator)
+        (mut input) (: (zeroed (array u64 9)) (array u64 9))
+        (mut output) (: (zeroed (array u64 9)) (array u64 9))
+        (mut expected) (: (zeroed (array u64 9)) (array u64 9))
+        (mut masks) (: (zeroed (array u64 9)) (array u64 9))
+        (mut crossings) (: 0 i64)
+        (mut held) (: 0 i64)]
+    (for [i 0 9]
+      (set! input i (+ 0x1111111122222222 (* (cast u64 i) 0x0101010110101010)))
+      (set! expected i (get input i))
+      (set! masks i 0xFFFFFFFFFFFFFFFF))
+    (for item copies
+      (let [transfer (.transfer item)
+            to (cell (.destination transfer))]
+        (set! expected to (get input (cell (.source transfer))))
+        ; A four-byte copy defines the low word only.
+        (set! masks to (if (= (.size item) 4) (: 0xFFFFFFFF u64) 0xFFFFFFFFFFFFFFFF))))
+    ; x0 = input, x1 = output. x9/x10 keep them; x11 moves slot contents.
+    (word! (mut code) (e/logical-register true 1 9 31 0))
+    (word! (mut code) (e/logical-register true 1 10 31 1))
+    (word! (mut code) (e/add-sub-immediate true true false 31 31 32))
+    (for [i (: 0 i32) 4]
+      (word! (mut code) (e/load-store true 8 (+ 4 i) 9 (* (cast i64 i) 8))))
+    (for [i (: 0 i32) 2]
+      (word! (mut code) (e/floating-load-store true 8 i 9 (+ 32 (* (cast i64 i) 8)))))
+    (for [i (: 0 i64) 3]
+      (word! (mut code) (e/load-store true 8 11 9 (+ 48 (* i 8))))
+      (word! (mut code) (e/load-store false 8 11 31 (* i 8))))
+    (let [before (len code)]
+      (match (typed/parallel-frame! (mut code) copies allocator (frame/stack-base))
+        (Err [message] (panic "{}: {}" name message))
+        (Ok [_] 0))
+      (for [i (/ before 4) (/ (len code) 4)]
+        (let [word (read/read32 code (* i 4))]
+          (when (crossing? word) (set! crossings (+ crossings 1)))
+          (when (holds-x17? word) (set! held (+ held 1)))))
+      (when (>= words 0)
+        (assert (= (- (len code) before) (* words 4)))))
+    (for [i (: 0 i32) 4]
+      (word! (mut code) (e/load-store false 8 (+ 4 i) 10 (* (cast i64 i) 8))))
+    (for [i (: 0 i32) 2]
+      (word! (mut code) (e/floating-load-store false 8 i 10 (+ 32 (* (cast i64 i) 8)))))
+    (for [i (: 0 i64) 3]
+      (word! (mut code) (e/load-store true 8 11 31 (* i 8)))
+      (word! (mut code) (e/load-store false 8 11 10 (+ 48 (* i 8)))))
+    (word! (mut code) (e/add-sub-immediate true false false 31 31 32))
+    (word! (mut code) (e/ret 30))
+    (when (or (and (= holder 17) (or (!= crossings 0) (< held 1)))
+              (and (= holder 63) (< crossings 2))
+              (and (= holder 0) (or (!= crossings 0) (!= held 0))))
+      (panic "{}: {} class crossings and {} moves into x17" name crossings held))
+    (match (jit/map-text (slice code))
+      (Err [message] (panic "{}: {}" name message))
+      (Ok [loaded]
+        (let [(mut mapped) loaded
+              f (p/cast (fnptr (cc/C) [(ptr u64) (ptr u64)] void) (.base mapped))]
+          (call-ptr f (p/cast (ptr u64) (mut input)) (p/cast (ptr u64) (mut output)))
+          (for [i 0 9]
+            (when (!= (& (get output i) (get masks i)) (& (get expected i) (get masks i)))
+              (panic "{}: cell {} is {:x}, expected {:x}" name i (get output i) (get expected i))))
+          (jit/release! (mut mapped)))))
+    (free! (mut code))
+    1))
+
+(defn main [] (-> i32)
+  (let [(mut groups) (: 0 i64)
+        a (slot 0) b (slot 8) c (slot 16)]
+    ; A swap of general registers: three register moves through x17.
+    (set! groups (+ groups (run "swap" [(copy (reg 4) (reg 5) 8) (copy (reg 5) (reg 4) 8)] 17 3)))
+    (set! groups (+ groups (run "word swap" [(copy (reg 4) (reg 5) 4) (copy (reg 5) (reg 4) 4)]
+                                17 3)))
+    (set! groups (+ groups (run "rotation" [(copy (reg 4) (reg 5) 8) (copy (reg 5) (reg 6) 8)
+                                            (copy (reg 6) (reg 4) 8)] 17 4)))
+    (set! groups (+ groups (run "two swaps" [(copy (reg 4) (reg 5) 8) (copy (reg 5) (reg 4) 8)
+                                             (copy (reg 6) (reg 7) 8) (copy (reg 7) (reg 6) 8)]
+                                17 6)))
+    ; A swap that also fans out, and mixed widths.
+    (set! groups (+ groups (run "fan out" [(copy (reg 4) (reg 5) 8) (copy (reg 5) (reg 4) 8)
+                                           (copy (reg 5) (reg 6) 4)] 17 -1)))
+    ; Direct stores and loads beside the cycle leave x17 free.
+    (set! groups (+ groups (run "with store and load"
+                                [(copy (reg 4) (reg 5) 8) (copy (reg 5) (reg 4) 8)
+                                 (copy (reg 6) a 8) (copy b (reg 7) 8)] 17 5)))
+    ; A register value saved while its register is reloaded from memory.
+    (set! groups (+ groups (run "through a slot" [(copy (reg 4) a 8) (copy a (reg 4) 8)] 17 -1)))
+    ; A memory-to-memory move needs x17 as its data scratch: v31 holds.
+    (set! groups (+ groups (run "with memory move"
+                                [(copy (reg 4) (reg 5) 8) (copy (reg 5) (reg 4) 8)
+                                 (copy a b 8)] 63 -1)))
+    (set! groups (+ groups (run "memory swap" [(copy a b 8) (copy b a 8)] -1 -1)))
+    (set! groups (+ groups (run "memory rotation with a register"
+                                [(copy a b 8) (copy b c 8) (copy c (reg 4) 8) (copy (reg 4) a 8)]
+                                -1 -1)))
+    ; A SIMD cycle stays in SIMD registers.
+    (set! groups (+ groups (run "simd swap" [(copy (reg 32) (reg 33) 8) (copy (reg 33) (reg 32) 8)]
+                                0 -1)))
+    ; A cycle across both classes saves whichever register the resolver picks.
+    (set! groups (+ groups (run "class swap" [(copy (reg 4) (reg 32) 8) (copy (reg 32) (reg 4) 8)]
+                                -1 -1)))
+    (println "a64-cycle-holder: {} groups" groups))
+  0)
