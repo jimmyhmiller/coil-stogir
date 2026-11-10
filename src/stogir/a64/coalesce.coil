@@ -9,6 +9,7 @@
 (import "stogir.node" :as n)
 (import "stogir.types" :as types)
 (import "stogir.interval" :as interval)
+(import "stogir.live-ranges" :as ranges)
 (import "stogir.constraints" :as c)
 (import "stogir.interval-queue" :as queue)
 (import "coil.hashmap" :use [HashMap])
@@ -205,6 +206,32 @@
                 (set! (mut parents) (cast i64 input) reference)
                 true))))))
 
+;;; A same-size view that is itself a member of a Phi group hands the group its
+;;; source: the source (an unshared, non-Phi singleton) joins as one more
+;;; non-overlapping member, exactly as a Phi input does, so the view's
+;;; definition has nothing to copy. Returns whether joined.
+(defn absorb! [(parents (mut (ArrayList i32)))
+               (parts (mut (ArrayList allocation/Part)))
+               (indices (ArrayList i32))
+               (heads (ArrayList i32))
+               (graph g/Graph)
+               (reference i32)
+               (a (dyn Allocator))] (-> bool)
+  (let [node (get (.instructions graph) (cast i64 reference))
+        input (.op1 node)
+        owner (phi/root parents reference)
+        source (get indices (cast i64 input))
+        target (get indices (cast i64 owner))]
+    (and (!= (n/opcode node) 35)
+         (>= source 0) (>= target 0) (!= source target)
+         (> (len parents) 0)
+         (= (get parents (cast i64 input)) input)
+         (!= (n/opcode (get (.instructions graph) (cast i64 input))) 67)
+         (or (= (len heads) 0) (= (get heads (cast i64 source)) source))
+         (if (phi/join! (mut parts) target source a)
+             (do (set! (mut parents) (cast i64 input) owner) true)
+             false))))
+
 ;;; Parts are unsplit and unassigned, before physical reservations. A view has
 ;;; its source's bits and neither is redefined while the other lives (a Phi
 ;;; source is excluded by entry-conflict?), so a child joins its source group
@@ -219,6 +246,7 @@
                (parts (mut (ArrayList allocation/Part)))
             (graph g/Graph)
             (scheduled schedule/Schedule)
+            (originals (slice ranges/Value))
             (a (dyn Allocator))] (-> void)
   (let [(mut indices) (ArrayList::new [i32] a)
         (mut heads) (ArrayList::new [i32] a)
@@ -243,11 +271,27 @@
         (let [input (.op1 (get (.instructions graph) (cast i64 reference)))
               source (if (= (len parents) 0) input (canonical parents input))
               parent (get indices (cast i64 source))
-              child (get indices (cast i64 reference))]
+              child (get indices (cast i64 reference))
+              grouped (phi/group? groups source)]
+          (when (and (!= source reference) (>= child 0) (not grouped)
+                     (phi/group? groups (phi/root parents reference))
+                     (absorb! (mut parents) (mut parts) indices heads graph reference a)
+                     fixed-ready)
+            (let [owner (phi/root parents reference)]
+              (for use (.uses (at parts (cast i64 (get indices (cast i64 owner)))))
+                (when (= (.kind use) 2)
+                  (set! (mut fixed) (fixed-key owner (.position use)) (.register use))))))
           (when (and (!= source reference)
                      (>= parent 0)
                      (>= child 0)
-                     (not (phi/group? groups source))
+                     ; A Phi group holds other values once this source dies:
+                     ; only a view inside the source's own lifetime may join.
+                     (or (not grouped)
+                         (and (< (cast i64 input) (len originals))
+                              (inside? (.ranges (get originals (cast i64 input)))
+                                       (.ranges (at parts (cast i64 child))))
+                              (not (entry-conflict? graph scheduled input
+                                                    (.ranges (at parts (cast i64 child)))))))
                      (not (phi/group? groups (phi/root parents reference)))
                      (or (= (len heads) 0)
                          (= (get heads (cast i64 child)) child)))
@@ -328,18 +372,21 @@
             (a (dyn Allocator))] (-> (ArrayList i32))
   (let [(mut parents) (ArrayList::new [i32] a)
         (mut groups) (HashMap::new-scalar [i32 bool] a)]
-    (extend! (mut parents) groups (mut parts) graph scheduled a)
+    (extend! (mut parents) groups (mut parts) graph scheduled [] a)
     (free! (mut groups))
     parents))
 
 ;;; Prepared CFG/depths belong to the same immutable graph/schedule epoch.
+;;; originals[r] is value r's own lifetime before any joining (empty when
+;;; unknown: views of Phi-group members then stay separate).
 (defn run-prepared! [(parts (mut (ArrayList allocation/Part)))
                      (graph g/Graph) (scheduled schedule/Schedule)
                      (blocks cfg/Blocks) (depths (ArrayList i32))
+                     (originals (slice ranges/Value))
                      (a (dyn Allocator))] (-> (ArrayList i32))
   (let [(mut parents) (ArrayList::new [i32] a)
         (mut groups) (phi/run! (mut parts) (mut parents) graph scheduled blocks depths a)]
-    (extend! (mut parents) groups (mut parts) graph scheduled a)
+    (extend! (mut parents) groups (mut parts) graph scheduled originals a)
     (free! (mut groups))
     parents))
 
