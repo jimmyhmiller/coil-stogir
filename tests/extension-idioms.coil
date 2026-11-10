@@ -7,6 +7,8 @@
 (import "stogir.builder" :as b)
 (import "stogir.calls" :as calls)
 (import "stogir.options" :as options)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
 (import "stogir.a64.compile" :as compile)
 (import "stogir.image" :as image)
 (import "stogir.jit.darwin" :as jit)
@@ -22,8 +24,11 @@
 (defstruct Built [(code image/Image) (mapped jit/Loaded)])
 
 (defn build [(graph g/Graph) (start i32) (ret i32) (level i32)] (-> Built)
+  (build-rooted graph start [ret] level))
+
+(defn build-rooted [(graph g/Graph) (start i32) (roots (slice i32)) (level i32)] (-> Built)
   (let [a (malloc-allocator)]
-    (match (compile/image-with-options graph start [ret] "_extension_idiom"
+    (match (compile/image-with-options graph start roots "_extension_idiom"
                                        (options/Options :level level) a)
       (Err [e] (panic "{}" e))
       (Ok [code]
@@ -440,7 +445,75 @@
           (drop! (mut built)))))
     (g/release! (mut graph))))
 
+;;; Extending the word view of a merged 64-bit value that is already that
+;;; extension of its low word is the value itself. A merge with an arbitrary
+;;; 64-bit input keeps both extensions.
+(defn extended-merges [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        word (require (b/emit! (mut graph) 71 10 [start (: 0 i32) 0]))
+        wide (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        selector (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        negative (require (b/scalar-constant! (mut graph) 5 0xFFFFFFFFFFFFFFFB 8))
+        half (require (b/scalar-constant! (mut graph) 5 0xFFFF 8))
+        chosen (require (b/emit! (mut graph) 15 1 [selector zero]))
+        split (require (b/emit! (mut graph) 116 0 [start chosen]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        left (require (b/emit! (mut graph) 114 0 [yes]))
+        right (require (b/emit! (mut graph) 114 0 [no]))
+        merge (require (b/emit! (mut graph) 112 0 [left right]))
+        signed (require (b/emit! (mut graph) 33 5 [word]))
+        unsigned (require (b/emit! (mut graph) 34 5 [word]))
+        masked (require (b/emit! (mut graph) 47 5 [wide half]))
+        x (require (b/emit! (mut graph) 67 5 [merge signed negative]))
+        y (require (b/emit! (mut graph) 67 5 [merge unsigned masked]))
+        w (require (b/emit! (mut graph) 67 5 [merge signed wide]))
+        xt (require (b/emit! (mut graph) 35 10 [x]))
+        yt (require (b/emit! (mut graph) 35 4 [y]))
+        wt (require (b/emit! (mut graph) 35 10 [w]))
+        wu (require (b/emit! (mut graph) 35 4 [w]))
+        s (require (b/emit! (mut graph) 33 5 [xt]))
+        z (require (b/emit! (mut graph) 34 5 [yt]))
+        t (require (b/emit! (mut graph) 33 5 [wt]))
+        u (require (b/emit! (mut graph) 34 5 [wu]))
+        ; x and y are also read directly, so they stay 64-bit merges.
+        sum (mix! (mut graph)
+                  (mix! (mut graph)
+                        (mix! (mut graph) (mix! (mut graph) (mix! (mut graph) s z) t) u)
+                        x)
+                  y)
+        ret (require (b/emit! (mut graph) 120 5 [merge sum (: 0 i32)]))]
+    ; Mode 0 compiles the graph as built, mode 1 after the optimizer.
+    (for mode [(: 0 i32) 1]
+      (let [(mut optimized) (match (sccp/optimize graph 8 [ret] a)
+                              (Err [e] (panic "{}" e))
+                              (Ok [result] result))
+            (mut built) (if (= mode 0)
+                            (build graph start ret 3)
+                            (build-rooted (.graph optimized) start (slice (.roots optimized)) 3))
+            f (p/cast (fnptr (cc/C) [u64 u64 u64] u64) (.base (.memory (.mapped built))))]
+        (when (= mode 1)
+          ; The argument's own two extensions and those of the open merge.
+          (assert (= (words built FIELD SXTW) 2))
+          (assert (= (words built FIELD UXTW-X) 2)))
+        (for value words64
+          (for other words64
+            (for selector [(: 0 u64) 1]
+              (let [x (if (= selector 0) (: 0xFFFFFFFFFFFFFFFB u64) (sext value 32))
+                    y (if (= selector 0) (& other 0xFFFF) (zext value 32))
+                    w (if (= selector 0) other (sext value 32))
+                    expected (mix (mix (mix (mix (mix x y) (sext w 32)) (zext w 32)) x) y)]
+                ; The I32 argument arrives with arbitrary upper register bits.
+                (assert (= (f value other selector) expected))))))
+        (drop! (mut built))
+        (rewrite/release! (mut optimized))))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
+  (extended-merges)
   (narrow-and)
   (narrow-loads)
   (narrow-load-addresses)
