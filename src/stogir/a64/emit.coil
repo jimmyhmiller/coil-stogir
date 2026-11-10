@@ -572,6 +572,36 @@
                                                            shift)))))))
           (if (= error "") (Ok (cast i32 (- (len output) start))) (Err error))))))
 
+;;; A rule 56 product: one or two shift/add/subtract steps of the source. The
+;;; first of two steps defines a temporary: the result register, or a reserved
+;;; scratch when the result register is the source, which the second step may
+;;; still read.
+(defn product! [(output (mut (ArrayList u8)))
+                (tile select/Tile)
+                (rd i32)
+                (rn i32)] (-> (Result i32 (slice u8)))
+  (let [count (select/product-steps tile)
+        temporary (if (!= rd rn) rd (if (= rn 16) (: 17 i32) 16))
+        start (len output)
+        (mut error) ""]
+    (if (or (< count 1) (> count 2) (< rn 0) (> rn 30))
+        (Err "invalid product recipe or source register")
+        (do
+          (for [index (: 0 i32) count]
+            (let [recipe (select/product-step tile index)
+                  shift (cast i32 (& recipe 63))
+                  first (if (!= (& recipe 64) 0) temporary rn)
+                  shifted (if (!= (& recipe 128) 0) temporary rn)
+                  destination (if (= index (- count 1)) rd temporary)]
+              (word! (mut output)
+                     (mut error)
+                     (case (>> recipe 8)
+                       0 (encode/shift-immediate (.wide tile) 0 destination first shift)
+                       1 (encode/add-sub-shifted (.wide tile) false destination first shifted 0 shift)
+                       2 (encode/add-sub-shifted (.wide tile) true destination first shifted 0 shift)
+                       (encode/add-sub-shifted (.wide tile) true destination 31 shifted 0 shift)))))
+          (if (= error "") (Ok (cast i32 (- (len output) start))) (Err error))))))
+
 (defn arithmetic! [(output (mut (ArrayList u8)))
                    (tile select/Tile)
                    (rd i32)
@@ -582,6 +612,8 @@
           (not (source-register? (.rule tile) rn))
           (and (!= (.right tile) 0) (not (source-register? (.rule tile) rm))))
       (Err "invalid arithmetic physical register")
+      (if (= (.rule tile) 56)
+          (product! (mut output) tile rd rn)
       (if (and (>= (.rule tile) 44) (<= (.rule tile) 47))
           (power-division! (mut output) tile rd rn)
           (if (and (>= (.rule tile) 34) (<= (.rule tile) 37))
@@ -628,7 +660,7 @@
                                                              scratch
                                                              rm
                                                              rn))))
-                      (single! (mut output) tile rd rn rm)))))))
+                      (single! (mut output) tile rd rn rm))))))))
 
 ;;; Compatibility entry retains the original full-scan lookup policy.
 (defn operand-register! [(output (mut code/Buffer))

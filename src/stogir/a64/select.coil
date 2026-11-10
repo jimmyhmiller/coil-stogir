@@ -7,6 +7,7 @@
 (import "stogir.integer-binary" :as binary)
 (import "stogir.conditional" :as conditional)
 (import "stogir.a64.encode" :as encode)
+(import "coil.primitive" :as primitive)
 (import "coil.result" :use [Result Ok Err Option Some None])
 
 ;;; Rules: 1..5=ADD/SUB/MUL and immediates; 6..8=logical; 9..13=shifts/rotates.
@@ -164,11 +165,130 @@
 
 ;;; Index of the lowest set bit; value must be nonzero.
 (defn trailing-zeros [(value u64)] (-> u64)
-  (let [(mut bits) value (mut count) (: 0 u64)]
-    (while (= (& bits 1) 0)
-      (set! bits (>> bits 1))
-      (set! count (+ count 1)))
-    count))
+  (cast u64 (primitive/ctz value)))
+
+(defn power-of-two? [(value u64)] (-> bool)
+  (and (!= value 0) (= (& value (- value 1)) 0)))
+
+(defn two-bits? [(value u64)] (-> bool)
+  (and (!= value 0) (power-of-two? (& value (- value 1)))))
+
+;;; Index of the highest set bit; value must be nonzero.
+(defn highest-bit [(value u64)] (-> u64)
+  (- 63 (cast u64 (primitive/clz value))))
+
+;;; value = 2^a - 2^b with a > b + 1 and a below the width: the exponent a,
+;;; otherwise zero. b is then the index of the lowest set bit.
+(defn run-end [(value u64) (full u64)] (-> u64)
+  (if (= value 0)
+      0
+      (let [top (& (+ value (& value (- 0 value))) full)]
+        (if (and (power-of-two? top) (> (trailing-zeros top) (+ (trailing-zeros value) 1)))
+            (trailing-zeros top)
+            0))))
+
+;;; One step of a rule 56 product of the source x, through a temporary t:
+;;; kind 0: a << s; 1: a + (b << s); 2: a - (b << s); 3: -(b << s). Bits 0..5
+;;; hold s, bit 6 selects t for a, bit 7 selects t for b, bits 8..9 the kind.
+(defn step [(kind u64) (first-temporary bool) (shifted-temporary bool) (shift u64)] (-> u64)
+  (| (<< kind 8) (if first-temporary (: 64 u64) 0) (if shifted-temporary (: 128 u64) 0) shift))
+
+;;; The first step defines t (or the result, when it is the only one); the
+;;; second defines the result. Immediate: count, then 16 bits per step.
+(defn product-tile [(tile Tile) (source i32) (first u64) (second u64) (count u64)] (-> Tile)
+  (Tile :rule 56 :wide (.wide tile) :left source :right 0
+        :immediate (| count (<< first 8) (<< second 24))))
+
+(defn product-steps [(tile Tile)] (-> i32)
+  (cast i32 (& (.immediate tile) 255)))
+
+(defn product-step [(tile Tile) (index i32)] (-> u64)
+  (& (>> (.immediate tile) (cast u64 (+ 8 (* 16 index)))) 0x3FF))
+
+;;; x + (x << k), the first step of most two-step products.
+(defn scaled-sum [(k u64)] (-> u64)
+  (step 1 false false k))
+
+;;; MUL by the literal RAW in a 32- or 64-bit type as at most two shift, add
+;;; and subtract instructions, or TILE itself. Powers of two and 2^k+1 were
+;;; selected before. With c the literal modulo the width and a > b:
+;;;   one step:   -2^k; 1 - 2^k.
+;;;   two steps:  2^a + 2^b; 2^a - 2^b; 2^b - 2^a; -(2^a + 2^b);
+;;;               1 + 2^a + 2^b; 1 - 2^a - 2^b; 1 + 2^a - 2^b; 1 - 2^a + 2^b;
+;;;               (1 +/- 2^k)(1 +/- 2^s).
+;;; Every step wraps modulo the width, as the multiplication does.
+(defn product [(tile Tile) (source i32) (raw u64) (width i32)] (-> Tile)
+  (let [full (if (= width 64) (: 0xFFFFFFFFFFFFFFFF u64) 0xFFFFFFFF)
+        c (& raw full)
+        negated (& (- 0 c) full)
+        below (& (- c 1) full)
+        above (& (- 1 c) full)]
+    (cond (or (= c 0) (not (or (= width 32) (= width 64)))) tile
+          (power-of-two? negated)
+            (product-tile tile source (step 3 false false (trailing-zeros negated)) 0 1)
+          (power-of-two? above)
+            (product-tile tile source (step 2 false false (trailing-zeros above)) 0 1)
+          (two-bits? c)
+            (let [b (trailing-zeros c)]
+              (product-tile tile source (scaled-sum (- (highest-bit c) b))
+                            (step 0 true false b) 2))
+          (> (run-end c full) 0)
+            (product-tile tile source (step 0 false false (run-end c full))
+                          (step 2 true false (trailing-zeros c)) 2)
+          (> (run-end negated full) 0)
+            (let [b (trailing-zeros negated)]
+              (product-tile tile source (step 2 false false (- (run-end negated full) b))
+                            (step 0 true false b) 2))
+          (two-bits? negated)
+            (let [b (trailing-zeros negated)]
+              (product-tile tile source (scaled-sum (- (highest-bit negated) b))
+                            (step 3 false true b) 2))
+          (two-bits? below)
+            (let [b (trailing-zeros below)]
+              (product-tile tile source (scaled-sum (- (highest-bit below) b))
+                            (step 1 false true b) 2))
+          (two-bits? above)
+            (let [b (trailing-zeros above)]
+              (product-tile tile source (scaled-sum (- (highest-bit above) b))
+                            (step 2 false true b) 2))
+          (> (run-end below full) 0)
+            (product-tile tile source (scaled-sum (run-end below full))
+                          (step 2 true false (trailing-zeros below)) 2)
+          (> (run-end above full) 0)
+            (let [b (trailing-zeros above)]
+              (product-tile tile source (step 2 false false (- (run-end above full) b))
+                            (step 1 false true b) 2))
+          :else
+            ; (1 +/- 2^k)(1 +/- 2^s) with k <= s: the lowest set bit of c - 1
+            ; is bit k, or bit k + 1 when k = s and the signs agree.
+            (let [low (trailing-zeros below)
+                  (mut found) tile]
+              (for [choice (: 0 u64) 4]
+                (let [k (if (< choice 2) low (- low 1))
+                      kind (if (= (& choice 1) 0) (: 1 u64) 2)]
+                  (when (and (= (.rule found) 3) (> k 0) (or (< choice 2) (> low 1)))
+                    (let [s (factor-shift c full k kind)]
+                      (when (> s 0)
+                        (set! found
+                              (product-tile tile source (step kind false false k)
+                                            (step (& s 3) true true (>> s 2)) 2)))))))
+              found))))
+
+;;; With q = 1 + 2^k (kind 1) or 1 - 2^k (kind 2) and c = q(1 + 2^s) or
+;;; q(1 - 2^s) modulo the width: s * 4 + the second step's kind (1 or 2), or
+;;; zero. c is odd and k > 0.
+(defn factor-shift [(c u64) (full u64) (k u64) (kind u64)] (-> u64)
+  (let [power (<< (: 1 u64) k)
+        factor (& (if (= kind 1) (+ 1 power) (- 1 power)) full)
+        rest (& (- c factor) full)]
+    (if (= rest 0)
+        0
+        (let [s (trailing-zeros rest)
+              scaled (& (<< factor s) full)]
+          (cond (= s 0) 0
+                (= (& (+ factor scaled) full) c) (+ (* s 4) 1)
+                (= (& (- factor scaled) full) c) (+ (* s 4) 2)
+                :else 0)))))
 
 (defn numeric-bits [(graph g/Graph) (reference i32)] (-> (Option u64))
   (if (>= reference 0)
@@ -266,7 +386,7 @@
                                             (set! exponent (+ exponent 1)))
                                           (Ok (Tile :rule 52 :wide (.wide tile)
                                                     :left source :right 0 :immediate exponent)))
-                                        (Ok tile))
+                                        (Ok (product tile source value (cast i32 (* size 8)))))
                                     (let [(mut bits) value
                                           (mut exponent) (: 0 u64)]
                                       (while (> bits 1)
