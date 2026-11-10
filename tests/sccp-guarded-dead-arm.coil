@@ -1,0 +1,163 @@
+;;; A branch SCCP folds leaves a guarded DIV/MOD in the arm that goes away.
+;;; The dead arm, its guarded data and everything computed from it must be
+;;; removed, the result must verify, and the function must still compute the
+;;; live arm. Covered: either arm dead; a literal and a range-decided
+;;; condition; two returns and a merge with a PHI; arithmetic hanging off the
+;;; dead quotient; the same quotient shape guarded in both arms.
+(module stogir.tests.sccp-guarded-dead-arm)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.sccp" :as sccp)
+(import "stogir.fact-fold" :as fold)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn signature! [(graph (mut g/Graph)) (a (dyn Allocator))] (-> void)
+  (let [(mut signature) (match (calls/create 0 11 [(: 11 u8)] a)
+                          (Err [message] (panic "{}" message)) (Ok [s] s))]
+    (require (calls/function! (mut graph) signature a))
+    (calls/release! (mut signature))))
+
+(defn native [(graph g/Graph) (exits (slice i32)) (xs (slice i64)) (a (dyn Allocator))]
+  (-> (ArrayList i64))
+  (let [(mut out) (ArrayList::new [i64] a)]
+    (match (compile/image-with-private graph 1 exits "_gd_entry"
+             (options/Options :level 3) a (private/no-context))
+      (Err [message] (panic "compile: {}" message))
+      (Ok [code]
+        (let [(mut code) code]
+          (match (link/compose [code] a)
+            (Err [message] (panic "compose: {}" message))
+            (Ok [module]
+              (let [(mut module) module]
+                (match (jit/map-image (.image module) a)
+                  (Err [message] (panic "map: {}" message))
+                  (Ok [loaded]
+                    (let [(mut loaded) loaded
+                          index (match (image/find-symbol (.image module) "_gd_entry")
+                                  (Some [id] id) (None [] (panic "symbol")))
+                          function (primitive/cast (fnptr (cc/C) [i64] i64)
+                            (primitive/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))]
+                      (for x xs (push! (mut out) (function x)))
+                      (jit/release-image! (mut loaded)))))
+                (link/release! (mut module)))))
+          (image/release! (mut code)))))
+    out))
+
+(defn samples [] (-> (array i64 20))
+  [(: -9223372036854775808 i64) -9223372036854775807 -4294967297 -2147483648
+   -129 -36 -35 -8 -2 -1 0 1 2 34 35 36 127 2147483647 4294967296
+   9223372036854775807])
+
+;;; The value each arm returns for x. The true arm divides, the false arm
+;;; takes the remainder; CHAIN adds arithmetic on top of the true arm's
+;;; quotient; SAME makes the false arm the same guarded quotient plus 1000.
+(defn yes-value [(x i64) (chain bool)] (-> i64)
+  (let [q (/ x 7)] (if chain (primitive/iadd (primitive/imul q 3) x) q)))
+(defn no-value [(x i64) (same bool)] (-> i64)
+  (if same (+ (/ x 7) 1000) (% x 5)))
+
+(defn count-opcode [(graph g/Graph) (first i32) (last i32)] (-> i64)
+  (let [(mut found) (: 0 i64) (mut r) 1]
+    (while (< r (len (.instructions graph)))
+      (let [opcode (cast i32 (n/opcode (get (.instructions graph) r)))]
+        (when (and (>= opcode first) (<= opcode last)) (set! found (+ found 1))))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    found))
+
+;;; TAKEN is the arm the decided condition selects. LITERAL decides it with a
+;;; constant condition, otherwise with (x & 31) compared against zero. MERGED
+;;; joins the arms in a PHI instead of returning from each.
+(defn case [(taken bool) (literal bool) (merged bool) (chain bool) (same bool)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a) (mut exits) (ArrayList::new [i32] a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        low (require (b/emit! (mut graph) 47 11
+              [x (require (b/scalar-constant! (mut graph) 11 31 8))]))
+        ; signed <  (never) or signed >= (always) against zero
+        test (if literal
+                 (require (b/scalar-constant! (mut graph) 1 (if taken 1 0) 8))
+                 (require (b/emit! (mut graph) (if taken 17 16) 1 [low zero])))
+        split (require (b/emit! (mut graph) 116 0 [start test]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))
+        five (require (b/scalar-constant! (mut graph) 11 5 8))
+        quotient (require (b/emit! (mut graph) 29 11 [x seven yes]))
+        tripled (require (b/emit! (mut graph) 28 11
+                  [quotient (require (b/scalar-constant! (mut graph) 11 3 8))]))
+        chained (require (b/emit! (mut graph) 26 11 [tripled x]))
+        yes-result (if chain chained quotient)
+        other (if same
+                  (require (b/emit! (mut graph) 29 11 [x seven no]))
+                  (require (b/emit! (mut graph) 30 11 [x five no])))
+        bumped (require (b/emit! (mut graph) 26 11
+                 [other (require (b/scalar-constant! (mut graph) 11 1000 8))]))
+        no-result (if same bumped other)]
+    (signature! (mut graph) a)
+    (if merged
+        (let [y (require (b/emit! (mut graph) 114 0 [yes]))
+              n (require (b/emit! (mut graph) 114 0 [no]))
+              merge (require (b/emit! (mut graph) 112 0 [y n]))
+              phi (require (b/emit! (mut graph) 67 11 [merge yes-result no-result]))]
+          (push! (mut exits) (require (b/emit! (mut graph) 120 11 [merge phi (: 0 i32)]))))
+        (do
+          (push! (mut exits) (require (b/emit! (mut graph) 120 11 [yes yes-result (: 0 i32)])))
+          (push! (mut exits) (require (b/emit! (mut graph) 120 11 [no no-result (: 0 i32)])))))
+    (match (sccp/optimize-memory-compacting graph 8 (slice exits) true false a)
+      (Err [message]
+        (panic "sccp: taken {} literal {} merged {} chain {} same {}: {}"
+               taken literal merged chain same message))
+      (Ok [result]
+        (let [(mut result) result]
+          (unless (= (count-opcode (.graph result) 116 116) 0)
+            (panic "the decided IF survives: taken {} literal {} merged {}" taken literal merged))
+          (unless (= (count-opcode (.graph result) 29 30) 1)
+            (panic "dead guarded division survives: taken {} literal {} merged {} chain {} same {}: {}"
+                   taken literal merged chain same (count-opcode (.graph result) 29 30)))
+          (free! (mut (.roots result)))
+          (g/release! (mut (.graph result))))))
+    ; The range-decided branch is also what the fact fold proves; it must run
+    ; under guarded data and hand SCCP the same graph shape.
+    (match (fold/run graph 1 (slice exits) false a)
+      (Err [message] (panic "fact fold: {}" message))
+      (Ok [edited]
+        (match edited
+          (None [] 0)
+          (Some [working] (let [(mut working) working] (g/release! (mut working)) 0)))))
+    (let [xs (samples) (mut got) (native graph (slice exits) xs a) (mut i) 0]
+      (for x xs
+        (let [want (if taken (yes-value x chain) (no-value x same))]
+          (unless (= (get got i) want)
+            (panic "native: taken {} literal {} merged {} chain {} same {} x {} got {} want {}"
+                   taken literal merged chain same x (get got i) want)))
+        (set! i (+ i 1)))
+      (free! (mut got)))
+    (free! (mut exits)) (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (let [(mut cases) (: 0 i64)]
+    (for taken [true false]
+      (for literal [true false]
+        (for merged [true false]
+          (for chain [true false]
+            (for same [true false]
+              (case taken literal merged chain same)
+              (set! cases (+ cases 1)))))))
+    (println "sccp guarded dead arm: {} cases" cases)
+    0))

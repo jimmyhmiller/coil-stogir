@@ -10,6 +10,7 @@
 (import "stogir.calls" :as calls)
 (import "stogir.fact-fold" :as fold)
 (import "stogir.induction" :as induction)
+(import "stogir.sccp" :as sccp)
 (import "stogir.cfg" :as cfg)
 (import "stogir.pipeline" :as pipeline)
 (import "stogir.types" :as types)
@@ -651,9 +652,9 @@
 ;;; --- Guarded data and emission ---------------------------------------------
 
 ;;; A DIV guarded by the projection of an IF that only the fold decides (no
-;;; value is below the signed minimum). SCCP cannot remove the guard from
-;;; under it, so the fold must leave such a function alone; without the guard
-;;; the same IF is folded. Both run correctly.
+;;; value is below the signed minimum). The fold decides it with or without
+;;; the guard; SCCP then removes the dead arm and the division guarded by it.
+;;; Both run correctly.
 (defn guarded-division [(pinned bool)] (-> void)
   (let [a (malloc-allocator) (mut graph) (g/create a) (mut exits) (ArrayList::new [i32] a)
         start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
@@ -678,15 +679,26 @@
           (unless (and (= (len found) 1) (not (.truth (get found 0))))
             (panic "guarded division: the test is not decided"))
           (free! (mut found)))))
-    (unless (= (fold/guarded-data? graph) pinned) (panic "guarded data detection"))
     (match (fold/run graph 1 [] false a)
       (Err [message] (panic "run: {}" message))
       (Ok [edited]
         (match edited
-          (None [] (unless pinned (panic "unguarded division was not folded")))
+          (None [] (panic "division was not folded: pinned {}" pinned))
           (Some [working]
             (let [(mut working) working]
-              (when pinned (panic "folded under a guarded division"))
+              (match (sccp/optimize-memory-compacting working 8 (slice exits) true false a)
+                (Err [message] (panic "sccp after fold: pinned {}: {}" pinned message))
+                (Ok [result]
+                  (let [(mut result) result (mut divisions) 0 (mut r) 1]
+                    (while (< r (len (.instructions (.graph result))))
+                      (when (= (n/opcode (get (.instructions (.graph result)) r)) 29)
+                        (set! divisions (+ divisions 1)))
+                      (set! r (+ r (/ (+ (cast i64 (get (.arities (.graph result)) r)) 4) 4))))
+                    (unless (= divisions 1)
+                      (panic "dead guarded division survives: pinned {} divisions {}"
+                             pinned divisions))
+                    (free! (mut (.roots result)))
+                    (g/release! (mut (.graph result))))))
               (g/release! (mut working)))))))
     (let [xs (samples) (mut got) (native graph (slice exits) xs [(: 0 i64)] a) (mut i) 0]
       (for x xs
