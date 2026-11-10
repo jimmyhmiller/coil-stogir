@@ -3,6 +3,7 @@
 (import "stogir.builder" :as b)
 (import "stogir.calls" :as calls)
 (import "stogir.types" :as types)
+(import "stogir.node" :as n)
 (import "stogir.a64.compile" :as compile)
 (import "stogir.a64.reciprocal" :as reciprocal)
 (import "stogir.jit.darwin" :as jit)
@@ -35,7 +36,10 @@
 ;;; a >> 1 (logical), whose clear sign bit selects the non-negative signed form.
 ;;; Checked on boundary dividends, the neighbours of multiples of the divisor
 ;;; and a pseudo-random sequence.
-(defn check [(opcode i32) (ty u8) (divisor u64) (halved? bool)] (-> i64)
+;;; With built? the function is (a / d) ^ (a % d) through checked construction,
+;;; which derives the remainder from the one shared quotient: the graph then
+;;; holds a single DIV and no MOD.
+(defn check [(opcode i32) (ty u8) (divisor u64) (halved? bool) (built? bool)] (-> i64)
   (let [allocator (malloc-allocator)
         (mut graph) (g/create allocator)
         start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
@@ -49,9 +53,26 @@
                                 [p (require (b/scalar-constant! (mut graph) (cast i32 ty) 1 8))]))
               p)
         right (require (b/scalar-constant! (mut graph) (cast i32 ty) d 8))
-        result (require (b/emit! (mut graph) opcode (cast i32 ty) [left right (: 0 i32)]))
+        result
+          (if built?
+              (require (b/emit! (mut graph) 48 (cast i32 ty)
+                                [(require (b/integer-division! (mut graph) 30 (cast i32 ty) 8
+                                                               left right 0))
+                                 (require (b/integer-division! (mut graph) 29 (cast i32 ty) 8
+                                                               left right 0))]))
+              (require (b/emit! (mut graph) opcode (cast i32 ty) [left right (: 0 i32)])))
         ret (require (b/emit! (mut graph) 120 (cast i32 ty) [start result (: 0 i32)]))
         (mut failures) 0]
+    (when (and built? (>= d 2) (!= (& d (- d 1)) 0)
+               (or (not (types/signed? (cast i32 ty))) (!= d mask)))
+      (let [(mut quotients) 0 (mut remainders) 0]
+        (for [index 1 (len (.instructions graph))]
+          (let [opcode (n/opcode (get (.instructions graph) index))]
+            (when (= opcode 29) (set! quotients (+ quotients 1)))
+            (when (= opcode 30) (set! remainders (+ remainders 1)))))
+        (when (or (!= quotients 1) (!= remainders 0))
+          (println "ty={} d={}: built remainder has {} DIV and {} MOD" ty d quotients remainders)
+          (set! failures (+ failures 1)))))
     (match (calls/create 0 ty [ty] allocator)
       (Err [_] (set! failures (+ failures 1)))
       (Ok [prototype]
@@ -121,7 +142,10 @@
                                               (>> state (& (>> state 58) 63))
                                               (^ state (>> state 29)))))
                             x (if halved? (>> (& a mask) 1) (& a mask))
-                            wanted (expected opcode (cast i32 ty) x d)
+                            wanted (if built?
+                                       (^ (expected 29 (cast i32 ty) x d)
+                                          (expected 30 (cast i32 ty) x d))
+                                       (expected opcode (cast i32 ty) x d))
                             actual (& (call-ptr f a) mask)]
                         (when (!= actual wanted)
                           (when (= failures 0)
@@ -178,13 +202,15 @@
         (for opcode [(: 29 i32) 30]
           ; every divisor of small magnitude, both signs for signed types
           (for [k (: 1 i64) 131]
-            (set! failures (+ failures (check opcode ty (cast u64 k) false)))
-            (set! failures (+ failures (check opcode ty (cast u64 k) true)))
-            (set! functions (+ functions 2))
+            (set! failures (+ failures (check opcode ty (cast u64 k) false false)))
+            (set! failures (+ failures (check opcode ty (cast u64 k) true false)))
+            (set! failures (+ failures (check opcode ty (cast u64 k) (= opcode 29) true)))
+            (set! functions (+ functions 3))
             (when signed?
-              (set! failures (+ failures (check opcode ty (cast u64 (- 0 k)) false)))
-              (set! failures (+ failures (check opcode ty (cast u64 (- 0 k)) true)))
-              (set! functions (+ functions 2))))
+              (set! failures (+ failures (check opcode ty (cast u64 (- 0 k)) false false)))
+              (set! failures (+ failures (check opcode ty (cast u64 (- 0 k)) true false)))
+              (set! failures (+ failures (check opcode ty (cast u64 (- 0 k)) (= opcode 29) true)))
+              (set! functions (+ functions 3))))
           ; boundary and structured divisors
           (for special [(: 641 u64) 1000 10000 100000 1000000007 0x55555555 0xAAAAAAAB
                         0x7FFFFFFF 0x80000001 0xFFFFFFFD 0xFFFFFFFF 0x100000001
@@ -194,9 +220,10 @@
                         0x7FFFFFFE 0x7FFFFFFFFFFFFFFE 0x80000003 0x8000000000000003]
             (let [d (& special mask)]
               (when (and (!= d 0) (or (not signed?) (!= d mask)))
-                (set! failures (+ failures (check opcode ty d false)))
-                (set! failures (+ failures (check opcode ty d true)))
-                (set! functions (+ functions 2))))))))
+                (set! failures (+ failures (check opcode ty d false false)))
+                (set! failures (+ failures (check opcode ty d true false)))
+                (set! failures (+ failures (check opcode ty d (= opcode 29) true)))
+                (set! functions (+ functions 3))))))))
     (println "native reciprocal division/remainder checks: {} functions, {} failures"
              functions failures)
     (if (= failures 0) 0 1)))
