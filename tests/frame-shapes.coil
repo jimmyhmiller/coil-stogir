@@ -1,0 +1,412 @@
+;;; Native execution of every frame shape the AArch64 prologue and epilogue
+;;; distinguish, with the frame record's SP writeback checked in the emitted
+;;; words: no preserved registers, odd and even numbers of them, floating
+;;; values live across a call, frames on both sides of the writeback range,
+;;; private call storage (an ARGVAL copy), arguments passed in memory, dynamic
+;;; stack allocation, and deep recursion through generated frames.
+(module stogir.tests.frame-shapes)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(const PLAIN (: 0 i32))
+(const COPY (: 1 i32))
+(const MEMORY (: 2 i32))
+(const DYNAMIC (: 3 i32))
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+
+(defn word-at [(text (ArrayList u8)) (i i64)] (-> u32)
+  (| (cast u32 (get text (* i 4))) (<< (cast u32 (get text (+ (* i 4) 1))) 8)
+     (<< (cast u32 (get text (+ (* i 4) 2))) 16) (<< (cast u32 (get text (+ (* i 4) 3))) 24)))
+
+;;; Every generated function and every native callee here has this signature.
+;;; next is forwarded as the callee's first argument, so a generated function
+;;; given another generated function as target makes that one call next.
+(defn leaf :cc (cc/C) [(next u64) (x u64) (pad u64) (numbers u64)] (-> u64)
+  (if (= pad 0)
+      (+ (* x 3) 1)
+      (let [cell (p/cast (ptr u64) pad)
+            seen (p/load cell)]
+        ; The caller stored x there. A second word, when present, is its own.
+        (p/store! cell (+ x 1000))
+        (+ (* x 3) 1 (- seen x)))))
+
+;;; Reads and then destroys its by-value aggregate: the caller's original must
+;;; keep its contents.
+(defn copied :cc (cc/C) [(next u64) (x u64) (pad u64) (numbers u64) (value u64)] (-> u64)
+  (let [words (p/cast (ptr u64) value)
+        a (p/load words)
+        b (p/load (p/index words 1))
+        c (p/load (p/index words 2))]
+    (p/store! words (: 0xDEAD u64))
+    (p/store! (p/index words 1) (: 0xDEAD u64))
+    (p/store! (p/index words 2) (: 0xDEAD u64))
+    (+ a (* b 2) (* c 3))))
+
+(defn spread :cc (cc/C) [(next u64) (x u64) (pad u64) (numbers u64)
+                         (e u64) (f u64) (g u64) (h u64) (i u64) (j u64)] (-> u64)
+  (+ x (* e 2) (* f 3) (* g 5) (* h 7) (* i 11) (* j 13)))
+
+;;; Calls the generated function next until x reaches zero.
+(defn bounce :cc (cc/C) [(next u64) (x u64) (pad u64) (numbers u64)] (-> u64)
+  (if (= x 0)
+      5
+      (call-ptr (p/cast (fnptr (cc/C) [u64 u64 u64 u64] u64) (p/cast (ptr u8) next))
+                (p/cast u64 (p/cast (ptr u8) (fnptr-of bounce)))
+                (- x 1)
+                next
+                numbers)))
+
+;;; f(target, x, next, numbers): loads saved integers and floats floating-point
+;;; values from numbers before its call, so each lives across the call, keeps a
+;;; frame object of pad bytes holding x that the callee sees and rewrites, and
+;;; returns the call's result plus all of them.
+(defn build [(saved i64) (floats i64) (pad i64) (mode i32) (a (dyn Allocator))]
+  (-> (ArrayList u8))
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        next (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        numbers (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 3]))
+        null (require (b/scalar-constant! (mut graph) 6 0 8))
+        one (require (b/scalar-constant! (mut graph) 5 1 8))
+        two (require (b/scalar-constant! (mut graph) 5 2 8))
+        eight (require (b/scalar-constant! (mut graph) 5 8 8))
+        sixteen (require (b/scalar-constant! (mut graph) 5 16 8))
+        (mut control) start
+        (mut object) (: 0 i32)
+        (mut aggregate) (: 0 i32)
+        (mut dynamic) (: 0 i32)
+        (mut values) (ArrayList::new [i32] a)
+        (mut doubles) (ArrayList::new [i32] a)]
+    (when (> pad 0)
+      (set! object
+            (require (b/frame-object! (mut graph) control
+                                      (require (b/scalar-constant! (mut graph) 5 (cast u64 pad) 8))
+                                      16)))
+      (set! control object))
+    (when (or (= mode COPY) (= mode DYNAMIC))
+      (set! aggregate
+            (require (b/frame-object! (mut graph) control
+                                      (require (b/scalar-constant! (mut graph) 5 24 8))
+                                      8)))
+      (set! control aggregate))
+    (when (> pad 0)
+      (set! control (require (b/emit! (mut graph) 93 0 [control object x]))))
+    (when (!= aggregate 0)
+      (let [x1 (require (b/emit! (mut graph) 26 5 [x one]))
+            x2 (require (b/emit! (mut graph) 26 5 [x two]))
+            second (require (b/emit! (mut graph) 26 6 [aggregate eight]))
+            third (require (b/emit! (mut graph) 26 6 [aggregate sixteen]))]
+        (set! control (require (b/emit! (mut graph) 93 0 [control aggregate x])))
+        (set! control (require (b/emit! (mut graph) 93 0 [control second x1])))
+        (set! control (require (b/emit! (mut graph) 93 0 [control third x2])))))
+    (for [i 0 saved]
+      (let [offset (require (b/scalar-constant! (mut graph) 5 (cast u64 (* i 8)) 8))
+            address (require (b/emit! (mut graph) 26 6 [numbers offset]))
+            loaded (require (b/emit! (mut graph) 91 5 [control address]))]
+        (push! (mut values) loaded)
+        (set! control loaded)))
+    (for [i 0 floats]
+      (let [offset (require (b/scalar-constant! (mut graph) 5 (cast u64 (* (+ i 16) 8)) 8))
+            address (require (b/emit! (mut graph) 26 6 [numbers offset]))
+            loaded (require (b/emit! (mut graph) 91 12 [control address]))]
+        (push! (mut doubles) loaded)
+        (set! control loaded)))
+    (when (= mode DYNAMIC)
+      ; x bytes whose first word holds x, live until the return.
+      (let [size (require (b/emit! (mut graph) 26 5 [x eight]))]
+        (set! dynamic (require (b/stack-allocate! (mut graph) control size 16)))
+        (set! control (require (b/emit! (mut graph) 93 0 [dynamic dynamic x])))))
+    (let [pad-argument (if (> pad 0) object null)
+          call
+            (cond
+              (= mode PLAIN)
+                (let [(mut prototype)
+                        (match (calls/create 0 5 [(: 5 u8) 5 6 6] a)
+                          (Ok [owned] owned) (Err [e] (panic "{}" e)))
+                      r (require (calls/emit! (mut graph) prototype control target
+                                              [next x pad-argument numbers] a))]
+                  (calls/release! (mut prototype))
+                  r)
+              (= mode MEMORY)
+                (let [(mut prototype)
+                        (match (calls/create 0 5 [(: 5 u8) 5 6 6 5 5 5 5 5 5] a)
+                          (Ok [owned] owned) (Err [e] (panic "{}" e)))
+                      x1 (require (b/emit! (mut graph) 26 5 [x one]))
+                      x2 (require (b/emit! (mut graph) 26 5 [x two]))
+                      r (require (calls/emit! (mut graph) prototype control target
+                                              [next x pad-argument numbers x x x x x1 x2] a))]
+                  (calls/release! (mut prototype))
+                  r)
+              :else
+                (let [(mut prototype)
+                        (match (calls/create 0 5 [(: 5 u8) 5 6 6 6] a)
+                          (Ok [owned] owned) (Err [e] (panic "{}" e)))
+                      value (require (b/argument-value! (mut graph) aggregate 24 8))
+                      r (require (calls/emit! (mut graph) prototype control target
+                                              [next x pad-argument numbers value] a))]
+                  (calls/release! (mut prototype))
+                  r))
+          (mut after) call
+          (mut sum) call]
+      (for value values
+        (set! sum (require (b/emit! (mut graph) 26 5 [sum value]))))
+      (for value doubles
+        (set! sum (require (b/emit! (mut graph) 26 5
+                                    [sum (require (b/conversion! (mut graph) 38 5 8 value))]))))
+      (when (> pad 0)
+        (let [loaded (require (b/emit! (mut graph) 91 5 [after object]))]
+          (set! after loaded)
+          (set! sum (require (b/emit! (mut graph) 26 5 [sum loaded])))))
+      (when (!= aggregate 0)
+        (let [third (require (b/emit! (mut graph) 26 6 [aggregate sixteen]))
+              loaded (require (b/emit! (mut graph) 91 5 [after third]))]
+          (set! after loaded)
+          (set! sum (require (b/emit! (mut graph) 26 5 [sum loaded])))))
+      (when (!= dynamic 0)
+        (let [loaded (require (b/emit! (mut graph) 91 5 [after dynamic]))]
+          (set! after loaded)
+          (set! sum (require (b/emit! (mut graph) 26 5 [sum loaded])))))
+      (let [ret (require (b/emit! (mut graph) 120 5 [after sum (: 0 i32)]))
+            text (match (compile/text graph start [ret] a)
+                   (Ok [text] text) (Err [e] (panic "{}" e)))]
+        (free! (mut values))
+        (free! (mut doubles))
+        (g/release! (mut graph))
+        text))))
+
+;;; What the emitted words say about the frame.
+(defstruct Shape
+  [(pre i64)        ; N of stp x29, x30, [sp, #-N]! as the first word, or 0
+   (post i64)       ; N of every ldp x29, x30, [sp], #N, or -1 when they differ
+   (reserved i64)   ; N of a leading sub sp, sp, #N, or 0
+   (preserved i64)]) ; x19..x28 stored by the prologue
+
+(defn shape [(text (ArrayList u8))] (-> Shape)
+  (let [count (/ (len text) 4)
+        first (word-at text 0)
+        (mut result) (Shape :pre 0 :post 0 :reserved 0 :preserved 0)
+        (mut i) (: 0 i64)
+        (mut prologue) true]
+    (when (= (& first 0xFFC07FFF) 0xA9807BFD)
+      (set! (.pre result) (* (- 128 (cast i64 (& (>> first 15) 0x7F))) 8)))
+    (when (= (& first 0xFFC003FF) 0xD10003FF)
+      (set! (.reserved result) (cast i64 (& (>> first 10) 0xFFF))))
+    (while (< i count)
+      (let [w (word-at text i)
+            rt (cast i64 (& w 31))
+            record? (or (= (& w 0xFFC07FFF) 0xA9807BFD)    ; stp x29, x30, [sp, #-N]!
+                        (= (& w 0xFFC07FFF) 0xA9007BFD))   ; stp x29, x30, [sp, #N]
+            anchor? (= (& w 0xFFC003FF) 0x910003FD)        ; add x29, sp, #N
+            reserve? (= (& w 0xFFC003FF) 0xD10003FF)       ; sub sp, sp, #N
+            pair? (and (= (& w 0xFFC003E0) 0xA90003E0) (>= rt 19) (<= rt 28))
+            single? (and (= (& w 0xFFC003E0) 0xF90003E0) (>= rt 19) (<= rt 28))]
+        (when prologue
+          (cond pair? (set! (.preserved result) (+ (.preserved result) 2))
+                single? (set! (.preserved result) (+ (.preserved result) 1))
+                (or record? anchor? reserve?) 0
+                :else (set! prologue false)))
+        (when (= (& w 0xFFC07FFF) 0xA8C07BFD)              ; ldp x29, x30, [sp], #N
+          (let [n (* (cast i64 (& (>> w 15) 0x7F)) 8)]
+            (set! (.post result)
+                  (if (or (= (.post result) 0) (= (.post result) n)) n -1)))))
+      (set! i (+ i 1)))
+    result))
+
+(defn address [(image jit/Image)] (-> u64) (p/cast u64 (.base image)))
+
+(defn map [(text (ArrayList u8))] (-> jit/Image)
+  (match (jit/map-text (slice text)) (Ok [image] image) (Err [e] (panic "{}" e))))
+
+(defn invoke [(image jit/Image) (target u64) (x u64) (next u64) (numbers (ptr u64))] (-> u64)
+  (call-ptr (p/cast (fnptr (cc/C) [u64 u64 u64 u64] u64) (.base image))
+            target x next (p/cast u64 numbers)))
+
+;;; What a generated function adds to its callee's result.
+(defn own [(saved i64) (floats i64) (pad i64) (mode i32) (x u64)] (-> u64)
+  (let [(mut sum) (: 0 u64)]
+    (for [i 0 saved] (set! sum (+ sum (cast u64 (+ 100 (* i 7))))))
+    (for [i 0 floats] (set! sum (+ sum (cast u64 (+ 2000 i)))))
+    ; The pad word is x when the callee leaves it and x + 1000 after leaf.
+    (when (> pad 0) (set! sum (+ sum x (if (= mode PLAIN) 1000 0))))
+    (when (or (= mode COPY) (= mode DYNAMIC)) (set! sum (+ sum x 2)))
+    (when (= mode DYNAMIC) (set! sum (+ sum x)))
+    sum))
+
+(defn callee-result [(pad i64) (mode i32) (x u64)] (-> u64)
+  (cond (= mode PLAIN) (+ (* x 3) 1)
+        (= mode MEMORY) (+ x (* x 2) (* x 3) (* x 5) (* x 7) (* (+ x 1) 11) (* (+ x 2) 13))
+        :else (+ x (* (+ x 1) 2) (* (+ x 2) 3))))
+
+(defn native [(mode i32)] (-> u64)
+  (cond (= mode PLAIN) (p/cast u64 (p/cast (ptr u8) (fnptr-of leaf)))
+        (= mode MEMORY) (p/cast u64 (p/cast (ptr u8) (fnptr-of spread)))
+        :else (p/cast u64 (p/cast (ptr u8) (fnptr-of copied)))))
+
+(defn expect-word [(failures (mut i64)) (name (slice u8)) (actual (Result u32 (slice u8)))
+                   (expected u32)] (-> void)
+  (match actual
+    (Ok [word]
+        (when (!= word expected)
+          (println "{}: {:x}, expected {:x}" name word expected)
+          (set! failures (+ failures 1))))
+    (Err [message]
+         (println "{}: {}" name message)
+         (set! failures (+ failures 1)))))
+
+(defn expect-rejected [(failures (mut i64)) (name (slice u8)) (actual (Result u32 (slice u8)))]
+  (-> void)
+  (match actual
+    (Ok [word] (println "{}: accepted as {:x}" name word) (set! failures (+ failures 1)))
+    (Err [_] 0)))
+
+(defn main [] (-> i32)
+  (let [a (malloc-allocator)
+        (mut failures) (: 0 i64)
+        (mut numbers) (ArrayList::new [u64] a)
+        (mut odd) false (mut even) false (mut none) false
+        (mut widest) (: 0 i64) (mut beyond) false
+        (mut variants) (: 1 i64)
+        (mut inner-text) (build 10 2 16 PLAIN a)
+        (mut inner) (map inner-text)]
+    (for [i 0 16] (push! (mut numbers) (cast u64 (+ 100 (* i 7)))))
+    (for [i 0 8] (push! (mut numbers) (: 0 u64)))
+    (for [i 0 8]
+      (p/store! (p/cast (ptr f64) (p/index (.data numbers) (+ 16 i))) (cast f64 (+ 2000 i))))
+    ; The writeback forms and the limits of their signed, scaled 7-bit offset.
+    (expect-word (mut failures) "stp x29, x30, [sp, #-16]!"
+                 (encode/load-store-pair-indexed false true 29 30 31 -16) 0xA9BF7BFD)
+    (expect-word (mut failures) "ldp x29, x30, [sp], #16"
+                 (encode/load-store-pair-indexed true false 29 30 31 16) 0xA8C17BFD)
+    (expect-word (mut failures) "stp x29, x30, [sp, #-496]!"
+                 (encode/load-store-pair-indexed false true 29 30 31 -496) 0xA9A17BFD)
+    (expect-word (mut failures) "ldp x29, x30, [sp], #496"
+                 (encode/load-store-pair-indexed true false 29 30 31 496) 0xA8DF7BFD)
+    (expect-word (mut failures) "stp x29, x30, [sp, #-512]!"
+                 (encode/load-store-pair-indexed false true 29 30 31 -512) 0xA9A07BFD)
+    (expect-word (mut failures) "ldp x29, x30, [sp], #504"
+                 (encode/load-store-pair-indexed true false 29 30 31 504) 0xA8DFFBFD)
+    (expect-word (mut failures) "stp x19, x20, [sp, #-32]!"
+                 (encode/load-store-pair-indexed false true 19 20 31 -32) 0xA9BE53F3)
+    (expect-word (mut failures) "ldp x19, x20, [sp], #32"
+                 (encode/load-store-pair-indexed true false 19 20 31 32) 0xA8C253F3)
+    (expect-rejected (mut failures) "offset -520" (encode/load-store-pair-indexed false true 29 30 31 -520))
+    (expect-rejected (mut failures) "offset 512" (encode/load-store-pair-indexed true false 29 30 31 512))
+    (expect-rejected (mut failures) "offset 12" (encode/load-store-pair-indexed true false 29 30 31 12))
+    (expect-rejected (mut failures) "base also stored"
+                     (encode/load-store-pair-indexed false true 31 30 31 -16))
+    (expect-rejected (mut failures) "one register loaded twice"
+                     (encode/load-store-pair-indexed true false 29 29 31 16))
+    ; Every preserved-register count, without and with floating values, each
+    ; called directly and through a second generated function that uses the
+    ; same registers and must give them back.
+    (for mode [PLAIN COPY MEMORY DYNAMIC]
+      (for saved [(: 0 i64) 1 2 3 4 5 7 10]
+        (for floats [(: 0 i64) 1 3]
+          (for pad [(: 0 i64) 8 40]
+            (let [(mut text) (build saved floats pad mode a)
+                  found (shape text)
+                  (mut image) (map text)]
+              (set! variants (+ variants 1))
+              (if (= (.preserved found) 0)
+                  (set! none true)
+                  (if (= (% (.preserved found) 2) 1) (set! odd true) (set! even true)))
+              ; No call here passes an argument in memory, so the record lies
+              ; at SP and carries the whole SP adjustment both ways.
+              (when (and (or (= mode PLAIN) (= mode COPY))
+                         (or (= (.pre found) 0) (!= (.post found) (.pre found))
+                             (!= (.reserved found) 0)))
+                (when (< failures 5)
+                  (println "mode={} saved={} floats={} pad={}: pre={} post={} reserved={}"
+                           mode saved floats pad (.pre found) (.post found) (.reserved found)))
+                (set! failures (+ failures 1)))
+              (for x [(: 0 u64) 1 24 255 4000]
+                (let [direct (invoke image (native mode) x 0 (.data numbers))
+                      expected (+ (callee-result pad mode x) (own saved floats pad mode x))]
+                  (when (!= direct expected)
+                    (when (< failures 5)
+                      (println "mode={} saved={} floats={} pad={} x={}: {} expected {}"
+                               mode saved floats pad x direct expected))
+                    (set! failures (+ failures 1))))
+                (when (= mode PLAIN)
+                  ; This function calls inner, which calls leaf with no pad of
+                  ; this function's in sight: inner's own pad is rewritten.
+                  (let [chained (invoke image (address inner) x
+                                        (p/cast u64 (p/cast (ptr u8) (fnptr-of leaf)))
+                                        (.data numbers))
+                        expected (+ (* x 3) 1
+                                    (own 10 2 16 PLAIN x)
+                                    (own saved floats pad MEMORY x))]
+                    (when (!= chained expected)
+                      (when (< failures 5)
+                        (println "chained saved={} floats={} pad={} x={}: {} expected {}"
+                                 saved floats pad x chained expected))
+                      (set! failures (+ failures 1))))))
+              (jit/release! (mut image))
+              (free! (mut text)))))))
+    (jit/release! (mut inner))
+    (free! (mut inner-text))
+    (unless (and none odd even)
+      (println "preserved register counts not all seen: none={} odd={} even={}" none odd even)
+      (set! failures (+ failures 1)))
+    ; Frames growing through the writeback range: up to 496 bytes the record
+    ; moves SP; beyond it SP is adjusted separately. Both run.
+    (for [step 0 24]
+      (let [pad (+ 336 (* step 16))
+            (mut text) (build 3 0 pad COPY a)
+            found (shape text)
+            (mut image) (map text)]
+        (set! variants (+ variants 1))
+        (if (> (.pre found) 0)
+            (do
+              (when (or (> (.pre found) 496) (!= (.post found) (.pre found)))
+                (println "pad={}: pre={} post={}" pad (.pre found) (.post found))
+                (set! failures (+ failures 1)))
+              (when (> (.pre found) widest) (set! widest (.pre found))))
+            (do
+              (when (or (<= (.reserved found) 496) (!= (.post found) 0))
+                (println "pad={}: reserved={} post={}" pad (.reserved found) (.post found))
+                (set! failures (+ failures 1)))
+              (when (= (.reserved found) 512) (set! beyond true))))
+        (for x [(: 0 u64) 9 77777]
+          (let [actual (invoke image (native COPY) x 0 (.data numbers))
+                expected (+ (callee-result pad COPY x) (own 3 0 pad COPY x))]
+            (when (!= actual expected)
+              (println "pad={} x={}: {} expected {}" pad x actual expected)
+              (set! failures (+ failures 1)))))
+        (jit/release! (mut image))
+        (free! (mut text))))
+    (unless (and (= widest 496) beyond)
+      (println "writeback boundary not reached: widest={} 512-byte frame={}" widest beyond)
+      (set! failures (+ failures 1)))
+    ; 20000 generated frames deep, each holding five preserved registers.
+    (let [(mut text) (build 5 1 8 PLAIN a)
+          (mut image) (map text)
+          depth (: 20000 u64)
+          actual (invoke image (p/cast u64 (p/cast (ptr u8) (fnptr-of bounce))) depth
+                         (address image) (.data numbers))
+          (mut expected) (: 5 u64)]
+      (set! variants (+ variants 1))
+      ; bounce never touches the pad, so each level adds its own x.
+      (for [level 0 (+ (cast i64 depth) 1)]
+        (set! expected (+ expected (own 5 1 8 MEMORY (cast u64 level)))))
+      (when (!= actual expected)
+        (println "recursion: {} expected {}" actual expected)
+        (set! failures (+ failures 1)))
+      (jit/release! (mut image))
+      (free! (mut text)))
+    (free! (mut numbers))
+    (println "frame shapes: {} functions, {} failures" variants failures)
+    (if (= failures 0) 0 1)))
