@@ -1,0 +1,108 @@
+;;; A piece of a register-returned aggregate is read by its RETURN, a use the
+;;; graph's operand edges do not carry once return lowering has promoted the
+;;; private result place. A piece that also has an ordinary use on one arm of a
+;;; branch must still be computed on the path that skips that arm.
+(module stogir.tests.jit-return-piece-placement)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.image" :as image)
+(import "stogir.call-results" :as results)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defstruct Pair [(a u64) (b u64)])
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [message] (panic "{}" message))))
+
+(defn map-image [(code image/Image) (a (dyn Allocator))] (-> (Result jit/Loaded (slice u8)))
+  (let [(mut resolved) (ArrayList::new [u64] a)
+        (mut present) (ArrayList::new [bool] a)]
+    (for symbol (.symbols code)
+      (assert (!= (.section symbol) 0))
+      (push! (mut resolved) (: 0 u64))
+      (push! (mut present) false))
+    (let [answer (jit/map-image-resolved code (slice resolved) (slice present) a)]
+      (free! (mut resolved))
+      (free! (mut present))
+      answer)))
+
+;;; f(x, y, other) -> Pair{x + 3, y ^ 7}. Mode 0 also stores the low piece to
+;;; `other` when x = 0, mode 1 when x != 0; modes 2 and 3 do the same with the
+;;; high piece. Returns the number of wrong results.
+(defn placement [(mode i32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        place (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        y (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        other (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 3]))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        three (require (b/scalar-constant! (mut graph) 5 3 8))
+        seven (require (b/scalar-constant! (mut graph) 5 7 8))
+        eight (require (b/scalar-constant! (mut graph) 5 8 8))
+        upper (require (b/emit! (mut graph) 26 6 [place eight]))
+        low (require (b/emit! (mut graph) 26 5 [x three]))
+        high (require (b/emit! (mut graph) 48 5 [y seven]))
+        condition (require (b/emit! (mut graph) 14 1 [x zero]))
+        split (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        stored (if (< mode 2) low high)
+        arm (if (= (& mode 1) 0) yes no)
+        kept (require (b/emit! (mut graph) 93 0 [arm other stored]))
+        e0 (require (b/emit! (mut graph) 114 0 [(if (= arm yes) kept yes)]))
+        e1 (require (b/emit! (mut graph) 114 0 [(if (= arm no) kept no)]))
+        join (require (b/emit! (mut graph) 112 0 [e0 e1]))
+        s0 (require (b/emit! (mut graph) 93 0 [join place low]))
+        s1 (require (b/emit! (mut graph) 93 0 [s0 upper high]))
+        ret (require (b/emit! (mut graph) 120 0 [s1 (: 0 i32) 0]))
+        (mut failures) 0]
+    (match (calls/create-result 9 [(: 6 u8) 5 5 6] [] (results/pieces 5 2) a)
+      (Err [e] (panic "{}" e))
+      (Ok [prototype]
+        (let [(mut prototype) prototype]
+          (require (calls/function! (mut graph) prototype a))
+          (calls/release! (mut prototype)))))
+    (match (compile/image graph start [ret] "_return_piece_placement" a)
+      (Err [e] (panic "return piece placement mode {}: {}" mode e))
+      (Ok [owned]
+        (let [(mut code) owned]
+          (match (map-image code a)
+            (Err [e] (panic "{}" e))
+            (Ok [loaded]
+              (let [(mut loaded) loaded
+                    f (primitive/cast (fnptr (cc/C) [u64 u64 (ptr u64)] Pair)
+                                      (.base (.memory loaded)))]
+                (for xv [(: 0 u64) 1 3 8 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
+                  (for yv [(: 0 u64) 7 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
+                    (let [(mut memory) (: 222 u64)
+                          result (call-ptr f xv yv (mut memory))
+                          want-low (primitive/iadd xv 3)
+                          want-high (^ yv 7)
+                          taken (= (= xv 0) (= (& mode 1) 0))
+                          want-memory (if taken (if (< mode 2) want-low want-high) (: 222 u64))]
+                      (unless (and (= (.a result) want-low)
+                                   (= (.b result) want-high)
+                                   (= memory want-memory))
+                        (println "mode {} x {} y {}: got ({}, {}) memory {}"
+                                 mode xv yv (.a result) (.b result) memory)
+                        (set! failures (+ failures 1))))))
+                (jit/release-image! (mut loaded)))))
+          (image/release! (mut code)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for mode [(: 0 i32) 1 2 3]
+      (set! failures (+ failures (placement mode))))
+    (println "return pieces with a use on one path: {} failures" failures)
+    (if (= failures 0) 0 1)))
