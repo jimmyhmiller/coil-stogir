@@ -29,7 +29,7 @@
 ;;; The callee of modes 16 and 17 only reads it, as its PURE_FUNC declaration says.
 (defn peek [(cell (ptr u64))] (-> u64) (load cell))
 
-(def MODES 18)
+(def MODES 22)
 
 ;;; f(p, q, k, callee) -> i64 over 64-bit cells. In the loop modes i counts
 ;;; from zero and sum adds what the read in question returned each iteration.
@@ -51,6 +51,12 @@
 ;;; 15 as 0, body stores i to p[1] only when i = k            (moved: disjoint on either path)
 ;;; 16 as 0, body calls callee(q) declared PURE_FUNC          (moved: the call writes nothing)
 ;;; 17 as 16, then stores 2 through q                         (kept: the store may write p)
+;;; Modes 18 to 21 head their loop with a MERGE, which loop rotation accepts.
+;;; 18 as 21, body then stores 2 through q                    (kept in the loop: q may be p)
+;;; 19 as 21, the body reads p[i]                             (kept in the loop: address varies)
+;;; 20 as 21, the body reads p[0] only when i != 1            (kept in the loop: not on every trip)
+;;; 21 as 5                                                   (the loop is rotated and the read
+;;;                                                            leaves it behind the zero-trip guard)
 (defn build [(mode i32) (a (dyn Allocator))] (-> Fixture)
   (let [(mut graph) (g/create a) (mut roots) (ArrayList::new [i32] a)
         start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
@@ -114,14 +120,20 @@
                          (require (b/emit! (mut graph) 91 11 [start p]))
                          start)
               enter (require (b/emit! (mut graph) 114 0 [before]))
-              header (require (b/loop-begin! (mut graph) enter))
-              i (require (b/loop-phi! (mut graph) header zero))
-              sum (require (b/loop-phi! (mut graph) header zero))
+              header (if (>= mode 18)
+                         (require (b/emit! (mut graph) 112 0 [enter enter]))
+                         (require (b/loop-begin! (mut graph) enter)))
+              i (if (>= mode 18)
+                    (require (b/emit! (mut graph) 67 11 [header zero zero]))
+                    (require (b/loop-phi! (mut graph) header zero)))
+              sum (if (>= mode 18)
+                      (require (b/emit! (mut graph) 67 11 [header zero zero]))
+                      (require (b/loop-phi! (mut graph) header zero)))
               cursor (if (= mode 6) (require (b/loop-phi! (mut graph) header p)) (: 0 i32))
               ; The read in question, and the control node the branch follows.
               (mut read) (: 0 i32)
               top (cond
-                    (or (= mode 5) (= mode 12) (= mode 13)) header
+                    (or (= mode 5) (= mode 12) (= mode 13) (>= mode 18)) header
                     (= mode 6)
                       (do (set! read (require (b/emit! (mut graph) 91 11 [header cursor]))) read)
                     (or (= mode 7) (= mode 8))
@@ -130,7 +142,7 @@
                         read)
                     :else (do (set! read (require (b/emit! (mut graph) 91 11 [header p]))) read))
               condition (cond
-                          (or (= mode 5) (= mode 12) (= mode 13))
+                          (or (= mode 5) (= mode 12) (= mode 13) (>= mode 18))
                             (require (b/emit! (mut graph) 16 1 [i k]))
                           (= mode 6) (require (b/emit! (mut graph) 15 1 [read zero]))
                           :else (require (b/emit! (mut graph) 16 1 [i read])))
@@ -164,8 +176,27 @@
                       (calls/release! (mut sig))
                       (if (= mode 17) (require (b/emit! (mut graph) 93 0 [call q two])) call))
                   (= mode 4) (require (b/emit! (mut graph) 93 0 [yes next-cell i]))
-                  (= mode 5)
+                  (or (= mode 5) (= mode 21))
                     (do (set! read (require (b/emit! (mut graph) 91 11 [yes p]))) read)
+                  (= mode 18)
+                    (do (set! read (require (b/emit! (mut graph) 91 11 [yes p])))
+                        (require (b/emit! (mut graph) 93 0 [read q two])))
+                  (= mode 19)
+                    (let [scaled (require (b/emit! (mut graph) 28 11 [i eight]))
+                          cell (require (b/emit! (mut graph) 26 6 [p scaled]))]
+                      (set! read (require (b/emit! (mut graph) 91 11 [yes cell])))
+                      read)
+                  (= mode 20)
+                    (let [hit (require (b/emit! (mut graph) 15 1 [i one]))
+                          inner (require (b/emit! (mut graph) 116 0 [yes hit]))
+                          on (require (b/emit! (mut graph) 107 0 [inner (: 0 i32)]))
+                          off (require (b/emit! (mut graph) 108 0 [inner (: 0 i32)]))
+                          value (require (b/emit! (mut graph) 91 11 [on p]))
+                          left (require (b/emit! (mut graph) 114 0 [value]))
+                          right (require (b/emit! (mut graph) 114 0 [off]))
+                          merge (require (b/emit! (mut graph) 112 0 [left right]))]
+                      (set! read (require (b/emit! (mut graph) 67 11 [merge value zero])))
+                      merge)
                   (= mode 12)
                     (do (set! read (require (b/emit! (mut graph) 91 11 [yes p])))
                         (require (b/emit! (mut graph) 93 0 [read next-cell i])))
@@ -182,7 +213,7 @@
                         (require (b/emit! (mut graph) 112 0 [left right]))))
                   :else yes)
               added (require (b/emit! (mut graph) 26 11 [sum read]))
-              back (require (b/emit! (mut graph) 115 0 [body]))
+              back (require (b/emit! (mut graph) (if (>= mode 18) 114 115) 0 [body]))
               result (if (or (= mode 12) (= mode 13))
                          (require (b/emit! (mut graph) 26 11 [sum before]))
                          sum)]
@@ -195,15 +226,42 @@
           (push! (mut roots) (require (b/emit! (mut graph) 120 11 [no result (: 0 i32)])))))
     (Fixture :graph graph :roots roots)))
 
-(defstruct Shape [(loads i64) (under-join i64)])
+(defstruct Shape [(loads i64) (under-join i64) (in-loop i64)])
+
+;;; REFERENCE is sequenced on a control cycle: a backward walk over control
+;;; predecessors from it comes back to it.
+(defn cyclic? [(graph g/Graph) (reference i32) (a (dyn Allocator))] (-> bool)
+  (let [(mut seen) (ArrayList::new [bool] a)
+        (mut work) (ArrayList::new [i32] a)
+        (mut answer) false]
+    (for [i 0 (len (.instructions graph))] (push! (mut seen) false))
+    (push! (mut work) (.op1 (get (.instructions graph) (cast i64 reference))))
+    (while (and (not answer) (> (len work) 0))
+      (let [current (get work (- (len work) 1))]
+        (pop! (mut work))
+        (cond (= current reference) (set! answer true)
+              (or (<= current 0) (get seen (cast i64 current))) 0
+              :else
+                (let [code (n/opcode (get (.instructions graph) (cast i64 current)))]
+                  (set! (mut seen) (cast i64 current) true)
+                  (if (or (= code 112) (= code 113))
+                      (for [k 1 (+ (cast i64 (get (.arities graph) (cast i64 current))) 1)]
+                        (match (g/operand graph current (cast i32 k))
+                          (Some [input] (push! (mut work) input))
+                          (None [] 0)))
+                      (push! (mut work) (.op1 (get (.instructions graph) (cast i64 current)))))))))
+    (free! (mut seen)) (free! (mut work))
+    answer))
 
 ;;; Plain reads in the graph, and how many of them are still sequenced directly
 ;;; under a join (possibly behind other such reads).
-(defn shape [(graph g/Graph)] (-> Shape)
-  (let [(mut result) (Shape :loads 0 :under-join 0) (mut r) (: 1 i64)]
+(defn shape [(graph g/Graph) (a (dyn Allocator))] (-> Shape)
+  (let [(mut result) (Shape :loads 0 :under-join 0 :in-loop 0) (mut r) (: 1 i64)]
     (while (< r (len (.instructions graph)))
       (when (= (n/opcode (get (.instructions graph) r)) 91)
         (set! (.loads result) (+ (.loads result) 1))
+        (when (cyclic? graph (cast i32 r) a)
+          (set! (.in-loop result) (+ (.in-loop result) 1)))
         (when (!= (.header (entry-load/chain graph (cast i32 r))) 0)
           (set! (.under-join result) (+ (.under-join result) 1))))
       (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
@@ -212,24 +270,28 @@
 ;;; -1 leaves a count unchecked.
 (defn wanted-shape [(mode i32)] (-> Shape)
   (match mode
-    (0 (Shape :loads 1 :under-join 0))
-    (1 (Shape :loads 1 :under-join 1))
-    (2 (Shape :loads 1 :under-join 1))
-    (3 (Shape :loads 1 :under-join 1))
-    (4 (Shape :loads 1 :under-join 0))
-    (5 (Shape :loads 1 :under-join 0))
-    (6 (Shape :loads 1 :under-join 1))
-    (7 (Shape :loads 2 :under-join 0))
-    (8 (Shape :loads 2 :under-join 2))
-    (10 (Shape :loads 2 :under-join 0))
-    (11 (Shape :loads 2 :under-join 1))
-    (12 (Shape :loads 1 :under-join 0))
-    (13 (Shape :loads 2 :under-join 0))
-    (14 (Shape :loads 2 :under-join 1))
-    (15 (Shape :loads 1 :under-join 0))
-    (16 (Shape :loads 1 :under-join 0))
-    (17 (Shape :loads 1 :under-join 1))
-    (_ (Shape :loads -1 :under-join -1))))
+    (0 (Shape :loads 1 :under-join 0 :in-loop 0))
+    (1 (Shape :loads 1 :under-join 1 :in-loop 1))
+    (2 (Shape :loads 1 :under-join 1 :in-loop 1))
+    (3 (Shape :loads 1 :under-join 1 :in-loop 1))
+    (4 (Shape :loads 1 :under-join 0 :in-loop 0))
+    (5 (Shape :loads 1 :under-join 0 :in-loop 1))
+    (6 (Shape :loads 1 :under-join 1 :in-loop 1))
+    (7 (Shape :loads 2 :under-join 0 :in-loop 0))
+    (8 (Shape :loads 2 :under-join 2 :in-loop 2))
+    (10 (Shape :loads 2 :under-join 0 :in-loop 0))
+    (11 (Shape :loads 2 :under-join 1 :in-loop 0))
+    (12 (Shape :loads 1 :under-join 0 :in-loop 0))
+    (13 (Shape :loads 2 :under-join 0 :in-loop 1))
+    (14 (Shape :loads 2 :under-join 1 :in-loop 0))
+    (15 (Shape :loads 1 :under-join 0 :in-loop 0))
+    (16 (Shape :loads 1 :under-join 0 :in-loop 0))
+    (17 (Shape :loads 1 :under-join 1 :in-loop 1))
+    (18 (Shape :loads 1 :under-join -1 :in-loop 1))
+    (19 (Shape :loads 1 :under-join -1 :in-loop 1))
+    (20 (Shape :loads 1 :under-join -1 :in-loop 1))
+    (21 (Shape :loads 1 :under-join -1 :in-loop 0))
+    (_ (Shape :loads -1 :under-join -1 :in-loop -1))))
 
 (defstruct Answer [(result u64) (cells (array u64 6))])
 
@@ -261,14 +323,17 @@
           (while (!= (get c at) 0)
             (set! sum (+ sum (get c at))) (set! at (+ at 1)))
           (set! result sum))
-      (or (= mode 5) (= mode 12) (= mode 13))
+      (or (= mode 5) (= mode 12) (= mode 13) (>= mode 18))
         (let [v (get c 0)]
           (while (< (cast i64 i) (cast i64 k))
-            (set! sum (+ sum (get c 0)))
+            (cond (= mode 19) (set! sum (+ sum (get c (cast i64 i))))
+                  (= mode 20) (when (!= i 1) (set! sum (+ sum (get c 0))))
+                  :else (set! sum (+ sum (get c 0))))
+            (when (= mode 18) (set! (mut c) qi 2))
             (when (= mode 12) (set! (mut c) 1 i))
             (when (and (= mode 13) (= i 1)) (set! (mut c) qi 2))
             (set! i (+ i 1)))
-          (set! result (if (= mode 5) sum (+ sum v))))
+          (set! result (if (or (= mode 5) (>= mode 18)) sum (+ sum v))))
       :else
         (do
           (while (< (cast i64 i) (cast i64 (get c 0)))
@@ -336,12 +401,14 @@
           (Err [message] (panic "mode {} optimize: {}" mode message))
           (Ok [optimized]
             (let [(mut optimized) optimized
-                  got (shape (.graph optimized))
+                  got (shape (.graph optimized) a)
                   want (wanted-shape (cast i32 mode))]
               (unless (and (or (< (.loads want) 0) (= (.loads got) (.loads want)))
-                           (or (< (.under-join want) 0) (= (.under-join got) (.under-join want))))
-                (panic "mode {}: {} reads, {} under a join; expected {} and {}"
-                       mode (.loads got) (.under-join got) (.loads want) (.under-join want)))
+                           (or (< (.under-join want) 0) (= (.under-join got) (.under-join want)))
+                           (or (< (.in-loop want) 0) (= (.in-loop got) (.in-loop want))))
+                (panic "mode {}: {} reads, {} under a join, {} in a loop; expected {}, {} and {}"
+                       mode (.loads got) (.under-join got) (.in-loop got)
+                       (.loads want) (.under-join want) (.in-loop want)))
               (rewrite/release! (mut optimized)))))
         ; Native answers at the unoptimised and the fully optimised level both
         ; equal the statement-by-statement result, cells included.
@@ -361,11 +428,12 @@
                              (get (.cells wanted) 2)))))))))
         ; A loop that runs zero times never reads through its body's pointer:
         ; with no object behind p the function must still return.
-        (when (= mode 5)
+        (when (or (= mode 5) (>= mode 18))
           (for level [(: 1 i32) 3]
-            (let [got (run-native (.graph f) (slice (.roots f)) 5 level false true 0 a)]
+            (let [got (run-native (.graph f) (slice (.roots f)) (cast i32 mode) level false true 0 a)]
               (set! native (+ native 1))
-              (unless (= (.result got) 0) (panic "mode 5 zero trips returned {}" (.result got))))))
+              (unless (= (.result got) 0)
+                (panic "mode {} zero trips returned {}" mode (.result got))))))
         (g/release! (mut (.graph f))) (free! (mut (.roots f)))))
     (println "entry-load: {} shapes, {} native answers pass" MODES native)
     0))
