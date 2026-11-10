@@ -1,0 +1,296 @@
+;;; Volatile accesses (LOAD_v, STORE_v) through the whole default pipeline.
+;;; Each one must reach machine code as its own access: never removed,
+;;; forwarded, hoisted, sunk, speculated, duplicated or merged with a
+;;; neighbour, and in order with the other accesses. Every shape is compiled
+;;; at level two and three, with no emission option and with all of them, the
+;;; memory instructions of the emitted function are counted by decoding it,
+;;; and the function is run.
+(module stogir.tests.volatile-access)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defstruct Fixture [(graph g/Graph) (roots (ArrayList i32))])
+
+;;; Memory instructions of a function that do not address the stack.
+;;; in-loop counts those inside a backward branch's span.
+(defstruct Census [(loads i64) (stores i64) (pairs i64) (loop-loads i64) (loop-stores i64)])
+
+(defn word-at [(text (ArrayList u8)) (index i64)] (-> u32)
+  (| (cast u32 (get text (* index 4)))
+     (<< (cast u32 (get text (+ (* index 4) 1))) 8)
+     (<< (cast u32 (get text (+ (* index 4) 2))) 16)
+     (<< (cast u32 (get text (+ (* index 4) 3))) 24)))
+
+;;; The word index a backward B, B.cond, CBZ/CBNZ or TBZ/TBNZ at INDEX jumps
+;;; to, or -1.
+(defn backward-target [(word u32) (index i64)] (-> i64)
+  (let [offset
+          (cond (= (& word 0x7c000000) 0x14000000)
+                  (- (cast i64 (^ (& word 0x03ffffff) 0x02000000)) 0x02000000)
+                (or (= (& word 0xff000010) 0x54000000) (= (& word 0x7e000000) 0x34000000))
+                  (- (cast i64 (^ (& (>> word 5) 0x7ffff) 0x40000)) 0x40000)
+                (= (& word 0x7e000000) 0x36000000)
+                  (- (cast i64 (^ (& (>> word 5) 0x3fff) 0x2000)) 0x2000)
+                :else 0)]
+    (if (< offset 0) (+ index offset) -1)))
+
+(defn census [(text (ArrayList u8))] (-> Census)
+  (let [words (/ (len text) 4)
+        (mut result) (Census :loads 0 :stores 0 :pairs 0 :loop-loads 0 :loop-stores 0)]
+    (for [i 0 words]
+      (let [word (word-at text i)
+            class (& (>> word 25) 5)
+            pair (= (& (>> word 27) 7) 5)
+            literal (= (& (>> word 27) 7) 3)
+            base (& (>> word 5) 31)
+            load (if pair (!= (& (>> word 22) 1) 0) (!= (& (>> word 22) 3) 0))]
+        (when (and (= class 4) (not literal) (!= base 31))
+          (let [(mut looped) false]
+            (for [j i words]
+              (let [target (backward-target (word-at text j) j)]
+                (when (and (>= target 0) (<= target i)) (set! looped true))))
+            (when pair (set! (.pairs result) (+ (.pairs result) 1)))
+            (if load
+                (do (set! (.loads result) (+ (.loads result) 1))
+                    (when looped (set! (.loop-loads result) (+ (.loop-loads result) 1))))
+                (do (set! (.stores result) (+ (.stores result) 1))
+                    (when looped (set! (.loop-stores result) (+ (.loop-stores result) 1)))))))))
+    result))
+
+(defn start! [(graph (mut g/Graph)) (a (dyn Allocator))] (-> i32)
+  (let [start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        (mut signature) (match (calls/create 0 11 [(: 6 u8) (: 6 u8) (: 11 u8)] a)
+                          (Err [message] (panic "{}" message)) (Ok [s] s))]
+    (require (calls/function! (mut graph) signature a))
+    (calls/release! (mut signature))
+    start))
+
+;;; f(p, q, n). The shapes, with v for a volatile and o for an ordinary access:
+;;;  0 poll: sum of n header v-loads of p
+;;;  1 poll: sum of n body v-loads of p
+;;;  2 two v-loads of p, added
+;;;  3 v-loads of p and p+8, added
+;;;  4 an unused v-load of p; returns n
+;;;  5 v-store p n; o-store p n+1; returns an o-load of q (as 6, 7, 14)
+;;;  6 v-store p n; v-store p n+1
+;;;  7 v-stores of n to p and n+1 to p+8
+;;;  8 v-store p n; v-load p
+;;;  9 o-store p n; v-load p; o-store p n+1
+;;; 10 v-load p; v-store q n; v-load p, added
+;;; 11 n != 0 ? v-load p : 7
+;;; 12 n != 0 ? (v-store p n, 1) : 0
+;;; 13 loop: n v-stores of the counter to p
+;;; 14 o-store p n; v-store p n+1
+;;; 15 v-load p; o-load p, added
+(defn build [(shape i32) (a (dyn Allocator))] (-> Fixture)
+  (let [(mut graph) (g/create a) (mut roots) (ArrayList::new [i32] a)
+        start (start! (mut graph) a)
+        p (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        q (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        n (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        eight (require (b/scalar-constant! (mut graph) 6 8 8))
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))
+        next-n (require (b/emit! (mut graph) 26 11 [n one]))
+        p8 (require (b/emit! (mut graph) 26 6 [p eight]))]
+    (cond
+      (or (= shape 0) (= shape 1) (= shape 13))
+        (let [enter (require (b/emit! (mut graph) 114 0 [start]))
+              header (require (b/loop-begin! (mut graph) enter))
+              phi (require (b/loop-phi! (mut graph) header zero))
+              sum (require (b/loop-phi! (mut graph) header zero))
+              headload (if (= shape 0) (require (b/emit! (mut graph) 92 11 [header p])) header)
+              condition (require (b/emit! (mut graph) 20 1 [phi n]))
+              branch (require (b/emit! (mut graph) 116 0 [headload condition]))
+              yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+              no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+              body (cond (= shape 1) (require (b/emit! (mut graph) 92 11 [yes p]))
+                         (= shape 13) (require (b/emit! (mut graph) 94 0 [yes p phi]))
+                         :else yes)
+              loaded (cond (= shape 0) headload (= shape 1) body :else one)
+              added (require (b/emit! (mut graph) 26 11 [sum loaded]))
+              next (require (b/emit! (mut graph) 26 11 [phi one]))
+              back (require (b/emit! (mut graph) 115 0 [body]))]
+          (require (b/patch! (mut graph) header 2 back))
+          (require (b/patch! (mut graph) phi 3 next))
+          (require (b/patch! (mut graph) sum 3 added))
+          (push! (mut roots) (require (b/emit! (mut graph) 120 11 [no sum (: 0 i32)]))))
+      (or (= shape 11) (= shape 12))
+        (let [condition (require (b/emit! (mut graph) 15 1 [n zero]))
+              branch (require (b/emit! (mut graph) 116 0 [start condition]))
+              yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+              no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+              access (if (= shape 11)
+                         (require (b/emit! (mut graph) 92 11 [yes p]))
+                         (require (b/emit! (mut graph) 94 0 [yes p n])))
+              y (require (b/emit! (mut graph) 114 0 [access]))
+              e (require (b/emit! (mut graph) 114 0 [no]))
+              merge (require (b/emit! (mut graph) 112 0 [y e]))
+              phi (require (b/emit! (mut graph) 67 11
+                    (if (= shape 11) [merge access seven] [merge one zero])))]
+          (push! (mut roots) (require (b/emit! (mut graph) 120 11 [merge phi (: 0 i32)]))))
+      :else
+        (let [(mut control) start (mut value) n]
+          (match shape
+            (2 (let [first (require (b/emit! (mut graph) 92 11 [control p]))
+                     second (require (b/emit! (mut graph) 92 11 [first p]))]
+                 (set! control second)
+                 (set! value (require (b/emit! (mut graph) 26 11 [first second])))))
+            (3 (let [first (require (b/emit! (mut graph) 92 11 [control p]))
+                     second (require (b/emit! (mut graph) 92 11 [first p8]))]
+                 (set! control second)
+                 (set! value (require (b/emit! (mut graph) 26 11 [first second])))))
+            (4 (set! control (require (b/emit! (mut graph) 92 11 [control p]))))
+            (5 (let [first (require (b/emit! (mut graph) 94 0 [control p n]))]
+                 (set! control (require (b/emit! (mut graph) 93 0 [first p next-n])))))
+            (6 (let [first (require (b/emit! (mut graph) 94 0 [control p n]))]
+                 (set! control (require (b/emit! (mut graph) 94 0 [first p next-n])))))
+            (7 (let [first (require (b/emit! (mut graph) 94 0 [control p n]))]
+                 (set! control (require (b/emit! (mut graph) 94 0 [first p8 next-n])))))
+            (8 (let [first (require (b/emit! (mut graph) 94 0 [control p n]))
+                     second (require (b/emit! (mut graph) 92 11 [first p]))]
+                 (set! control second) (set! value second)))
+            (9 (let [first (require (b/emit! (mut graph) 93 0 [control p n]))
+                     second (require (b/emit! (mut graph) 92 11 [first p]))]
+                 (set! control (require (b/emit! (mut graph) 93 0 [second p next-n])))
+                 (set! value second)))
+            (10 (let [first (require (b/emit! (mut graph) 92 11 [control p]))
+                      stored (require (b/emit! (mut graph) 94 0 [first q n]))
+                      second (require (b/emit! (mut graph) 92 11 [stored p]))]
+                  (set! control second)
+                  (set! value (require (b/emit! (mut graph) 26 11 [first second])))))
+            (14 (let [first (require (b/emit! (mut graph) 93 0 [control p n]))]
+                  (set! control (require (b/emit! (mut graph) 94 0 [first p next-n])))))
+            (15 (let [first (require (b/emit! (mut graph) 92 11 [control p]))
+                      second (require (b/emit! (mut graph) 91 11 [first p]))]
+                  (set! control second)
+                  (set! value (require (b/emit! (mut graph) 26 11 [first second])))))
+            (_ (panic "shape {}" shape)))
+          ; An ordinary load after the stores makes the memory passes
+          ; (forwarding, promotion, dead stores) run on the store shapes.
+          (when (or (= shape 5) (= shape 6) (= shape 7) (= shape 14))
+            (set! control (require (b/emit! (mut graph) 91 11 [control q])))
+            (set! value control))
+          (push! (mut roots) (require (b/emit! (mut graph) 120 11 [control value (: 0 i32)])))))
+    (Fixture :graph graph :roots roots)))
+
+(defn expect [(shape i32) (label (slice u8)) (got i64) (want i64)] (-> void)
+  (unless (= got want) (panic "shape {}: {} is {}, expected {}" shape label got want)))
+
+(defn check-census [(shape i32) (c Census)] (-> void)
+  (let [loads (match shape (0 1) (1 1) (2 2) (3 2) (4 1) (5 1) (6 1) (7 1) (8 1) (9 1) (10 2) (11 1) (14 1) (15 2)
+                (_ 0))
+        stores (match shape (5 2) (6 2) (7 2) (8 1) (9 2) (10 1) (12 1) (13 1) (14 2) (_ 0))]
+    (expect shape "loads" (.loads c) loads)
+    (expect shape "stores" (.stores c) stores)
+    (expect shape "paired accesses" (.pairs c) 0)
+    (expect shape "loads in a loop" (.loop-loads c) (if (or (= shape 0) (= shape 1)) 1 0))
+    (expect shape "stores in a loop" (.loop-stores c) (if (= shape 13) 1 0))))
+
+(defn run [(shape i32) (function (fnptr (cc/C) [(ptr u64) (ptr u64) u64] u64))] (-> void)
+  (for n [(: 0 u64) 1 2 5 100]
+    (let [(mut cells) [(: 17 u64) 1000]
+          (mut other) [(: 40 u64) 50]
+          p (primitive/cast (ptr u64) (mut cells))
+          q (primitive/cast (ptr u64) (mut other))
+          null (primitive/cast (ptr u64) 0)
+          got (cond (= shape 10) (function p p n)
+                    (and (or (= shape 11) (= shape 12)) (= n 0)) (function null null n)
+                    :else (function p q n))
+          want (match shape
+                 (0 (* n 17)) (1 (* n 17)) (2 34) (3 1017) (4 n) (5 40) (6 40) (7 40)
+                 (8 n) (9 n) (10 (+ 17 n)) (11 (if (= n 0) 7 17)) (12 (if (= n 0) 0 1))
+                 (13 n) (14 40) (15 34) (_ (panic "shape")))
+          first (match shape
+                  (5 (+ n 1)) (6 (+ n 1)) (7 n) (8 n) (9 (+ n 1)) (10 n)
+                  (12 (if (= n 0) 17 n)) (13 (if (= n 0) 17 (- n 1))) (14 (+ n 1)) (_ 17))
+          second (if (= shape 7) (+ n 1) 1000)]
+      (unless (= got want) (panic "shape {} n {}: returned {}, expected {}" shape n got want))
+      (unless (and (= (get cells 0) first) (= (get cells 1) second))
+        (panic "shape {} n {}: memory is {} {}, expected {} {}"
+               shape n (get cells 0) (get cells 1) first second))
+      (unless (and (= (get other 0) 40) (= (get other 1) 50))
+        (panic "shape {} n {}: unrelated memory changed" shape n)))))
+
+(defn everything [] (-> private/Context)
+  (private/with-strength
+    (private/with-hoist-loads
+      (private/with-if-convert
+        (private/with-global-loads
+          (private/with-regional
+            (private/with-recolor
+              (private/with-induction
+                (private/with-branch-facts
+                  (private/with-rotate
+                    (private/with-predict
+                      (private/with-frame-split
+                        (private/with-loop-evict
+                          (private/with-loop-reloads
+                            (private/with-prune-default
+                              (private/with-shrink-wrap (private/no-context) true)
+                              true)
+                            true)
+                          true)
+                        true)
+                      true)
+                    true)
+                  true)
+                true)
+              true)
+            true)
+          true)
+        true)
+      true)
+    true))
+
+(defn case [(shape i32) (level i32) (context private/Context) (a (dyn Allocator))] (-> void)
+  (let [(mut f) (build shape a)]
+    (match (compile/image-with-private (.graph f) 1 (slice (.roots f)) "_va_entry"
+             (options/Options :level level) a context)
+      (Err [message] (panic "compile shape {} level {}: {}" shape level message))
+      (Ok [code]
+        (let [(mut code) code]
+          (check-census shape (census (.text code)))
+          (match (link/compose [code] a)
+            (Err [message] (panic "compose: {}" message))
+            (Ok [module]
+              (let [(mut module) module]
+                (match (jit/map-image (.image module) a)
+                  (Err [message] (panic "map: {}" message))
+                  (Ok [loaded]
+                    (let [(mut loaded) loaded
+                          index (match (image/find-symbol (.image module) "_va_entry")
+                                  (Some [id] id) (None [] (panic "symbol")))]
+                      (run shape (primitive/cast (fnptr (cc/C) [(ptr u64) (ptr u64) u64] u64)
+                                   (primitive/cast (ptr u8)
+                                                   (get (.addresses loaded) (cast i64 index)))))
+                      (jit/release-image! (mut loaded)))))
+                (link/release! (mut module)))))
+          (image/release! (mut code)))))
+    (g/release! (mut (.graph f))) (free! (mut (.roots f)))))
+
+(defn main [] (-> i64)
+  (let [a (malloc-allocator) (mut cases) 0]
+    (for [shape 0 16]
+      (for level [(: 1 i32) 2 3]
+        (case (cast i32 shape) level (private/no-context) a)
+        (case (cast i32 shape) level (everything) a)
+        (set! cases (+ cases 2))))
+    (println "volatile access: {} cases" cases)
+    0))

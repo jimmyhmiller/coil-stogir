@@ -1,0 +1,350 @@
+(module stogir.tests.tail-split)
+;;; Calls in tail position that reach the RETURN through a join (tail-split),
+;;; with stack arguments and with a two-register aggregate result. Every
+;;; function calls itself through a pointer ten million levels deep, so a call
+;;; that is not a jump overflows the stack; the text must also hold no BL/BLR.
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.call-results" :as results)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(const DEPTH 10000000)
+
+(defstruct Pair [(low i64) (high i64)])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn word [(text (ArrayList u8)) (at i64)] (-> u32)
+  (| (cast u32 (get text at))
+     (<< (cast u32 (get text (+ at 1))) 8)
+     (<< (cast u32 (get text (+ at 2))) 16)
+     (<< (cast u32 (get text (+ at 3))) 24)))
+
+;;; BL or BLR anywhere in the text.
+(defn links [(text (ArrayList u8))] (-> i64)
+  (let [(mut count) 0 (mut at) (: 0 i64)]
+    (while (< (+ at 3) (len text))
+      (let [w (word text at)]
+        (when (or (= (& w (: 0xFC000000 u32)) (: 0x94000000 u32))
+                  (= (& w (: 0xFFFFFC1F u32)) (: 0xD63F0000 u32)))
+          (set! count (+ count 1))))
+      (set! at (+ at 4)))
+    count))
+
+(defn declare! [(graph (mut g/Graph)) (result u8) (parameters (slice u8))] (-> i32)
+  (match (calls/create 0 result parameters (malloc-allocator))
+    (Err [e] (panic "{}" e))
+    (Ok [owned]
+        (let [(mut prototype) owned
+              id (require (calls/function! (mut graph) prototype (malloc-allocator)))]
+          (calls/release! (mut prototype))
+          id))))
+
+(defn call! [(graph (mut g/Graph)) (result u8) (parameters (slice u8)) (control i32)
+             (target i32) (arguments (slice i32))] (-> i32)
+  (match (calls/create 0 result parameters (malloc-allocator))
+    (Err [e] (panic "{}" e))
+    (Ok [owned]
+        (let [(mut prototype) owned
+              call (require (calls/emit! (mut graph) prototype control target arguments
+                                         (malloc-allocator)))]
+          (calls/release! (mut prototype))
+          call))))
+
+;;; f(self, n, acc): n = 0 returns acc; odd n calls self(n-1, acc+1); even n
+;;; calls self(n-1, acc+2). One RETURN reads a PHI of the three paths, so two
+;;; of the three inputs are calls in tail position and the join dissolves.
+;;; NESTED: the two calls first meet in an inner join of their own (a PHI and
+;;; an END, as an expanded callee's return leaves it), which disappears.
+(defn scalar [(level i32) (nested bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut failures) 0
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        self (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        n (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        acc (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        two (require (b/scalar-constant! (mut graph) 11 2 8))
+        _ (declare! (mut graph) 11 [(: 6 u8) 11 11])
+        done (require (b/emit! (mut graph) 14 1 [n zero]))
+        split (require (b/emit! (mut graph) 116 0 [start done]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        low (require (b/emit! (mut graph) 47 11 [n one]))
+        odd (require (b/emit! (mut graph) 15 1 [low zero]))
+        split2 (require (b/emit! (mut graph) 116 0 [no odd]))
+        yes2 (require (b/emit! (mut graph) 107 0 [split2 (: 0 i32)]))
+        no2 (require (b/emit! (mut graph) 108 0 [split2 (: 0 i32)]))
+        less (require (b/emit! (mut graph) 27 11 [n one]))
+        plus1 (require (b/emit! (mut graph) 26 11 [acc one]))
+        plus2 (require (b/emit! (mut graph) 26 11 [acc two]))
+        call1 (call! (mut graph) 11 [(: 6 u8) 11 11] yes2 self [self less plus1])
+        call2 (call! (mut graph) 11 [(: 6 u8) 11 11] no2 self [self less plus2])
+        e0 (require (b/emit! (mut graph) 114 0 [yes]))
+        e1 (require (b/emit! (mut graph) 114 0 [call1]))
+        e2 (require (b/emit! (mut graph) 114 0 [call2]))
+        inner (if nested (require (b/emit! (mut graph) 112 0 [e1 e2])) 0)
+        inner-phi (if nested (require (b/emit! (mut graph) 67 11 [inner call1 call2])) 0)
+        e3 (if nested (require (b/emit! (mut graph) 114 0 [inner])) 0)
+        merge (if nested
+                  (require (b/emit! (mut graph) 112 0 [e3 e0]))
+                  (require (b/emit! (mut graph) 112 0 [e1 e0 e2])))
+        phi (if nested
+                (require (b/emit! (mut graph) 67 11 [merge inner-phi acc]))
+                (require (b/emit! (mut graph) 67 11 [merge call1 acc call2])))
+        ret (require (b/emit! (mut graph) 120 11 [merge phi (: 0 i32)]))]
+    (match (compile/image-with-options graph start [ret] "_tail_split_scalar"
+                                       (options/Options :level level) a)
+      (Err [e] (panic "{}" e))
+      (Ok [value]
+          (let [(mut code) value]
+            (when (!= (links (.text code)) 0)
+              (println "scalar level {}: {} linking calls remain" level (links (.text code)))
+              (set! failures (+ failures 1)))
+            (match (jit/map-image code a)
+              (Err [e] (panic "{}" e))
+              (Ok [mapped]
+                  (let [(mut loaded) mapped
+                        base (.base (.memory loaded))
+                        f (p/cast (fnptr (cc/C) [(ptr u8) i64 i64] i64) base)]
+                    (for depth [(: 0 i64) 1 2 7 DEPTH]
+                      (let [; n runs from depth down to 1: half of them, rounded up, are odd.
+                            odd-steps (/ (+ depth 1) 2)
+                            expected (+ 5 odd-steps (* 2 (- depth odd-steps)))]
+                        (when (!= (f (p/cast (ptr u8) base) depth 5) expected)
+                          (println "scalar level {} depth {}: wrong result" level depth)
+                          (set! failures (+ failures 1)))))
+                    (jit/release-image! (mut loaded)))))
+            (image/release! (mut code)))))
+    (g/release! (mut graph))
+    failures))
+
+;;; g(self, n, a1..a9): three arguments on the stack. n = 0 returns a1, n = -1
+;;; returns a9, otherwise self(n-1, a9, a1, .., a7, a8+1): every stack argument
+;;; moves, one of them from a register and two from other stack slots. Two
+;;; plain paths remain, so the join shrinks and keeps its RETURN.
+(defn stack [(level i32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut failures) 0
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        self (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        n (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        (mut xs) (ArrayList::new [i32] a)
+        types [(: 6 u8) 11 11 11 11 11 11 11 11 11 11]
+        _ (do (for [i 0 9]
+                (push! (mut xs)
+                       (require (b/emit! (mut graph) 71 11 [start (: 0 i32) (cast i32 (+ i 2))]))))
+              0)
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        minus (require (b/scalar-constant! (mut graph) 11 (p/cast u64 (: -1 i64)) 8))
+        _ (declare! (mut graph) 11 types)
+        done (require (b/emit! (mut graph) 14 1 [n zero]))
+        split (require (b/emit! (mut graph) 116 0 [start done]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        never (require (b/emit! (mut graph) 14 1 [n minus]))
+        split2 (require (b/emit! (mut graph) 116 0 [no never]))
+        yes2 (require (b/emit! (mut graph) 107 0 [split2 (: 0 i32)]))
+        no2 (require (b/emit! (mut graph) 108 0 [split2 (: 0 i32)]))
+        less (require (b/emit! (mut graph) 27 11 [n one]))
+        bumped (require (b/emit! (mut graph) 26 11 [(get xs 7) one]))
+        call (call! (mut graph) 11 types no2 self
+                    [self less (get xs 8) (get xs 0) (get xs 1) (get xs 2) (get xs 3)
+                     (get xs 4) (get xs 5) (get xs 6) bumped])
+        e0 (require (b/emit! (mut graph) 114 0 [yes]))
+        e1 (require (b/emit! (mut graph) 114 0 [yes2]))
+        e2 (require (b/emit! (mut graph) 114 0 [call]))
+        merge (require (b/emit! (mut graph) 112 0 [e0 e2 e1]))
+        phi (require (b/emit! (mut graph) 67 11 [merge (get xs 0) call (get xs 8)]))
+        ret (require (b/emit! (mut graph) 120 11 [merge phi (: 0 i32)]))]
+    (match (compile/image-with-options graph start [ret] "_tail_split_stack"
+                                       (options/Options :level level) a)
+      (Err [e] (panic "{}" e))
+      (Ok [value]
+          (let [(mut code) value]
+            (when (!= (links (.text code)) 0)
+              (println "stack level {}: {} linking calls remain" level (links (.text code)))
+              (set! failures (+ failures 1)))
+            (match (jit/map-image code a)
+              (Err [e] (panic "{}" e))
+              (Ok [mapped]
+                  (let [(mut loaded) mapped
+                        base (.base (.memory loaded))
+                        f (p/cast (fnptr (cc/C) [(ptr u8) i64 i64 i64 i64 i64 i64 i64 i64 i64 i64] i64)
+                                  base)]
+                    (for depth [(: 0 i64) 1 2 9 10 (+ DEPTH 3)]
+                      (let [(mut v) [(: 11 i64) 22 33 44 55 66 77 88 99]]
+                        (for [step 0 depth]
+                          (let [last (get v 8)
+                                bumped (+ (get v 7) 1)]
+                            (for [k 0 7] (set! (mut v) (- 7 k) (get v (- 6 k))))
+                            (set! (mut v) 0 last)
+                            (set! (mut v) 8 bumped)))
+                        (when (!= (f (p/cast (ptr u8) base) depth 11 22 33 44 55 66 77 88 99) (get v 0))
+                          (println "stack level {} depth {}: wrong result" level depth)
+                          (set! failures (+ failures 1)))))
+                    (when (!= (f (p/cast (ptr u8) base) -1 11 22 33 44 55 66 77 88 99) 99)
+                      (println "stack level {}: wrong plain path" level)
+                      (set! failures (+ failures 1)))
+                    (jit/release-image! (mut loaded)))))
+            (image/release! (mut code)))))
+    (free! (mut xs))
+    (g/release! (mut graph))
+    failures))
+
+(defn leaf :cc (cc/C) [(x i64)] (-> i64) (+ x 7))
+
+;;; h(self, leaf, n, acc): n = 0 calls leaf(acc), otherwise self(n-1, acc+3).
+;;; Every path into the RETURN ends in a call, so the RETURN itself takes one.
+(defn all-calls [(level i32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut failures) 0
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        self (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        n (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        acc (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 3]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        three (require (b/scalar-constant! (mut graph) 11 3 8))
+        _ (declare! (mut graph) 11 [(: 6 u8) 6 11 11])
+        done (require (b/emit! (mut graph) 14 1 [n zero]))
+        split (require (b/emit! (mut graph) 116 0 [start done]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        less (require (b/emit! (mut graph) 27 11 [n one]))
+        more (require (b/emit! (mut graph) 26 11 [acc three]))
+        call1 (call! (mut graph) 11 [(: 11 u8)] yes target [acc])
+        call2 (call! (mut graph) 11 [(: 6 u8) 6 11 11] no self [self target less more])
+        e1 (require (b/emit! (mut graph) 114 0 [call1]))
+        e2 (require (b/emit! (mut graph) 114 0 [call2]))
+        merge (require (b/emit! (mut graph) 112 0 [e1 e2]))
+        phi (require (b/emit! (mut graph) 67 11 [merge call1 call2]))
+        ret (require (b/emit! (mut graph) 120 11 [merge phi (: 0 i32)]))]
+    (match (compile/image-with-options graph start [ret] "_tail_split_all"
+                                       (options/Options :level level) a)
+      (Err [e] (panic "{}" e))
+      (Ok [value]
+          (let [(mut code) value]
+            (when (!= (links (.text code)) 0)
+              (println "all-calls level {}: {} linking calls remain" level (links (.text code)))
+              (set! failures (+ failures 1)))
+            (match (jit/map-image code a)
+              (Err [e] (panic "{}" e))
+              (Ok [mapped]
+                  (let [(mut loaded) mapped
+                        base (.base (.memory loaded))
+                        f (p/cast (fnptr (cc/C) [(ptr u8) (ptr u8) i64 i64] i64) base)]
+                    (for depth [(: 0 i64) 1 5 DEPTH]
+                      (when (!= (f (p/cast (ptr u8) base) (p/cast (ptr u8) (fnptr-of leaf)) depth 2)
+                                (+ 9 (* 3 depth)))
+                        (println "all-calls level {} depth {}: wrong result" level depth)
+                        (set! failures (+ failures 1))))
+                    (jit/release-image! (mut loaded)))))
+            (image/release! (mut code)))))
+    (g/release! (mut graph))
+    failures))
+
+;;; k(self, n, x, y, c1..c7) returning two words in x0/x1 through the result
+;;; place PARAM0, with two arguments on the stack. n = 0 stores (x + c7, y);
+;;; otherwise the call forwards the place: self(n-1, y, x+1, c7, c1..c6).
+;;; A void RETURN follows the join of both paths.
+(defn pair [(level i32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut failures) 0
+        types [(: 6 u8) 6 11 11 11 11 11 11 11 11 11 11]
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        place (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        self (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        n (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 3]))
+        y (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 4]))
+        (mut cs) (ArrayList::new [i32] a)
+        _ (do (for [i 0 7]
+                (push! (mut cs)
+                       (require (b/emit! (mut graph) 71 11 [start (: 0 i32) (cast i32 (+ i 5))]))))
+              0)
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        eight (require (b/scalar-constant! (mut graph) 5 8 8))
+        prototype (match (calls/create-result 0 types [] (results/pieces 11 2) a)
+                    (Err [e] (panic "{}" e))
+                    (Ok [owned] owned))
+        _ (require (calls/function! (mut graph) prototype a))
+        done (require (b/emit! (mut graph) 14 1 [n zero]))
+        split (require (b/emit! (mut graph) 116 0 [start done]))
+        yes (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        sum (require (b/emit! (mut graph) 26 11 [x (get cs 6)]))
+        store1 (require (b/emit! (mut graph) 93 0 [yes place sum]))
+        second (require (b/emit! (mut graph) 26 6 [place eight]))
+        store2 (require (b/emit! (mut graph) 93 0 [store1 second y]))
+        less (require (b/emit! (mut graph) 27 11 [n one]))
+        more (require (b/emit! (mut graph) 26 11 [x one]))
+        call (require (calls/emit! (mut graph) prototype no self
+                                   [place self less y more (get cs 6) (get cs 0) (get cs 1)
+                                    (get cs 2) (get cs 3) (get cs 4) (get cs 5)]
+                                   a))
+        e1 (require (b/emit! (mut graph) 114 0 [store2]))
+        e2 (require (b/emit! (mut graph) 114 0 [call]))
+        merge (require (b/emit! (mut graph) 112 0 [e1 e2]))
+        ret (require (b/emit! (mut graph) 120 0 [merge (: 0 i32) (: 0 i32)]))
+        (mut prototype) prototype]
+    (calls/release! (mut prototype))
+    (match (compile/image-with-options graph start [ret] "_tail_split_pair"
+                                       (options/Options :level level) a)
+      (Err [e] (panic "{}" e))
+      (Ok [value]
+          (let [(mut code) value]
+            (when (!= (links (.text code)) 0)
+              (println "pair level {}: {} linking calls remain" level (links (.text code)))
+              (set! failures (+ failures 1)))
+            (match (jit/map-image code a)
+              (Err [e] (panic "{}" e))
+              (Ok [mapped]
+                  (let [(mut loaded) mapped
+                        base (.base (.memory loaded))
+                        f (p/cast (fnptr (cc/C) [(ptr u8) i64 i64 i64 i64 i64 i64 i64 i64 i64 i64] Pair)
+                                  base)]
+                    (for depth [(: 0 i64) 1 2 7 8 (+ DEPTH 5)]
+                      (let [(mut vx) (: 100 i64) (mut vy) (: 200 i64)
+                            (mut c) [(: 1 i64) 2 3 4 5 6 7]]
+                        (for [step 0 depth]
+                          (let [nx vy ny (+ vx 1) last (get c 6)]
+                            (for [k 0 6] (set! (mut c) (- 6 k) (get c (- 5 k))))
+                            (set! (mut c) 0 last)
+                            (set! vx nx)
+                            (set! vy ny)))
+                        (let [got (f (p/cast (ptr u8) base) depth 100 200 1 2 3 4 5 6 7)]
+                          (when (or (!= (.low got) (+ vx (get c 6))) (!= (.high got) vy))
+                            (println "pair level {} depth {}: wrong result" level depth)
+                            (set! failures (+ failures 1))))))
+                    (jit/release-image! (mut loaded)))))
+            (image/release! (mut code)))))
+    (free! (mut cs))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for level [(: 1 i32) 2 3]
+      (set! failures (+ failures (scalar level false) (scalar level true) (stack level)
+                        (all-calls level) (pair level))))
+    (println "tail split: {} failures" failures)
+    (if (= failures 0) 0 1)))
