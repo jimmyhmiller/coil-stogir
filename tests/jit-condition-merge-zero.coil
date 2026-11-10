@@ -1,0 +1,164 @@
+(module stogir.tests.jit-condition-merge-zero)
+;;; Two IFs that reach one target through either condition or through both,
+;;; where one of them is a register branch: a zero test (CBZ/CBNZ), a sign test
+;;; or a single-bit test (TBZ/TBNZ). Shape 0 puts the register branch first,
+;;; before a comparison of another value with 7 or a register; shape 1 puts it
+;;; second, after a comparison with 5. Every pair is executed natively over
+;;; boundary values at both widths. Zero and sign tests merge in both
+;;; positions and bit tests in the first, using CCMP.
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn need [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn word [(text (ArrayList u8)) (at i64)] (-> u32)
+  (| (cast u32 (get text at))
+     (<< (cast u32 (get text (+ at 1))) 8)
+     (<< (cast u32 (get text (+ at 2))) 16)
+     (<< (cast u32 (get text (+ at 3))) 24)))
+
+;;; CCMP/CCMN words, either width and operand form.
+(defn conditional-compares [(text (ArrayList u8))] (-> i64)
+  (let [(mut found) (: 0 i64) (mut at) (: 0 i64)]
+    (while (< (+ at 3) (len text))
+      (when (= (& (word text at) (: 0x3FE00410 u32)) (: 0x3A400000 u32))
+        (set! found (+ found 1)))
+      (set! at (+ at 4)))
+    found))
+
+(defn wide? [(ty i32)] (-> bool) (= ty 11))
+
+(defn signed-of [(ty i32) (x u64)] (-> i64)
+  (if (wide? ty) (cast i64 x) (cast i64 (cast i32 (cast u32 x)))))
+
+(defn unsigned-of [(ty i32) (x u64)] (-> u64)
+  (if (wide? ty) x (& x 0xFFFFFFFF)))
+
+(defn truth [(opcode i32) (ty i32) (x u64) (y u64)] (-> bool)
+  (let [sx (signed-of ty x) sy (signed-of ty y) ux (unsigned-of ty x) uy (unsigned-of ty y)]
+    (cond (= opcode 14) (= ux uy) (= opcode 15) (!= ux uy)
+          (= opcode 16) (< sx sy) (= opcode 17) (>= sx sy)
+          (= opcode 18) (<= sx sy) (= opcode 19) (> sx sy)
+          (= opcode 20) (< ux uy) (= opcode 21) (>= ux uy)
+          (= opcode 22) (<= ux uy) (= opcode 23) (> ux uy)
+          :else false)))
+
+;;; Register tests 0..3 are x = 0, x != 0, x < 0, x >= 0; from 4 on, pairs of
+;;; (bit clear, bit set) for the bits below.
+(def bits [(: 0 u64) 5 31 32 63])
+
+(defn tests-of [(ty i32)] (-> i64) (if (wide? ty) 14 10))
+
+(defn zero-truth [(test i64) (ty i32) (x u64)] (-> bool)
+  (cond (= test 0) (= (unsigned-of ty x) 0)
+        (= test 1) (!= (unsigned-of ty x) 0)
+        (= test 2) (< (signed-of ty x) 0)
+        (= test 3) (>= (signed-of ty x) 0)
+        :else
+          (let [set? (!= (& (>> x (get bits (/ (- test 4) 2))) 1) 0)]
+            (if (= (% test 2) 0) (not set?) set?))))
+
+(defn zero-test! [(graph (mut g/Graph)) (test i64) (ty i32) (x i32)] (-> i32)
+  (let [zero (need (b/scalar-constant! (mut graph) ty 0 8))]
+    (cond (= test 0) (need (b/emit! (mut graph) 14 1 [x zero]))
+          (= test 1) (need (b/emit! (mut graph) 15 1 [x zero]))
+          (= test 2) (need (b/emit! (mut graph) 16 1 [x zero]))
+          (= test 3) (need (b/emit! (mut graph) 17 1 [x zero]))
+          :else
+            (let [mask (need (b/scalar-constant! (mut graph) ty
+                                                 (<< (: 1 u64) (get bits (/ (- test 4) 2))) 8))
+                  masked (need (b/emit! (mut graph) 47 ty [x mask]))]
+              (need (b/emit! (mut graph) (if (= (% test 2) 0) 14 15) 1 [masked zero]))))))
+
+(def values [(: 0 u64) 1 4 5 6 7 8 0x20 0x21 0x7FFFFFFF 0x80000000 0xFFFFFFFF 0x100000000
+             0x7FFFFFFFFFFFFFFF 0x8000000000000000 0xFFFFFFFFFFFFFFFF])
+
+(defstruct Tally [(merged i64) (answers i64) (failures i64)])
+
+;;; shape 0: (test of x) then (y OP 7) or (y OP z) when `register`.
+;;; shape 1: (x OP 5) then (test of y). Returns 11 when the combined condition
+;;; holds and 20 otherwise.
+(defn check [(ty i32) (shape i32) (test i64) (opcode i32) (register bool) (both bool)
+             (tally (mut Tally))] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        y (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 1]))
+        z (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 2]))
+        five (need (b/scalar-constant! (mut graph) ty 5 8))
+        seven (need (b/scalar-constant! (mut graph) ty 7 8))
+        k11 (need (b/scalar-constant! (mut graph) 5 11 8))
+        k20 (need (b/scalar-constant! (mut graph) 5 20 8))
+        c1 (if (= shape 0) (zero-test! (mut graph) test ty x)
+               (need (b/emit! (mut graph) opcode 1 [x five])))
+        if1 (need (b/emit! (mut graph) 116 0 [start c1]))
+        t1 (need (b/emit! (mut graph) 107 0 [if1 (: 0 i32)]))
+        f1 (need (b/emit! (mut graph) 108 0 [if1 (: 0 i32)]))
+        c2 (if (= shape 0) (need (b/emit! (mut graph) opcode 1 [y (if register z seven)]))
+               (zero-test! (mut graph) test ty y))
+        if2 (need (b/emit! (mut graph) 116 0 [(if both t1 f1) c2]))
+        t2 (need (b/emit! (mut graph) 107 0 [if2 (: 0 i32)]))
+        f2 (need (b/emit! (mut graph) 108 0 [if2 (: 0 i32)]))
+        e1 (need (b/emit! (mut graph) 114 0 [(if both f1 t1)]))
+        e2 (need (b/emit! (mut graph) 114 0 [(if both f2 t2)]))
+        meet (need (b/emit! (mut graph) 112 0 [e1 e2]))
+        r1 (need (b/emit! (mut graph) 120 5 [meet (if both k20 k11) (: 0 i32)]))
+        r2 (need (b/emit! (mut graph) 120 5 [(if both t2 f2) (if both k11 k20) r1]))
+        (mut roots) (ArrayList::new [i32] a)]
+    (push! (mut roots) r1) (push! (mut roots) r2)
+    (match (compile/image graph start (slice roots) "_condition_merge_zero" a)
+      (Err [e] (panic "condition-merge-zero {} {} {} {} {}: {}" ty shape test opcode both e))
+      (Ok [value]
+        (let [(mut code) value
+              merged (conditional-compares (.text code))]
+          (set! (.merged tally) (+ (.merged tally) merged))
+          ; Zero and sign tests merge in either position, bit tests when first.
+          (when (and (= merged 0) (or (= shape 0) (< test 4)))
+            (println "ty {} shape {} test {} op {} register {} both {}: no CCMP"
+                     ty shape test opcode register both)
+            (set! (.failures tally) (+ (.failures tally) 1)))
+          (match (jit/map-image code a)
+            (Err [e] (panic "{}" e))
+            (Ok [mapped]
+              (let [(mut loaded) mapped
+                    f (p/cast (fnptr (cc/C) [u64 u64 u64] u64) (.base (.memory loaded)))]
+                (for xv values
+                  (for yv values
+                    (for zv [(: 7 u64) 0xFFFFFFFFFFFFFFFF 0x80000000]
+                      (when (or (and register (= shape 0)) (= zv 7))
+                        (let [p1 (if (= shape 0) (zero-truth test ty xv) (truth opcode ty xv 5))
+                              p2 (if (= shape 0) (truth opcode ty yv (if register zv 7))
+                                     (zero-truth test ty yv))
+                              want (if (if both (and p1 p2) (or p1 p2)) (: 11 u64) 20)
+                              got (f xv yv zv)]
+                          (set! (.answers tally) (+ (.answers tally) 1))
+                          (when (!= got want)
+                            (println "ty {} shape {} test {} op {} register {} both {} x {:x} y {:x} z {:x}: got {} want {}"
+                                     ty shape test opcode register both xv yv zv got want)
+                            (set! (.failures tally) (+ (.failures tally) 1))))))))
+                (jit/release-image! (mut loaded)))))
+          (image/release! (mut code)))))
+    (free! (mut roots)) (g/release! (mut graph))))
+
+(defn main [] (-> i32)
+  (let [(mut tally) (Tally :merged 0 :answers 0 :failures 0)]
+    (for ty [(: 11 i32) 10]
+      (for [shape 0 2]
+        (for [test 0 (tests-of ty)]
+          (for [opcode 14 24]
+            (for both [false true]
+              (check ty (cast i32 shape) test (cast i32 opcode) false both (mut tally))
+              (when (= shape 0)
+                (check ty (cast i32 shape) test (cast i32 opcode) true both (mut tally))))))))
+    (println "merged zero conditions: {} CCMP, {} native answers, {} failures"
+             (.merged tally) (.answers tally) (.failures tally))
+    (if (= (.failures tally) 0) 0 1)))
