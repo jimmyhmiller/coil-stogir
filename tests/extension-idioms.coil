@@ -445,6 +445,68 @@
           (drop! (mut built)))))
     (g/release! (mut graph))))
 
+(def shift-types [(: 2 i32) 3 8 9])
+(def shift-counts-literal [(: 0 u64) 1 3 7 8 9 15 16 17])
+
+;;; The value a byte or halfword shift by a literal has: the count is taken
+;;; modulo the width and the result is extended to its type.
+(defn narrow-shift [(opcode i32) (ty i32) (source u64) (literal u64)] (-> u64)
+  (let [bits (if (or (= ty 2) (= ty 8)) (: 8 u64) 16)
+        count (& literal (- bits 1))
+        raw (cond (= opcode 49) (<< (zext source bits) count)
+                  (= opcode 50) (>> (zext source bits) count)
+                  :else (p/cast u64 (>> (p/cast i64 (sext source bits)) (p/cast i64 count))))]
+    (if (>= ty 8) (sext raw bits) (zext raw bits))))
+
+;;; Byte and halfword shifts by a literal are single bitfield moves; only an
+;;; arithmetic shift of an unsigned type keeps the general sequence.
+(defn narrow-literal-shifts [] (-> void)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        base (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        (mut chain) start
+        (mut sum) zero
+        (mut loads) (ArrayList::new [i32] a)
+        (mut bytes) (ArrayList::new [u8] a)]
+    (for [i 0 (len shift-types)]
+      (let [load (require (b/emit! (mut graph) 91 (get shift-types i)
+                                   [chain (address! (mut graph) base (cast u64 (* i 2)))]))]
+        (push! (mut loads) load)
+        (set! chain load)))
+    (for [i 0 (len shift-types)]
+      (for opcode [(: 49 i32) 50 51]
+        (for literal shift-counts-literal
+          (let [ty (get shift-types i)
+                count (require (b/scalar-constant! (mut graph) ty literal 8))
+                shifted (require (b/emit! (mut graph) opcode ty [(get loads i) count]))
+                wide (require (b/emit! (mut graph) (if (>= ty 8) 33 34) 5 [shifted]))]
+            (set! sum (mix! (mut graph) sum wide))))))
+    (let [ret (require (b/emit! (mut graph) 120 5 [chain sum (: 0 i32)]))]
+      (for level [(: 1 i32) 3]
+        (let [(mut built) (build graph start ret level)
+              f (p/cast (fnptr (cc/C) [(ptr u8)] u64) (.base (.memory (.mapped built))))]
+          ; LSLV, LSRV and ASRV W forms. Six nonzero reduced counts for a
+          ; byte and seven for a halfword keep the unsigned ASRV sequence.
+          (assert (= (words built (: 0xFFE0FC00 u32) (: 0x1AC02000 u32)) 0))
+          (assert (= (words built (: 0xFFE0FC00 u32) (: 0x1AC02400 u32)) 0))
+          (assert (= (words built (: 0xFFE0FC00 u32) (: 0x1AC02800 u32)) 13))
+          (for [seed 0 32]
+            (fill! (mut bytes) 8 seed)
+            (let [(mut expected) (: 0 u64)]
+              (for [i 0 (len shift-types)]
+                (let [ty (get shift-types i)
+                      source (bytes-at bytes (* i 2) (if (or (= ty 2) (= ty 8)) 1 2))]
+                  (for opcode [(: 49 i32) 50 51]
+                    (for literal shift-counts-literal
+                      (set! expected (mix expected (narrow-shift opcode ty source literal)))))))
+              (assert (= (f (.data bytes)) expected))))
+          (drop! (mut built)))))
+    (free! (mut loads))
+    (free! (mut bytes))
+    (g/release! (mut graph))))
+
 ;;; Extending the word view of a merged 64-bit value that is already that
 ;;; extension of its low word is the value itself. A merge with an arbitrary
 ;;; 64-bit input keeps both extensions.
@@ -514,6 +576,7 @@
 
 (defn main [] (-> i64)
   (extended-merges)
+  (narrow-literal-shifts)
   (narrow-and)
   (narrow-loads)
   (narrow-load-addresses)
