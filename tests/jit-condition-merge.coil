@@ -1,0 +1,140 @@
+(module stogir.tests.jit-condition-merge)
+;;; Two IFs that reach one target through either condition (a OP1 5 || b OP2 k)
+;;; or through both (a OP1 5 && b OP2 k), for every pair of integer comparison
+;;; opcodes at both widths, executed natively over boundary values. The second
+;;; comparison is against a literal a conditional comparison can hold (7), one
+;;; it cannot (100), or a register. Merged pairs use CCMP; a literal out of
+;;; range never does.
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn need [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn word [(text (ArrayList u8)) (at i64)] (-> u32)
+  (| (cast u32 (get text at))
+     (<< (cast u32 (get text (+ at 1))) 8)
+     (<< (cast u32 (get text (+ at 2))) 16)
+     (<< (cast u32 (get text (+ at 3))) 24)))
+
+;;; CCMP/CCMN words, either width and operand form.
+(defn conditional-compares [(text (ArrayList u8))] (-> i64)
+  (let [(mut found) (: 0 i64) (mut at) (: 0 i64)]
+    (while (< (+ at 3) (len text))
+      (when (= (& (word text at) (: 0x3FE00410 u32)) (: 0x3A400000 u32))
+        (set! found (+ found 1)))
+      (set! at (+ at 4)))
+    found))
+
+(defn wide? [(ty i32)] (-> bool) (= ty 11))
+
+(defn signed-of [(ty i32) (x u64)] (-> i64)
+  (if (wide? ty) (cast i64 x) (cast i64 (cast i32 (cast u32 x)))))
+
+(defn unsigned-of [(ty i32) (x u64)] (-> u64)
+  (if (wide? ty) x (& x 0xFFFFFFFF)))
+
+(defn truth [(opcode i32) (ty i32) (x u64) (y u64)] (-> bool)
+  (let [sx (signed-of ty x) sy (signed-of ty y) ux (unsigned-of ty x) uy (unsigned-of ty y)]
+    (cond (= opcode 14) (= ux uy) (= opcode 15) (!= ux uy)
+          (= opcode 16) (< sx sy) (= opcode 17) (>= sx sy)
+          (= opcode 18) (<= sx sy) (= opcode 19) (> sx sy)
+          (= opcode 20) (< ux uy) (= opcode 21) (>= ux uy)
+          (= opcode 22) (<= ux uy) (= opcode 23) (> ux uy)
+          :else false)))
+
+(def firsts [(: 0 u64) 4 5 6 0x7FFFFFFF 0x80000000 0xFFFFFFFF
+             0x7FFFFFFFFFFFFFFF 0x8000000000000000 0xFFFFFFFFFFFFFFFF])
+(def seconds [(: 0 u64) 6 7 8 99 100 101 0x7FFFFFFF 0x80000000 0xFFFFFFFF
+              0x7FFFFFFFFFFFFFFF 0x8000000000000000 0xFFFFFFFFFFFFFFFF])
+
+(defstruct Tally [(merged i64) (answers i64) (failures i64)])
+
+;;; kind 0: b OP2 7; kind 1: b OP2 100; kind 2: b OP2 c (third parameter).
+;;; `both` selects the conjunction. The function returns 11 when the combined
+;;; condition holds and 20 otherwise.
+(defn check [(ty i32) (first i32) (second i32) (kind i32) (both bool) (tally (mut Tally))]
+  (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        y (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 1]))
+        z (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 2]))
+        five (need (b/scalar-constant! (mut graph) ty 5 8))
+        bound (if (= kind 2) z
+                  (need (b/scalar-constant! (mut graph) ty (if (= kind 0) 7 100) 8)))
+        k11 (need (b/scalar-constant! (mut graph) 5 11 8))
+        k20 (need (b/scalar-constant! (mut graph) 5 20 8))
+        c1 (need (b/emit! (mut graph) first 1 [x five]))
+        if1 (need (b/emit! (mut graph) 116 0 [start c1]))
+        t1 (need (b/emit! (mut graph) 107 0 [if1 (: 0 i32)]))
+        f1 (need (b/emit! (mut graph) 108 0 [if1 (: 0 i32)]))
+        c2 (need (b/emit! (mut graph) second 1 [y bound]))
+        if2 (need (b/emit! (mut graph) 116 0 [(if both t1 f1) c2]))
+        t2 (need (b/emit! (mut graph) 107 0 [if2 (: 0 i32)]))
+        f2 (need (b/emit! (mut graph) 108 0 [if2 (: 0 i32)]))
+        ; The two paths that share an outcome meet in one block.
+        e1 (need (b/emit! (mut graph) 114 0 [(if both f1 t1)]))
+        e2 (need (b/emit! (mut graph) 114 0 [(if both f2 t2)]))
+        meet (need (b/emit! (mut graph) 112 0 [e1 e2]))
+        r1 (need (b/emit! (mut graph) 120 5 [meet (if both k20 k11) (: 0 i32)]))
+        r2 (need (b/emit! (mut graph) 120 5 [(if both t2 f2) (if both k11 k20) r1]))
+        (mut roots) (ArrayList::new [i32] a)]
+    (push! (mut roots) r1) (push! (mut roots) r2)
+    (match (compile/image graph start (slice roots) "_condition_merge" a)
+      (Err [e] (panic "condition-merge {} {} {} {} {}: {}" ty first second kind both e))
+      (Ok [value]
+        (let [(mut code) value
+              merged (conditional-compares (.text code))]
+          (set! (.merged tally) (+ (.merged tally) merged))
+          (when (and (= kind 1) (!= merged 0))
+            (println "ty {} ops {} {} both {}: CCMP with a literal out of range" ty first second both)
+            (set! (.failures tally) (+ (.failures tally) 1)))
+          (match (jit/map-image code a)
+            (Err [e] (panic "{}" e))
+            (Ok [mapped]
+              (let [(mut loaded) mapped
+                    f (p/cast (fnptr (cc/C) [u64 u64 u64] u64) (.base (.memory loaded)))]
+                (for xv firsts
+                  (for yv seconds
+                    (for zv [(: 7 u64) 0xFFFFFFFFFFFFFFFF 0x80000000]
+                      (when (or (= kind 2) (= zv 7))
+                        (let [p1 (truth first ty xv 5)
+                              p2 (truth second ty yv (cond (= kind 0) 7 (= kind 1) 100 :else zv))
+                              want (if (if both (and p1 p2) (or p1 p2)) (: 11 u64) 20)
+                              got (f xv yv zv)]
+                          (set! (.answers tally) (+ (.answers tally) 1))
+                          (when (!= got want)
+                            (println "ty {} ops {} {} kind {} both {} x {:x} y {:x} z {:x}: got {} want {}"
+                                     ty first second kind both xv yv zv got want)
+                            (set! (.failures tally) (+ (.failures tally) 1))))))))
+                (jit/release-image! (mut loaded)))))
+          (image/release! (mut code)))))
+    (free! (mut roots)) (g/release! (mut graph))))
+
+(defn main [] (-> i32)
+  (let [(mut failures) (: 0 i64) (mut answers) (: 0 i64)]
+    (for ty [(: 11 i32) 10]
+      (for [kind 0 3]
+        (for both [false true]
+          (let [(mut tally) (Tally :merged 0 :answers 0 :failures 0)]
+            (for [first 14 24]
+              (for [second 14 24]
+                (check ty (cast i32 first) (cast i32 second) (cast i32 kind) both (mut tally))))
+            ; Every opcode pair of a form that can merge does.
+            (when (and (!= kind 1) (< (.merged tally) 100))
+              (println "ty {} kind {} both {}: only {} of 100 pairs merged" ty kind both
+                       (.merged tally))
+              (set! failures (+ failures 1)))
+            (set! failures (+ failures (.failures tally)))
+            (set! answers (+ answers (.answers tally)))))))
+    (println "merged conditions: {} native answers, {} failures" answers failures)
+    (if (= failures 0) 0 1)))

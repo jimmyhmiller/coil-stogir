@@ -7,7 +7,7 @@
 (import "stogir.a64.encode" :as e)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [malloc-allocator])
-(import "coil.result" :use [Result Ok Err])
+(import "coil.result" :use [Ok Err])
 
 (defn relative-check [] (-> i64)
   (let [allocator (malloc-allocator)
@@ -256,6 +256,78 @@
       (free! (mut relatives)))
     failures))
 
+;;; TBZ/TBNZ conditions: exact near encodings for a bit in each half of the
+;;; register, XOR-1 inversion, the family's bounds, the last displacement in
+;;; reach left alone and the first one past it expanded.
+(defn bit-branches [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut failures) 0]
+    (let [(mut output) (ArrayList::new [u8] a)
+          (mut labels) (ArrayList::new [i64] a)
+          (mut branches) (ArrayList::new [f/Branch] a)]
+      (for [i 0 4] (b/append32! (mut output) 0xD503201F))
+      (push! (mut labels) 8)
+      (push! (mut labels) 0)
+      (push! (mut branches)
+             (f/Branch :offset 0 :label 0 :condition (e/bit-condition 5 63 false) :link false))
+      (push! (mut branches)
+             (f/Branch :offset 12 :label 1 :condition (e/bit-condition 3 31 true) :link false))
+      (match (f/apply! (mut output) labels branches)
+        (Err [_] (set! failures (+ failures 1)))
+        (Ok [count] (when (!= count 2) (set! failures (+ failures 1)))))
+      ; TBZ x5, #63, +8 and TBNZ w3, #31, -12.
+      (when (or (!= (read/read32 output 0) 0xB6F80045)
+                (!= (read/read32 output 12) 0x37FFFFA3))
+        (set! failures (+ failures 1)))
+      (when (or (!= (^ (e/bit-condition 7 0 false) 1) (e/bit-condition 7 0 true))
+                (e/branch-condition? 255)
+                (not (e/branch-condition? (e/bit-condition 0 0 false)))
+                (not (e/branch-condition? (e/bit-condition 30 63 true)))
+                ; Register 31 is not a test-bit operand.
+                (e/branch-condition? 318)
+                (e/branch-condition? 4352)
+                (not (e/predicate-reach? (e/bit-condition 1 2 false) 32764))
+                (e/predicate-reach? (e/bit-condition 1 2 false) 32768)
+                (not (e/predicate-reach? (e/bit-condition 1 2 false) -32768))
+                (e/predicate-reach? (e/bit-condition 1 2 false) -32772)
+                (not (e/predicate-reach? 0 32768)))
+        (set! failures (+ failures 1)))
+      (free! (mut output))
+      (free! (mut labels))
+      (free! (mut branches)))
+    (for far [false true]
+      (let [(mut output) (code/create a)
+            (mut labels) (ArrayList::new [i64] a)
+            (mut branches) (ArrayList::new [f/Branch] a)
+            (mut relatives) (ArrayList::new [f/Relative] a)
+            target (if far (: 32768 i64) 32764)]
+        (while (< (len (.text output)) (+ target 4)) (b/append32! (mut (.text output)) 0))
+        (push! (mut labels) target)
+        (push! (mut branches)
+               (f/Branch :offset 0 :label 0 :condition (e/bit-condition 5 63 false) :link false))
+        (match (f/relax! (mut output) (mut labels) (mut branches) (mut relatives))
+          (Err [_] (set! failures (+ failures 1)))
+          (Ok [count] (when (!= count (if far 1 0)) (set! failures (+ failures 1)))))
+        (match (f/apply! (mut (.text output)) labels branches)
+          (Err [_] (set! failures (+ failures 1)))
+          (Ok [_] 0))
+        (if far
+            ; Inverse TBNZ x5, #63 over an unconditional B.
+            (when (or (!= (read/read32 (.text output) 0) 0xB7F80045)
+                      (!= (get labels 0) (+ target 4))
+                      (!= (read/read32 (.text output) 4)
+                          (| (: 0x14000000 u32) (cast u32 (/ target 4)))))
+              (set! failures (+ failures 1)))
+            ; TBZ x5, #63, +32764.
+            (when (or (!= (read/read32 (.text output) 0) 0xB6FBFFE5)
+                      (!= (get labels 0) target))
+              (set! failures (+ failures 1))))
+        (code/release! (mut output))
+        (free! (mut labels))
+        (free! (mut branches))
+        (free! (mut relatives))))
+    failures))
+
 (defn alignment-only [(invalid bool)] (-> i64)
   (let [a (malloc-allocator)
         (mut output) (code/create a)
@@ -323,79 +395,6 @@
     (free! (mut labels))
     (free! (mut branches))
     (free! (mut relatives))
-    failures))
-
-(defn expected [(word (Result u32 (slice u8)))] (-> u32)
-  (match word (Ok [value] value) (Err [message] (panic "{}" message))))
-
-;;; TBZ/TBNZ conditions. Within +/-32 KiB the branch is one word. Beyond it the
-;;; word becomes TST and B.cond, and beyond B.cond's reach TST, the inverse
-;;; B.cond over a B. backward places the target before the branch.
-(defn bit-branch [(distance i64) (backward bool) (nonzero bool) (level i32)] (-> i64)
-  (let [a (malloc-allocator)
-        (mut output) (code/create a)
-        (mut labels) (ArrayList::new [i64] a)
-        (mut branches) (ArrayList::new [f/Branch] a)
-        (mut relatives) (ArrayList::new [f/Relative] a)
-        offset (if backward distance 0)
-        target (if backward 0 distance)
-        condition (e/bit-condition 5 40 nonzero)
-        grown (* 4 (cast i64 level))
-        ; A forward target moves with the inserted words; a backward one stays.
-        moved (if backward target (+ target grown))
-        site (+ offset grown)
-        (mut failures) 0]
-    (while (< (len (.text output)) (+ distance 8)) (b/append32! (mut (.text output)) 0xD503201F))
-    (push! (mut labels) target)
-    (push! (mut branches) (f/Branch :offset offset :label 0 :condition condition :link false))
-    (match (f/relax! (mut output) (mut labels) (mut branches) (mut relatives))
-      (Err [_] (set! failures (+ failures 1)))
-      (Ok [count] (when (!= count (if (= level 0) 0 1)) (set! failures (+ failures 1)))))
-    (match (f/apply! (mut (.text output)) labels branches)
-      (Err [_] (set! failures (+ failures 1)))
-      (Ok [_] 0))
-    (let [text (.text output)
-          delta (- moved site)
-          flags (if nonzero (: 1 i32) 0)]
-      (when (or (!= (len text) (+ distance 8 grown))
-                (!= (get labels 0) moved)
-                (!= (.offset (get branches 0)) site)
-                (!= (read/read32 text site)
-                    (expected (cond (= level 0) (e/test-branch condition delta)
-                                    (= level 1) (e/conditional-branch flags delta)
-                                    :else (e/branch false delta))))
-                (and (> level 0)
-                     (!= (read/read32 text offset) (expected (e/test-bit true 5 40))))
-                (and (= level 2)
-                     (!= (read/read32 text (+ offset 4))
-                         (expected (e/conditional-branch (^ flags 1) 8)))))
-        (set! failures (+ failures 1))))
-    (when (!= failures 0)
-      (println "bit branch distance={} backward={} nonzero={} level={}: size={} label={} site={}"
-               distance backward nonzero level (len (.text output)) (get labels 0)
-               (.offset (get branches 0))))
-    (code/release! (mut output))
-    (free! (mut labels))
-    (free! (mut branches))
-    (free! (mut relatives))
-    failures))
-
-(defn bit-branches [] (-> i64)
-  (let [(mut failures) 0]
-    (for nonzero [false true]
-      (set! failures
-            (+ failures
-               (bit-branch 8 false nonzero 0)
-               (bit-branch 32764 false nonzero 0)
-               (bit-branch 32768 false nonzero 1)
-               (bit-branch 32768 true nonzero 0)
-               (bit-branch 32772 true nonzero 1)
-               (bit-branch 1048572 false nonzero 1)
-               (bit-branch 1048576 false nonzero 2)
-               (bit-branch 1048572 true nonzero 1)
-               (bit-branch 1048576 true nonzero 2)
-               (bit-branch 4194304 false nonzero 2)
-               (bit-branch 4194304 true nonzero 2))))
     failures))
 
 (defn main [] (-> i64)

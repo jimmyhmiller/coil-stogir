@@ -216,87 +216,35 @@
              (<< (cast u32 base) 5)
              (cast u32 rt)))))
 
-;;; Branch-condition codes 0..15 select B.cond. Codes 64..191 select CBZ/CBNZ
-;;; 64 + register*4 + wide*2 + nonzero. Bit 0 inverts the branch, as it does for
-;;; B.cond, so callers and relaxation invert both families with XOR 1.
+;;; Branch-condition codes 0..15 select B.cond. Codes 64..191 select CBZ/CBNZ:
+;;; 64 + register*4 + wide*2 + nonzero. Codes 256..4351 select TBZ/TBNZ:
+;;; 256 + bit*64 + register*2 + nonzero. Bit 0 inverts the branch, as it does
+;;; for B.cond, so callers and relaxation invert every family with XOR 1.
 (defn register-condition [(register i32) (wide bool) (nonzero bool)] (-> i32)
   (+ 64 (* register 4) (if wide 2 0) (if nonzero 1 0)))
 
 (defn register-condition? [(condition i32)] (-> bool)
   (and (>= condition 64) (<= condition 191)))
 
-(defn branch-condition? [(condition i32)] (-> bool)
-  (or (and (>= condition 0) (<= condition 15)) (register-condition? condition)
-      (bit-condition? condition)))
-
-;;; Codes 256..4223 select TBZ/TBNZ: 256 + register*128 + bit*2 + nonzero, for
-;;; registers x0..x30 and bits 0..63. Bit 0 inverts, as in the other families.
-;;; NZCV must be dead at such a branch: a target beyond TBZ's reach is reached
-;;; by TST and B.cond (see expansion).
+;;; Branch on one bit of x0..x30; bit 0..63 (bits below 32 use the W form).
 (defn bit-condition [(register i32) (bit i32) (nonzero bool)] (-> i32)
-  (+ 256 (* register 128) (* bit 2) (if nonzero 1 0)))
+  (+ 256 (* bit 64) (* register 2) (if nonzero 1 0)))
 
 (defn bit-condition? [(condition i32)] (-> bool)
-  (and (>= condition 256) (<= condition 4223)))
+  (and (>= condition 256) (<= condition 4351) (< (& (- condition 256) 63) 62)))
 
-;;; TBZ/TBNZ has a signed 14-bit word displacement.
-(defn test-branch [(condition i32) (displacement i64)]
-  (-> (Result u32 (slice u8)))
-  (if (or (not (bit-condition? condition))
-          (!= (% displacement 4) 0)
-          (< displacement -32768)
-          (> displacement 32764))
-      (Err "invalid AArch64 test-and-branch")
-      (let [code (- condition 256)
-            register (cast u32 (/ code 128))
-            bit (cast u32 (/ (% code 128) 2))
-            nonzero (!= (& code 1) 0)]
-        (Ok (| (: 0x36000000 u32)
-               (if (>= bit 32) (: 0x80000000 u32) (: 0 u32))
-               (if nonzero (: 0x01000000 u32) (: 0 u32))
-               (<< (& bit 31) 19)
-               (<< (& (cast u32 (/ displacement 4)) (: 0x3FFF u32)) 5)
-               register)))))
+(defn branch-condition? [(condition i32)] (-> bool)
+  (or (and (>= condition 0) (<= condition 15))
+      (register-condition? condition)
+      (bit-condition? condition)))
 
-;;; TST Xn, #(1 << bit): ANDS XZR with a single-bit logical immediate.
-(defn test-bit [(wide bool) (rn i32) (bit i32)] (-> (Result u32 (slice u8)))
-  (let [size (if wide (: 64 i32) 32)]
-    (if (or (< rn 0) (> rn 30) (< bit 0) (>= bit size))
-        (Err "invalid AArch64 bit test")
-        (Ok (| (if wide (: 0xF240001F u32) (: 0x7200001F u32))
-               (<< (cast u32 (% (- size bit) size)) 16)
-               (<< (cast u32 rn) 5))))))
-
-;;; The bit tested by a word that test-bit produced, or -1 for any other word.
-(defn tested-bit [(word u32)] (-> i32)
-  (let [pattern (& word (: 0xFFC0FC1F u32))
-        rotation (cast i32 (& (>> word 16) 63))]
-    (cond (= pattern (: 0xF240001F u32)) (% (- 64 rotation) 64)
-          (and (= pattern (: 0x7200001F u32)) (< rotation 32)) (% (- 32 rotation) 32)
-          :else -1)))
-
-;;; The flag test and B.cond condition that replace a bit-condition branch
-;;; whose target TBZ/TBNZ cannot reach.
-(defn bit-condition-test [(condition i32)] (-> (Result u32 (slice u8)))
-  (if (not (bit-condition? condition))
-      (Err "invalid AArch64 test-and-branch")
-      (test-bit true (/ (- condition 256) 128) (/ (% (- condition 256) 128) 2))))
-
-(defn bit-condition-flags [(condition i32)] (-> i32)
-  (& condition 1))
-
-;;; Extra words a conditional branch needs to span displacement: none within
-;;; its own reach. B.cond and CBZ/CBNZ beyond theirs become the inverse branch
-;;; over a B (one word). TBZ/TBNZ becomes TST and B.cond (one word), or TST,
-;;; the inverse B.cond and a B (two words) beyond B.cond's reach as well.
-;;; displacement is measured from the first word of the sequence; the B.cond
-;;; after a TST is its second word.
-(defn expansion [(condition i32) (displacement i64)] (-> i32)
+;;; A conditional branch whose byte displacement its encoding cannot hold must
+;;; be expanded. B.cond and CBZ/CBNZ hold a signed 19-bit word displacement,
+;;; TBZ/TBNZ a signed 14-bit one.
+(defn predicate-reach? [(condition i32) (displacement i64)] (-> bool)
   (if (bit-condition? condition)
-      (cond (and (>= displacement -32768) (<= displacement 32764)) 0
-            (and (>= displacement -1048572) (<= displacement 1048576)) 1
-            :else 2)
-      (if (and (>= displacement -1048576) (<= displacement 1048572)) 0 1)))
+      (and (>= displacement -32768) (<= displacement 32764))
+      (and (>= displacement -1048576) (<= displacement 1048572))))
 
 ;;; CBZ/CBNZ share B.cond's signed 19-bit word displacement.
 (defn compare-branch [(condition i32) (displacement i64)]
@@ -316,7 +264,42 @@
                (<< (& (cast u32 (/ displacement 4)) (: 0x7FFFF u32)) 5)
                register)))))
 
-;;; Either conditional family; condition must satisfy branch-condition?.
+(defn test-branch [(condition i32) (displacement i64)]
+  (-> (Result u32 (slice u8)))
+  (if (or (not (bit-condition? condition))
+          (!= (% displacement 4) 0)
+          (< displacement -32768)
+          (> displacement 32764))
+      (Err "invalid AArch64 test-bit-and-branch")
+      (let [code (- condition 256)
+            bit (cast u32 (/ code 64))
+            register (cast u32 (/ (& code 63) 2))
+            nonzero (!= (& code 1) 0)]
+        (Ok (| (: 0x36000000 u32)
+               (<< (>> bit 5) 31)
+               (if nonzero (: 0x01000000 u32) (: 0 u32))
+               (<< (& bit (: 31 u32)) 19)
+               (<< (& (cast u32 (/ displacement 4)) (: 0x3FFF u32)) 5)
+               register)))))
+
+;;; TST Rn, #(1 << bit): ANDS WZR/XZR with a single-bit logical immediate.
+(defn test-bit [(wide bool) (rn i32) (bit i32)] (-> (Result u32 (slice u8)))
+  (let [size (if wide (: 64 i32) 32)]
+    (if (or (< rn 0) (> rn 30) (< bit 0) (>= bit size))
+        (Err "invalid AArch64 bit test")
+        (Ok (| (if wide (: 0xF240001F u32) (: 0x7200001F u32))
+               (<< (cast u32 (% (- size bit) size)) 16)
+               (<< (cast u32 rn) 5))))))
+
+;;; The bit tested by a word that test-bit produced, or -1 for any other word.
+(defn tested-bit [(word u32)] (-> i32)
+  (let [pattern (& word (: 0xFFC0FC1F u32))
+        rotation (cast i32 (& (>> word 16) 63))]
+    (cond (= pattern (: 0xF240001F u32)) (% (- 64 rotation) 64)
+          (and (= pattern (: 0x7200001F u32)) (< rotation 32)) (% (- 32 rotation) 32)
+          :else -1)))
+
+;;; Any conditional family; condition must satisfy branch-condition?.
 (defn predicate-branch [(condition i32) (displacement i64)]
   (-> (Result u32 (slice u8)))
   (cond (register-condition? condition) (compare-branch condition displacement)
