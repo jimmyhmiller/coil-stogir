@@ -28,7 +28,13 @@ decision changes.
   `src/stogir/native/private-leaf.coil`: the same public API as
   `stogir.a64.compile` / `stogir.a64.private-leaf`, forwarding to the backend of
   the target being compiled for (`stogir.target/arch-pick`). Embedders and
-  target-neutral tests import these.
+  target-neutral tests import these. The facade imports only the chosen backend
+  (the import itself is inside `arch-pick`), so a backend's signature mismatch
+  shows up when compiling for that machine. `object` is built in the facade from
+  `image` and `stogir.aot.native`; a backend does not provide it.
+- `src/stogir/native/private-types.coil`: the private `Context` / `Publication`
+  types and option switches shared by both backends (today a re-export of the
+  definitions in `stogir.a64.private-leaf`).
 - `src/stogir/jit/native.coil`, `src/stogir/aot/native.coil`: JIT and object
   writing for the target (Mach-O on Darwin, ELF on Linux).
 - Logic that is target-neutral but lives under `a64/` today (phi coalescing,
@@ -142,6 +148,11 @@ follows, in which case the addend accounts for it).
   its name; the port is a change of imports plus platform symbol names
   (`stogir.target` helper), never a weakening of what it checks.
 - Tests of x64 internals are named `x64-*.coil`.
+- `tests/X64_STATUS.md` lists every test with its category and, for facade
+  tests, its operation family; `tools/x86/family-tests.sh FAMILY` prints a
+  family's tests. A facade test may keep an AArch64 instruction-shape check as
+  `(target/arch-pick CHECK (do))`; object symbols are written
+  `(target/os-pick "_name" "name")`.
 - Every new behavior has a test; every stub is a hard error with a clear
   message.
 
