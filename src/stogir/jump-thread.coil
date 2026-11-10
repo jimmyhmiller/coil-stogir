@@ -112,9 +112,14 @@
    (rotate bool)                ; the candidate is rotated
    (no-flatten bool)
    (first-load i64)
-   (depth-ready bool)
-   (depth (ArrayList u8))       ; natural loops a control node lies in
-   (owner (ArrayList i32))      ; last loop header counted for it
+   (cycles-ready bool)
+   (cyclic (ArrayList u8))      ; control node on a cycle
+   (order (ArrayList i32))      ; depth-first number over control predecessors
+   (low (ArrayList i32))        ; once built, the node's component
+   (merges (ArrayList i32))     ; MERGEs the threading pass saw, for rotate-with!
+   (calls bool)                 ; the rotated loop's body holds a call
+   (walk i32)                   ; stamp of the latest backward walk
+   (walked (ArrayList i32))
    (instances (ArrayList i32))])
 
 (defn create [(pointer-bytes i32) (a (dyn Allocator))] (-> State)
@@ -172,9 +177,14 @@
          :rotate false
          :no-flatten false
          :first-load 0
-         :depth-ready false
-         :depth (ArrayList::new [u8] a)
-         :owner (ArrayList::new [i32] a)
+         :cycles-ready false
+         :cyclic (ArrayList::new [u8] a)
+         :order (ArrayList::new [i32] a)
+         :low (ArrayList::new [i32] a)
+         :merges (ArrayList::new [i32] a)
+         :calls false
+         :walk 0
+         :walked (ArrayList::new [i32] a)
          :instances (ArrayList::new [i32] a)))
 
 (defn release! [(s (mut State))] (-> void)
@@ -212,8 +222,11 @@
   (free! (mut (.scratch s)))
   (free! (mut (.inputs s)))
   (free! (mut (.pending s)))
-  (free! (mut (.depth s)))
-  (free! (mut (.owner s)))
+  (free! (mut (.cyclic s)))
+  (free! (mut (.order s)))
+  (free! (mut (.low s)))
+  (free! (mut (.walked s)))
+  (free! (mut (.merges s)))
   (free! (mut (.instances s))))
 
 (defn opcode [(graph g/Graph) (reference i32)] (-> i32)
@@ -972,44 +985,169 @@
               (set! result (join result seen))))))
     (if failed IN-PROGRESS result)))
 
-;;; Natural-loop nesting of every control node, built on first need: each
-;;; header's loop is walked once from its back edges.
-(defn ensure-depth! [(s (mut State)) (graph g/Graph) (edges uses/Uses) (a (dyn Allocator))] (-> void)
-  (unless (.depth-ready s)
-    (set! (.depth-ready s) true)
-    (ensure-flow! (mut s) graph edges a)
+;;; Control predecessor K (from zero) of REFERENCE, or zero past the last: a
+;;; MERGE's inputs, any other control node's source.
+(defn predecessor [(graph g/Graph) (reference i32) (k i32)] (-> i32)
+  (let [code (opcode graph reference)]
+    (cond (merge-like? code)
+            (if (< k (arity graph reference)) (input graph reference (+ k 1)) 0)
+          (and (= k 0) (op/control? code) (= (op/operand-code code 1) op/OPERAND-SRC))
+            (input graph reference 1)
+          :else 0)))
+
+;;; Which control nodes lie on a cycle, built on first need: the strongly
+;;; connected components of the control predecessor relation below the roots
+;;; (Tarjan's algorithm, iterative). Only operands are read, no use lists. A
+;;; node no root reaches backward stays unmarked. Afterwards low names each
+;;; node's component, which for a node on a cycle is its outermost loop.
+(defn ensure-cycles! [(s (mut State)) (graph g/Graph) (roots (ArrayList i32)) (a (dyn Allocator))]
+  (-> void)
+  (unless (.cycles-ready s)
+    (set! (.cycles-ready s) true)
     (let [size (len (.instructions graph))
-          (mut work) (ArrayList::new [i32] a)]
-      (clear! (mut (.depth s)))
-      (clear! (mut (.owner s)))
-      (extend-zeroed! (mut (.depth s)) size)
-      (extend-zeroed! (mut (.owner s)) size)
-      (for [r 1 (len (.back s))]
-        (when (and (!= (get (.back s) r) 0) (< r size) (= (opcode graph (cast i32 r)) 114))
-          (let [range (get (.ranges edges) r)
-                (mut header) (: 0 i32)]
-            (for [i (.offset range) (+ (.offset range) (.count range))]
-              (let [user (.user (get (.edges edges) i))]
-                (when (merge-like? (opcode graph user)) (set! header user))))
-            (when (> header 0)
-              (push! (mut work) (cast i32 r))
-              (while (> (len work) 0)
-                (let [current (get work (- (len work) 1))]
-                  (pop! (mut work))
-                  (when (and (> current 0) (< (cast i64 current) size) (!= current header)
-                             (!= (get (.owner s) (cast i64 current)) header))
-                    (set! (mut (.owner s)) (cast i64 current) header)
-                    (when (< (get (.depth s) (cast i64 current)) 255)
-                      (set! (mut (.depth s)) (cast i64 current)
-                            (+ (get (.depth s) (cast i64 current)) 1)))
-                    (let [code (opcode graph current)]
-                      (if (merge-like? code)
-                          (for [k 1 (+ (cast i64 (arity graph current)) 1)]
-                            (push! (mut work) (input graph current (cast i32 k))))
-                          (when (and (op/control? code)
-                                     (= (op/operand-code code 1) op/OPERAND-SRC))
-                            (push! (mut work) (input graph current 1))))))))))))
-      (free! (mut work)))))
+          (mut frames) (ArrayList::new [i32] a)
+          (mut cursors) (ArrayList::new [i32] a)
+          (mut component) (ArrayList::new [i32] a)
+          (mut on) (ArrayList::new [u8] a)
+          (mut counter) (: 0 i32)]
+      (clear! (mut (.cyclic s)))
+      (clear! (mut (.order s)))
+      (clear! (mut (.low s)))
+      (extend-zeroed! (mut (.cyclic s)) size)
+      (extend-zeroed! (mut (.order s)) size)
+      (extend-zeroed! (mut (.low s)) size)
+      (extend-zeroed! (mut on) size)
+      (when (< (len (.walked s)) size)
+        (extend-zeroed! (mut (.walked s)) (- size (len (.walked s)))))
+      (for [i 0 (len roots)]
+        (let [root (get roots i)]
+          (when (and (> root 0) (< (cast i64 root) size) (= (get (.order s) (cast i64 root)) 0))
+            (set! counter (+ counter 1))
+            (set! (mut (.order s)) (cast i64 root) counter)
+            (set! (mut (.low s)) (cast i64 root) counter)
+            (set! (mut on) (cast i64 root) (: 1 u8))
+            (push! (mut component) root)
+            (push! (mut frames) root)
+            (push! (mut cursors) 0)
+            (while (> (len frames) 0)
+              (let [top (- (len frames) 1)
+                    current (get frames top)
+                    k (get cursors top)
+                    next (predecessor graph current k)]
+                (if (and (> next 0) (< (cast i64 next) size))
+                    (do
+                      (set! (mut cursors) top (+ k 1))
+                      (if (= (get (.order s) (cast i64 next)) 0)
+                          (do (set! counter (+ counter 1))
+                              (set! (mut (.order s)) (cast i64 next) counter)
+                              (set! (mut (.low s)) (cast i64 next) counter)
+                              (set! (mut on) (cast i64 next) (: 1 u8))
+                              (push! (mut component) next)
+                              (push! (mut frames) next)
+                              (push! (mut cursors) 0))
+                          (when (and (!= (get on (cast i64 next)) 0)
+                                     (< (get (.order s) (cast i64 next))
+                                        (get (.low s) (cast i64 current))))
+                            (set! (mut (.low s)) (cast i64 current)
+                                  (get (.order s) (cast i64 next))))))
+                    (do
+                      (pop! (mut frames))
+                      (pop! (mut cursors))
+                      (when (= (get (.low s) (cast i64 current)) (get (.order s) (cast i64 current)))
+                        ; A component of more than one node is a cycle.
+                        (let [alone (= (get component (- (len component) 1)) current)
+                              (mut popping) true]
+                          (while popping
+                            (let [member (get component (- (len component) 1))]
+                              (pop! (mut component))
+                              (set! (mut on) (cast i64 member) (: 0 u8))
+                              (set! (mut (.low s)) (cast i64 member)
+                                    (get (.order s) (cast i64 current)))
+                              (unless alone (set! (mut (.cyclic s)) (cast i64 member) (: 1 u8)))
+                              (when (= member current) (set! popping false))))))
+                      (when (> (len frames) 0)
+                        (let [parent (get frames (- (len frames) 1))]
+                          (when (< (get (.low s) (cast i64 current)) (get (.low s) (cast i64 parent)))
+                            (set! (mut (.low s)) (cast i64 parent)
+                                  (get (.low s) (cast i64 current)))))))))))))
+      (free! (mut frames))
+      (free! (mut cursors))
+      (free! (mut component))
+      (free! (mut on)))))
+
+;;; The loop rules for a rotated MERGE inside another loop, from walks over
+;;; control predecessors alone. Every input of such a MERGE lies on a cycle of
+;;; the MERGE's own component; a MERGE with any other input heads no nested
+;;; loop and is refused before anything is walked. A walk from an edge stops
+;;; at the MERGE. One that leaves the component (or reaches START) came from
+;;; outside the MERGE's loop: the edge enters it. Any other walk ends having
+;;; covered the loop body below one projection of the branch: the edge closes
+;;; the loop, and all such edges must agree on that one projection, the body;
+;;; the other projection leaves the loop. Sets header, body and backs as
+;;; loops! does. Control is assumed reducible, as there.
+(defn rotation-loop! [(s (mut State)) (graph g/Graph) (roots (ArrayList i32)) (a (dyn Allocator))]
+  (-> bool)
+  (let [merge (.merge s)
+        (mut good) (and (= (len (.sides s)) 2) (<= (len (.ends s)) MAX-ROTATE-EDGES))]
+    (set! (.header s) false)
+    (set! (.body s) -1)
+    (set! (.calls s) false)
+    (clear! (mut (.backs s)))
+    (when good
+      (ensure-cycles! (mut s) graph roots a)
+      (when (= (flag-at (.cyclic s) merge) 0) (set! good false))
+      (for [i 0 (len (.ends s))]
+        (let [end (get (.ends s) i)]
+          (when (or (= (flag-at (.cyclic s) end) 0)
+                    (!= (cell (.low s) end) (cell (.low s) merge)))
+            (set! good false)))))
+    (for [i 0 (len (.ends s))]
+      (when good
+        (let [(mut entered) false
+              (mut first) false
+              (mut second) false
+              (mut called) false]
+          (set! (.walk s) (+ (.walk s) 1))
+          (clear! (mut (.work s)))
+          (push! (mut (.work s)) (get (.ends s) i))
+          (while (and good (not entered) (> (len (.work s)) 0))
+            (let [current (get (.work s) (- (len (.work s)) 1))]
+              (pop! (mut (.work s)))
+              (set! (.steps s) (+ (.steps s) 1))
+              (cond (or (<= current 0) (> (.steps s) MAX-STEPS)) (set! good false)
+                    (or (= current merge) (= (cell (.walked s) current) (.walk s))) 0
+                    (or (= (flag-at (.cyclic s) current) 0)
+                        (!= (cell (.low s) current) (cell (.low s) merge)))
+                      (set! entered true)
+                    :else
+                      (let [code (opcode graph current)]
+                        (put! (mut (.walked s)) current (.walk s))
+                        (when (= current (get (.sides s) 0)) (set! first true))
+                        (when (= current (get (.sides s) 1)) (set! second true))
+                        (when (= code 79) (set! called true))
+                        (cond (merge-like? code)
+                                ; The first input is walked first: builders
+                                ; put a loop's entry there.
+                                (let [(mut k) (cast i64 (arity graph current))]
+                                  (while (> k 0)
+                                    (push! (mut (.work s)) (input graph current (cast i32 k)))
+                                    (set! k (- k 1))))
+                              (and (op/control? code) (= (op/operand-code code 1) op/OPERAND-SRC))
+                                (push! (mut (.work s)) (input graph current 1))
+                              :else (set! good false))))))
+          (when good
+            (if entered
+                (push! (mut (.backs s)) 0)
+                (let [side (cond (and first (not second)) (: 0 i64)
+                                 (and second (not first)) 1
+                                 :else -1)]
+                  (if (or (< side 0) (and (>= (.body s) 0) (!= (.body s) side)))
+                      (set! good false)
+                      (do (set! (.body s) side)
+                          (set! (.header s) true)
+                          (when called (set! (.calls s) true))
+                          (push! (mut (.backs s)) 1)))))))))
+    good))
 
 ;;; Floating values copied to read VALUE on one edge; over MAX-CONE when the
 ;;; walk is too deep.
@@ -1026,30 +1164,33 @@
 
 ;;; Rotation: every edge of a loop header gets its own copy of the header's
 ;;; reads and test, so the test runs once before the loop and once at each
-;;; latch, and the body arm becomes the header. The loop rules have run with
-;;; every edge marked SPLIT. It pays where the loop sits inside another loop:
+;;; latch, and the body arm becomes the header. It pays where the loop sits inside another loop:
 ;;; work that only the body needs then stays off the outer loop's path when the
 ;;; inner loop does not run. A back edge that already leaves a test is the
 ;;; bottom of a rotated loop and is left alone, so rotation cannot repeat.
-(defn rotation? [(s (mut State)) (graph g/Graph) (edges uses/Uses) (a (dyn Allocator))] (-> bool)
+;;; rotation-loop! has classified the edges and found the enclosing loop.
+(defn rotation? [(s State) (graph g/Graph) (edges uses/Uses)] (-> bool)
   (let [(mut entries) (: 0 i64)
         (mut returns) (: 0 i64)
-        (mut tested) false
-        (mut nested) false]
-    (when (and (.header s) (>= (.body s) 0) (<= (len (.ends s)) MAX-ROTATE-EDGES))
-      (ensure-depth! (mut s) graph edges a)
+        (mut tested) false]
+    (when (and (.header s) (>= (.body s) 0))
       (for [i 0 (len (.ends s))]
-        (let [end (get (.ends s) i)]
-          (if (!= (get (.backs s) i) 0)
-              (let [above (opcode graph (input graph end 1))]
-                (set! returns (+ returns 1))
-                (when (or (= above 107) (= above 108)) (set! tested true)))
-              (do (set! entries (+ entries 1))
-                  (when (!= (flag-at (.depth s) end) 0) (set! nested true)))))))
-    (and (> entries 0) (> returns 0) (not tested) nested)))
+        (if (!= (get (.backs s) i) 0)
+            (let [above (opcode graph (input graph (get (.ends s) i) 1))]
+              (set! returns (+ returns 1))
+              (when (or (= above 107) (= above 108)) (set! tested true)))
+            (set! entries (+ entries 1)))))
+    (and (> entries 0) (> returns 0) (not tested)
+         ; Something only the body needs: a read in the header or heading the
+         ; body, which may move behind the guard, or a call, around which
+         ; values that live across the loop are spilled.
+         (or (< (.first-load s) (len (.phis s)))
+             (.calls s)
+             (= (opcode graph (control-successor graph edges (get (.sides s) (.body s)))) 91)))))
 
 ;;; Everything commit! needs, decided without changing the graph.
-(defn plan! [(s (mut State)) (graph g/Graph) (edges uses/Uses) (a (dyn Allocator))] (-> bool)
+(defn plan! [(s (mut State)) (graph g/Graph) (roots (ArrayList i32)) (edges uses/Uses)
+             (a (dyn Allocator))] (-> bool)
   (set! (.epoch s) (+ (.epoch s) 1))
   (set! (.steps s) 0)
   (set! (.rotate s) false)
@@ -1072,9 +1213,11 @@
               (for [i 0 (len (.states s))]
                 (when (!= (get (.states s) i) UNKNOWN) (set! known true)))
               (unless known (set! good false))))))
-    (when good (unless (loops! (mut s) graph edges a) (set! good false)))
-    (when (and good (.rotate s))
-      (unless (rotation? (mut s) graph edges a) (set! good false)))
+    (when good
+      (unless (if (.rotate s)
+                  (and (rotation-loop! (mut s) graph roots a) (rotation? s graph edges))
+                  (loops! (mut s) graph edges a))
+        (set! good false)))
     (when good
       ; What remains after the loop rules: something to thread, and a MERGE
       ; that still fits its cells.
@@ -1586,11 +1729,35 @@
     (when (and live (= (opcode graph merge) 112)) (push! (mut (.pending s)) merge))
     (set! (.changes s) (+ (.changes s) 1))))
 
+;;; MERGE and every input of it lie on one cycle-bearing component: the only
+;;; MERGEs that can head a loop inside another loop. Decided from the cycle
+;;; facts alone, so a rotating pass prepares nothing for any other MERGE.
+(defn nested-header? [(s (mut State)) (graph g/Graph) (roots (ArrayList i32)) (merge i32)
+                      (a (dyn Allocator))] (-> bool)
+  (let [count (cast i64 (arity graph merge))
+        ; A loop to rotate has a back edge that does not leave a test.
+        (mut untested) false]
+    (for [k 1 (+ count 1)]
+      (let [above (opcode graph (input graph (input graph merge (cast i32 k)) 1))]
+        (unless (or (= above 107) (= above 108)) (set! untested true))))
+    (if (or (< count 2) (> count MAX-ROTATE-EDGES) (not untested))
+        false
+        (do
+          (ensure-cycles! (mut s) graph roots a)
+          (let [(mut good) (!= (flag-at (.cyclic s) merge) 0)]
+            (for [k 1 (+ count 1)]
+              (let [end (input graph merge (cast i32 k))]
+                (when (or (= (flag-at (.cyclic s) end) 0)
+                          (!= (cell (.low s) end) (cell (.low s) merge)))
+                  (set! good false))))
+            good)))))
+
 (defn try! [(s (mut State)) (graph (mut g/Graph)) (roots (mut (ArrayList i32)))
             (edges (mut uses/Uses)) (queue (mut q/Queue)) (merge i32) (a (dyn Allocator))] (-> void)
-  (when (gather! (mut s) graph edges merge)
+  (when (and (gather! (mut s) graph edges merge)
+             (or (not (.rotating s)) (nested-header? (mut s) graph roots merge a)))
     (ensure-protected! (mut s) graph roots)
-    (when (plan! (mut s) graph edges a)
+    (when (plan! (mut s) graph roots edges a)
       (commit! (mut s) (mut graph) (mut roots) (mut edges) (mut queue)))))
 
 ;;; edges are exact and stay exact; new and changed nodes are queued for the
@@ -1602,12 +1769,26 @@
                 (pointer-bytes i32)
                 (a (dyn Allocator))] (-> (Result i32 (slice u8)))
   (let [(mut s) (create pointer-bytes a)
-        size (len (.instructions graph))
+        result (rewrite-with! (mut s) (mut graph) (mut roots) (mut edges) (mut queue) a)]
+    (release! (mut s))
+    result))
+
+;;; As rewrite!, with the caller's state, which a later rotate-with! on the
+;;; same graph may reuse.
+(defn rewrite-with! [(s (mut State))
+                     (graph (mut g/Graph))
+                     (roots (mut (ArrayList i32)))
+                     (edges (mut uses/Uses))
+                     (queue (mut q/Queue))
+                     (a (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (let [size (len (.instructions graph))
         (mut budget) (+ (* size 2) 64)
         (mut error) ""
         (mut r) (: 1 i64)]
+    (clear! (mut (.merges s)))
     (while (< r size)
       (when (= (n/opcode (get (.instructions graph) r)) 112)
+        (push! (mut (.merges s)) (cast i32 r))
         (try! (mut s) (mut graph) (mut roots) (mut edges) (mut queue) (cast i32 r) a))
       (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
     ; Joins and narrowed MERGEs can expose another test of their own PHIs.
@@ -1616,6 +1797,7 @@
         (pop! (mut (.pending s)))
         (set! budget (- budget 1))
         (when (= (opcode graph next) 112)
+          (when (>= (cast i64 next) size) (push! (mut (.merges s)) next))
           (try! (mut s) (mut graph) (mut roots) (mut edges) (mut queue) next a))))
     (when (.pruning s)
       (grow-bits! (mut (.protected s)) (len (.instructions graph)))
@@ -1623,29 +1805,32 @@
                              (mut (.protected s)) a)
         (Err [message] (set! error message))
         (Ok [_] 0)))
-    (let [changes (.changes s)]
-      (release! (mut s))
-      (if (= error "") (Ok changes) (Err error)))))
+    (if (= error "") (Ok (.changes s)) (Err error))))
 
-;;; As rewrite!, but the only change made is loop rotation (see rotation?).
-;;; Run after the cleanup that moves a header's invariant reads onto its entry
-;;; edge, so those are not copied into the latch. Returns the loops rotated.
-(defn rotate! [(graph (mut g/Graph))
-               (roots (mut (ArrayList i32)))
-               (edges (mut uses/Uses))
-               (queue (mut q/Queue))
-               (pointer-bytes i32)
-               (a (dyn Allocator))] (-> i32)
-  (let [(mut s) (create pointer-bytes a)
-        size (len (.instructions graph))
-        (mut r) (: 1 i64)]
-    (set! (.rotating s) true)
-    (while (< r size)
-      (when (= (n/opcode (get (.instructions graph) r)) 112)
-        (try! (mut s) (mut graph) (mut roots) (mut edges) (mut queue) (cast i32 r) a))
-      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
-    (when (.pruning s) (panic "loop rotation left unreachable control"))
-    (let [changes (.changes s)]
-      (release! (mut s))
-      changes)))
-
+;;; The only change made is loop rotation (see rotation?). Run after the
+;;; cleanup that moves a header's invariant reads onto its entry edge, so those
+;;; are not copied into the latch. S is the state of rewrite-with! on this
+;;; graph in the same cleanup: the MERGEs that pass saw are the candidates, so
+;;; the graph is not scanned again (one made since waits for the next
+;;; cleanup), and everything else derived from the graph is rebuilt. Returns
+;;; the loops rotated.
+(defn rotate-with! [(s (mut State))
+                    (graph (mut g/Graph))
+                    (roots (mut (ArrayList i32)))
+                    (edges (mut uses/Uses))
+                    (queue (mut q/Queue))
+                    (a (dyn Allocator))] (-> i32)
+  (set! (.rotating s) true)
+  (set! (.flow-ready s) false)
+  (set! (.cycles-ready s) false)
+  (set! (.protected-ready s) false)
+  (bits/clear! (mut (.protected s)))
+  (set! (.pruning s) false)
+  (set! (.changes s) 0)
+  (clear! (mut (.pending s)))
+  (for [i 0 (len (.merges s))]
+    (let [merge (get (.merges s) i)]
+      (when (and (< (cast i64 merge) (len (.instructions graph))) (= (opcode graph merge) 112))
+        (try! (mut s) (mut graph) (mut roots) (mut edges) (mut queue) merge a))))
+  (when (.pruning s) (panic "loop rotation left unreachable control"))
+  (.changes s))
