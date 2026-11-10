@@ -1,0 +1,78 @@
+;;; COND on integer values: rd = condition ? yes : no, with cmovcc.
+;;;
+;;; The condition's flags come from the fused comparison's tile or from the
+;;; truth test of the condition value. After the flags are set only `mov`
+;;; and `cmovcc` follow: the arms are read from their registers, rebuilt as
+;;; constants with `mov`, or reloaded with `mov`, none of which writes flags.
+;;;
+;;; cmovcc has no 8-bit form: narrow values are selected at 32 bits, which
+;;; keeps their low bits (stogir.x64.value). The 32-bit form zeroes the upper
+;;; half of rd even when the condition is false, which is unspecified anyway.
+;;;
+;;; Floating and vector selections belong to their families.
+(module stogir.x64.conditional)
+(import "stogir.conditional" :as cond)
+(import "stogir.types" :as types)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.context" :as context)
+(import "stogir.x64.emit" :as emit)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.truth" :as truth)
+(import "stogir.x64.value" :as value)
+(import "coil.result" :use [Result Ok Err])
+
+(defn emit! [(out (mut code/Buffer)) (cx context/Context) (reference i32) (position i64)]
+  (-> (Result i32 (slice u8)))
+  (let [node (get (.instructions (.graph cx)) (cast i64 reference))]
+    (match (cond/validate (.graph cx) reference)
+      (Err [message] (Err message))
+      (Ok [ty]
+          (if (not (types/integer? ty))
+              (Err "x86-64 backend: floating and vector COND are not implemented yet (floating/vector families)")
+              (match (emit/destination cx reference position)
+                (Err [message] (Err message))
+                (Ok [rd]
+                    (match (if (plan/fused? (.matched cx) reference)
+                               (emit/flags! (mut out) cx position
+                                            (plan/condition-tile (.matched cx) reference))
+                               (truth/flags! (mut out) cx (.op1 node) position))
+                      (Err [message] (Err message))
+                      (Ok [cc]
+                          (let [bits (value/operation-bits ty)
+                                yes (.op2 node)
+                                no (.op3 node)
+                                ryes (value/register-of (.graph cx) (.parts cx) yes position)
+                                rno (value/register-of (.graph cx) (.parts cx) no position)
+                                (mut error) ""]
+                            (cond (= ryes rd)
+                                    ; rd already holds the true arm.
+                                    (match (emit/operand! (mut out) cx no position
+                                                          registers/SCRATCH-GPR)
+                                      (Err [message] (set! error message))
+                                      (Ok [source]
+                                          (code/accept! (mut error)
+                                                        (encode/cmov-rr (mut (.text out))
+                                                                        (encode/invert cc)
+                                                                        bits rd source))))
+                                  (= rno rd)
+                                    (match (emit/operand! (mut out) cx yes position
+                                                          registers/SCRATCH-GPR)
+                                      (Err [message] (set! error message))
+                                      (Ok [source]
+                                          (code/accept! (mut error)
+                                                        (encode/cmov-rr (mut (.text out)) cc
+                                                                        bits rd source))))
+                                  :else
+                                    (do
+                                      (code/accept-count! (mut error)
+                                                          (emit/into! (mut out) cx no position rd))
+                                      (match (emit/operand! (mut out) cx yes position
+                                                            registers/SCRATCH-GPR)
+                                        (Err [message] (set! error message))
+                                        (Ok [source]
+                                            (code/accept! (mut error)
+                                                          (encode/cmov-rr (mut (.text out)) cc
+                                                                          bits rd source))))))
+                            (if (= error "") (Ok 0) (Err error))))))))))))

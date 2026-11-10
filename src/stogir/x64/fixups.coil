@@ -1,0 +1,98 @@
+;;; Internal branch fixups for x86-64 text, in byte offsets independent of the
+;;; load address.
+;;;
+;;; A jump is emitted in its long form (`jmp rel32`, `jcc rel32`) with a zero
+;;; displacement and one Branch record. Labels are byte offsets, -1 while
+;;; unbound; block labels are indexed by graph reference and further labels
+;;; (edge stubs) are appended. `apply!` patches every displacement once all
+;;; labels are bound.
+;;;
+;;; Records are data, not baked offsets, so a later relaxation pass can shrink
+;;; a jump to its rel8 form: a record gives the instruction's first byte
+;;; (`start`), its displacement field (`field`, always the last 4 bytes) and
+;;; its condition, which is everything needed to re-encode it and to shift
+;;; the labels, records and references behind it. No such pass exists yet.
+;;;
+;;; The a64 module of this name is not shared: it patches 4-byte instruction
+;;; words and its relaxation and peepholes are word arithmetic.
+(module stogir.x64.fixups)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.encode" :as encode)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err])
+
+;;; condition -1 is `jmp`; 0..15 is `jcc` with that condition code.
+(defstruct Branch [(start i64) (field i64) (label i32) (condition i32)])
+
+;;; A signed 32-bit table word at `offset` holding `label - base` (jump
+;;; tables of the switch family). Both addresses are text-relative.
+(defstruct Relative [(offset i64) (base i64) (label i32)])
+
+;;; Append a jump to `label` and record it.
+(defn jump! [(out (mut code/Buffer))
+             (branches (mut (ArrayList Branch)))
+             (label i32)
+             (condition i32)] (-> (Result i32 (slice u8)))
+  (let [start (len (.text out))]
+    (match (if (= condition -1)
+               (encode/jmp-rel32 (mut (.text out)) 0)
+               (encode/jcc-rel32 (mut (.text out)) condition 0))
+      (Err [message] (Err message))
+      (Ok [field]
+          (push! (mut branches)
+                 (Branch :start start :field field :label label :condition condition))
+          (Ok (cast i32 (- (len (.text out)) start)))))))
+
+(defn patch32! [(output (mut (ArrayList u8))) (offset i64) (value i64)] (-> void)
+  (for [i 0 4]
+    (set! (mut output) (+ offset i) (cast u8 (& (>> value (* i 8)) 255)))))
+
+;;; Patch every branch. Everything is validated before the first byte
+;;; changes, so a failure leaves the text as it was.
+(defn apply! [(output (mut (ArrayList u8)))
+              (labels (ArrayList i64))
+              (branches (ArrayList Branch))] (-> (Result i32 (slice u8)))
+  (let [(mut error) ""]
+    (for branch branches
+      (when (= error "")
+        (if (or (< (.field branch) 0)
+                (> (.field branch) (- (len output) 4))
+                (< (.label branch) 0)
+                (>= (cast i64 (.label branch)) (len labels)))
+            (set! error "invalid x86-64 branch fixup offset or label")
+            (let [target (get labels (cast i64 (.label branch)))]
+              (when (or (< target 0)
+                        (> target (len output))
+                        (not (encode/fits32? (- target (+ (.field branch) 4)))))
+                (set! error "unbound or out-of-range x86-64 branch target"))))))
+    (if (!= error "")
+        (Err error)
+        (do
+          (for branch branches
+            (patch32! (mut output) (.field branch)
+                      (- (get labels (cast i64 (.label branch))) (+ (.field branch) 4))))
+          (Ok (cast i32 (len branches)))))))
+
+;;; Patch every table word with `label - base`.
+(defn apply-relative! [(output (mut (ArrayList u8)))
+                       (labels (ArrayList i64))
+                       (relatives (ArrayList Relative))] (-> (Result i32 (slice u8)))
+  (let [(mut error) ""]
+    (for relative relatives
+      (when (= error "")
+        (if (or (< (.offset relative) 0)
+                (> (.offset relative) (- (len output) 4))
+                (< (.label relative) 0)
+                (>= (cast i64 (.label relative)) (len labels))
+                (< (get labels (cast i64 (.label relative))) 0)
+                (not (encode/fits32? (- (get labels (cast i64 (.label relative)))
+                                        (.base relative)))))
+            (set! error "invalid x86-64 relative table fixup")
+            0)))
+    (if (!= error "")
+        (Err error)
+        (do
+          (for relative relatives
+            (patch32! (mut output) (.offset relative)
+                      (- (get labels (cast i64 (.label relative))) (.base relative))))
+          (Ok (cast i32 (len relatives)))))))

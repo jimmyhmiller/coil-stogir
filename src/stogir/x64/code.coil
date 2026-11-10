@@ -1,0 +1,103 @@
+;;; x86-64 code bytes and the pending graph references that travel with them.
+;;;
+;;; The a64 Buffer is not shared: its text is a sequence of 4-byte words
+;;; (alignment checks, word peephole bookkeeping), while x86-64 text is bytes
+;;; and its relocations carry explicit addends.
+;;;
+;;; Every instruction encoder returns `(Result i64 (slice u8))`. Emitters keep
+;;; one `(mut error)` string and feed each encoder result through `accept!`,
+;;; which records the first failure; the caller discards the bytes on error.
+(module stogir.x64.code)
+(import "stogir.alignment" :as alignment)
+(import "stogir.bytes" :as bytes)
+(import "stogir.text-data" :as text-data)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err])
+
+;;; A pending image relocation of 4 bytes at `offset`: `kind` is an image
+;;; relocation kind (5 PC32, 6 PLT32), `target` a negative graph constant
+;;; reference, and `addend` the explicit addend (-4 when the field ends the
+;;; instruction; see stogir.x64.encode's header).
+(defstruct Reference [(offset i64) (kind i32) (target i32) (addend i64)])
+
+(defstruct Buffer
+  [(alignment i64)
+   (text (ArrayList u8))
+   (references (ArrayList Reference))
+   (text-data (ArrayList text-data/Range))])
+
+(defn create [(allocator (dyn Allocator))] (-> Buffer)
+  (Buffer
+    :alignment 1
+    :text (ArrayList::new [u8] allocator)
+    :references (ArrayList::new [Reference] allocator)
+    :text-data (ArrayList::new [text-data/Range] allocator)))
+
+(defn release! [(buffer (mut Buffer))] (-> void)
+  (free! (mut (.text buffer)))
+  (free! (mut (.references buffer)))
+  (free! (mut (.text-data buffer))))
+
+(defn take-text! [(buffer (mut Buffer)) (allocator (dyn Allocator))]
+  (-> (ArrayList u8))
+  (let [text (load (mut (.text buffer)))]
+    (store! (mut (.text buffer)) (ArrayList::new [u8] allocator))
+    text))
+
+;;; Record the first encoder failure in `error`.
+(defn accept! [(error (mut (slice u8))) (result (Result i64 (slice u8)))] (-> void)
+  (match result
+    (Err [message] (when (= error "") (set! error message)))
+    (Ok [_] 0)))
+
+;;; As accept! for the i32 results of emitters built on the encoders.
+(defn accept-count! [(error (mut (slice u8))) (result (Result i32 (slice u8)))]
+  (-> void)
+  (match result
+    (Err [message] (when (= error "") (set! error message)))
+    (Ok [_] 0)))
+
+;;; Append a distinct temporary buffer, rebasing its references and data
+;;; ranges. False (and no change) when `source` shares storage with `output`
+;;; or carries an invalid reference.
+(defn append! [(output (mut Buffer)) (source Buffer)] (-> bool)
+  (let [base (len (.text output))
+        (mut valid?)
+          (not (or (and (> (len (.references source)) 0)
+                        (= (primitive/cast usize (.data (.references source)))
+                           (primitive/cast usize (.data (.references output)))))
+                   (and (> (len (.text-data source)) 0)
+                        (= (primitive/cast usize (.data (.text-data source)))
+                           (primitive/cast usize (.data (.text-data output)))))))]
+    (unless (and (alignment/valid? (.alignment source))
+                 (alignment/valid? (.alignment output)))
+      (set! valid? false))
+    (for reference (.references source)
+      (when (or (< (.offset reference) 0)
+                (> (.offset reference) (- (len (.text source)) 4))
+                (>= (.target reference) 0)
+                (< (.kind reference) 5)
+                (> (.kind reference) 6))
+        (set! valid? false)))
+    (if (or (not valid?)
+            (not (bytes/append-slice! (mut (.text output)) (slice (.text source)))))
+        false
+        (do
+          (set! (.alignment output)
+                (alignment/maximum (.alignment output) (.alignment source)))
+          (for range (.text-data source)
+            (push! (mut (.text-data output))
+                   (text-data/Range
+                     :offset (+ base (.offset range))
+                     :length (.length range)
+                     :kind (.kind range))))
+          (for reference (.references source)
+            (push! (mut (.references output))
+                   (Reference
+                     :offset (+ base (.offset reference))
+                     :kind (.kind reference)
+                     :target (.target reference)
+                     :addend (.addend reference))))
+          true))))

@@ -1,0 +1,48 @@
+;;; Virtual-register joining before allocation on x86-64: non-overlapping PHI
+;;; inputs and results share one allocation identity, so most PHI edge copies
+;;; disappear (the neutral stogir.phi-coalesce).
+;;;
+;;; The a64 module of this name also joins COPY, BITCAST and TRUNC "views"
+;;; with their sources. That part is written against AArch64 conversion
+;;; knowledge (stogir.a64.convert) and is not ported yet: on x86-64 those
+;;; nodes are hinted to their source's register instead
+;;; (stogir.x64.constraints), which removes the move in the common case.
+(module stogir.x64.coalesce)
+(import "stogir.graph" :as g)
+(import "stogir.cfg" :as cfg)
+(import "stogir.phi-coalesce" :as phi)
+(import "stogir.allocation" :as allocation)
+(import "stogir.locations" :as locations)
+(import "stogir.schedule" :as schedule)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+
+;;; The allocation owner of graph value `reference`. `parents` is empty when
+;;; nothing was joined.
+(defn canonical [(parents (ArrayList i32)) (reference i32)] (-> i32)
+  (if (= (len parents) 0)
+      reference
+      (let [(mut result) reference]
+        (while (!= (get parents (cast i64 result)) result)
+          (set! result (get parents (cast i64 result))))
+        result)))
+
+;;; Join PHI groups in `parts` (unsplit, unassigned, sorted by parent). The
+;;; result maps each graph reference to its owner, or is empty.
+(defn run-prepared! [(parts (mut (ArrayList allocation/Part)))
+                     (graph g/Graph) (scheduled schedule/Schedule)
+                     (blocks cfg/Blocks) (depths (ArrayList i32))
+                     (a (dyn Allocator))] (-> (ArrayList i32))
+  (let [(mut parents) (ArrayList::new [i32] a)
+        (mut groups) (phi/run! (mut parts) (mut parents) graph scheduled blocks depths a)]
+    (free! (mut groups))
+    parents))
+
+;;; Make the finalized location index answer for joined values: an alias
+;;; borrows its owner's split children.
+(defn index! [(index (mut locations/Index)) (parents (ArrayList i32))] (-> void)
+  (when (> (len parents) 0) (set! (.coalesced index) true))
+  (for [r 1 (len parents)]
+    (let [parent (get parents r)]
+      (when (!= parent (cast i32 r))
+        (set! (mut (.parents index)) r (get (.parents index) (cast i64 parent)))))))

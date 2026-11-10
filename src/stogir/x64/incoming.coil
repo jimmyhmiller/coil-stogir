@@ -1,0 +1,161 @@
+;;; System V x86-64 scalar parameter locations from a complete signature.
+;;;
+;;; Integer parameters take rdi rsi rdx rcx r8 r9 in order, floating
+;;; parameters xmm0..xmm7; a parameter whose bank is exhausted takes the next
+;;; 8-byte stack slot. Stack offsets are relative to the first stack argument,
+;;; which is at entry rsp + 8 (the return address is at entry rsp).
+;;;
+;;; Grouped (aggregate) parameters and register-piece or indirect results are
+;;; the call family's job (stogir.x64.call-abi): `build` reports a clear error
+;;; for a prototype that declares them.
+;;;
+;;; The a64 module of this name is not shared: it places parameters through
+;;; the AAPCS64/Darwin planner and loads them with AArch64 encodings.
+(module stogir.x64.incoming)
+(import "stogir.locations" :as locations)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.registers" :as registers)
+(import "stogir.x64.value" :as value)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.calls" :as calls)
+(import "stogir.strings" :as strings)
+(import "stogir.call-groups" :as groups)
+(import "stogir.call-results" :as results)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; kind: -1 absent, 0 general register, 1 incoming stack slot, 2 XMM register.
+;;; `register` is the library register number (general 0..15, XMM 32..47).
+;;; `offset` is relative to the first stack argument (entry rsp + 8).
+(defstruct Parameter
+  [(reference i32)
+   (kind i32)
+   (register i32)
+   (offset i64)
+   (size i32)])
+
+(defn absent [] (-> Parameter)
+  (Parameter :reference 0 :kind -1 :register -1 :offset -1 :size 0))
+
+;;; The calling-convention number in a prototype's flags: 0 (default) and 8
+;;; (System V) are this backend's convention.
+(defn convention? [(flags u8)] (-> bool)
+  (or (= (& flags 15) 0) (= (& flags 15) 8)))
+
+;;; One Parameter per PARAM projection of `entry`. Requires structural
+;;; verification. Without a declared prototype every preceding parameter must
+;;; have a PARAM projection, or positions cannot be inferred.
+(defn build [(graph g/Graph) (entry i32) (allocator (dyn Allocator))]
+  (-> (Result (ArrayList Parameter) (slice u8)))
+  (let [(mut result) (ArrayList::new [Parameter] allocator)
+        (mut parameters) (ArrayList::new [u8] allocator)
+        (mut references) (ArrayList::new [i32] allocator)
+        declared? (!= (.function-prototype graph) 0)
+        (mut return-type) (: 0 u8)
+        (mut error) ""
+        (mut r) 1]
+    (when declared?
+      (match (strings/lookup (.strings graph) (.function-prototype graph))
+        (None [] (set! error "function prototype string missing"))
+        (Some [bytes]
+              (cond (not (calls/valid-bytes? bytes))
+                      (set! error "malformed function prototype")
+                    (not (convention? (get bytes 0)))
+                      (set! error "unsupported x86-64 function convention")
+                    (> (groups/count bytes) 0)
+                      (set! error "x86-64 backend: grouped (aggregate) parameters are not implemented yet (call family)")
+                    (!= (.kind (results/decode bytes)) 0)
+                      (set! error "x86-64 backend: register-piece and indirect results are not implemented yet (call family)")
+                    :else
+                      (do
+                        (set! return-type (get bytes 1))
+                        (for [i 3 (+ 3 (cast i64 (get bytes 2)))]
+                          (push! (mut parameters) (get bytes i))
+                          (push! (mut references) 0)))))))
+    (while (and (= error "") (< r (len (.instructions graph))))
+      (let [node (get (.instructions graph) r)
+            count (get (.arities graph) r)]
+        (when (= (n/opcode node) 71)
+          (let [ordinal (cast i64 (.op3 node))]
+            (if (or (!= (.op1 node) entry)
+                    (< ordinal 0)
+                    (and declared? (>= ordinal (len parameters)))
+                    (and (not declared?) (>= ordinal (len (.instructions graph)))))
+                (set! error "invalid parameter region or ordinal")
+                (do
+                  (while (<= (len parameters) ordinal)
+                    (push! (mut parameters) 0)
+                    (push! (mut references) 0))
+                  (when (!= (get references ordinal) 0)
+                    (set! error "duplicate parameter projection"))
+                  (if declared?
+                      (when (!= (get parameters ordinal) (n/type-id node))
+                        (set! error "parameter type disagrees with function prototype"))
+                      (set! (mut parameters) ordinal (n/type-id node)))
+                  (set! (mut references) ordinal (cast i32 r))))))
+        (when (and declared? (= (n/opcode node) 120) (!= (n/type-id node) return-type))
+          (set! error "return type disagrees with function prototype"))
+        (set! r (+ r (/ (+ (cast i64 count) 4) 4)))))
+    (when (= error "")
+      (let [(mut general) (: 0 i32)
+            (mut floating) (: 0 i32)
+            (mut stack) (: 0 i64)]
+        (for [i 0 (len parameters)]
+          (let [ty (cast i32 (get parameters i))
+                reference (get references i)
+                size (types/size ty 8)]
+            (cond (or (= ty 0) (not (types/valid? ty)))
+                    (set! error "incomplete parameter types; declare a function prototype")
+                  (types/vector? ty)
+                    (set! error "x86-64 backend: vector parameters are not implemented yet (call family)")
+                  :else
+                    (let [float? (types/floating? ty)
+                          register (if float?
+                                       (registers/simd-argument floating)
+                                       (registers/gpr-argument general))]
+                      (if float? (set! floating (+ floating 1)) (set! general (+ general 1)))
+                      (when (> reference 0)
+                        (push! (mut result)
+                               (Parameter
+                                 :reference reference
+                                 :kind (if (< register 0) 1 (if float? 2 0))
+                                 :register register
+                                 :offset (if (< register 0) stack -1)
+                                 :size size)))
+                      (when (< register 0) (set! stack (+ stack 8)))))))))
+    (free! (mut parameters))
+    (free! (mut references))
+    (if (= error "") (Ok result) (do (free! (mut result)) (Err error)))))
+
+;;; Load stack parameter `parameter` into its allocated register at its PARAM
+;;; definition (`position + 1`). `frame-size` is the rsp adjustment of the
+;;; prologue, so the first stack argument is at rsp + frame-size + 8.
+;;; Register parameters are already in place and emit nothing.
+(defn emit-entry-with-locations! [(out (mut code/Buffer))
+                                  (graph g/Graph)
+                                  (parts locations/View)
+                                  (parameter Parameter)
+                                  (position i64)
+                                  (frame-size i64)] (-> (Result i32 (slice u8)))
+  (let [begin (len (.text out))
+        ty (value/type-of graph (.reference parameter))]
+    (cond (= (.kind parameter) 0) (Ok 0)
+          (!= (.kind parameter) 1)
+            (Err "x86-64 backend: floating parameters are not implemented yet (floating family)")
+          (not (types/integer? ty))
+            (Err "x86-64 backend: floating stack parameters are not implemented yet (floating family)")
+          :else
+            (match (value/destination graph parts (.reference parameter) position)
+              (Err [message] (Err message))
+              (Ok [destination]
+                  (match (encode/mov-rm (mut (.text out))
+                                        (value/operation-bits ty)
+                                        destination
+                                        (encode/mem registers/RSP
+                                                    (+ frame-size 8 (.offset parameter))))
+                    (Err [message] (Err message))
+                    (Ok [_] (Ok (cast i32 (- (len (.text out)) begin))))))))))

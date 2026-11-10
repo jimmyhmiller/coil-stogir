@@ -1,0 +1,40 @@
+;;; Fixed-frame addressing for x86-64.
+;;;
+;;; Logical frame offsets are measured upward from rsp after the prologue, as
+;;; on AArch64 (docs/X86_PORT.md, "Frame"): outgoing area, locals, spills,
+;;; callee-saved area. With the stack base a logical offset is the rsp
+;;; displacement itself. An anchored frame (dynamic stack or over-alignment;
+;;; the stack family) addresses the same offsets from rbp: `bias` is the
+;;; logical offset rbp points at.
+;;;
+;;; The a64 module of this name is not shared: it encodes AArch64 immediates
+;;; and its base registers are x29/sp.
+(module stogir.x64.frame-address)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.registers" :as registers)
+(import "coil.result" :use [Result Ok Err])
+
+(defstruct Base [(reg i32) (bias i64)])
+
+(defn stack-base [] (-> Base)
+  (Base :reg registers/RSP :bias 0))
+
+(defn valid-base? [(base Base)] (-> bool)
+  (or (and (= (.reg base) registers/RSP) (= (.bias base) 0))
+      (and (= (.reg base) registers/RBP) (>= (.bias base) 0))))
+
+;;; The memory operand of the frame bytes at logical `offset`.
+(defn slot [(base Base) (offset i64)] (-> (Result encode/Mem (slice u8)))
+  (if (or (not (valid-base? base)) (< offset 0))
+      (Err "invalid x86-64 frame base or offset")
+      (let [displacement (- offset (.bias base))]
+        (if (not (encode/fits32? displacement))
+            (Err "x86-64 frame offset exceeds a 32-bit displacement")
+            (Ok (encode/mem (.reg base) displacement))))))
+
+;;; rsp-relative bytes this function's frame occupies below the return
+;;; address: the frame contents rounded up so that rsp is 16-byte aligned after
+;;; the prologue (entry rsp + 8 + N is a multiple of 16). Zero stays zero: a
+;;; function with no frame contents is frameless.
+(defn allocation-size [(aligned-contents i64)] (-> i64)
+  (if (= aligned-contents 0) 0 (+ aligned-contents 8)))

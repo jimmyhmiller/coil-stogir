@@ -1397,7 +1397,7 @@ unchanged. See CONSTANT_MULTIPLY.md.
 
 ## Preallocation Phi coalescing
 
-`a64/phi-coalesce.coil` follows pinned `ir_ra.c:ir_coalesce`,
+`phi-coalesce.coil` follows pinned `ir_ra.c:ir_coalesce`,
 `ir_vregs_overlap`, `ir_vregs_join`, and `ir_vregs_coalesce`: predecessor-block
 ordering, exact non-overlap, preference for an existing coalesced group and then
 original reference order, union of ranges/uses, and exclusion of Phi groups from
