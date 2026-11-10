@@ -1,0 +1,478 @@
+(module stogir.tests.view-lifetime-coalesce)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.a64.constants" :as constants)
+(import "stogir.bytes" :as bytes)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+(defn word! [(text (mut (ArrayList u8))) (r (Result u32 (slice u8)))] (-> void)
+  (match r (Ok [word] (bytes/append32! (mut text) word)) (Err [e] (panic "{}" e))))
+
+;;; Returns x0 + 7 and destroys every other caller-saved GPR (x1..x17) and NZCV.
+(defn clobber-target [] (-> (ArrayList u8))
+  (let [a (malloc-allocator) (mut text) (ArrayList::new [u8] a)]
+    (word! (mut text) (encode/add-sub-immediate true false false 0 0 7))
+    (for [r 1 18]
+      (require (constants/emit! (mut text) true (cast i32 r)
+                               (+ (: 0xFEDCBA9876540000 u64) (cast u64 r)))))
+    (word! (mut text) (encode/add-sub true true true 31 0 1))
+    (word! (mut text) (encode/ret 30))
+    text))
+
+;;; Address of the index-th 64-bit cell.
+(defn cell [(cells (ptr i64)) (index i64)] (-> (ptr i64))
+  (p/cast (ptr i64) (+ (p/cast i64 cells) (* index 8))))
+
+(defn word [(text (slice u8)) (i i64)] (-> u32)
+  (| (cast u32 (get text i))
+     (<< (cast u32 (get text (+ i 1))) 8)
+     (<< (cast u32 (get text (+ i 2))) 16)
+     (<< (cast u32 (get text (+ i 3))) 24)))
+
+;;; ORR Rd, Rn, ZR (either width, no shift): the copy a view conversion emits
+;;; when its result does not share its source's register.
+(defn view-copy? [(w u32)] (-> bool)
+  (and (= (& w (: 0x7FE0FC00 u32)) (: 0x2A000000 u32))
+       (= (& (>> w 16) (: 31 u32)) (: 31 u32))
+       (!= (& (>> w 5) (: 31 u32)) (: 31 u32))))
+
+;;; STR Xt/Wt, [SP, #imm] (unsigned offset form).
+(defn stack-store? [(w u32)] (-> bool)
+  (and (= (& w (: 0xBFC00000 u32)) (: 0xB9000000 u32))
+       (= (& (>> w 5) (: 31 u32)) (: 31 u32))))
+
+(defn view-copies [(text (slice u8))] (-> i64)
+  (let [(mut count) 0]
+    (for [i 0 (/ (len text) 4)]
+      (when (view-copy? (word text (* i 4))) (set! count (+ count 1))))
+    count))
+
+(defn repeated-stores [(text (slice u8))] (-> i64)
+  (let [(mut count) 0]
+    (for [i 1 (/ (len text) 4)]
+      (let [w (word text (* i 4))]
+        (when (and (stack-store? w) (= w (word text (* (- i 1) 4))))
+          (set! count (+ count 1)))))
+    count))
+
+(defn target-call! [(graph (mut g/Graph)) (control i32) (target i32) (argument i32)] (-> i32)
+  (let [a (malloc-allocator)]
+    (match (calls/create 0 11 [(: 11 u8)] a)
+      (Err [e] (panic "{}" e))
+      (Ok [owned]
+        (let [(mut signature) owned
+              call (require (calls/emit! (mut graph) signature control target [argument] a))]
+          (calls/release! (mut signature))
+          call)))))
+
+;;; x + 1 .. x + count, all live until summed: more values than preserved
+;;; registers when held across a call.
+(defn pressure! [(graph (mut g/Graph)) (x i32) (count i64) (values (mut (ArrayList i32)))] (-> void)
+  (for [i 1 (+ count 1)]
+    (let [constant (require (b/scalar-constant! (mut graph) 11 (cast u64 i) 8))]
+      (push! (mut values) (require (b/emit! (mut graph) 26 11 [x constant]))))))
+
+(defn sum! [(graph (mut g/Graph)) (start i32) (values (ArrayList i32))] (-> i32)
+  (let [(mut total) start]
+    (for value values (set! total (require (b/emit! (mut graph) 26 11 [total value]))))
+    total))
+
+;;; The largest number of times one stack-store instruction word occurs.
+(defn most-repeated-store [(text (slice u8))] (-> i64)
+  (let [(mut most) 0]
+    (for [i 0 (/ (len text) 4)]
+      (let [w (word text (* i 4))]
+        (when (stack-store? w)
+          (let [(mut count) 0]
+            (for [j 0 (/ (len text) 4)]
+              (when (= (word text (* j 4)) w) (set! count (+ count 1))))
+            (when (> count most) (set! most count))))))
+    most))
+
+;;; Compile at every level, check the code shape where one is demanded
+;;; (limit < 0: unchecked) and hand each mapped function to run. store-limit
+;;; bounds how often one register is stored to one stack slot in the text: a
+;;; home is written once per definition reaching it.
+(defn each-level [(graph g/Graph) (start i32) (root i32) (name (slice u8))
+                  (copy-limit i64) (store-limit i64) (cells (ptr i64)) (target u64)
+                  (run (fnptr (cc/C) [(ptr u8) u64 (ptr i64)] void))] (-> void)
+  (let [a (malloc-allocator)]
+    (for level [(: 1 i32) 2 3]
+      (match (compile/image-with-options graph start [root] name (options/Options :level level) a)
+        (Err [e] (panic "{} level {}: {}" name level e))
+        (Ok [owned-code]
+          (let [(mut code) owned-code
+                text (slice (.text code))]
+            (when (>= copy-limit 0)
+              (unless (<= (view-copies text) copy-limit)
+                (panic "{} level {}: {} view copies" name level (view-copies text))))
+            (unless (= (repeated-stores text) 0)
+              (panic "{} level {}: a spill home is stored twice in a row" name level))
+            (when (>= store-limit 0)
+              (unless (<= (most-repeated-store text) store-limit)
+                (panic "{} level {}: one home store occurs {} times" name level
+                       (most-repeated-store text))))
+            (match (jit/map-image code a)
+              (Err [e] (panic "{}" e))
+              (Ok [owned-image]
+                (let [(mut loaded) owned-image]
+                  (call-ptr run (p/cast (ptr u8) (.base (.memory loaded))) target cells)
+                  (jit/release-image! (mut loaded)))))
+            (image/release! (mut code))))))))
+
+;;; f(target, p, x) = *p + (x + 7) [+ sum of pressure]. The loaded word dies at
+;;; the BITCAST; its view crosses the call. Under pressure the view is used
+;;; last, so it is the value sent to a spill home.
+(defn run-dying :cc (cc/C) [(f (ptr u8)) (target u64) (cells (ptr i64))] (-> void)
+  (let [function (p/cast (fnptr (cc/C) [u64 (ptr i64) i64] i64) f)
+        pressure (load (cell cells 7))]
+    (for value [(: -9000000000 i64) -1 0 1 0x7FFFFFFFFFFFFFFF]
+      (store! cells value)
+      (for x [(: -100 i64) -1 0 1 12345]
+        (assert (= (call-ptr function target cells x)
+                   (p/iadd (if (= (load (cell cells 6)) 0) value (p/iadd value value))
+                           (+ x 7 (* pressure x) (/ (* pressure (+ pressure 1)) 2)))))))))
+
+;;; again: the source is read once more after the view, so it outlives it
+;;; (answer + *p); the pair is one spilled value whose home is written once.
+(defn dying-source [(pressure i64) (again bool) (target u64)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        callee (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        place (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        (mut values) (ArrayList::new [i32] a)
+        loaded (require (b/emit! (mut graph) 91 11 [start place]))
+        view (require (b/emit! (mut graph) 36 5 [loaded]))]
+    (pressure! (mut graph) x pressure (mut values))
+    (let [call (target-call! (mut graph) loaded callee x)
+          total (sum! (mut graph) call values)
+          unsigned (require (b/emit! (mut graph) 36 5 [total]))
+          once (require (b/emit! (mut graph) 26 5 [unsigned view]))
+          signed (require (b/emit! (mut graph) 36 11 [once]))
+          answer (if again (require (b/emit! (mut graph) 26 11 [signed loaded])) signed)
+          ret (require (b/emit! (mut graph) 120 11 [call answer (: 0 i32)]))
+          (mut cells) (zeroed (array i64 8))]
+      (set! (mut cells) 6 (if again 1 0))
+      (set! (mut cells) 7 pressure)
+      (each-level graph start ret "_view_dying" 0 1 (p/cast (ptr i64) (mut cells)) target
+                  (fnptr-of run-dying)))
+    (free! (mut values)) (g/release! (mut graph))))
+
+;;; f(target, p, x) = (v + 1) + (v + 7) + v where v = *p: the source stays live
+;;; past its view and both are arguments of one call, in different registers.
+;;; They cannot share one there; the answer must not depend on the decision.
+(defn run-shared :cc (cc/C) [(f (ptr u8)) (target u64) (cells (ptr i64))] (-> void)
+  (let [function (p/cast (fnptr (cc/C) [u64 (ptr i64) i64] i64) f)]
+    (for value [(: -9000000000 i64) -1 0 1 0x3FFFFFFFFFFFFFFF]
+      (store! cells value)
+      (assert (= (call-ptr function target cells 5) (+ value 1 value 7 value))))))
+
+(defn shared-arguments [(target u64)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        callee (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        place (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        loaded (require (b/emit! (mut graph) 91 11 [start place]))
+        view (require (b/emit! (mut graph) 36 5 [loaded]))
+        bumped (require (b/emit! (mut graph) 26 11 [loaded one]))]
+    (match (calls/create 0 11 [(: 11 u8) 5] a)
+      (Err [e] (panic "{}" e))
+      (Ok [owned]
+        (let [(mut signature) owned
+              call (require (calls/emit! (mut graph) signature loaded callee [loaded view] a))
+              first (require (b/emit! (mut graph) 26 11 [bumped call]))
+              back (require (b/emit! (mut graph) 36 11 [view]))
+              answer (require (b/emit! (mut graph) 26 11 [first back]))
+              ret (require (b/emit! (mut graph) 120 11 [call answer (: 0 i32)]))
+              (mut cells) (zeroed (array i64 8))]
+          (calls/release! (mut signature))
+          (each-level graph start ret "_view_shared" -1 1 (p/cast (ptr i64) (mut cells)) target
+                      (fnptr-of run-shared)))))
+    (g/release! (mut graph))))
+
+;;; Widening views of narrow loads whose sources have other narrow consumers:
+;;; f = zext(a) + zext(a +32 a) + sext(s) + sext(s +32 s) + zext(c) + zext(c +8 c)
+;;;     + (x + 7) [+ pressure]. Under pressure the groups are spilled and
+;;; reloaded at the wide member's size.
+(defn run-widening :cc (cc/C) [(f (ptr u8)) (target u64) (cells (ptr i64))] (-> void)
+  (let [function (p/cast (fnptr (cc/C) [u64 (ptr i64) i64] i64) f)
+        pressure (load (cell cells 7))]
+    (for unsigned [(: 0 u64) 1 0x7FFFFFFF 0x80000000 0xFFFFFFFF 0xDEADBEEF]
+      (for signed [(: 0 i64) 1 -1 0x7FFFFFFF -0x80000000 0x40000000 -0x40000001]
+        (for byte [(: 0 u64) 1 0x7F 0x80 0xFF]
+          ; High halves hold junk a narrow load must not read.
+          (store! cells (p/cast i64 (| unsigned (: 0xA5A5A5A500000000 u64))))
+          (store! (cell cells 1) (p/cast i64 (| (& (p/cast u64 signed) (: 0xFFFFFFFF u64))
+                                                    (: 0x5A5A5A5A00000000 u64))))
+          (store! (cell cells 2) (p/cast i64 (| byte (: 0xC3C3C3C3C3C3C300 u64))))
+          (let [x (- signed 3)
+                doubled (& (+ unsigned unsigned) (: 0xFFFFFFFF u64))
+                twice (& (p/cast u64 (+ signed signed)) (: 0xFFFFFFFF u64))
+                twice-signed (if (>= twice (: 0x80000000 u64))
+                                 (- (p/cast i64 twice) 0x100000000)
+                                 (p/cast i64 twice))
+                expected (+ (p/cast i64 unsigned) (p/cast i64 doubled) signed twice-signed
+                            (p/cast i64 byte) (p/cast i64 (& (+ byte byte) (: 0xFF u64)))
+                            x 7 (* pressure x) (/ (* pressure (+ pressure 1)) 2))]
+            (assert (= (call-ptr function target cells x) expected))))))))
+
+(defn widening [(pressure i64) (target u64)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        callee (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        place (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        eight (require (b/scalar-constant! (mut graph) 6 8 8))
+        sixteen (require (b/scalar-constant! (mut graph) 6 16 8))
+        second (require (b/emit! (mut graph) 26 6 [place eight]))
+        third (require (b/emit! (mut graph) 26 6 [place sixteen]))
+        (mut values) (ArrayList::new [i32] a)
+        unsigned (require (b/emit! (mut graph) 91 4 [start place]))
+        signed (require (b/emit! (mut graph) 91 10 [unsigned second]))
+        byte (require (b/emit! (mut graph) 91 2 [signed third]))
+        wide-unsigned (require (b/emit! (mut graph) 34 11 [unsigned]))
+        doubled (require (b/emit! (mut graph) 26 4 [unsigned unsigned]))
+        wide-doubled (require (b/emit! (mut graph) 34 11 [doubled]))
+        wide-signed (require (b/emit! (mut graph) 33 11 [signed]))
+        twice (require (b/emit! (mut graph) 26 10 [signed signed]))
+        wide-twice (require (b/emit! (mut graph) 33 11 [twice]))
+        wide-byte (require (b/emit! (mut graph) 34 11 [byte]))
+        byte-twice (require (b/emit! (mut graph) 26 2 [byte byte]))
+        wide-byte-twice (require (b/emit! (mut graph) 34 11 [byte-twice]))]
+    (pressure! (mut graph) x pressure (mut values))
+    (let [call (target-call! (mut graph) byte callee x)
+          (mut total) (sum! (mut graph) call values)]
+      (for piece [wide-unsigned wide-doubled wide-signed wide-twice wide-byte wide-byte-twice]
+        (set! total (require (b/emit! (mut graph) 26 11 [total piece]))))
+      (let [ret (require (b/emit! (mut graph) 120 11 [call total (: 0 i32)]))
+            (mut cells) (zeroed (array i64 8))]
+        (set! (mut cells) 7 pressure)
+        ; Without pressure every widened load lives in one register from its
+        ; load on: no copy at any of the six widenings.
+        (each-level graph start ret "_view_widening" (if (= pressure 0) 0 -1) 1
+                    (p/cast (ptr i64) (mut cells)) target (fnptr-of run-widening))))
+    (free! (mut values)) (g/release! (mut graph))))
+
+;;; f(target, p, x) = *(x != 0 ? p[0] : p[1] as pointers) + (x + 7) [+ pressure]:
+;;; both arms' views are members of the merge Phi's group, which takes their
+;;; loads in. Under pressure the group is spilled and each arm writes its home
+;;; once.
+(defn run-merged :cc (cc/C) [(f (ptr u8)) (target u64) (cells (ptr i64))] (-> void)
+  (let [function (p/cast (fnptr (cc/C) [u64 (ptr i64) i64] i64) f)
+        pressure (load (cell cells 7))]
+    (for x [(: -100 i64) -1 0 1 12345]
+      (assert (= (call-ptr function target cells x)
+                 (+ (if (!= x 0) 100 200) x 7 (* pressure x) (/ (* pressure (+ pressure 1)) 2)))))))
+
+(defn merged-views [(pressure i64) (target u64)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        callee (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        place (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        eight (require (b/scalar-constant! (mut graph) 6 8 8))
+        second (require (b/emit! (mut graph) 26 6 [place eight]))
+        (mut values) (ArrayList::new [i32] a)
+        condition (require (b/emit! (mut graph) 15 1 [x zero]))
+        branch (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        first-word (require (b/emit! (mut graph) 91 11 [yes place]))
+        first-view (require (b/emit! (mut graph) 36 6 [first-word]))
+        first-end (require (b/emit! (mut graph) 114 0 [first-word]))
+        no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        second-word (require (b/emit! (mut graph) 91 11 [no second]))
+        second-view (require (b/emit! (mut graph) 36 6 [second-word]))
+        second-end (require (b/emit! (mut graph) 114 0 [second-word]))
+        merge (require (b/emit! (mut graph) 112 0 [first-end second-end]))
+        chosen (require (b/emit! (mut graph) 67 6 [merge first-view second-view]))]
+    (pressure! (mut graph) x pressure (mut values))
+    (let [call (target-call! (mut graph) merge callee x)
+          total (sum! (mut graph) call values)
+          word (require (b/emit! (mut graph) 91 11 [call chosen]))
+          answer (require (b/emit! (mut graph) 26 11 [total word]))
+          ret (require (b/emit! (mut graph) 120 11 [word answer (: 0 i32)]))
+          (mut cells) (zeroed (array i64 8))]
+      (set! (mut cells) 0 (p/cast i64 (cell (p/cast (ptr i64) (mut cells)) 2)))
+      (set! (mut cells) 1 (p/cast i64 (cell (p/cast (ptr i64) (mut cells)) 3)))
+      (set! (mut cells) 2 100)
+      (set! (mut cells) 3 200)
+      (set! (mut cells) 7 pressure)
+      (each-level graph start ret "_view_merged" 0 2 (p/cast (ptr i64) (mut cells)) target
+                  (fnptr-of run-merged)))
+    (free! (mut values)) (g/release! (mut graph))))
+
+;;; f(target, p, x) = x != 0 ? p[0] : p[1] + (x + 7) + pressure. The short arm
+;;; leaves its word in a register up to the merge; the long arm's pressure and
+;;; call send the merge Phi's group to its home, so the Phi enters in memory.
+;;; Each arm's definition already wrote that home: the short arm's transfer
+;;; into the Phi stores nothing more.
+(defn run-spilled :cc (cc/C) [(f (ptr u8)) (target u64) (cells (ptr i64))] (-> void)
+  (let [function (p/cast (fnptr (cc/C) [u64 (ptr i64) i64] i64) f)]
+    (for first [(: -9000000000 i64) 0 77]
+      (for second [(: -5 i64) 0 0x7FFFFFFF00000000]
+        (store! cells first)
+        (store! (cell cells 1) second)
+        (for x [(: -100 i64) -1 0 1 12345]
+          (assert (= (call-ptr function target cells x)
+                     (if (!= x 0) first (+ second x 7 (* 24 x) 300)))))))))
+
+(defn spilled-merge [(target u64)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        callee (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        place (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        eight (require (b/scalar-constant! (mut graph) 6 8 8))
+        second (require (b/emit! (mut graph) 26 6 [place eight]))
+        (mut values) (ArrayList::new [i32] a)
+        condition (require (b/emit! (mut graph) 15 1 [x zero]))
+        branch (require (b/emit! (mut graph) 116 0 [start condition]))
+        yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        first-word (require (b/emit! (mut graph) 91 11 [yes place]))
+        first-end (require (b/emit! (mut graph) 114 0 [first-word]))
+        no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        second-word (require (b/emit! (mut graph) 91 11 [no second]))]
+    (pressure! (mut graph) x 24 (mut values))
+    (let [call (target-call! (mut graph) second-word callee x)
+          total (sum! (mut graph) call values)
+          second-end (require (b/emit! (mut graph) 114 0 [call]))
+          merge (require (b/emit! (mut graph) 112 0 [first-end second-end]))
+          chosen (require (b/emit! (mut graph) 67 11 [merge first-word second-word]))
+          extra (require (b/emit! (mut graph) 67 11 [merge zero total]))
+          answer (require (b/emit! (mut graph) 26 11 [extra chosen]))
+          ret (require (b/emit! (mut graph) 120 11 [merge answer (: 0 i32)]))
+          (mut cells) (zeroed (array i64 8))]
+      ; One store of the Phi's home per arm, by the same register.
+      (each-level graph start ret "_view_spilled" 0 2 (p/cast (ptr i64) (mut cells)) target
+                  (fnptr-of run-spilled)))
+    (free! (mut values)) (g/release! (mut graph))))
+
+;;; f(target, p, x) = (address of a frame object, as an integer) + x. The
+;;; BITCAST builds the address in its own result register instead of copying
+;;; it out of a scratch register. The frame sits at the same depth on every
+;;; call from one place, so differences of answers are differences of x.
+(defn run-framed :cc (cc/C) [(f (ptr u8)) (target u64) (cells (ptr i64))] (-> void)
+  (let [function (p/cast (fnptr (cc/C) [u64 (ptr i64) i64] i64) f)]
+    (for x [(: -100 i64) -1 0 1 0x7FFFFFFF]
+      (let [(mut answers) (zeroed (array i64 2))]
+        (for [k 0 2] (set! (mut answers) k (call-ptr function target cells (* k x))))
+        (assert (= (- (get answers 1) (get answers 0)) x))
+        (assert (= (& (get answers 0) 7) 0))))))
+
+(defn frame-address [(target u64)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        callee (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        place (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        size (require (b/scalar-constant! (mut graph) 5 16 8))
+        object (require (b/frame-object! (mut graph) start size 16))
+        stored (require (b/emit! (mut graph) 93 0 [object object x]))
+        number (require (b/emit! (mut graph) 36 11 [object]))
+        answer (require (b/emit! (mut graph) 26 11 [number x]))
+        ret (require (b/emit! (mut graph) 120 11 [stored answer (: 0 i32)]))
+        (mut cells) (zeroed (array i64 8))]
+    (each-level graph start ret "_view_framed" 0 -1 (p/cast (ptr i64) (mut cells)) target
+                (fnptr-of run-framed))
+    (g/release! (mut graph))))
+
+;;; f(target, base, limit) = sum over i in [base, limit) of
+;;; sext32(trunc32(i)) + sext32(2 * trunc32(i)) + i + (i + 7) + unchanged, where unchanged = base ^ limit
+;;; is computed before the loop. The TRUNC lies inside the loop Phi's own
+;;; lifetime and reads its register; the Phi group changes every iteration
+;;; while the unchanged value only crosses the call.
+(defn run-counted :cc (cc/C) [(f (ptr u8)) (target u64) (cells (ptr i64))] (-> void)
+  (let [function (p/cast (fnptr (cc/C) [u64 i64 i64] i64) f)]
+    (for base [(: -3 i64) 0 0x7FFFFFFD 0xFFFFFFFE -0x80000002]
+      (for count [(: 0 i64) 1 2 5]
+        (let [limit (+ base count)
+              (mut expected) (: 0 i64)]
+          (for [i base limit]
+            (let [low (& (p/cast u64 i) (: 0xFFFFFFFF u64))
+                  narrow (if (>= low (: 0x80000000 u64))
+                             (- (p/cast i64 low) 0x100000000)
+                             (p/cast i64 low))
+                  doubled (& (+ low low) (: 0xFFFFFFFF u64))
+                  twice (if (>= doubled (: 0x80000000 u64))
+                            (- (p/cast i64 doubled) 0x100000000)
+                            (p/cast i64 doubled))]
+              (set! expected (+ expected narrow twice i i 7 (p/cast i64 (^ (p/cast u64 base) (p/cast u64 limit)))))))
+          (assert (= (call-ptr function target base limit) expected)))))))
+
+(defn counted-loop [(target u64)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        callee (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        base (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        limit (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        unchanged (require (b/emit! (mut graph) 48 11 [base limit]))
+        entry (require (b/emit! (mut graph) 114 0 [start]))
+        header (require (b/loop-begin! (mut graph) entry))
+        counter (require (b/loop-phi! (mut graph) header base))
+        answer (require (b/loop-phi! (mut graph) header zero))
+        condition (require (b/emit! (mut graph) 16 1 [counter limit]))
+        branch (require (b/emit! (mut graph) 116 0 [header condition]))
+        body (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        exit (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        narrow (require (b/emit! (mut graph) 35 10 [counter]))
+        widened (require (b/emit! (mut graph) 33 11 [narrow]))
+        call (target-call! (mut graph) body callee counter)
+        doubled (require (b/emit! (mut graph) 26 10 [narrow narrow]))
+        twice (require (b/emit! (mut graph) 33 11 [doubled]))
+        plain (require (b/emit! (mut graph) 26 11 [answer widened]))
+        first (require (b/emit! (mut graph) 26 11 [plain twice]))
+        second (require (b/emit! (mut graph) 26 11 [first counter]))
+        third (require (b/emit! (mut graph) 26 11 [second call]))
+        fourth (require (b/emit! (mut graph) 26 11 [third unchanged]))
+        next (require (b/emit! (mut graph) 26 11 [counter one]))
+        back (require (b/emit! (mut graph) 115 0 [call]))
+        ret (require (b/emit! (mut graph) 120 11 [exit answer (: 0 i32)]))
+        (mut cells) (zeroed (array i64 8))]
+    (require (b/patch! (mut graph) header 2 back))
+    (require (b/patch! (mut graph) counter 3 next))
+    (require (b/patch! (mut graph) answer 3 fourth))
+    (each-level graph start ret "_view_counted" 0 -1 (p/cast (ptr i64) (mut cells)) target
+                (fnptr-of run-counted))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (let [(mut target-code) (clobber-target)]
+    (match (jit/map-text (slice target-code))
+      (Err [e] (panic "{}" e))
+      (Ok [owned-target]
+        (let [(mut native-target) owned-target
+              target (p/cast u64 (.base native-target))]
+          (dying-source 0 false target)
+          (dying-source 24 false target)
+          (dying-source 0 true target)
+          (dying-source 24 true target)
+          (shared-arguments target)
+          (widening 0 target)
+          (widening 24 target)
+          (merged-views 0 target)
+          (merged-views 24 target)
+          (spilled-merge target)
+          (frame-address target)
+          (counted-loop target)
+          (jit/release! (mut native-target)))))
+    (free! (mut target-code)))
+  (println "view lifetimes: dying, shared, widened, Phi-merged and loop-counter views share registers and spill homes; answers survive call clobbers and pressure at every level")
+  0)
