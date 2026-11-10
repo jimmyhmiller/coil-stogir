@@ -1,0 +1,315 @@
+(module stogir.tests.load-sink)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.node" :as n)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defstruct Fixture [(graph g/Graph) (roots (ArrayList i32))])
+
+(def MODES 12)
+
+;;; f(p, q, k) -> i64 over 64-bit cells. d = p[2] holds the address of p[0];
+;;; a = d[0] is the read in question (its address comes from a read) and
+;;; b = p[1] the one the branch tests.
+;;;  0 a; b; if b = k: r = a + 1 else r = 7                    (a moves under the branch)
+;;;  1 if k != 0: {d; a; b; if b = k: r = a else 5} else 9      (moves; nothing read when k = 0, p absent)
+;;;  2 a; q[0] = 2; b; if b = k: r = a else 7                  (kept: a write lies between)
+;;;  3 a; b; if b = k: {q[0] = 2; r = a} else 7                (moves above the write on its side)
+;;;  4 a; b; if b = k: r = a + 1 else r = a + 2                (kept: both sides use it)
+;;;  5 a; b; if b = k: x = 1 else x = 7; r = x + a             (kept: used after the join)
+;;;  6 loop i < k: {a; b; if b = i: sum += a; q[0] = i + 10}   (moves; a later iteration's value)
+;;;  7 a; if a = k: r = a else 7                               (kept: the branch tests it)
+;;;  8 a; b; c = a[0]; if b = k: r = c + a else 7              (a kept: a read above the branch uses it)
+;;;  9 a; b; if b = k: {if k != 3: r = a else 1} else 7        (moves under both branches)
+;;; 10 a; b; if b = k: r = a else 7; w = p[0]; r + w           (either placement; answers checked)
+;;; 11 as 0 with a = p[0] read through the parameter itself   (kept for the loop-entry proofs)
+(defn build [(mode i32) (a (dyn Allocator))] (-> Fixture)
+  (let [(mut graph) (g/create a) (mut roots) (ArrayList::new [i32] a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        q (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        k (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        two (require (b/scalar-constant! (mut graph) 11 2 8))
+        three (require (b/scalar-constant! (mut graph) 11 3 8))
+        five (require (b/scalar-constant! (mut graph) 11 5 8))
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))
+        eight (require (b/scalar-constant! (mut graph) 11 8 8))
+        nine (require (b/scalar-constant! (mut graph) 11 9 8))
+        ten (require (b/scalar-constant! (mut graph) 11 10 8))
+        sixteen (require (b/scalar-constant! (mut graph) 11 16 8))
+        second (require (b/emit! (mut graph) 26 6 [p eight]))
+        third (require (b/emit! (mut graph) 26 6 [p sixteen]))]
+    (let [(mut signature) (match (calls/create 0 11 [(: 6 u8) (: 6 u8) (: 11 u8)] a)
+                            (Err [message] (panic "{}" message)) (Ok [s] s))]
+      (require (calls/function! (mut graph) signature a))
+      (calls/release! (mut signature)))
+    (cond
+      (= mode 1)
+        (let [guard (require (b/emit! (mut graph) 15 1 [k zero]))
+              outer (require (b/emit! (mut graph) 116 0 [start guard]))
+              in (require (b/emit! (mut graph) 107 0 [outer (: 0 i32)]))
+              out (require (b/emit! (mut graph) 108 0 [outer (: 0 i32)]))
+              d (require (b/emit! (mut graph) 91 6 [in third]))
+              va (require (b/emit! (mut graph) 91 11 [d d]))
+              vb (require (b/emit! (mut graph) 91 11 [va second]))
+              condition (require (b/emit! (mut graph) 14 1 [vb k]))
+              branch (require (b/emit! (mut graph) 116 0 [vb condition]))
+              yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+              no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+              e1 (require (b/emit! (mut graph) 114 0 [yes]))
+              e2 (require (b/emit! (mut graph) 114 0 [no]))
+              e3 (require (b/emit! (mut graph) 114 0 [out]))
+              merge (require (b/emit! (mut graph) 112 0 [e1 e2 e3]))
+              r (require (b/emit! (mut graph) 67 11 [merge va five nine]))]
+          (push! (mut roots) (require (b/emit! (mut graph) 120 11 [merge r (: 0 i32)]))))
+      (= mode 6)
+        (let [d (require (b/emit! (mut graph) 91 6 [start third]))
+              enter (require (b/emit! (mut graph) 114 0 [d]))
+              header (require (b/loop-begin! (mut graph) enter))
+              i (require (b/loop-phi! (mut graph) header zero))
+              sum (require (b/loop-phi! (mut graph) header zero))
+              more (require (b/emit! (mut graph) 16 1 [i k]))
+              test (require (b/emit! (mut graph) 116 0 [header more]))
+              body (require (b/emit! (mut graph) 107 0 [test (: 0 i32)]))
+              done (require (b/emit! (mut graph) 108 0 [test (: 0 i32)]))
+              va (require (b/emit! (mut graph) 91 11 [body d]))
+              vb (require (b/emit! (mut graph) 91 11 [va second]))
+              condition (require (b/emit! (mut graph) 14 1 [vb i]))
+              branch (require (b/emit! (mut graph) 116 0 [vb condition]))
+              yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+              no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+              added (require (b/emit! (mut graph) 26 11 [sum va]))
+              e1 (require (b/emit! (mut graph) 114 0 [yes]))
+              e2 (require (b/emit! (mut graph) 114 0 [no]))
+              merge (require (b/emit! (mut graph) 112 0 [e1 e2]))
+              carried (require (b/emit! (mut graph) 67 11 [merge added sum]))
+              fresh (require (b/emit! (mut graph) 26 11 [i ten]))
+              write (require (b/emit! (mut graph) 93 0 [merge q fresh]))
+              next (require (b/emit! (mut graph) 26 11 [i one]))
+              back (require (b/emit! (mut graph) 115 0 [write]))]
+          (require (b/patch! (mut graph) header 2 back))
+          (require (b/patch! (mut graph) i 3 next))
+          (require (b/patch! (mut graph) sum 3 carried))
+          (push! (mut roots) (require (b/emit! (mut graph) 120 11 [done sum (: 0 i32)]))))
+      :else
+        (let [d (if (= mode 11) start (require (b/emit! (mut graph) 91 6 [start third])))
+              va (require (b/emit! (mut graph) 91 (if (= mode 8) 6 11) [d (if (= mode 11) p d)]))
+              between (if (= mode 2) (require (b/emit! (mut graph) 93 0 [va q two])) va)
+              vb (if (= mode 7) between (require (b/emit! (mut graph) 91 11 [between second])))
+              vc (if (= mode 8) (require (b/emit! (mut graph) 91 11 [vb va])) vb)
+              condition (require (b/emit! (mut graph) 14 1 [(if (= mode 7) va vb) k]))
+              branch (require (b/emit! (mut graph) 116 0 [vc condition]))
+              yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+              no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+              number (if (= mode 8) one va)
+              plus-one (require (b/emit! (mut graph) 26 11 [number one]))
+              plus-two (require (b/emit! (mut graph) 26 11 [number two]))]
+          (if (= mode 9)
+              (let [odd (require (b/emit! (mut graph) 15 1 [k three]))
+                    inner (require (b/emit! (mut graph) 116 0 [yes odd]))
+                    on (require (b/emit! (mut graph) 107 0 [inner (: 0 i32)]))
+                    off (require (b/emit! (mut graph) 108 0 [inner (: 0 i32)]))
+                    e1 (require (b/emit! (mut graph) 114 0 [on]))
+                    e2 (require (b/emit! (mut graph) 114 0 [off]))
+                    e3 (require (b/emit! (mut graph) 114 0 [no]))
+                    merge (require (b/emit! (mut graph) 112 0 [e1 e2 e3]))
+                    r (require (b/emit! (mut graph) 67 11 [merge va one seven]))]
+                (push! (mut roots) (require (b/emit! (mut graph) 120 11 [merge r (: 0 i32)]))))
+              (let [taken (if (= mode 3) (require (b/emit! (mut graph) 93 0 [yes q two])) yes)
+                    e1 (require (b/emit! (mut graph) 114 0 [taken]))
+                    e2 (require (b/emit! (mut graph) 114 0 [no]))
+                    merge (require (b/emit! (mut graph) 112 0 [e1 e2]))
+                    r (cond
+                        (or (= mode 0) (= mode 11))
+                          (require (b/emit! (mut graph) 67 11 [merge plus-one seven]))
+                        (= mode 4) (require (b/emit! (mut graph) 67 11 [merge plus-one plus-two]))
+                        (= mode 5)
+                          (let [x (require (b/emit! (mut graph) 67 11 [merge one seven]))]
+                            (require (b/emit! (mut graph) 26 11 [x va])))
+                        (= mode 8)
+                          (let [both (require (b/emit! (mut graph) 26 11 [vc (require (b/emit! (mut graph) 36 11 [va]))]))]
+                            (require (b/emit! (mut graph) 67 11 [merge both seven])))
+                        :else (require (b/emit! (mut graph) 67 11 [merge va seven])))]
+                (if (= mode 10)
+                    (let [w (require (b/emit! (mut graph) 91 11 [merge p]))
+                          total (require (b/emit! (mut graph) 26 11 [r w]))]
+                      (push! (mut roots) (require (b/emit! (mut graph) 120 11 [w total (: 0 i32)]))))
+                    (push! (mut roots) (require (b/emit! (mut graph) 120 11 [merge r (: 0 i32)]))))))))
+    (Fixture :graph graph :roots roots)))
+
+(defstruct Shape [(loads i64) (under-branch i64)])
+
+;;; Plain reads in the graph, and how many are sequenced directly under an
+;;; IF_TRUE or IF_FALSE.
+(defn shape [(graph g/Graph)] (-> Shape)
+  (let [(mut result) (Shape :loads 0 :under-branch 0) (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (let [node (get (.instructions graph) r)]
+        (when (= (n/opcode node) 91)
+          (set! (.loads result) (+ (.loads result) 1))
+          (when (> (.op1 node) 0)
+            (let [code (n/opcode (get (.instructions graph) (cast i64 (.op1 node))))]
+              (when (or (= code 107) (= code 108))
+                (set! (.under-branch result) (+ (.under-branch result) 1)))))))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    result))
+
+;;; -1 leaves a count unchecked.
+(defn wanted-shape [(mode i32)] (-> Shape)
+  (match mode
+    (0 (Shape :loads 3 :under-branch 1))
+    ; d heads the guarded side; a was behind it and is now under the inner branch.
+    (1 (Shape :loads 3 :under-branch 2))
+    (2 (Shape :loads 3 :under-branch 0))
+    (3 (Shape :loads 3 :under-branch 1))
+    (4 (Shape :loads 3 :under-branch 0))
+    (5 (Shape :loads 3 :under-branch 0))
+    ; a under its branch leaves b heading the loop body.
+    (6 (Shape :loads 3 :under-branch 2))
+    (7 (Shape :loads 2 :under-branch 0))
+    (8 (Shape :loads 4 :under-branch 0))
+    (9 (Shape :loads 3 :under-branch 1))
+    (11 (Shape :loads 2 :under-branch 0))
+    (_ (Shape :loads -1 :under-branch -1))))
+
+(defstruct Answer [(result u64) (cells (array u64 6)) (base u64)])
+
+;;; BASE is the address of cell 0: cell 2 holds it, and in mode 8 cell 0 holds
+;;; the address of cell 3.
+(defn initial-cells [(mode i32) (base u64)] (-> (array u64 6))
+  [(if (= mode 8) (+ base 24) 6) (: 3 u64) base 0x44 0 0x55])
+
+;;; What the program computes, statement by statement, on the same cells. P and
+;;; Q index the cell each pointer names.
+(defn expected [(mode i32) (pi i64) (qi i64) (k u64) (base u64)] (-> Answer)
+  (let [(mut c) (initial-cells mode base)
+        (mut result) (: 0 u64)]
+    (cond
+      (= mode 1)
+        (if (!= k 0)
+            (let [va (get c pi) vb (get c (+ pi 1))]
+              (set! result (if (= vb k) va 5)))
+            (set! result 9))
+      (= mode 6)
+        (let [(mut i) (: 0 u64) (mut sum) (: 0 u64)]
+          (while (< (cast i64 i) (cast i64 k))
+            (let [va (get c pi) vb (get c (+ pi 1))]
+              (when (= vb i) (set! sum (primitive/iadd sum va)))
+              (set! (mut c) qi (+ i 10))
+              (set! i (+ i 1))))
+          (set! result sum))
+      :else
+        (let [va (get c pi)]
+          (when (= mode 2) (set! (mut c) qi 2))
+          (let [vb (get c (+ pi 1))
+                vc (if (= mode 8) (get c 3) 0)
+                hit (if (= mode 7) (= va k) (= vb k))]
+            (when (and hit (= mode 3)) (set! (mut c) qi 2))
+            (set! result
+                  (cond (or (= mode 0) (= mode 11)) (if hit (+ va 1) 7)
+                        (= mode 4) (if hit (+ va 1) (+ va 2))
+                        (= mode 5) (primitive/iadd (if hit 1 7) va)
+                        (= mode 8) (if hit (primitive/iadd vc va) 7)
+                        (= mode 9) (if hit (if (!= k 3) va 1) 7)
+                        (= mode 10) (primitive/iadd (if hit va 7) (get c pi))
+                        :else (if hit va 7))))))
+    (Answer :result result :cells c :base base)))
+
+;;; Compile at LEVEL and run on fresh cells. p names cells[0], or nothing at
+;;; all when PI is negative; q names cells[QI].
+(defn run-native [(graph g/Graph) (roots (slice i32)) (mode i32) (level i32)
+                  (pi i64) (qi i64) (k u64) (a (dyn Allocator))] (-> Answer)
+  (match (compile/image-with-private graph 1 roots "_ls_entry" (options/Options :level level) a
+                                     (private/no-context))
+    (Err [message] (panic "native compile mode {} level {}: {}" mode level message))
+    (Ok [code]
+      (let [(mut code) code (mut answer) (Answer :result 0 :cells (zeroed (array u64 6)) :base 0)]
+        (match (link/compose [code] a)
+          (Err [message] (panic "compose: {}" message))
+          (Ok [module]
+            (let [(mut module) module]
+              (match (jit/map-image (.image module) a)
+                (Err [message] (panic "map: {}" message))
+                (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        index (match (image/find-symbol (.image module) "_ls_entry")
+                                (Some [id] id) (None [] (panic "symbol")))
+                        function (primitive/cast
+                                   (fnptr (cc/C) [(ptr u64) (ptr u64) u64] u64)
+                                   (primitive/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))
+                        (mut cells) (zeroed (array u64 6))
+                        base (primitive/cast (ptr u64) (mut cells))
+                        _ (set! cells (initial-cells mode (primitive/cast u64 base)))
+                        result (function (if (< pi 0) (primitive/cast (ptr u64) 0) base)
+                                         (primitive/index base qi)
+                                         k)]
+                    (set! answer (Answer :result result :cells cells :base (primitive/cast u64 base)))
+                    (jit/release-image! (mut loaded)))))
+              (link/release! (mut module)))))
+        (image/release! (mut code))
+        answer))))
+
+(defn main [] (-> i32)
+  (let [a (malloc-allocator) (mut native) 0]
+    (for [mode 0 MODES]
+      (let [(mut f) (build (cast i32 mode) a)]
+        ; The memory optimisation moves exactly the reads the proofs allow.
+        (match (sccp/optimize-memory (.graph f) 8 (slice (.roots f)) true a)
+          (Err [message] (panic "mode {} optimize: {}" mode message))
+          (Ok [optimized]
+            (let [(mut optimized) optimized
+                  got (shape (.graph optimized))
+                  want (wanted-shape (cast i32 mode))]
+              (unless (and (or (< (.loads want) 0) (= (.loads got) (.loads want)))
+                           (or (< (.under-branch want) 0)
+                               (= (.under-branch got) (.under-branch want))))
+                (panic "mode {}: {} reads, {} under a branch; expected {} and {}"
+                       mode (.loads got) (.under-branch got) (.loads want) (.under-branch want)))
+              (rewrite/release! (mut optimized)))))
+        ; Native answers at the unoptimised and the fully optimised level both
+        ; equal the statement-by-statement result, cells included. q names the
+        ; cell p does, the one after it, or an unrelated one.
+        (for qi [(: 0 i64) 1 4]
+          (for k [(: 0 u64) 1 3 4 6 12]
+            (do
+              (for level [(: 1 i32) 3]
+                (let [got (run-native (.graph f) (slice (.roots f)) (cast i32 mode) level 0 qi k a)
+                      wanted (expected (cast i32 mode) 0 qi k (.base got))
+                      (mut good) (= (.result got) (.result wanted))]
+                  (set! native (+ native 1))
+                  (for [i 0 6]
+                    (unless (= (get (.cells got) i) (get (.cells wanted) i)) (set! good false)))
+                  (unless good
+                    (panic "mode {} level {} q {} k {}: got {} [{} {} {}], expected {} [{} {} {}]"
+                           mode level qi k (.result got) (get (.cells got) 0)
+                           (get (.cells got) 1) (get (.cells got) 2) (.result wanted)
+                           (get (.cells wanted) 0) (get (.cells wanted) 1)
+                           (get (.cells wanted) 2))))))))
+        ; Mode 1 reads through p only under its guard: with no object behind p
+        ; and k = 0 the function must still return.
+        (when (= mode 1)
+          (for level [(: 1 i32) 3]
+            (let [got (run-native (.graph f) (slice (.roots f)) 1 level -1 4 0 a)]
+              (set! native (+ native 1))
+              (unless (= (.result got) 9) (panic "mode 1 without p returned {}" (.result got))))))
+        (g/release! (mut (.graph f))) (free! (mut (.roots f)))))
+    (println "load-sink: {} shapes, {} native answers pass" MODES native)
+    0))
