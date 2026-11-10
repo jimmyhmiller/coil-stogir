@@ -5,6 +5,7 @@
 (import "stogir.graph" :as g)
 (import "stogir.cfg" :as cfg)
 (import "stogir.a64.phi-coalesce" :as phi)
+(import "stogir.a64.convert" :as convert)
 (import "stogir.node" :as n)
 (import "stogir.types" :as types)
 (import "stogir.interval" :as interval)
@@ -139,6 +140,77 @@
                                             (cast i64 (.op1 node))))
                               2)))))
 
+;;; Graph reference to part index, built on the first candidate.
+(defn index-parts! [(indices (mut (ArrayList i32))) (parts (ArrayList allocation/Part))
+                    (graph g/Graph)] (-> void)
+  (when (= (len indices) 0)
+    (fill/append! (mut indices) (len (.instructions graph)) -1)
+    (for [i 0 (len parts)]
+      (let [part (at parts i)]
+        (when (> (.parent part) 0)
+          (set! (mut indices) (cast i64 (.parent part)) (cast i32 i)))))))
+
+;;; A widening view (convert/widening-view?) whose source has no other consumer
+;;; takes over the source's lifetime: the source's definition already leaves
+;;; the whole widened value in its register, so the pair is one value of the
+;;; wide type from that definition on. The wide member owns the group, and
+;;; every later move and spill of it has the wide type's size. The source must
+;;; be an unshared, non-Phi singleton that dies at the view at position; both
+;;; members keep their own uses, which never coincide. Returns whether joined.
+(defn widen! [(parents (mut (ArrayList i32)))
+              (groups (HashMap i32 bool))
+              (parts (mut (ArrayList allocation/Part)))
+              (indices (ArrayList i32))
+              (heads (ArrayList i32))
+              (graph g/Graph)
+              (reference i32)
+              (position i64)
+              (a (dyn Allocator))] (-> bool)
+  (let [input (.op1 (get (.instructions graph) (cast i64 reference)))
+        source (get indices (cast i64 input))
+        target (get indices (cast i64 reference))]
+    (if (or (< source 0) (< target 0)
+            (= (n/opcode (get (.instructions graph) (cast i64 input))) 67)
+            (and (> (len parents) 0)
+                 (or (!= (get parents (cast i64 input)) input)
+                     (!= (get parents (cast i64 reference)) reference)))
+            (phi/group? groups input)
+            (phi/group? groups reference)
+            (and (> (len heads) 0)
+                 (or (!= (get heads (cast i64 source)) source)
+                     (!= (get heads (cast i64 target)) target))))
+        false
+        (let [s (at parts (cast i64 source))
+              t (at parts (cast i64 target))
+              (mut alone) (and (= (.allowed s) (.allowed t))
+                               (= (len (.ranges s)) 1)
+                               (> (len (.ranges t)) 0)
+                               (phi/compatible? (.uses s) (.uses t)))]
+          (when alone
+            (let [range (get (.ranges s) 0)]
+              (when (> (.end range) (+ position 1)) (set! alone false))
+              (for use (.uses s)
+                (unless (or (= (.position use) (.start range)) (= (.position use) position))
+                  (set! alone false)))))
+          (if (not alone)
+              false
+              (let [ranges (phi/union-ranges (.ranges s) (.ranges t) a)
+                    uses (phi/union-uses (.uses s) (.uses t) a)
+                    owner (elem (mut parts) (cast i64 target))
+                    member (elem (mut parts) (cast i64 source))]
+                (free! (mut (.ranges owner)))
+                (free! (mut (.uses owner)))
+                (set! (.ranges owner) ranges)
+                (set! (.uses owner) uses)
+                (clear! (mut (.ranges member)))
+                (clear! (mut (.uses member)))
+                (when (= (len parents) 0)
+                  (reserve! (mut parents) (len (.instructions graph)))
+                  (for [r 0 (len (.instructions graph))]
+                    (push! (mut parents) (cast i32 r))))
+                (set! (mut parents) (cast i64 input) reference)
+                true))))))
+
 ;;; Parts are unsplit and unassigned, before physical reservations. A view has
 ;;; its source's bits and neither is redefined while the other lives (a Phi
 ;;; source is excluded by entry-conflict?), so a child joins its source group
@@ -162,14 +234,19 @@
         (mut fixed-ready) false]
     ; One schedule walk. Index only on a reusable node, fixed uses only on a
     ; contained candidate, and group storage only after a successful proof.
-    (for reference (.nodes scheduled)
+    (for [ordinal 0 (len (.nodes scheduled))]
+     (let [reference (get (.nodes scheduled) ordinal)]
+      (when (convert/widening-view? graph reference)
+        (index-parts! (mut indices) parts graph)
+        (when (and (widen! (mut parents) groups (mut parts) indices heads graph reference
+                           (* ordinal 2) a)
+                   fixed-ready)
+          ; The owner's fixed uses now include its source's definition.
+          (for use (.uses (at parts (cast i64 (get indices (cast i64 reference)))))
+            (when (= (.kind use) 2)
+              (set! (mut fixed) (fixed-key reference (.position use)) (.register use))))))
       (when (reusable? graph reference)
-        (when (= (len indices) 0)
-          (fill/append! (mut indices) (len (.instructions graph)) -1)
-          (for [i 0 (len parts)]
-            (let [part (at parts i)]
-              (when (> (.parent part) 0)
-                (set! (mut indices) (cast i64 (.parent part)) (cast i32 i))))))
+        (index-parts! (mut indices) parts graph)
         (let [input (.op1 (get (.instructions graph) (cast i64 reference)))
               source (if (= (len parents) 0) input (canonical parents input))
               parent (get indices (cast i64 source))
@@ -237,7 +314,7 @@
                       (get heads (cast i64 parent)))
                 (set! (mut heads) (cast i64 parent) child)
                 (set! (mut heads) (cast i64 child) -1)
-                (set! (mut parents) (cast i64 reference) source)))))))
+                (set! (mut parents) (cast i64 reference) source))))))))
     (when (> (len heads) 0)
       (fill/append! (mut cursors) (len parts) 0)
       (for [i 0 (len parts)]
