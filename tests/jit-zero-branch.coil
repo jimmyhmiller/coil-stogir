@@ -1,0 +1,336 @@
+(module stogir.tests.jit-zero-branch)
+;;; Branches on a comparison with zero, executed natively:
+;;;  - every integer comparison opcode against literal zero at both widths,
+;;;    with CBZ/CBNZ for EQ/NE/ULE/UGT and TBZ/TBNZ on the sign bit for LT/GE;
+;;;  - small switches whose case key is zero (CBZ/CBNZ) or whose last case
+;;;    falls through;
+;;;  - a decrement feeding IF(value > 0) / IF(value <= 0): SUBS replaces the
+;;;    comparison only when the source is proven non-negative, and the wrapping
+;;;    result is kept when it is not.
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.options" :as options)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn need [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn word [(text (ArrayList u8)) (at i64)] (-> u32)
+  (| (cast u32 (get text at))
+     (<< (cast u32 (get text (+ at 1))) 8)
+     (<< (cast u32 (get text (+ at 2))) 16)
+     (<< (cast u32 (get text (+ at 3))) 24)))
+
+;;; Number of words W in the text with (W & mask) = bits.
+(defn count-words [(text (ArrayList u8)) (mask u32) (bits u32)] (-> i64)
+  (let [(mut found) (: 0 i64) (mut at) (: 0 i64)]
+    (while (< (+ at 3) (len text))
+      (when (= (& (word text at) mask) bits) (set! found (+ found 1)))
+      (set! at (+ at 4)))
+    found))
+
+;;; CMP Rn,#0 or CMP Rn,ZR at either width.
+(defn zero-compares [(text (ArrayList u8))] (-> i64)
+  (+ (count-words text 0x7FFFFC1F 0x7100001F) (count-words text 0x7FFFFC1F 0x6B1F001F)))
+
+(defn wide? [(ty i32)] (-> bool) (or (= ty 5) (= ty 11)))
+
+;;; The parameter's value at its type's width, sign-extended.
+(defn signed-of [(ty i32) (x u64)] (-> i64)
+  (if (wide? ty) (cast i64 x) (cast i64 (cast i32 (cast u32 x)))))
+
+(defn unsigned-of [(ty i32) (x u64)] (-> u64)
+  (if (wide? ty) x (& x 0xFFFFFFFF)))
+
+(defn truth [(opcode i32) (ty i32) (x u64)] (-> bool)
+  (let [s (signed-of ty x) u (unsigned-of ty x)]
+    (cond (= opcode 14) (= u 0) (= opcode 15) (!= u 0)
+          (= opcode 16) (< s 0) (= opcode 17) (>= s 0)
+          (= opcode 18) (<= s 0) (= opcode 19) (> s 0)
+          (= opcode 20) false (= opcode 21) true
+          (= opcode 22) (= u 0) (= opcode 23) (!= u 0)
+          :else false)))
+
+;;; Low words cover zero, one, both signs and both extremes; the upper word of
+;;; a 32-bit argument register is unspecified, so the same low words are also
+;;; passed under nonzero upper bits.
+(def samples [(: 0 u64) 1 2 0x7FFFFFFF 0x80000000 0x80000001 0xFFFFFFFF
+              0x100000000 0x180000000 0xFFFFFFFF00000000 0xFFFFFFFF7FFFFFFF
+              0x7FFFFFFFFFFFFFFF 0x8000000000000000 0x8000000000000001
+              0xFFFFFFFFFFFFFFFF 0x00000001FFFFFFFF])
+
+;;; f(x) = (x OPCODE 0) ? 11 : 20 on a parameter of type TY.
+(defn zero-test [(opcode i32) (ty i32)] (-> i64)
+  (let [a (malloc-allocator) (mut graph) (g/create a) (mut failures) (: 0 i64)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        zero (need (b/scalar-constant! (mut graph) ty 0 8))
+        condition (need (b/emit! (mut graph) opcode 1 [x zero]))
+        split (need (b/emit! (mut graph) 116 0 [start condition]))
+        yes (need (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (need (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        k11 (need (b/scalar-constant! (mut graph) 5 11 8))
+        k20 (need (b/scalar-constant! (mut graph) 5 20 8))
+        r1 (need (b/emit! (mut graph) 120 5 [yes k11 (: 0 i32)]))
+        r2 (need (b/emit! (mut graph) 120 5 [no k20 r1]))
+        (mut roots) (ArrayList::new [i32] a)]
+    (push! (mut roots) r1) (push! (mut roots) r2)
+    (match (compile/image graph start (slice roots) "_zero_test" a)
+      (Err [e] (panic "zero-test {} {}: {}" opcode ty e))
+      (Ok [value]
+        (let [(mut code) value text (.text code)
+              zero-form (or (= opcode 14) (= opcode 15) (= opcode 22) (= opcode 23))
+              sign-form (or (= opcode 16) (= opcode 17))
+              ; TBZ/TBNZ of bit 63 (b5 set, b40 = 31) or of bit 31 of a W register.
+              sign-tests (count-words text 0xFEF80000
+                                      (if (wide? ty) (: 0xB6F80000 u32) (: 0x36F80000 u32)))
+              zero-tests (count-words text 0xFE000000
+                                      (if (wide? ty) (: 0xB4000000 u32) (: 0x34000000 u32)))]
+          (when (and zero-form (or (!= zero-tests 1) (!= (zero-compares text) 0)))
+            (println "op {} ty {}: {} CBZ/CBNZ, {} zero compares" opcode ty zero-tests
+                     (zero-compares text))
+            (set! failures (+ failures 1)))
+          (when (and sign-form (or (!= sign-tests 1) (!= (zero-compares text) 0)))
+            (println "op {} ty {}: {} sign-bit tests, {} zero compares" opcode ty sign-tests
+                     (zero-compares text))
+            (set! failures (+ failures 1)))
+          (match (jit/map-image code a)
+            (Err [e] (panic "{}" e))
+            (Ok [mapped]
+              (let [(mut loaded) mapped
+                    f (p/cast (fnptr (cc/C) [u64] u64) (.base (.memory loaded)))]
+                (for x samples
+                  (let [want (if (truth opcode ty x) (: 11 u64) 20) got (f x)]
+                    (when (!= got want)
+                      (println "zero-test op {} ty {} x {:x}: got {} want {}" opcode ty x got want)
+                      (set! failures (+ failures 1)))))
+                (jit/release-image! (mut loaded)))))
+          (image/release! (mut code)))))
+    (free! (mut roots)) (g/release! (mut graph))
+    failures))
+
+;;; f(x) = 10 + index of the case key equal to x, else 99. With `exhaustive`
+;;; the default is UNREACHABLE and pruned, so the last case needs no test and
+;;; only keys are passed. A signed selector is dispatched on a normalized key,
+;;; where zero is no longer zero, so only unsigned types promise CBZ/CBNZ.
+(defn switch-test [(ty i32) (keys (slice u64)) (exhaustive bool)] (-> i64)
+  (let [a (malloc-allocator) (mut graph) (g/create a) (mut failures) (: 0 i64)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        split (need (b/switch! (mut graph) start x))
+        (mut roots) (ArrayList::new [i32] a)
+        (mut previous) (: 0 i32)]
+    (for [k 0 (len keys)]
+      (let [key (need (b/scalar-constant! (mut graph) ty (unsigned-of ty (get keys k)) 8))
+            arm (need (b/case-value! (mut graph) split key))
+            value (need (b/scalar-constant! (mut graph) 5 (cast u64 (+ 10 k)) 8))
+            ret (need (b/emit! (mut graph) 120 5 [arm value previous]))]
+        (set! previous ret)
+        (push! (mut roots) ret)))
+    (let [fallback (need (b/case-default! (mut graph) split))]
+      (if exhaustive
+          (push! (mut roots) (need (b/emit! (mut graph) 121 0 [fallback (: 0 i32) previous])))
+          (let [value (need (b/scalar-constant! (mut graph) 5 99 8))]
+            (push! (mut roots) (need (b/emit! (mut graph) 120 5 [fallback value previous]))))))
+    (match (compile/image-with-private graph start (slice roots) "_zero_switch"
+                                       (options/Options :level 1) a
+                                       (private/with-prune-default (private/no-context) exhaustive))
+      (Err [e] (panic "switch-test: {}" e))
+      (Ok [value]
+        (let [(mut code) value text (.text code)
+              (mut zero-key) false]
+          (for key keys (when (= (unsigned-of ty key) 0) (set! zero-key true)))
+          ; A tested zero key never needs CMP #0. Exhaustive two-way dispatch
+          ; on {0, k} tests only the first case.
+          (when (and zero-key (or (= ty 5) (= ty 4))
+                     (or (not exhaustive) (and (= (get keys 0) 0) (> (len keys) 1)))
+                     (or (!= (zero-compares text) 0)
+                         (= (count-words text 0x7E000000 0x34000000) 0)))
+            (println "switch ty {} keys {} exhaustive {}: {} zero compares, {} CBZ/CBNZ" ty
+                     (len keys) exhaustive (zero-compares text)
+                     (count-words text 0x7E000000 0x34000000))
+            (set! failures (+ failures 1)))
+          (match (jit/map-image code a)
+            (Err [e] (panic "{}" e))
+            (Ok [mapped]
+              (let [(mut loaded) mapped
+                    f (p/cast (fnptr (cc/C) [u64] u64) (.base (.memory loaded)))]
+                (for [i 0 (if exhaustive (len keys) (len samples))]
+                  (let [x (if exhaustive (get keys i) (get samples i))
+                        (mut want) (: 99 u64)]
+                    (for [k 0 (len keys)]
+                      (when (= (unsigned-of ty x) (unsigned-of ty (get keys k)))
+                        (set! want (cast u64 (+ 10 k)))))
+                    (let [got (f x)]
+                      (when (!= got want)
+                        (println "switch ty {} keys {} exhaustive {} x {:x}: got {} want {}" ty
+                                 (len keys) exhaustive x got want)
+                        (set! failures (+ failures 1))))))
+                (jit/release-image! (mut loaded)))))
+          (image/release! (mut code)))))
+    (free! (mut roots)) (g/release! (mut graph))
+    failures))
+
+;;; SUBS Rd,Rn,#imm with a real destination, either width.
+(defn flag-decrements [(text (ArrayList u8))] (-> i64)
+  (- (count-words text 0x7F800000 0x71000000) (count-words text 0x7F80001F 0x7100001F)))
+
+;;; shape 0: v = x - c;                        return (v OP 0) ? 1 : 2
+;;; shape 1: if (x > 0) { v = x - c; return (v OP 0) ? 1 : 2 } else return 3
+;;; shape 2: as shape 1 with the guard x >= 0
+;;; `add` writes the decrement as x + (-c). OP is GT (19) or LE (18).
+;;; Only the guarded shapes may use SUBS: unguarded, x - c wraps for x near the
+;;; minimum and the wrapped (positive) value decides the branch.
+(defn decrement-test [(ty i32) (opcode i32) (shape i32) (add bool) (amount u64)] (-> i64)
+  (let [a (malloc-allocator) (mut graph) (g/create a) (mut failures) (: 0 i64)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        zero (need (b/scalar-constant! (mut graph) ty 0 8))
+        step (need (b/scalar-constant! (mut graph) ty
+                                       (unsigned-of ty (if add (- (: 0 u64) amount) amount)) 8))
+        k1 (need (b/scalar-constant! (mut graph) 5 1 8))
+        k2 (need (b/scalar-constant! (mut graph) 5 2 8))
+        k3 (need (b/scalar-constant! (mut graph) 5 3 8))
+        (mut roots) (ArrayList::new [i32] a)
+        (mut control) start
+        (mut previous) (: 0 i32)]
+    (when (> shape 0)
+      (let [guard (need (b/emit! (mut graph) (if (= shape 1) 19 17) 1 [x zero]))
+            outer (need (b/emit! (mut graph) 116 0 [start guard]))
+            yes (need (b/emit! (mut graph) 107 0 [outer (: 0 i32)]))
+            no (need (b/emit! (mut graph) 108 0 [outer (: 0 i32)]))
+            r3 (need (b/emit! (mut graph) 120 5 [no k3 (: 0 i32)]))]
+        (push! (mut roots) r3)
+        (set! previous r3)
+        (set! control yes)))
+    (let [v (need (b/emit! (mut graph) (if add 26 27) ty [x step]))
+          test (need (b/emit! (mut graph) opcode 1 [v zero]))
+          split (need (b/emit! (mut graph) 116 0 [control test]))
+          yes (need (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+          no (need (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+          r1 (need (b/emit! (mut graph) 120 5 [yes k1 previous]))
+          r2 (need (b/emit! (mut graph) 120 5 [no k2 r1]))]
+      (push! (mut roots) r1) (push! (mut roots) r2))
+    (match (compile/image graph start (slice roots) "_zero_decrement" a)
+      (Err [e] (panic "decrement-test: {}" e))
+      (Ok [value]
+        (let [(mut code) value text (.text code)
+              fused (flag-decrements text)]
+          ; x + (-c) is fused only where selection emits it as SUB #c.
+          (when (if (and (> shape 0) (<= amount 4095))
+                    (if add (> fused 1) (!= fused 1))
+                    (!= fused 0))
+            (println "decrement ty {} op {} shape {} add {} amount {}: {} SUBS" ty opcode shape add
+                     amount fused)
+            (set! failures (+ failures 1)))
+          (match (jit/map-image code a)
+            (Err [e] (panic "{}" e))
+            (Ok [mapped]
+              (let [(mut loaded) mapped
+                    f (p/cast (fnptr (cc/C) [u64] u64) (.base (.memory loaded)))]
+                (for base samples
+                  (for delta [(: 0 u64) amount (+ amount 1) (- amount 1)]
+                    (let [x (+ base delta)
+                          s (signed-of ty x)
+                          ; The wrapped difference at the type's width.
+                          v (signed-of ty (- (unsigned-of ty x) amount))
+                          taken (if (= opcode 19) (> v 0) (<= v 0))
+                          guarded (cond (= shape 0) true (= shape 1) (> s 0) :else (>= s 0))
+                          want (if guarded (if taken (: 1 u64) 2) (: 3 u64))
+                          got (f x)]
+                      (when (!= got want)
+                        (println "decrement ty {} op {} shape {} add {} amount {} x {:x}: got {} want {}"
+                                 ty opcode shape add amount x got want)
+                        (set! failures (+ failures 1))))))
+                (jit/release-image! (mut loaded)))))
+          (image/release! (mut code)))))
+    (free! (mut roots)) (g/release! (mut graph))
+    failures))
+
+;;; n = 0; s = x; while (s > 0) { s -= c; n += 1 }; return n. The test is
+;;; placed after the decrement on the back edge, where SUBS sets its flags.
+(defn countdown-test [(ty i32) (amount u64)] (-> i64)
+  (let [a (malloc-allocator) (mut graph) (g/create a) (mut failures) (: 0 i64)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        zero (need (b/scalar-constant! (mut graph) ty 0 8))
+        step (need (b/scalar-constant! (mut graph) ty amount 8))
+        count0 (need (b/scalar-constant! (mut graph) 5 0 8))
+        one (need (b/scalar-constant! (mut graph) 5 1 8))
+        entry (need (b/emit! (mut graph) 114 0 [start]))
+        header (need (b/loop-begin! (mut graph) entry))
+        s (need (b/loop-phi! (mut graph) header x))
+        n (need (b/loop-phi! (mut graph) header count0))
+        test (need (b/emit! (mut graph) 19 1 [s zero]))
+        split (need (b/emit! (mut graph) 116 0 [header test]))
+        yes (need (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        no (need (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        s2 (need (b/emit! (mut graph) 27 ty [s step]))
+        n2 (need (b/emit! (mut graph) 26 5 [n one]))
+        back (need (b/emit! (mut graph) 115 0 [yes]))
+        ret (need (b/emit! (mut graph) 120 5 [no n (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)]
+    (need (b/patch! (mut graph) header 2 back))
+    (need (b/patch! (mut graph) s 3 s2))
+    (need (b/patch! (mut graph) n 3 n2))
+    (push! (mut roots) ret)
+    (match (compile/image graph start (slice roots) "_zero_countdown" a)
+      (Err [e] (panic "countdown-test: {}" e))
+      (Ok [value]
+        (let [(mut code) value text (.text code)]
+          (when (!= (flag-decrements text) 1)
+            (println "countdown ty {} amount {}: {} SUBS" ty amount (flag-decrements text))
+            (set! failures (+ failures 1)))
+          (match (jit/map-image code a)
+            (Err [e] (panic "{}" e))
+            (Ok [mapped]
+              (let [(mut loaded) mapped
+                    f (p/cast (fnptr (cc/C) [u64] u64) (.base (.memory loaded)))]
+                (for x [(: 0 u64) 1 2 4 5 6 9 10 11 4095 4096 100000
+                        0xFFFFFFFFFFFFFFFF 0xFFFFFFFF80000000 0x8000000000000000
+                        0x80000000 0xFFFFFFFF 0x100000007]
+                  (let [s (signed-of ty x)
+                        want (if (<= s 0) (: 0 u64)
+                                 (cast u64 (/ (+ s (- (cast i64 amount) 1)) (cast i64 amount))))]
+                    ; Keep the native loop short.
+                    (when (< want 200000000)
+                      (let [got (f x)]
+                        (when (!= got want)
+                          (println "countdown ty {} amount {} x {:x}: got {} want {}" ty amount x
+                                   got want)
+                          (set! failures (+ failures 1)))))))
+                (jit/release-image! (mut loaded)))))
+          (image/release! (mut code)))))
+    (free! (mut roots)) (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i32)
+  (let [(mut failures) (: 0 i64)]
+    (for ty [(: 11 i32) 10 5 4]
+      (for [opcode 14 24]
+        (set! failures (+ failures (zero-test (cast i32 opcode) ty))))
+      (for exhaustive [false true]
+        (set! failures (+ failures (switch-test ty [(: 0 u64)] exhaustive)))
+        (set! failures (+ failures (switch-test ty [(: 0 u64) 1] exhaustive)))
+        (set! failures (+ failures (switch-test ty [(: 1 u64) 0] exhaustive)))
+        (set! failures (+ failures (switch-test ty [(: 5 u64)] exhaustive)))
+        (set! failures (+ failures (switch-test ty [(: 0 u64) 7 0x80000000] exhaustive)))
+        (set! failures (+ failures (switch-test ty [(: 9 u64) 0xFFFFFFFF 0] exhaustive)))))
+    (for ty [(: 11 i32) 10]
+      (for opcode [(: 19 i32) 18]
+        (for [shape 0 3]
+          (for add [false true]
+            (for amount [(: 1 u64) 5 4095 4096]
+              (set! failures (+ failures (decrement-test ty opcode (cast i32 shape) add amount)))))))
+      (for amount [(: 1 u64) 5 4095]
+        (set! failures (+ failures (countdown-test ty amount)))))
+    (println "zero branches, zero-key switches and flag-setting decrements: {} failures" failures)
+    (if (= failures 0) 0 1)))
