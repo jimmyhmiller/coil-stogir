@@ -392,6 +392,59 @@
                 (fnptr-of run-framed))
     (g/release! (mut graph))))
 
+;;; MOV X30, Xm (ORR X30, XZR, Xm): an indirect target copied for BLR X30.
+(defn link-copy? [(w u32)] (-> bool)
+  (= (& w (: 0xFFE0FFFF u32)) (: 0xAA0003FE u32)))
+
+;;; BLR through x9..x15.
+(defn temporary-call? [(w u32)] (-> bool)
+  (and (= (& w (: 0xFFFFFC1F u32)) (: 0xD63F0000 u32))
+       (>= (& (>> w 5) (: 31 u32)) (: 9 u32))
+       (<= (& (>> w 5) (: 31 u32)) (: 15 u32))))
+
+;;; f(target, p, x) = (*p)(x) + 1, or (*p)((*p)(x)) + 1 when twice: a target
+;;; loaded for one call lives in a temporary register outside the argument
+;;; registers and is called there; one that must survive a call cannot.
+(defn run-indirect :cc (cc/C) [(f (ptr u8)) (target u64) (cells (ptr i64))] (-> void)
+  (let [function (p/cast (fnptr (cc/C) [u64 (ptr i64) i64] i64) f)
+        calls (load (cell cells 7))]
+    (store! cells (p/cast i64 target))
+    (for x [(: -100 i64) -1 0 1 0x7FFFFFFFFFFFFF00]
+      (assert (= (call-ptr function 0 cells x) (+ x (* 7 calls) 1))))))
+
+(defn indirect-target [(twice bool) (target u64)] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        unused (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        place (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        callee (require (b/emit! (mut graph) 91 6 [start place]))
+        first (target-call! (mut graph) callee callee x)
+        last (if twice (target-call! (mut graph) first callee first) first)
+        answer (require (b/emit! (mut graph) 26 11 [last one]))
+        ret (require (b/emit! (mut graph) 120 11 [last answer (: 0 i32)]))
+        (mut cells) (zeroed (array i64 8))]
+    (set! (mut cells) 7 (if twice 2 1))
+    (for level [(: 1 i32) 2 3]
+      (match (compile/image-with-options graph start [ret] "_view_indirect" (options/Options :level level) a)
+        (Err [e] (panic "{}" e))
+        (Ok [owned-code]
+          (let [(mut code) owned-code
+                text (slice (.text code))
+                (mut copies) 0
+                (mut direct) 0]
+            (for [i 0 (/ (len text) 4)]
+              (when (link-copy? (word text (* i 4))) (set! copies (+ copies 1)))
+              (when (temporary-call? (word text (* i 4))) (set! direct (+ direct 1))))
+            (unless twice
+              (unless (and (= copies 0) (= direct 1) (= (view-copies text) 0))
+                (panic "indirect target level {}: {} link copies, {} temporary calls" level copies direct)))
+            (image/release! (mut code))))))
+    (each-level graph start ret "_view_indirect" -1 -1 (p/cast (ptr i64) (mut cells)) target
+                (fnptr-of run-indirect))
+    (g/release! (mut graph))))
+
 ;;; f(target, base, limit) = sum over i in [base, limit) of
 ;;; sext32(trunc32(i)) + sext32(2 * trunc32(i)) + i + (i + 7) + unchanged, where unchanged = base ^ limit
 ;;; is computed before the loop. The TRUNC lies inside the loop Phi's own
@@ -471,8 +524,10 @@
           (merged-views 24 target)
           (spilled-merge target)
           (frame-address target)
+          (indirect-target false target)
+          (indirect-target true target)
           (counted-loop target)
           (jit/release! (mut native-target)))))
     (free! (mut target-code)))
-  (println "view lifetimes: dying, shared, widened, Phi-merged and loop-counter views share registers and spill homes; answers survive call clobbers and pressure at every level")
+  (println "view lifetimes: dying, shared, widened, Phi-merged, loop-counter and call-target views share registers and spill homes; answers survive call clobbers and pressure at every level")
   0)
