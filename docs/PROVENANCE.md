@@ -1453,7 +1453,9 @@ BOOL and pointer conversion boundaries are excluded.
 `ir_find_aliasing_load_i` CALL case: CONST_FUNC32/PURE_FUNC64 declarations
 permit walking the memory predecessor. Unknown/malformed prototypes stay
 barriers. Coil aggregate-result roles stay barriers because their calling
-sequence can write a caller result place. Calls themselves remain retained.
+sequence can write a caller result place. Calls themselves remain retained:
+either bit is read only as "writes no caller-visible memory", never as a licence
+to move or merge the call (`CALL_EFFECTS.md`).
 `nonwriting-verified-body?` is a conservative Coil effect proof, not an upstream
 interprocedural analysis: validated scalar graphs are scanned through a safe
 opcode whitelist and existing declared call effects. Mutation invalidates it.
