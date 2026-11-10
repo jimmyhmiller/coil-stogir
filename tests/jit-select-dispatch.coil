@@ -1,0 +1,210 @@
+(module stogir.tests.jit-select-dispatch)
+;;; `(if (or (= c K1) (= c K2) ...) a b)`: the equality chain becomes a SWITCH
+;;; whose cases share one MERGE, and stogir.select-diamond turns the choice
+;;; into selects on one bit of a literal mask when the constants lie within 64
+;;; of each other. Every selector type, executed natively on each constant,
+;;; its neighbours and the extremes. Variants of the chosen values:
+;;;   0  hit ? y : z
+;;;   1  hit ? z + 1 : z                 a conditional increment
+;;;   2  (hit ? y : z) + (hit ? 7 : y)   two PHIs
+;;;   3  hit ? (store 1; y) : z          a store in the arm: stays a branch
+;;; Variants 0..2 over a window of at most 64 must hold no conditional branch
+;;; and two selects per PHI; variant 3 and wider windows must keep a branch.
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn need [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn word [(text (ArrayList u8)) (at i64)] (-> u32)
+  (| (cast u32 (get text at))
+     (<< (cast u32 (get text (+ at 1))) 8)
+     (<< (cast u32 (get text (+ at 2))) 16)
+     (<< (cast u32 (get text (+ at 3))) 24)))
+
+;;; B.cond, CBZ/CBNZ and TBZ/TBNZ words.
+(defn branches [(text (ArrayList u8))] (-> i64)
+  (let [(mut found) (: 0 i64) (mut at) (: 0 i64)]
+    (while (< (+ at 3) (len text))
+      (let [w (word text at)]
+        (when (or (= (& w (: 0xFF000010 u32)) (: 0x54000000 u32))
+                  (= (& w (: 0x7E000000 u32)) (: 0x34000000 u32))
+                  (= (& w (: 0x7E000000 u32)) (: 0x36000000 u32)))
+          (set! found (+ found 1))))
+      (set! at (+ at 4)))
+    found))
+
+;;; CSEL/CSINC/CSINV/CSNEG words, either width.
+(defn selects [(text (ArrayList u8))] (-> i64)
+  (let [(mut found) (: 0 i64) (mut at) (: 0 i64)]
+    (while (< (+ at 3) (len text))
+      (when (= (& (word text at) (: 0x3FE00000 u32)) (: 0x1A800000 u32))
+        (set! found (+ found 1)))
+      (set! at (+ at 4)))
+    found))
+
+(defn mask [(ty i32)] (-> u64)
+  (let [size (types/scalar-size ty 8)]
+    (if (= size 8) 0xFFFFFFFFFFFFFFFF (- (<< (: 1 u64) (cast u64 (* size 8))) 1))))
+
+(defn switches [(graph g/Graph)] (-> i64)
+  (let [(mut count) (: 0 i64) (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (let [arity (get (.arities graph) r)]
+        (when (and (>= arity 0) (= (n/opcode (get (.instructions graph) r)) 117))
+          (set! count (+ count 1)))
+        (set! r (+ r (if (< arity 0) 1 (/ (+ (cast i64 arity) 4) 4))))))
+    count))
+
+(defn hit? [(ty i32) (constants (slice i64)) (x u64)] (-> bool)
+  (let [(mut found) false]
+    (for value constants
+      (when (= (& x (mask ty)) (& (cast u64 value) (mask ty))) (set! found true)))
+    found))
+
+(defn expected [(variant i32) (hit bool) (y u64) (z u64)] (-> u64)
+  (cond (= variant 0) (if hit y z)
+        (= variant 1) (if hit (p/iadd z 1) z)
+        (= variant 2) (p/iadd (if hit y z) (if hit 7 y))
+        :else (if hit y z)))
+
+(defstruct Tally [(answers i64) (failures i64) (converted i64)])
+
+;;; f(x, y, z, cell). The selector is x in type ty. window tells whether the
+;;; constants (as keys of ty) lie within 64 of each other.
+(defn check [(ty i32) (constants (slice i64)) (variant i32) (window bool) (tally (mut Tally))]
+  (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        (mut ends) (ArrayList::new [i32] a)
+        (mut roots) (ArrayList::new [i32] a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (need (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        y (need (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        z (need (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        pointer (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 3]))
+        one (need (b/scalar-constant! (mut graph) 11 1 8))
+        seven (need (b/scalar-constant! (mut graph) 11 7 8))
+        selector (cond (= ty 11) x
+                       (= ty 5) (need (b/emit! (mut graph) 36 ty [x]))
+                       :else (need (b/emit! (mut graph) 35 ty [x])))
+        (mut control) start]
+    (for [i 0 (len constants)]
+      (let [key (need (b/scalar-constant! (mut graph) ty
+                                          (& (cast u64 (get constants i)) (mask ty)) 8))
+            equal (= (% i 2) 0)
+            test (need (b/emit! (mut graph) (if equal 14 15) 1 [selector key]))
+            branch (need (b/emit! (mut graph) 116 0 [control test]))
+            yes (need (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+            no (need (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))]
+        (set! control (if equal no yes))
+        (push! (mut ends) (need (b/emit! (mut graph) 114 0 [(if equal yes no)])))))
+    (let [table (need (b/emit! (mut graph) 112 0 (slice ends)))
+          arm (if (= variant 3) (need (b/emit! (mut graph) 93 0 [table pointer one])) table)
+          matched (need (b/emit! (mut graph) 114 0 [arm]))
+          missed (need (b/emit! (mut graph) 114 0 [control]))
+          meet (need (b/emit! (mut graph) 112 0 [matched missed]))
+          first (if (= variant 1) (need (b/emit! (mut graph) 26 11 [z one])) y)
+          phi (need (b/emit! (mut graph) 67 11 [meet first z]))
+          result (if (= variant 2)
+                     (let [other (need (b/emit! (mut graph) 67 11 [meet seven y]))]
+                       (need (b/emit! (mut graph) 26 11 [phi other])))
+                     phi)]
+      (push! (mut roots) (need (b/emit! (mut graph) 120 11 [meet result (: 0 i32)]))))
+    (match (sccp/optimize graph 8 (slice roots) a)
+      (Err [message] (panic "optimize: {}" message))
+      (Ok [optimized]
+        (let [(mut optimized) optimized]
+          (when (!= (switches (.graph optimized)) 1)
+            (println "ty {} variant {} with {} constants: {} SWITCH nodes"
+                     ty variant (len constants) (switches (.graph optimized)))
+            (set! (.failures tally) (+ (.failures tally) 1)))
+          (match (compile/vector-image (.graph optimized) start (slice (.roots optimized))
+                                       "_select_dispatch" a)
+            (Err [e] (panic "select-dispatch {} {}: {}" ty variant e))
+            (Ok [value]
+              (let [(mut code) value
+                    jumps (branches (.text code))
+                    chosen (selects (.text code))
+                    convert (and window (<= variant 2))]
+                (when (and convert (or (!= jumps 0) (< chosen (if (= variant 2) 4 2))))
+                  (println "ty {} variant {} first {}: {} branches, {} selects"
+                           ty variant (get constants 0) jumps chosen)
+                  (set! (.failures tally) (+ (.failures tally) 1)))
+                (when (and (not convert) (= jumps 0))
+                  (println "ty {} variant {} first {}: no branch kept" ty variant (get constants 0))
+                  (set! (.failures tally) (+ (.failures tally) 1)))
+                (when convert (set! (.converted tally) (+ (.converted tally) 1)))
+                (match (jit/map-image code a)
+                  (Err [e] (panic "{}" e))
+                  (Ok [mapped]
+                    (let [(mut loaded) mapped
+                          f (p/cast (fnptr (cc/C) [u64 u64 u64 (ptr u64)] u64)
+                                    (.base (.memory loaded)))
+                          (mut inputs) (ArrayList::new [u64] a)]
+                      (for value constants
+                        (for delta [(: -1 i64) 0 1 2 63 64 65 -63 -64 -65 256 -256 65536
+                                    4294967296 -4294967296]
+                          (push! (mut inputs) (cast u64 (p/iadd value delta)))))
+                      (for xv [(: 0 u64) 1 2 62 63 64 65 127 128 129 255 256 32767 32768 65535
+                               65536 0x7FFFFFFF 0x80000000 0xFFFFFFFF 0x100000000
+                               0x7FFFFFFFFFFFFFFF 0x8000000000000000 0xFFFFFFFFFFFFFFFF
+                               0xFFFFFFFFFFFFFFC0 0xFFFFFFFFFFFFFF00]
+                        (push! (mut inputs) xv))
+                      (for xv inputs
+                        (for yv [(: 11 u64) 0xFFFFFFFFFFFFFFFF]
+                          (for zv [(: 3 u64) 0x7FFFFFFFFFFFFFFF]
+                            (let [(mut cell) (: 0x1122334455667788 u64)
+                                  hit (hit? ty constants xv)
+                                  want (expected variant hit yv zv)
+                                  got (f xv yv zv (mut cell))]
+                              (set! (.answers tally) (+ (.answers tally) 1))
+                              (when (!= got want)
+                                (println "ty {} variant {} x {:x} y {:x} z {:x}: got {:x} want {:x}"
+                                         ty variant xv yv zv got want)
+                                (set! (.failures tally) (+ (.failures tally) 1)))
+                              (when (and (= variant 3)
+                                         (!= cell (if hit (: 1 u64) 0x1122334455667788)))
+                                (println "ty {} variant 3 x {:x}: cell {:x}, hit {}" ty xv cell hit)
+                                (set! (.failures tally) (+ (.failures tally) 1)))))))
+                      (free! (mut inputs))
+                      (jit/release-image! (mut loaded)))))
+                (image/release! (mut code)))))
+          (rewrite/release! (mut optimized)))))
+    (free! (mut ends)) (free! (mut roots)) (g/release! (mut graph))))
+
+(defn main [] (-> i32)
+  (let [(mut tally) (Tally :answers 0 :failures 0 :converted 0)]
+    (for ty [(: 11 i32) 5 10 4 9 3 8 2]
+      (for [variant 0 4]
+        (let [v (cast i32 variant)]
+          ; The vowels; a window that starts at zero and spans exactly 64
+          ; values; two adjacent constants; three at the top of the byte.
+          (check ty [97 101 105 111 117] v true (mut tally))
+          (check ty [0 63 10 31 32] v true (mut tally))
+          (check ty [5 6] v true (mut tally))
+          (check ty [125 127 120] v true (mut tally))
+          ; Signed types: keys on both sides of zero, and at the minimum.
+          (when (types/signed? ty)
+            (check ty [-3 2 -1 5] v true (mut tally))
+            (check ty [-128 -126 -120] v true (mut tally)))
+          ; A span of 65 values has no single mask.
+          (check ty [1 65 7] v false (mut tally))
+          (when (>= (types/scalar-size ty 8) 4)
+            (check ty [1000000 1000063 1000001 1000040] v true (mut tally))
+            (check ty [-2147483648 -2147483647 -2147483600] v true (mut tally))
+            (check ty [3 70000 9] v false (mut tally))))))
+    (println "select dispatch: {} native answers, {} converted, {} failures"
+             (.answers tally) (.converted tally) (.failures tally))
+    (if (= (.failures tally) 0) 0 1)))

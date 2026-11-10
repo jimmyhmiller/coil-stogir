@@ -1,0 +1,238 @@
+;;; Reciprocal division inside a loop: the multiplier of a DIV/MOD by a
+;;; literal is defined once before the loop (stogir.a64.constant-hoist) and the
+;;; division reads it from that register, instead of rebuilding it in a
+;;; scratch register on every iteration.
+(module stogir.tests.jit-reciprocal-hoist)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.types" :as types)
+(import "stogir.relocate" :as read)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.a64.constant-hoist" :as hoist)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn need [T] [(r (Result T (slice u8)))] (-> T)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+
+(defn touch :cc (cc/C) [(address u64) (value u64)] (-> void)
+  (set! (index (p/cast (ptr u64) address) 0) value))
+
+(def SCALE (: 0x9E3779B97F4A7C15 u64))
+(def SHIFT (: 0x7F4A7C15F39CC060 u64))
+
+;;; Truncating DIV (29) or MOD (30) of the WIDTH-bit patterns a and b in ty.
+(defn divide [(opcode i32) (ty i32) (a u64) (b u64)] (-> u64)
+  (let [width (* 8 (types/scalar-size ty 8))
+        modulus (<< (: 1 i128) (cast i128 width))
+        mask (cast u64 (- modulus 1))
+        x (& a mask)
+        y (& b mask)
+        sign (cast u64 (/ modulus 2))]
+    (if (types/signed? ty)
+        (let [sx (if (>= x sign) (- (cast i128 x) modulus) (cast i128 x))
+              sy (if (>= y sign) (- (cast i128 y) modulus) (cast i128 y))
+              quotient (/ sx sy)
+              result (if (= opcode 29) quotient (- sx (* quotient sy)))]
+          (& (cast u64 result) mask))
+        (if (= opcode 29) (/ x y) (- x (* (/ x y) y))))))
+
+;;; Independent model of the fixture: accumulator k starts at seed + k; each
+;;; iteration takes v = acc ^ index (halved: logically shifted right once),
+;;; then acc = ((v OP d) + v) * SCALE + SHIFT. The result is the XOR of all.
+(defn model [(opcode i32) (ty i32) (limit u64) (seed u64) (d u64) (count i64) (halved bool)]
+  (-> u64)
+  (let [width (* 8 (types/scalar-size ty 8))
+        mask (cast u64 (- (<< (: 1 u128) (cast u128 width)) 1))
+        (mut total) (: 0 u64)]
+    (for [k 0 count]
+      (let [(mut acc) (& (p/iadd seed (cast u64 k)) mask)]
+        (for [index (: 0 u64) limit]
+          (let [mixed (^ acc (& index mask))
+                v (if halved (>> mixed 1) mixed)
+                result (divide opcode ty v d)]
+            (set! acc (& (p/iadd (p/imul (& (p/iadd result v) mask) (& SCALE mask))
+                                 (& SHIFT mask))
+                         mask))))
+        (set! total (^ total acc))))
+    total))
+
+;;; Whether any MOVN/MOVZ/MOVK writes x16/x17 inside the single loop, which
+;;; spans from the target of the only backward branch to that branch.
+(defn scratch-literal-in-loop? [(bytes (ArrayList u8))] (-> bool)
+  (let [(mut first) (: -1 i64) (mut last) (: -1 i64) (mut found) false]
+    (for [i 0 (/ (len bytes) 4)]
+      (let [word (read/read32 bytes (* i 4))]
+        (when (and (= (& word 0xFF000010) 0x54000000) (!= (& word 0x00800000) 0))
+          (set! first (+ i (- (cast i64 (& (>> word 5) 0x7FFFF)) 524288)))
+          (set! last i))
+        (when (and (= (& word 0xFC000000) 0x14000000) (!= (& word 0x02000000) 0))
+          (set! first (+ i (- (cast i64 (& word 0x3FFFFFF)) 67108864)))
+          (set! last i))))
+    (assert (and (>= first 0) (> last first)))
+    (for [i first (+ last 1)]
+      (let [word (read/read32 bytes (* i 4))
+            rd (& word 31)]
+        (when (and (= (& word 0x1F800000) 0x12800000) (or (= rd 16) (= rd 17)))
+          (set! found true))))
+    found))
+
+;;; f(limit, seed, target, cell) as the model describes. With calling, each
+;;; iteration calls target(cell, index); nothing is then hoisted out of the
+;;; loop. spare tells that registers are free for the hoisted definitions.
+;;; Returns native answers checked.
+(defn fixture [(opcode i32) (ty i32) (divisor u64) (count i64) (halved bool) (calling bool)]
+  (-> i64)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        width (* 8 (types/scalar-size ty 8))
+        mask (cast u64 (- (<< (: 1 u128) (cast u128 width)) 1))
+        d (& divisor mask)
+        ; A reciprocal form: not zero, one, minus one or a power of two.
+        reciprocal (and (>= d 2) (!= (& d (- d 1)) 0)
+                        (or (not (types/signed? ty))
+                            (and (!= d mask)
+                                 (!= (& (& (- 0 d) mask) (- (& (- 0 d) mask) 1)) 0))))
+        clean (and reciprocal (<= count 3) (not calling))
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        limit (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        seed (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        target (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        cell (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 3]))
+        (mut prototype) (need (calls/create 0 0 [(: 6 u8) 5] a))
+        entry (need (b/emit! (mut graph) 114 0 [start]))
+        loop (need (b/loop-begin! (mut graph) entry))
+        zero (need (b/scalar-constant! (mut graph) 5 0 8))
+        one (need (b/scalar-constant! (mut graph) 5 1 8))
+        k-one (need (b/scalar-constant! (mut graph) ty 1 8))
+        k-divisor (need (b/scalar-constant! (mut graph) ty d 8))
+        k-scale (need (b/scalar-constant! (mut graph) ty (& SCALE mask) 8))
+        k-shift (need (b/scalar-constant! (mut graph) ty (& SHIFT mask) 8))
+        index (need (b/loop-phi! (mut graph) loop zero))
+        (mut phis) (ArrayList::new [i32] a)
+        (mut divisions) (ArrayList::new [i32] a)
+        (mut roots) (ArrayList::new [i32] a)
+        (mut answers) (: 0 i64)]
+    (for [k 0 count]
+      (let [offset (need (b/scalar-constant! (mut graph) 5 (cast u64 k) 8))
+            moved (need (b/emit! (mut graph) 26 5 [seed offset]))
+            initial (if (= ty 5) moved
+                        (need (b/emit! (mut graph) (if (= width 64) 36 35) ty [moved])))]
+        (push! (mut phis) (need (b/loop-phi! (mut graph) loop initial)))))
+    (let [condition (need (b/emit! (mut graph) 20 1 [index limit]))
+          split (need (b/emit! (mut graph) 116 0 [loop condition]))
+          body (need (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+          exit (need (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+          next-index (need (b/emit! (mut graph) 26 5 [index one]))
+          narrow (if (= ty 5) index
+                     (need (b/emit! (mut graph) (if (= width 64) 36 35) ty [index])))
+          (mut total) (: 0 i32)]
+      (for [k 0 count]
+        (let [acc (get phis k)
+              mixed (need (b/emit! (mut graph) 48 ty [acc narrow]))
+              value (if halved (need (b/emit! (mut graph) 50 ty [mixed k-one])) mixed)
+              result (need (b/emit! (mut graph) opcode ty [value k-divisor (: 0 i32)]))
+              summed (need (b/emit! (mut graph) 26 ty [result value]))
+              scaled (need (b/emit! (mut graph) 28 ty [summed k-scale]))
+              next (need (b/emit! (mut graph) 26 ty [scaled k-shift]))]
+          (push! (mut divisions) result)
+          (b/patch! (mut graph) acc 3 next)
+          (let [wide (if (= ty 5) acc
+                         (need (b/emit! (mut graph) (if (= width 64) 36 34) 5 [acc])))]
+            (set! total (if (= total 0) wide (need (b/emit! (mut graph) 48 5 [total wide])))))))
+      (let [control (if calling
+                        (need (calls/emit! (mut graph) prototype body target [cell index] a))
+                        body)
+            back (need (b/emit! (mut graph) 115 0 [control]))
+            ret (need (b/emit! (mut graph) 120 5 [exit total (: 0 i32)]))]
+        (b/patch! (mut graph) loop 2 back)
+        (b/patch! (mut graph) index 3 next-index)
+        (push! (mut roots) ret))
+      ; Structure: each division is paired with a definition outside the
+      ; loop, a COPY of a literal that only the overlay's pool holds; one
+      ; definition serves every division by the same literal; the caller's
+      ; graph and its constant pool are intact.
+      (let [(mut prepared) (need (pipeline/prepare graph start (slice roots) a))
+            cells (len (.instructions graph))
+            constants (len (.constants graph))
+            (mut hoisted) (need (hoist/run graph (mut prepared) true a))]
+        (assert (= (len (.instructions graph)) cells))
+        (assert (= (len (.constants graph)) constants))
+        (when calling (assert (= (len (.reciprocals hoisted)) 0)))
+        (when (and reciprocal (not calling))
+          (assert (= (len (.reciprocals hoisted)) (* 2 count)))
+          (assert (.constants hoisted))
+          (assert (= (len (.constants (.graph hoisted))) (+ constants 1)))
+          (for [k 0 count]
+            (let [division (get (.reciprocals hoisted) (* k 2))
+                  definition (get (.reciprocals hoisted) (+ (* k 2) 1))
+                  node (get (.instructions (.graph hoisted)) (cast i64 definition))
+                  kept (get (.instructions (.graph hoisted)) (cast i64 division))
+                  (mut seen) (: 0 i64)]
+              (assert (= division (get divisions k)))
+              (assert (= definition (get (.reciprocals hoisted) 1)))
+              (assert (>= (cast i64 definition) cells))
+              (assert (= (n/opcode node) 68))
+              (assert (< (cast i64 (.op1 node)) (- 0 constants)))
+              ; The division still divides by its literal.
+              (assert (= (.op2 kept) k-divisor))
+              (for block (.starts (.blocks prepared))
+                (let [range (get (.ranges (.schedule prepared)) (cast i64 block))]
+                  (for [i (.offset range) (+ (.offset range) (.count range))]
+                    (when (= (get (.nodes (.schedule prepared)) i) definition)
+                      (assert (= (get (.depths prepared) (cast i64 block)) 0))
+                      (set! seen (+ seen 1))))))
+              (assert (= seen 1)))))
+        (hoist/release! (mut hoisted))
+        (pipeline/release! (mut prepared))))
+    (let [(mut text) (need (compile/text graph start (slice roots) a))
+          (mut mapped) (need (jit/map-text (slice text)))
+          f (p/cast (fnptr (cc/C) [u64 u64 u64 (ptr u64)] u64) (.base mapped))
+          callee (p/cast u64 (p/cast (ptr u8) (fnptr-of touch)))
+          (mut touched) (: 0xDEAD u64)
+          top (<< (: 1 u64) (cast u64 (- width 1)))]
+      ; With registers to spare, a DIV builds nothing in a scratch register
+      ; inside the loop. (A MOD still builds its divisor for the MSUB.)
+      (when (and clean (= opcode 29)) (assert (not (scratch-literal-in-loop? text))))
+      (for seed [(: 0 u64) 1 2 mask (- mask 1) (- top 1) top (+ top 1)
+                 (- d 1) d (+ d 1) (- 0 d) (- 1 d) (* d 2) (- (* (/ mask d) d) 1)
+                 (* (/ mask d) d) (* (/ (- top 1) d) d) (- 0 (* (/ (- top 1) d) d))
+                 0x123456789ABCDEF1 0xFEDCBA9876543210]
+        (for limit [(: 0 u64) 1 2 3 9 200]
+          (set! touched 0xDEAD)
+          (assert (= (f limit seed callee (mut touched))
+                     (model opcode ty limit seed d count halved)))
+          (assert (= touched (if (and calling (> limit 0)) (- limit 1) 0xDEAD)))
+          (set! answers (+ answers 1))))
+      (jit/release! (mut mapped)) (free! (mut text)))
+    (free! (mut phis)) (free! (mut divisions)) (free! (mut roots))
+    (calls/release! (mut prototype))
+    (g/release! (mut graph))
+    answers))
+
+(defn main [] (-> i32)
+  (let [(mut fixtures) (: 0 i64) (mut answers) (: 0 i64)]
+    (for opcode [(: 29 i32) 30]
+      (for ty [(: 5 i32) 11 4 10]
+        ; 251 and 10: plain recipes; 7: the unsigned fix-up; 14 and 6: a
+        ; pre-shifted even divisor; -7 and -251 as signed, huge as unsigned;
+        ; 641 and 0x7FFFFFFF: large magics; 8: a power of two (no reciprocal).
+        (for divisor [(: 251 u64) 10 7 14 6 641 0x7FFFFFFF 0xFFFFFFFFFFFFFFF9
+                      0xFFFFFFFFFFFFFF05 8]
+          ; One and three accumulators leave registers free. Forty exceed
+          ; them: the definition is withdrawn and each division builds its
+          ; multiplier again.
+          (for count [(: 1 i64) 3 40]
+            (for halved [false true]
+              (for calling [false true]
+                (when (or (= count 1) (not calling))
+                  (set! answers (+ answers (fixture opcode ty divisor count halved calling)))
+                  (set! fixtures (+ fixtures 1)))))))))
+    (println "jit-reciprocal-hoist: {} fixtures; {} native answers" fixtures answers))
+  0)
