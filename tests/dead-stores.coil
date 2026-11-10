@@ -1,0 +1,220 @@
+(module stogir.tests.dead-stores)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.load-forward" :as forward)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.node" :as n)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defstruct Fixture [(graph g/Graph) (roots (ArrayList i32))])
+
+;;; The callee of mode 3 reads the cell a removed store would have written.
+(defn observe [(cell (ptr u64))] (-> u64) (load cell))
+
+;;; f(p, q, x, callee) -> u64. Every mode writes p[0] twice in program order.
+;;; 0 adjacent rewrite            1 load through q between (may alias p)
+;;; 2 store through q between     3 call reading p between
+;;; 4 narrower second store       5 wider second store covers a narrow first
+;;; 6 second store on one branch  7 loop: store, back edge, header load
+;;; 8 plain END/BEGIN between     9 load of p[1] between (disjoint)
+;;; 10 three stores, all to p[0]
+(defn build [(mode i32) (a (dyn Allocator))] (-> Fixture)
+  (let [(mut graph) (g/create a) (mut roots) (ArrayList::new [i32] a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        q (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        callee (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 3]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))
+        ones (require (b/scalar-constant! (mut graph) 11 0xFFFFFFFFFFFFFFFF 8))]
+    (let [(mut signature) (match (calls/create 0 11 [(: 6 u8) (: 6 u8) (: 11 u8) (: 6 u8)] a)
+                            (Err [message] (panic "{}" message)) (Ok [s] s))]
+      (require (calls/function! (mut graph) signature a))
+      (calls/release! (mut signature)))
+    (cond
+      (= mode 6)
+        (let [first (require (b/emit! (mut graph) 93 0 [start p seven]))
+              condition (require (b/emit! (mut graph) 15 1 [x zero]))
+              branch (require (b/emit! (mut graph) 116 0 [first condition]))
+              yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+              no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+              second (require (b/emit! (mut graph) 93 0 [yes p x]))]
+          (push! (mut roots) (require (b/emit! (mut graph) 120 11 [second one (: 0 i32)])))
+          (push! (mut roots) (require (b/emit! (mut graph) 120 11 [no zero (: 0 i32)]))))
+      (= mode 7)
+        (let [enter (require (b/emit! (mut graph) 114 0 [start]))
+              header (require (b/loop-begin! (mut graph) enter))
+              phi (require (b/loop-phi! (mut graph) header zero))
+              sum (require (b/loop-phi! (mut graph) header zero))
+              headload (require (b/emit! (mut graph) 91 11 [header p]))
+              condition (require (b/emit! (mut graph) 20 1 [phi x]))
+              branch (require (b/emit! (mut graph) 116 0 [headload condition]))
+              yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+              no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+              added (require (b/emit! (mut graph) 26 11 [sum headload]))
+              next (require (b/emit! (mut graph) 26 11 [phi one]))
+              first (require (b/emit! (mut graph) 93 0 [yes p next]))
+              back (require (b/emit! (mut graph) 115 0 [first]))]
+          (require (b/patch! (mut graph) header 2 back))
+          (require (b/patch! (mut graph) phi 3 next))
+          (require (b/patch! (mut graph) sum 3 added))
+          (push! (mut roots) (require (b/emit! (mut graph) 120 11 [no sum (: 0 i32)]))))
+      :else
+        (let [eight (require (b/scalar-constant! (mut graph) 11 8 8))
+              four (require (b/scalar-constant! (mut graph) 11 4 8))
+              first (cond (= mode 4) (require (b/emit! (mut graph) 93 0 [start p ones]))
+                          (= mode 5)
+                            (let [narrow (require (b/scalar-constant! (mut graph) 4 0xAAAA 4))
+                                  high (require (b/emit! (mut graph) 26 6 [p four]))]
+                              (require (b/emit! (mut graph) 93 0 [start high narrow])))
+                          :else (require (b/emit! (mut graph) 93 0 [start p zero])))
+              (mut value) zero
+              between
+                (cond (= mode 1)
+                        (do (set! value (require (b/emit! (mut graph) 91 11 [first q]))) value)
+                      (= mode 2) (require (b/emit! (mut graph) 93 0 [first q seven]))
+                      (= mode 3)
+                        (let [(mut sig) (match (calls/create 0 11 [(: 6 u8)] a)
+                                          (Err [message] (panic "{}" message)) (Ok [sig] sig))
+                              call (require (calls/emit! (mut graph) sig first callee [p] a))]
+                          (calls/release! (mut sig)) (set! value call) call)
+                      (= mode 8)
+                        (let [end (require (b/emit! (mut graph) 114 0 [first]))]
+                          (require (b/emit! (mut graph) 106 0 [end (: 0 i32)])))
+                      (= mode 9)
+                        (let [slot (require (b/emit! (mut graph) 26 6 [p eight]))]
+                          (set! value (require (b/emit! (mut graph) 91 11 [first slot]))) value)
+                      (= mode 10) (require (b/emit! (mut graph) 93 0 [first p seven]))
+                      :else first)
+              second (if (= mode 4)
+                         (let [narrow (require (b/emit! (mut graph) 35 4 [x]))]
+                           (require (b/emit! (mut graph) 93 0 [between p narrow])))
+                         (require (b/emit! (mut graph) 93 0 [between p x])))]
+          (push! (mut roots) (require (b/emit! (mut graph) 120 11 [second value (: 0 i32)])))))
+    (Fixture :graph graph :roots roots)))
+
+(defn count-stores [(graph g/Graph)] (-> i64)
+  (let [(mut count) (: 0 i64) (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (when (= (n/opcode (get (.instructions graph) r)) 93) (set! count (+ count 1)))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    count))
+
+(defstruct Answer [(result u64) (first u64) (second u64)])
+
+;;; Run f on two cells: p -> cells[0], q -> cells[0] when ALIASED, else cells[2].
+(defn run-native [(graph g/Graph) (roots (slice i32)) (mode i32) (aliased bool) (x u64)
+                  (a (dyn Allocator))] (-> Answer)
+  (match (compile/image-with-private graph 1 roots "_ds_entry" (options/Options :level 3) a
+                                     (private/no-context))
+    (Err [message] (panic "native compile mode {}: {}" mode message))
+    (Ok [code]
+      (let [(mut code) code (mut answer) (Answer :result 0 :first 0 :second 0)]
+        (match (link/compose [code] a)
+          (Err [message] (panic "compose: {}" message))
+          (Ok [module]
+            (let [(mut module) module]
+              (match (jit/map-image (.image module) a)
+                (Err [message] (panic "map: {}" message))
+                (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        index (match (image/find-symbol (.image module) "_ds_entry")
+                                (Some [id] id) (None [] (panic "symbol")))
+                        function (primitive/cast
+                                   (fnptr (cc/C) [(ptr u64) (ptr u64) u64 (fnptr (cc/C) [(ptr u64)] u64)] u64)
+                                   (primitive/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))
+                        (mut cells) [(: 0x1111111111111111 u64) 0x2222222222222222
+                                     0x3333333333333333 0x4444444444444444]
+                        base (primitive/cast (ptr u64) (mut cells))
+                        other (if aliased base (primitive/index base 2))
+                        result (function base other x (fnptr-of observe))]
+                    (set! answer (Answer :result result :first (get cells 0) :second (get cells 2)))
+                    (unless (and (= (get cells 1) 0x2222222222222222) (= (get cells 3) 0x4444444444444444))
+                      (when (!= mode 9) (panic "mode {} wrote outside its cells" mode)))
+                    (jit/release-image! (mut loaded)))))
+              (link/release! (mut module)))))
+        (image/release! (mut code))
+        answer))))
+
+;;; What the unoptimised program computes.
+(defn expected [(mode i32) (aliased bool) (x u64)] (-> Answer)
+  (let [q0 (: 0x3333333333333333 u64)]
+    (cond
+      (= mode 1) (Answer :result (if aliased 0 q0) :first x :second q0)
+      (= mode 2) (Answer :result 0 :first x :second (if aliased q0 7))
+      (= mode 3) (Answer :result 0 :first x :second q0)
+      (= mode 4) (Answer :result 0 :first (| 0xFFFFFFFF00000000 (& x 0xFFFFFFFF)) :second q0)
+      (= mode 6) (Answer :result (if (= x 0) 0 1) :first (if (= x 0) 7 x) :second q0)
+      (= mode 7)
+        ; Each iteration that runs adds the header's read (the initial cell,
+        ; then 1, 2, ...) and stores i + 1.
+        (let [(mut sum) (: 0 u64) (mut cell) (: 0x1111111111111111 u64) (mut i) (: 0 u64)]
+          (while (< i x)
+            (set! sum (primitive/iadd sum cell)) (set! cell (+ i 1)) (set! i (+ i 1)))
+          (Answer :result sum :first cell :second q0))
+      (= mode 9) (Answer :result 0x2222222222222222 :first x :second q0)
+      :else (Answer :result 0 :first x :second q0))))
+
+(defn main [] (-> i32)
+  (let [a (malloc-allocator) (mut native) 0]
+    (for [mode 0 11]
+      (let [(mut f) (build (cast i32 mode) a)
+            (mut working) (g/duplicate (.graph f) a)
+            (mut roots) (ArrayList::new [i32] a)
+            want (cond (or (= mode 0) (= mode 2) (= mode 5) (= mode 8) (= mode 9)) (: 1 i32)
+                       (= mode 10) 2
+                       :else 0)]
+        (for root (.roots f) (push! (mut roots) root))
+        (let [before (count-stores working)
+              removed (forward/dead-stores! (mut working) (mut roots) 8 a)]
+          (unless (= removed want) (panic "mode {} removed {} stores, expected {}" mode removed want))
+          (unless (= (count-stores working) (- before (cast i64 removed)))
+            (panic "mode {} store count disagrees" mode))
+          (unless (= (forward/dead-stores! (mut working) (mut roots) 8 a) 0)
+            (panic "mode {} not at a fixed point" mode)))
+        ; Native answers of the original, the rewritten graph and the complete
+        ; memory optimisation must all equal the unoptimised program's.
+        (for aliased [false true]
+          (for x [(: 0 u64) 1 5 0x80000000 0xFFFFFFFFFFFFFFFF 0x123456789ABCDEF0]
+            (let [count (if (= mode 7) (& x 7) x)
+                  wanted (expected (cast i32 mode) aliased count)]
+              (for variant [0 1 2]
+                (let [got (cond
+                            (= variant 0) (run-native (.graph f) (slice (.roots f)) (cast i32 mode) aliased count a)
+                            (= variant 1) (run-native working (slice roots) (cast i32 mode) aliased count a)
+                            :else
+                              (match (sccp/optimize-memory (.graph f) 8 (slice (.roots f)) true a)
+                                (Err [message] (panic "mode {} optimize: {}" mode message))
+                                (Ok [optimized]
+                                  (let [(mut optimized) optimized
+                                        answer (run-native (.graph optimized) (slice (.roots optimized))
+                                                           (cast i32 mode) aliased count a)]
+                                    (rewrite/release! (mut optimized))
+                                    answer))))]
+                  (set! native (+ native 1))
+                  (unless (and (= (.result got) (.result wanted)) (= (.first got) (.first wanted))
+                               (= (.second got) (.second wanted)))
+                    (panic "mode {} variant {} aliased {} x {}: got {} {:x} {:x}, expected {} {:x} {:x}"
+                           mode variant aliased count (.result got) (.first got) (.second got)
+                           (.result wanted) (.first wanted) (.second wanted))))))))
+        (g/release! (mut working)) (free! (mut roots))
+        (g/release! (mut (.graph f))) (free! (mut (.roots f)))))
+    (println "dead-stores: 11 shapes, {} native answers pass" native)
+    0))
