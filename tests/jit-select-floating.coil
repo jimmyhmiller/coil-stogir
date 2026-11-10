@@ -1,0 +1,228 @@
+(module stogir.tests.jit-select-floating)
+;;; Diamonds whose PHIs are f32 or f64 become FCSEL when their values cost
+;;; little (stogir.select-diamond). Executed natively at both widths over
+;;; signed zeros, infinities, subnormals and quiet and signalling NaNs, under
+;;; every floating comparison of x and y and under an integer comparison.
+;;; Variants of the chosen values:
+;;;   0  c ? y : z                       two parameters
+;;;   1  c ? NaN literal : z             a literal with a payload
+;;;   2  c ? x + y : z                   one speculated operation
+;;;   3  (c ? x : y), (c ? |z| : -z)     two PHIs, combined bit for bit
+;;;   4  c ? x*y + z : z                 a multiply and an add: the whole budget
+;;;   5  c ? x*y + z - x : z             over the budget: stays a branch
+;;;   6  c ? x / y : z                   a division: stays a branch
+;;; Variants 0..4 must hold no conditional branch and one FCSEL per PHI;
+;;; variants 5 and 6 must keep a branch. A select moves bits, so every result
+;;; is compared exactly, NaN payloads and zero signs included.
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.floating" :as floating)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn need [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn word [(text (ArrayList u8)) (at i64)] (-> u32)
+  (| (cast u32 (get text at))
+     (<< (cast u32 (get text (+ at 1))) 8)
+     (<< (cast u32 (get text (+ at 2))) 16)
+     (<< (cast u32 (get text (+ at 3))) 24)))
+
+;;; B.cond, CBZ/CBNZ and TBZ/TBNZ words.
+(defn branches [(text (ArrayList u8))] (-> i64)
+  (let [(mut found) (: 0 i64) (mut at) (: 0 i64)]
+    (while (< (+ at 3) (len text))
+      (let [w (word text at)]
+        (when (or (= (& w (: 0xFF000010 u32)) (: 0x54000000 u32))
+                  (= (& w (: 0x7E000000 u32)) (: 0x34000000 u32))
+                  (= (& w (: 0x7E000000 u32)) (: 0x36000000 u32)))
+          (set! found (+ found 1))))
+      (set! at (+ at 4)))
+    found))
+
+;;; FCSEL words, either width.
+(defn selects [(text (ArrayList u8))] (-> i64)
+  (let [(mut found) (: 0 i64) (mut at) (: 0 i64)]
+    (while (< (+ at 3) (len text))
+      (when (= (& (word text at) (: 0xFFA00C00 u32)) (: 0x1E200C00 u32))
+        (set! found (+ found 1)))
+      (set! at (+ at 4)))
+    found))
+
+(defn nan? [(ty i32) (bits u64)] (-> bool)
+  (if (= ty 12)
+      (> (& bits 0x7FFFFFFFFFFFFFFF) 0x7FF0000000000000)
+      (> (& bits 0x7FFFFFFF) 0x7F800000)))
+
+;;; An oracle from the bit patterns alone: no floating comparison is executed.
+(defn truth [(opcode i32) (ty i32) (a u64) (b u64)] (-> bool)
+  (let [mask (if (= ty 12) (: 0xFFFFFFFFFFFFFFFF u64) 0xFFFFFFFF)
+        sign (if (= ty 12) (: 0x8000000000000000 u64) 0x80000000)
+        unordered? (or (nan? ty a) (nan? ty b))
+        equal? (and (not unordered?)
+                    (or (= a b) (and (= (& a (^ mask sign)) 0) (= (& b (^ mask sign)) 0))))
+        ak (if (= (& a sign) 0) (^ a sign) (^ a mask))
+        bk (if (= (& b sign) 0) (^ b sign) (^ b mask))
+        less? (and (not unordered?) (not equal?) (< ak bk))
+        greater? (and (not unordered?) (not equal?) (> ak bk))]
+    (match opcode
+      (14 equal?)
+      (15 (not equal?))
+      (16 less?)
+      (17 (or greater? equal?))
+      (18 (or less? equal?))
+      (19 greater?)
+      (20 (or unordered? less?))
+      (21 (or unordered? greater? equal?))
+      (22 (or unordered? less? equal?))
+      (23 (or unordered? greater?))
+      (24 (not unordered?))
+      (_ unordered?))))
+
+(defn compute [(opcode i32) (ty i32) (a u64) (b u64)] (-> u64)
+  (match (floating/evaluate opcode ty a b)
+    (Some [bits] bits)
+    (None [] (panic "floating oracle has no value for {}" opcode))))
+
+(defn literal [(ty i32)] (-> u64)
+  (if (= ty 12) (: 0x7FF8DEADBEEF1234 u64) 0x7FC5A5A5))
+
+(defn expected [(variant i32) (ty i32) (c bool) (x u64) (y u64) (z u64)] (-> u64)
+  (let [sign (if (= ty 12) (: 0x8000000000000000 u64) 0x80000000)]
+    (cond (= variant 0) (if c y z)
+          (= variant 1) (if c (literal ty) z)
+          (= variant 2) (if c (compute 26 ty x y) z)
+          (= variant 3) (^ (if c x y) (<< (if c (& z (- sign 1)) (^ z sign)) 1))
+          (= variant 4) (if c (compute 26 ty (compute 28 ty x y) z) z)
+          (= variant 5) (if c (compute 27 ty (compute 26 ty (compute 28 ty x y) z) x) z)
+          :else (if c (compute 29 ty x y) z))))
+
+(def wide [(: 0 u64) 0x8000000000000000 0x3FF0000000000000 0xBFF0000000000000
+           0x4000000000000000 0x7FF0000000000000 0xFFF0000000000000
+           0x7FF8123456789ABC 0x7FF0123456789ABC 0xFFF8000000000001
+           0x0000000000000001 0x7FEFFFFFFFFFFFFF])
+
+(def narrow [(: 0 u64) 0x80000000 0x3F800000 0xBF800000 0x40000000 0x7F800000
+             0xFF800000 0x7FC12345 0x7F812345 0xFFC00001 0x00000001 0x7F7FFFFF])
+
+(defstruct Tally [(answers i64) (failures i64)])
+
+(defn invoke [(base (ptr u8)) (ty i32) (x u64) (y u64) (z u64) (i i64) (j i64)] (-> u64)
+  (if (= ty 12)
+      (let [f (p/cast (fnptr (cc/C) [f64 f64 f64 i64 i64] u64) base)
+            (mut a) (: 0.0 f64) (mut b) (: 0.0 f64) (mut c) (: 0.0 f64)]
+        (store! (p/cast (ptr u64) (mut a)) x)
+        (store! (p/cast (ptr u64) (mut b)) y)
+        (store! (p/cast (ptr u64) (mut c)) z)
+        (call-ptr f a b c i j))
+      (let [f (p/cast (fnptr (cc/C) [f32 f32 f32 i64 i64] u64) base)
+            (mut a) (: 0.0 f32) (mut b) (: 0.0 f32) (mut c) (: 0.0 f32)]
+        (store! (p/cast (ptr u32) (mut a)) (cast u32 x))
+        (store! (p/cast (ptr u32) (mut b)) (cast u32 y))
+        (store! (p/cast (ptr u32) (mut c)) (cast u32 z))
+        (call-ptr f a b c i j))))
+
+;;; OPCODE 0 tests the integers i < j; otherwise it is the floating comparison
+;;; of x and y.
+(defn check [(ty i32) (opcode i32) (variant i32) (tally (mut Tally))] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        bits-type (if (= ty 12) (: 5 i32) 4)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        y (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 1]))
+        z (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 2]))
+        i (need (b/emit! (mut graph) 71 11 [start (: 0 i32) 3]))
+        j (need (b/emit! (mut graph) 71 11 [start (: 0 i32) 4]))
+        c (if (= opcode 0)
+              (need (b/emit! (mut graph) 16 1 [i j]))
+              (need (b/emit! (mut graph) opcode 1 [x y])))
+        branch (need (b/emit! (mut graph) 116 0 [start c]))
+        yes (need (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        no (need (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        e1 (need (b/emit! (mut graph) 114 0 [yes]))
+        e2 (need (b/emit! (mut graph) 114 0 [no]))
+        meet (need (b/emit! (mut graph) 112 0 [e1 e2]))
+        product (need (b/emit! (mut graph) 28 ty [x y]))
+        sum (need (b/emit! (mut graph) 26 ty [product z]))
+        first (cond (= variant 0) y
+                    (= variant 1) (need (b/scalar-constant! (mut graph) ty (literal ty) 8))
+                    (= variant 2) (need (b/emit! (mut graph) 26 ty [x y]))
+                    (= variant 3) x
+                    (= variant 4) sum
+                    (= variant 5) (need (b/emit! (mut graph) 27 ty [sum x]))
+                    :else (need (b/emit! (mut graph) 29 ty [x y (: 0 i32)])))
+        second (if (= variant 3) y z)
+        phi (need (b/emit! (mut graph) 67 ty [meet first second]))
+        chosen (need (b/emit! (mut graph) 36 bits-type [phi]))
+        result (if (= variant 3)
+                   (let [magnitude (need (b/emit! (mut graph) 32 ty [z]))
+                         negated (need (b/emit! (mut graph) 31 ty [z]))
+                         other (need (b/emit! (mut graph) 67 ty [meet magnitude negated]))
+                         other-bits (need (b/emit! (mut graph) 36 bits-type [other]))
+                         one (need (b/scalar-constant! (mut graph) bits-type 1 8))
+                         shifted (need (b/emit! (mut graph) 49 bits-type [other-bits one]))]
+                     (need (b/emit! (mut graph) 48 bits-type [chosen shifted])))
+                   chosen)
+        value (if (= ty 13) (need (b/emit! (mut graph) 34 5 [result])) result)
+        r (need (b/emit! (mut graph) 120 5 [meet value (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)
+        patterns (if (= ty 12) wide narrow)
+        mask (if (= ty 12) (: 0xFFFFFFFFFFFFFFFF u64) 0xFFFFFFFF)]
+    (push! (mut roots) r)
+    (match (compile/vector-image graph start (slice roots) "_select_floating" a)
+      (Err [e] (panic "select-floating {} {} {}: {}" ty opcode variant e))
+      (Ok [image-value]
+        (let [(mut code) image-value
+              jumps (branches (.text code))
+              chosen-count (selects (.text code))]
+          (when (and (<= variant 4)
+                     (or (!= jumps 0) (< chosen-count (if (= variant 3) 2 1))))
+            (println "ty {} op {} variant {}: {} branches, {} FCSEL"
+                     ty opcode variant jumps chosen-count)
+            (set! (.failures tally) (+ (.failures tally) 1)))
+          (when (and (>= variant 5) (= jumps 0))
+            (println "ty {} op {} variant {}: no branch kept" ty opcode variant)
+            (set! (.failures tally) (+ (.failures tally) 1)))
+          (match (jit/map-image code a)
+            (Err [e] (panic "{}" e))
+            (Ok [mapped]
+              (let [(mut loaded) mapped]
+                (for xv patterns
+                  (for yv patterns
+                    (for zv patterns
+                      (for less? [false true]
+                        (when (or (= opcode 0) less?)
+                          (let [condition (if (= opcode 0) less? (truth opcode ty xv yv))
+                                want (& (expected variant ty condition xv yv zv) mask)
+                                got (invoke (.base (.memory loaded)) ty xv yv zv
+                                            (if less? -5 9) 7)
+                                ; an arithmetic NaN's payload is the instruction's choice
+                                loose (and (or (= variant 2) (>= variant 4)) condition
+                                           (nan? ty want))]
+                            (set! (.answers tally) (+ (.answers tally) 1))
+                            (when (if loose (not (nan? ty got)) (!= got want))
+                              (when (< (.failures tally) 5)
+                                (println "ty {} op {} variant {} x {:x} y {:x} z {:x}: got {:x} want {:x}"
+                                         ty opcode variant xv yv zv got want))
+                              (set! (.failures tally) (+ (.failures tally) 1)))))))))
+                (jit/release-image! (mut loaded)))))
+          (image/release! (mut code)))))
+    (free! (mut roots)) (g/release! (mut graph))))
+
+(defn main [] (-> i32)
+  (let [(mut tally) (Tally :answers 0 :failures 0)]
+    (for ty [(: 12 i32) 13]
+      (for [variant 0 7]
+        (check ty 0 (cast i32 variant) (mut tally))
+        (for [opcode 14 26]
+          (check ty (cast i32 opcode) (cast i32 variant) (mut tally)))))
+    (println "floating select diamonds: {} native answers, {} failures"
+             (.answers tally) (.failures tally))
+    (if (= (.failures tally) 0) 0 1)))
