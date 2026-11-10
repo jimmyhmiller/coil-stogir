@@ -42,8 +42,9 @@
 ;;; Lifetime bounds of every part: the start of its first range and the end of
 ;;; its last one. A part without ranges gets bounds no position lies within.
 ;;; A position outside a part's bounds is in none of its ranges, so the bounds
-;;; let inherit-bounded! pass over a part without reading its range list.
-(defstruct Bounds [(lows (ArrayList i64)) (highs (ArrayList i64))])
+;;; let inherit-bounded! pass over a part without reading its range list. near
+;;; is that function's scratch list of the parts whose bounds meet a region.
+(defstruct Bounds [(lows (ArrayList i64)) (highs (ArrayList i64)) (near (ArrayList i32))])
 
 (defn bound! [(bounds (mut Bounds)) (parts (ArrayList a/Part)) (index i64)] (-> void)
   (let [part (at parts index)
@@ -59,7 +60,8 @@
 
 (defn bounds-of [(parts (ArrayList a/Part)) (allocator (dyn Allocator))] (-> Bounds)
   (let [(mut bounds) (Bounds :lows (ArrayList::new [i64] allocator)
-                             :highs (ArrayList::new [i64] allocator))]
+                             :highs (ArrayList::new [i64] allocator)
+                             :near (ArrayList::new [i32] allocator))]
     (reserve! (mut (.lows bounds)) (len parts))
     (reserve! (mut (.highs bounds)) (len parts))
     (for [i 0 (len parts)] (bound! (mut bounds) parts i))
@@ -67,7 +69,8 @@
 
 (defn release-bounds! [(bounds (mut Bounds))] (-> void)
   (free! (mut (.lows bounds)))
-  (free! (mut (.highs bounds))))
+  (free! (mut (.highs bounds)))
+  (free! (mut (.near bounds))))
 
 ;;; Caller proves the region contains no instructions or Phi definitions.
 ;;; Reject partial liveness, register-required uses, or fixed interference.
@@ -100,21 +103,29 @@
     (assert (= count (len (.lows bounds))))
     (clear! (mut changes))
     (clear! (mut touched))
+    (clear! (mut (.near bounds)))
     (for [i 0 count]
-      ; A range holding source starts at or before it and ends after it.
-      (when (and (<= (load (p/index lows i)) source) (> (load (p/index highs i)) source))
-        (let [part (at parts i)]
-          (when (and (>= (.parent part) 0) (range/covers? (.ranges part) source))
-            (if (>= (cast i64 (.parent part)) (len sources))
-                (set! valid false)
-                (do
-                  (push! (mut touched) (.parent part))
-                  (set! (mut sources) (cast i64 (.parent part)) (cast i32 i))))))))
-    (for [i 0 count]
-      ; Some range ends after start only when the last one does, and the first
-      ; such range starts before end only when the first range of all does.
-      (when (and valid (> (load (p/index highs i)) start) (< (load (p/index lows i)) end))
-        (let [part (at parts i)
+      (let [low (load (p/index lows i))
+            high (load (p/index highs i))]
+        ; A range holding source starts at or before it and ends after it.
+        (when (and (<= low source) (> high source))
+          (let [part (at parts i)]
+            (when (and (>= (.parent part) 0) (range/covers? (.ranges part) source))
+              (if (>= (cast i64 (.parent part)) (len sources))
+                  (set! valid false)
+                  (do
+                    (push! (mut touched) (.parent part))
+                    (set! (mut sources) (cast i64 (.parent part)) (cast i32 i)))))))
+        ; Some range ends after start only when the last one does, and the first
+        ; such range starts before end only when the first range of all does.
+        ; Only these parts can meet the region; they are examined below, in
+        ; order, once every source is known.
+        (when (and (> high start) (< low end))
+          (push! (mut (.near bounds)) (cast i32 i)))))
+    (for [k 0 (len (.near bounds))]
+      (when valid
+        (let [i (cast i64 (get (.near bounds) k))
+              part (at parts i)
               r (range/first-ending-after (.ranges part) start)]
           (when (and (< r (len (.ranges part)))
                      (< (.start (get (.ranges part) r)) end))

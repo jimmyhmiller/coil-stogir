@@ -24,7 +24,8 @@
         operations-constants-and-phis-target
         operations-constants-and-phis-target-noting
         structure-noting
-        phis-among)
+        phis-among
+        phis-structured)
 
 (import "stogir.graph" :as g)
 (import "stogir.calls" :as calls)
@@ -52,7 +53,7 @@
 (import "stogir.opcode" :as op)
 (import "stogir.validation-kind" :as kind)
 (import "stogir.types" :as t)
-(import "coil.arraylist" :use [ArrayList])
+(import "stogir.noted" :as noted)
 (import "coil.result" :use [Result Ok Err Some None])
 
 ;;; Whether a walk after structure's gives OPCODE a role of its own: PHI
@@ -63,16 +64,19 @@
       (= opcode 104) (terminal/chain? opcode)))
 
 (defn structure [(graph g/Graph)] (-> (Result i32 (slice u8)))
-  (let [(mut unused) (ArrayList::new [i32] (.alc (.instructions graph)))]
+  (let [(mut unused) (noted/create (.alc (.instructions graph)))]
     (structure-noting graph (mut unused) false)))
 
-;;; structure. With NOTING, every node start whose opcode satisfies noted? is
-;;; also appended to NOTED, in increasing order. After success NOTED therefore
-;;; lists exactly the nodes that phis-structured, calls/verify, switch/verify's
-;;; SWITCH search and terminal/verify-chains act on, in the order their own
-;;; walks over the same unchanged graph reach them: those walks step from node
-;;; start to node start by the same arity extents this one checks.
-(defn structure-noting [(graph g/Graph) (noted (mut (ArrayList i32))) (noting bool)]
+;;; structure. With NOTING (NOTED empty on entry), every node start whose
+;;; opcode satisfies noted? is also appended to NOTED's nodes, in increasing
+;;; order. After success that lists exactly the nodes that phis-structured,
+;;; calls/verify, switch/verify's SWITCH search and terminal/verify-chains act
+;;; on, in the order their own walks over the same unchanged graph reach them:
+;;; those walks step from node start to node start by the same arity extents
+;;; this one checks. NOTED's switch-uses likewise receives every reference
+;;; operand (a kind uses/edge-code? accepts) whose value is a SWITCH node
+;;; start, in walk order: the edges switch/verify's own operand scan gathers.
+(defn structure-noting [(graph g/Graph) (noted (mut noted/Noted)) (noting bool)]
   (-> (Result i32 (slice u8)))
   (let [(mut error) ""
         (mut r) 1
@@ -111,7 +115,7 @@
                                  (!= count (cast i32 (>> header 16))))
                         (set! error "variable input header count mismatch"))
                       (when (and noting (noted? opcode))
-                        (push! (mut noted) (cast i32 r)))
+                        (push! (mut (.nodes noted)) (cast i32 r)))
                       (let [cells (/ (+ (cast i64 count) 4) 4)
                             shape-word (get (op/metadata) (cast i64 opcode))
                             (mut j) 1]
@@ -146,16 +150,21 @@
                                                  (<= (- 0 (cast i64 v)) constant-count)
                                                  (> (load (p/index spans (- (- 0 (cast i64 v)) 1))) 0)))]
                                   (if present
-                                      ; A data operand must not name local storage.
-                                      (when (and (or (= kind op/OPERAND-DEF)
-                                                     (= kind op/OPERAND-REF))
-                                                 (= (& (load (if (> v 0)
-                                                                 (p/index words (* (cast i64 v) 4))
-                                                                 (p/index constants
-                                                                          (* (- (- 0 (cast i64 v)) 1) 4))))
-                                                       255)
-                                                    72))
-                                        (set! error "local storage is not a register value"))
+                                      (let [target (& (load (if (> v 0)
+                                                                (p/index words (* (cast i64 v) 4))
+                                                                (p/index constants
+                                                                         (* (- (- 0 (cast i64 v)) 1) 4))))
+                                                      255)]
+                                        ; A data operand must not name local storage.
+                                        (when (and (= target 72)
+                                                   (or (= kind op/OPERAND-DEF)
+                                                       (= kind op/OPERAND-REF)))
+                                          (set! error "local storage is not a register value"))
+                                        (when (and noting (= target 117) (> v 0))
+                                          (push! (mut (.switch-uses noted))
+                                                 (noted/SwitchUse :target v
+                                                                  :user (cast i32 r)
+                                                                  :operand i))))
                                       ; op/optional-reference? for this operand's kind.
                                       (when (not (and (= v 0)
                                                       (or (= kind op/OPERAND-GRD)
@@ -286,7 +295,7 @@
   (phis-walk graph [] false))
 
 ;;; phis-structured for a graph that structure-noting has just passed, with
-;;; NOTED as it filled it: the Phis are visited through that list.
+;;; NOTED the nodes it listed: the Phis are visited through that list.
 (defn phis-among [(graph g/Graph) (noted (slice i32))] (-> (Result i32 (slice u8)))
   (phis-walk graph noted true))
 
@@ -613,7 +622,7 @@
 ;;; operations-constants-and-phis-target, also filling NOTED (empty on entry)
 ;;; as structure-noting does; the Phi check reads its nodes from that list.
 (defn operations-constants-and-phis-target-noting [(graph g/Graph) (pointer-bytes i32)
-                                                   (noted (mut (ArrayList i32)))]
+                                                   (noted (mut noted/Noted))]
   (-> (Result i32 (slice u8)))
   (match (structure-noting graph (mut noted) true)
     (Err [message] (Err message))
@@ -623,18 +632,18 @@
           (Ok [_]
               (match (constants graph pointer-bytes)
                 (Err [message] (Err message))
-                (Ok [_] (phis-among graph (slice noted)))))))))
+                (Ok [_] (phis-among graph (slice (.nodes noted))))))))))
 
 ;;; operations-and-phis-target, also filling NOTED (empty on entry) likewise.
 (defn operations-and-phis-target-noting [(graph g/Graph) (pointer-bytes i32)
-                                         (noted (mut (ArrayList i32)))]
+                                         (noted (mut noted/Noted))]
   (-> (Result i32 (slice u8)))
   (match (structure-noting graph (mut noted) true)
     (Err [message] (Err message))
     (Ok [_]
         (match (integer-operations-target-structured graph pointer-bytes)
           (Err [message] (Err message))
-          (Ok [_] (phis-among graph (slice noted)))))))
+          (Ok [_] (phis-among graph (slice (.nodes noted))))))))
 
 ;;; One immutable transaction preserves pipeline's structure, entry/root and
 ;;; Phi diagnostic ordering without checking the same structure twice. No proof
