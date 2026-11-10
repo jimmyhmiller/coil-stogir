@@ -1,0 +1,74 @@
+;;; Where a spilled value resumes when control can reach its next use without
+;;; passing the spill (allocation/bypass-cut): the layout of a guarded loop.
+;;; Block 0 ends in the guard, block 1 is the loop's preheader behind it, block
+;;; 2 the loop, block 3 the join after the loop, which the guard also reaches.
+(module stogir.tests.bypass-reload-cut)
+(import "stogir.allocation" :as a)
+(import "stogir.split-position" :as split)
+(import "stogir.interval" :as r)
+(import "stogir.constraints" :as c)
+(import "stogir.frame" :as f)
+(import "stogir.interval-queue" :as queue)
+(import "stogir.fixed-uses" :as fixed)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+;;; A value evicted at 12, in the preheader, with its next register use at
+;;; `use`. `join-idom` is the immediate dominator of the join: 0 when the guard
+;;; can skip the loop, 2 when the join is only reached through the loop.
+;;; Returns the start of the resumed part, or -1 when there is none, and
+;;; checks the register it prefers.
+(defn resumed [(join-idom i32) (use i64) (was i32) (preferred i32)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut parts) (ArrayList::new [a/Part] allocator)
+        (mut value) (a/create 0 allocator)
+        (mut layout) (f/create allocator)
+        (mut work) (ArrayList::new [queue/Item] allocator)
+        blocks [(split/Block :start 0 :end 10 :depth 0 :header -1 :idom 0)
+                (split/Block :start 10 :end 20 :depth 0 :header -1 :idom 0)
+                (split/Block :start 20 :end 40 :depth 1 :header 2 :idom 1)
+                (split/Block :start 40 :end 60 :depth 0 :header -1 :idom join-idom)]]
+    (r/add! (mut (.ranges value)) 12 58)
+    (c/add! (mut (.uses value)) use 1 -1)
+    (push! (mut parts) value)
+    (match (a/spill-prefix-from! (mut parts) (mut work) 0 (mut layout) 8 8 allocator
+                                 (cast (ptr fixed/Index) 0) blocks -1 was)
+      (Err [msg] (panic "spill failed: {}" msg))
+      (Ok [_] 0))
+    (let [start (if (= (len parts) 2) (.start (get (.ranges (get parts 1)) 0)) -1)
+          wants (if (= (len parts) 2) (.preferred (get parts 1)) -2)]
+      (unless (or (!= (len parts) 2) (= wants preferred))
+        (panic "resumed part prefers register {}, want {}" wants preferred))
+      (let [(mut i) 0]
+        (while (< i (len parts))
+          (a/release! (elem (mut parts) i))
+          (set! i (+ i 1))))
+      (free! (mut parts)) (free! (mut work))
+      (f/release! (mut layout))
+      start)))
+
+(defn expect [(got i64) (want i64) (label (slice u8))] (-> i64)
+  (if (= got want)
+      0
+      (do (println "{}: resumed at {}, want {}" label got want) 1)))
+
+(defn main [] (-> i64)
+  (let [failures
+          (+ ; The guard reaches the join past the spill: the value resumes at
+             ; the join's start, an edge-resolved boundary, in the register it
+             ; had, so the guard's edge moves nothing and only the loop's exit
+             ; edge reloads.
+             (expect (resumed 0 46 5 5) 40 "guarded loop")
+             (expect (resumed 0 41 5 5) 40 "use just inside the join")
+             ; Without a register to return to there is nothing to prefer.
+             (expect (resumed 0 46 -1 -1) 40 "no former register")
+             ; The join is reached only through the loop: every path passed
+             ; the spill, so the value is reloaded at its use.
+             (expect (resumed 2 46 5 -1) 46 "dominated join")
+             ; The spill's own block dominates the join.
+             (expect (resumed 1 46 5 -1) 46 "join under the preheader")
+             ; A use at the very start of the join is already that boundary.
+             (expect (resumed 0 40 5 -1) 40 "use at the join start"))]
+    (println "bypass reload cut: {} failures" failures)
+    (if (= failures 0) 0 1)))
