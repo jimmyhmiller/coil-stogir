@@ -24,7 +24,12 @@
 ;;; 54/55=MADD/MSUB, chosen by persistent matching for ADD/SUB of a single-use
 ;;; register MUL: left is the addend/minuend, right the multiplicand and the
 ;;; immediate holds the multiplier's graph reference (see multiplier).
-;;; 56=MUL by a literal as one or two shift/add/subtract steps (see product).
+;;; 56=the 64-bit register of an already extended source, read as it is: a
+;;; conversion of a LOAD that matching gave the wanted access form.
+;;; 57=access form of a LOAD, never emitted as arithmetic: the immediate holds
+;;; the access width in bytes in bits0..7 and bit8 when it sign-extends into
+;;; the X register; without bit8 it zero-extends.
+;;; 58=MUL by a literal as one or two shift/add/subtract steps (see product).
 ;;; A rule 20/21 comparison with zero may instead be a bit test (see bit-test).
 ;;; Operands remain graph references until allocation. Immediate holds unsigned
 ;;; arithmetic bits/fields or the signed CMP/CMN displacement bit pattern.
@@ -187,7 +192,7 @@
             (trailing-zeros top)
             0))))
 
-;;; One step of a rule 56 product of the source x, through a temporary t:
+;;; One step of a rule 58 product of the source x, through a temporary t:
 ;;; kind 0: a << s; 1: a + (b << s); 2: a - (b << s); 3: -(b << s). Bits 0..5
 ;;; hold s, bit 6 selects t for a, bit 7 selects t for b, bits 8..9 the kind.
 (defn step [(kind u64) (first-temporary bool) (shifted-temporary bool) (shift u64)] (-> u64)
@@ -196,7 +201,7 @@
 ;;; The first step defines t (or the result, when it is the only one); the
 ;;; second defines the result. Immediate: count, then 16 bits per step.
 (defn product-tile [(tile Tile) (source i32) (first u64) (second u64) (count u64)] (-> Tile)
-  (Tile :rule 56 :wide (.wide tile) :left source :right 0
+  (Tile :rule 58 :wide (.wide tile) :left source :right 0
         :immediate (| count (<< first 8) (<< second 24))))
 
 (defn product-steps [(tile Tile)] (-> i32)
@@ -351,8 +356,8 @@
                     :immediate exponent)))))))
 
 ;;; Constant shifts and multiply-by-power-of-two need no constant register.
-;;; Narrow (<32-bit) shifts by a literal keep their width-specific operand and
-;;; result normalization around the constant-shift rule.
+;;; Narrow (<32-bit) shifts keep their width-specific lowering; only SAR of an
+;;; unsigned byte or halfword by a literal selects the constant-shift rule.
 (defn arithmetic [(graph g/Graph) (reference i32)] (-> (Result Tile (slice u8)))
   (match (arithmetic-register graph reference)
     (Err [message] (Err message))
@@ -372,16 +377,21 @@
                         (not (or (= rule 3) (and (>= rule 9) (<= rule 13)))))
                     (Ok (if (and (>= rule 14) (<= rule 17))
                             (division-power graph tile (* size 8))
-                            ; A byte or halfword shift counts modulo its own
-                            ; width; a literal count needs no count register.
-                            (match (if (and (>= rule 9) (<= rule 11) (> (.left tile) 0))
+                            ; A byte or halfword shift by a literal is one
+                            ; bitfield move chosen at emission, except SAR of
+                            ; an unsigned type by a nonzero count: there the
+                            ; sign-extended source is shifted by the constant
+                            ; (counts are taken modulo the type width).
+                            (match (if (and (= rule 11) (> (.left tile) 0)
+                                            (not (types/signed? (cast i32 (n/type-id x)))))
                                        literal
                                        (None))
                               (None [] tile)
                               (Some [count]
-                                (Tile :rule (+ 38 (- rule 9)) :wide false :left (.left tile)
-                                      :right 0
-                                      :immediate (& count (cast u64 (- (* size 8) 1))))))))
+                                (if (= (& count (cast u64 (- (* size 8) 1))) 0)
+                                    tile
+                                    (Tile :rule 40 :wide false :left (.left tile) :right 0
+                                          :immediate (& count (cast u64 (- (* size 8) 1)))))))))
                     (match literal
                       (None [] (Ok tile))
                       (Some [value]
@@ -647,6 +657,46 @@
                        (= (types/scalar-size (cast i32 (n/type-id shift)) 8) 8))
                   (unit-shift-count graph source (n/type-id shift))
                   0))))))
+
+;;; The access form matching chose for a LOAD, or zero for the form its type
+;;; gives: see rule 57.
+(defn load-form [(tile Tile)] (-> i32)
+  (if (= (.rule tile) 57) (cast i32 (.immediate tile)) 0))
+
+;;; The 64-bit move of rule 56 from SOURCE.
+(defn extended-copy [(source i32)] (-> Tile)
+  (Tile :rule 56 :wide true :left source :right 0 :immediate 0))
+
+;;; An integer LOAD of WIDTH bytes can be read by a narrower access at the
+;;; same address: memory is little-endian. Address-typed loads are excluded.
+(defn narrowable-load-type? [(ty u8)] (-> bool)
+  (or (= ty 3) (= ty 4) (= ty 5) (= ty 9) (= ty 10) (= ty 11)))
+
+;;; Integer types a TRUNC view of a narrowed LOAD may have. BOOL and CHAR
+;;; destinations are canonicalized by their own conversion.
+(defn narrow-view-type? [(ty u8)] (-> bool)
+  (or (= ty 2) (= ty 3) (= ty 4) (= ty 8) (= ty 9) (= ty 10)))
+
+;;; A variable shift reads only the low bits of its count: six for an X form
+;;; and five for a W form. SEXT, ZEXT, TRUNC and integer BITCAST between
+;;; integer types of at least a byte keep those bits, so the count can be read
+;;; from the conversion's source. Returns that source, or zero. BOOL is
+;;; excluded on both sides: its conversions canonicalize.
+(defn count-view-source [(graph g/Graph) (reference i32)] (-> i32)
+  (if (<= reference 0)
+      0
+      (let [node (get (.instructions graph) (cast i64 reference))
+            opcode (n/opcode node)
+            ty (cast i32 (n/type-id node))
+            source (.op1 node)]
+        (if (or (< opcode 33) (> opcode 36) (<= source 0)
+                (not (types/integer? ty)) (= ty 1) (= ty 6))
+            0
+            (let [from (cast i32 (n/type-id (get (.instructions graph) (cast i64 source))))]
+              (if (or (not (types/integer? from)) (= from 1) (= from 6)
+                      (= (n/opcode (get (.instructions graph) (cast i64 source))) 89))
+                  0
+                  source))))))
 
 (defn swapped-condition [(condition i32)] (-> i32)
   (case condition 2 9 3 8 8 3 9 2 10 13 11 12 12 11 13 10 condition))
