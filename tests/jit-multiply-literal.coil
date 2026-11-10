@@ -1,0 +1,170 @@
+;;; MUL by a literal is one or two shift/add/subtract instructions whenever
+;;; such a sequence exists, and a machine multiply otherwise. Every literal in
+;;; a range, and every literal near a power of two or a sum or difference of
+;;; two, is run natively against wide multiplication modulo the width.
+(module stogir.tests.jit-multiply-literal)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.types" :as types)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn need [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [x] x) (Err [message] (panic "{}" message))))
+
+(defn read [(text (slice u8)) (at i64)] (-> u32)
+  (| (cast u32 (get text at))
+     (<< (cast u32 (get text (+ at 1))) 8)
+     (<< (cast u32 (get text (+ at 2))) 16)
+     (<< (cast u32 (get text (+ at 3))) 24)))
+
+;;; kind 0: MADD/MSUB (MUL is MADD with XZR). 1: MOVN/MOVZ/MOVK.
+;;; 2: shifted-register ADD/SUB, or a shift (UBFM) with a nonzero rotation.
+(defn words [(text (slice u8)) (kind i32)] (-> i64)
+  (let [(mut count) 0 (mut at) 0]
+    (while (< (+ at 3) (len text))
+      (let [word (read text at)]
+        (when (case kind
+                0 (= (& word (: 0x7FE00000 u32)) (: 0x1B000000 u32))
+                1 (and (= (& word (: 0x1F800000 u32)) (: 0x12800000 u32))
+                       (!= (& word (: 0x60000000 u32)) (: 0x20000000 u32)))
+                2 (or (= (& word (: 0x1F200000 u32)) (: 0x0B000000 u32))
+                      (and (= (& word (: 0x7F800000 u32)) (: 0x53000000 u32))
+                           (!= (& (>> word 16) 63) 0)))
+                false)
+          (set! count (+ count 1))))
+      (set! at (+ at 4)))
+    count))
+
+;;; The independent recipe search. A first step gives the source x times
+;;; 2^k, 1 + 2^k, 1 - 2^k or -2^k; a second combines x and that value t by any
+;;; of the eight shifted forms. Returns the fewest steps (1 or 2), or 3.
+(defn fewest [(literal u64) (width i32)] (-> i32)
+  (let [full (if (= width 64) (: 0xFFFFFFFFFFFFFFFF u64) 0xFFFFFFFF)
+        c (& literal full)
+        (mut best) (: 3 i32)]
+    (for [k (: 0 u64) (cast u64 width)]
+      (let [power (<< (: 1 u64) k)]
+        (for first [(& power full) (& (+ 1 power) full) (& (- 1 power) full) (& (- 0 power) full)]
+          (when (= first c) (set! best 1))
+          (when (> best 2)
+            (for [s (: 0 u64) (cast u64 width)]
+              (let [unit (<< (: 1 u64) s)
+                    scaled (<< first s)]
+                (for second [scaled (+ first unit) (+ 1 scaled) (- first unit) (- 1 scaled)
+                             (+ first scaled) (- first scaled) (- 0 scaled)]
+                  (when (= (& second full) c) (set! best 2)))))))))
+    best))
+
+(def probes
+  [(: 0 u64) 1 2 3 7 0x7FFFFFFF 0x80000000 0xFFFFFFFF 0x100000001 0x7FFFFFFFFFFFFFFF
+   0x8000000000000000 0xFFFFFFFFFFFFFFFF 0x0123456789ABCDEF 0xFEDCBA9876543210])
+
+;;; shared 1 also returns the source added to the product, so that the
+;;; result register differs from a still-live source.
+(defn fixture [(ty i32) (literal u64) (flip bool) (shared bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut roots) (ArrayList::new [i32] a)
+        width (* 8 (types/scalar-size ty 8))
+        full (if (= width 64) (: 0xFFFFFFFFFFFFFFFF u64) 0xFFFFFFFF)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        argument (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        narrow (if (= width 64) (: 36 i32) 35)
+        x (if (= ty 5) argument (need (b/emit! (mut graph) narrow ty [argument])))
+        constant (need (b/scalar-constant! (mut graph) ty (& literal full) 8))
+        product (need (b/emit! (mut graph) 28 ty (if flip [constant x] [x constant])))
+        result (if shared (need (b/emit! (mut graph) 48 ty [product x])) product)
+        value (if (= ty 5) result
+                  (need (b/emit! (mut graph) (if (= width 64) 36 34) 5 [result])))
+        steps (fewest literal width)
+        c (& literal full)
+        simple (or (= c 0) (= (& c (- c 1)) 0))
+        (mut checked) 0]
+    (push! (mut roots) (need (b/emit! (mut graph) 120 5 [start value (: 0 i32)])))
+    (match (compile/text graph start (slice roots) a)
+      (Err [message] (panic "{}" message))
+      (Ok [text]
+          (let [(mut text) text
+                multiplies (words (slice text) 0)
+                moves (words (slice text) 1)
+                shifted (words (slice text) 2)]
+            ; Zero folds to a move of zero and a power of two is one shift;
+            ; neither is this rule's. Every other literal with a recipe has no
+            ; multiply and no literal move, and at most its step count of
+            ; shifted instructions (a 64-bit result needs no extension).
+            (when (and (not simple)
+                       (if (<= steps 2)
+                           (or (!= multiplies 0) (!= moves 0)
+                               (and (= width 64) (not shared) (!= shifted (cast i64 steps))))
+                           (!= multiplies 1)))
+              (panic "type={} literal={} flip={} shared={}: steps={} mul={} mov={} shifted={}"
+                     ty literal flip shared steps multiplies moves shifted))
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "{}" message))
+              (Ok [image]
+                  (let [(mut image) image
+                        function (p/cast (fnptr (cc/C) [u64] u64) (.base image))
+                        modulus (<< (: 1 u128) (cast u128 width))]
+                    (for input probes
+                      (let [low (& input full)
+                            wide (cast u64 (% (* (cast u128 low) (cast u128 c)) modulus))
+                            want (if shared (^ wide low) wide)
+                            got (function input)]
+                        (set! checked (+ checked 1))
+                        (when (!= got want)
+                          (panic "type={} literal={} flip={} shared={} input={} expected={} got={}"
+                                 ty literal flip shared input want got))))
+                    (jit/release! (mut image)))))
+            (free! (mut text)))))
+    (free! (mut roots))
+    (g/release! (mut graph))
+    checked))
+
+(defn main [] (-> i32)
+  (let [(mut fixtures) (: 0 i64) (mut answers) (: 0 i64) (mut recipes) (: 0 i64)]
+    (for ty [(: 4 i32) 5 10 11]
+      (let [width (* 8 (types/scalar-size ty 8))
+            span (if (or (= ty 4) (= ty 5)) (: 1100 i64) 70)]
+        ; Every literal of a range around zero, with the operands in either
+        ; order and the source kept live.
+        (for [value (- 0 span) (+ span 1)]
+          (let [literal (p/cast u64 value)]
+            (when (<= (fewest literal width) 2) (set! recipes (+ recipes 1)))
+            (for flip [false true]
+              (for shared [false true]
+                (set! answers (+ answers (fixture ty literal flip shared)))
+                (set! fixtures (+ fixtures 1))))))
+        ; Near every power of two, and every sum and difference of two powers
+        ; with small offsets: all recipe boundaries, including wrap-around at
+        ; the sign bit and the top of the word.
+        (when (or (= ty 4) (= ty 5))
+          (for [a (: 0 u64) (cast u64 width)]
+            (for delta [(: -3 i64) -2 -1 0 1 2 3]
+              (for sign [(: 1 i64) -1]
+                (let [literal (p/cast u64 (* sign (+ (p/cast i64 (<< (: 1 u64) a)) delta)))]
+                  (set! answers (+ answers (fixture ty literal false false)))
+                  (set! fixtures (+ fixtures 1)))))
+            (for [b (: 0 u64) a]
+              (for form [(: 0 i32) 1 2 3 4 5 6 7]
+                (let [high (<< (: 1 u64) a)
+                      low (<< (: 1 u64) b)
+                      literal (case form
+                                0 (+ high low)
+                                1 (- high low)
+                                2 (- low high)
+                                3 (- 0 (+ high low))
+                                4 (+ 1 (+ high low))
+                                5 (- 1 (+ high low))
+                                6 (+ 1 (- high low))
+                                (* (+ 1 high) (+ 1 low)))]
+                  (set! answers (+ answers (fixture ty literal false (= (% (+ a b) 2) 0))))
+                  (set! fixtures (+ fixtures 1)))))))))
+    (println "literal multiplies: {} fixtures; {} native answers; {} range literals with recipes"
+             fixtures answers recipes))
+  0)

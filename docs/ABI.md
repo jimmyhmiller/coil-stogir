@@ -185,7 +185,14 @@ Volatile variants remain explicit control-chain operations. Objects are not
 automatically initialized.
 
 Fixed outgoing arguments, the non-leaf frame record, local objects and spill
-slots occupy disjoint frame storage. Local objects and spilled values have
+slots occupy disjoint frame storage. The outgoing area lies at SP with the frame
+record above it when some call passes an argument in memory, which its callee
+reads at SP, and in every anchored frame. Otherwise the area holds only the
+function's private call storage (ARGVAL copies and result-pointer saves) and
+lies above a frame record placed at SP itself (`frame-address.Base.call-area`).
+A record at SP in a frame of at most 496 bytes is stored with SP pre-decrement
+and reloaded with post-increment, so the prologue and every epilogue need no
+separate SP adjustment; `tests/frame-shapes.coil` executes each frame shape. Local objects and spilled values have
 separate ownership maps, so equal owner IDs cannot cause accidental aliasing.
 Local addressing handles offsets beyond ADD-immediate encoding. Native coverage
 includes all scalar types, mixed storage views, literal/volatile accesses,
