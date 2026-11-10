@@ -148,6 +148,8 @@
         (mut narrow-users) (ArrayList::new [i32] a)
         (mut narrow-switches) (ArrayList::new [i32] a)
         (mut wide-switches) (ArrayList::new [i32] a)
+        (mut bit-tests) (ArrayList::new [i32] a)
+        (mut bit-users) (ArrayList::new [i32] a)
         (mut block) (: 0 i32)
         (mut error) ""]
     ; One sized allocation per per-cell table instead of a growing push each.
@@ -246,7 +248,12 @@
               (when (and fuse (.wide tile) (>= (.rule tile) 20) (<= (.rule tile) 33)
                          (or (select/word-extension? graph (.left tile))
                              (select/word-extension? graph (.right tile))))
-                (push! (mut narrowable) reference))))))) (set! for-index-1 (+ for-index-1 1))))
+                (push! (mut narrowable) reference))
+              ; EQ/NE(AND(...), 0) may be a bit test of the AND's input.
+              (when (and fuse (or (= (.rule tile) 20) (= (.rule tile) 21))
+                         (= (.right tile) 0) (= (.immediate tile) 0) (> (.left tile) 0)
+                         (= (n/opcode (get (.instructions graph) (cast i64 (.left tile)))) 47))
+                (push! (mut bit-tests) reference))))))) (set! for-index-1 (+ for-index-1 1))))
     ; Remove only each consumed Boolean edge. Shared/protected comparisons
     ; remain definitions; no new arithmetic edges are speculated.
     (for reference choices
@@ -353,6 +360,29 @@
               (set! (mut tiles) (cast i64 reference) narrow))))))
     (free! (mut narrow-tiles))
     (free! (mut narrow-switches))
+    ; A zero test of an AND that nothing else reads tests a bit of the AND's
+    ; input directly. The comparison takes the input edges; the AND gives up
+    ; its own when it is retired below, and with it an unshared SHL.
+    (when (= error "")
+      (for [i 0 (len bit-tests)]
+        (let [reference (get bit-tests i)
+              index (cast i64 reference)
+              tile (get tiles index)
+              mask (cast i64 (.left tile))]
+          (match (if (or (get omitted index) (!= (get counts mask) 1) (get protected mask))
+                     (None)
+                     (select/bit-test graph tile))
+            (None [] (set! (mut bit-tests) i 0))
+            (Some [test]
+              (set! (mut tiles) index test)
+              (set! (mut counts) mask 0)
+              (push! (mut retired) (.left tile))
+              (when (> (.left test) 0)
+                (set! (mut counts) (cast i64 (.left test))
+                      (+ (get counts (cast i64 (.left test))) 1)))
+              (when (> (.right test) 0)
+                (set! (mut counts) (cast i64 (.right test))
+                      (+ (get counts (cast i64 (.right test))) 1))))))))
     (when (and fuse (= error ""))
       (let [items-2 (.nodes scheduled) (mut for-index-2) (: 0 i64)] (while (< for-index-2 (len items-2)) (let [reference (get items-2 for-index-2)]
         (let [node (get (.instructions graph) (cast i64 reference))
@@ -377,6 +407,7 @@
                       (set! (mut omitted) index true)
                       (set! (mut comparisons) (cast i64 reference) source)
                       (unless (.wide tile) (push! (mut narrow-users) reference))
+                      (when (select/bit-test? tile) (push! (mut bit-users) reference))
                       (when selection (push! (mut selects) reference)))
                     (if inverted
                         ; IF(EQ/NE(ZEXT(comparison), 0)) branches on the inner
@@ -388,6 +419,7 @@
                               (mut live) true]
                           (set! (mut comparisons) (cast i64 reference) inner)
                           (unless (.wide base) (push! (mut narrow-users) reference))
+                          (when (select/bit-test? base) (push! (mut bit-users) reference))
                           (set! (mut tiles) (cast i64 reference)
                                 (select/Tile :rule (if (= (.rule tile) 20)
                                                        (+ 20 (^ (- (.rule base) 20) 1))
@@ -416,6 +448,7 @@
                                    (immediate-comparison? graph tile source))
                           (set! (mut comparisons) (cast i64 reference) source)
                           (unless (.wide tile) (push! (mut narrow-users) reference))
+                          (when (select/bit-test? tile) (push! (mut bit-users) reference))
                           (when selection (push! (mut selects) reference))
                           (set! (mut counts) index (- (get counts index) 1))
                           (if (and (= (get counts index) 0) (not (get protected index)))
@@ -602,7 +635,8 @@
                                                               (n/type-id node))
                                                         8)
                                      8))
-                              (or (= (n/opcode node) 28) (= (n/opcode node) 49)
+                              (or (= (n/opcode node) 28) (= (n/opcode node) 47)
+                                  (= (n/opcode node) 49)
                                   (= (n/opcode node) 50) (= (n/opcode node) 51)))
                          ; A TRUNC whose extensions all read its source.
                          (and (= (n/opcode node) 35)
@@ -659,6 +693,8 @@
           (free! (mut word-views))
           (free! (mut narrowable))
           (free! (mut narrow-users))
+          (free! (mut bit-tests))
+          (free! (mut bit-users))
           (free! (mut choices))
           (free! (mut selects))
           (free! (mut tiles))
@@ -729,6 +765,27 @@
                       (set! (mut (.inputs operands)) (+ (.offset range) i)
                             (.op1 (get (.instructions graph) (cast i64 value))))))))))
           (free! (mut narrow-users))
+          ; A bit test, or the branch that consumed it, was given the
+          ; comparison's graph operands: the AND and the literal zero. It
+          ; reads the tile's sources; an immediate form keeps the literal.
+          (for reference bit-tests (push! (mut bit-users) reference))
+          (free! (mut bit-tests))
+          (for reference bit-users
+            (when (and (> reference 0)
+                       (not (get (.omitted operands) (cast i64 reference))))
+              (let [own (get tiles (cast i64 reference))
+                    tile (if (select/bit-test? own) own
+                             (get tiles (cast i64 (get comparisons (cast i64 reference)))))
+                    range (get (.ranges operands) (cast i64 reference))]
+                (when (or (!= (.count range) 2) (not (select/bit-test? tile)))
+                  (panic "bit test without its comparison operands"))
+                (let [first (get (.inputs operands) (.offset range))
+                      second (get (.inputs operands) (+ (.offset range) 1))]
+                  (set! (mut (.inputs operands)) (.offset range) (.left tile))
+                  (set! (mut (.inputs operands)) (+ (.offset range) 1)
+                        (if (!= (.right tile) 0) (.right tile)
+                            (if (<= first 0) first second)))))))
+          (free! (mut bit-users))
           ; Only selected choices need replacement input ranges.
           (for reference choices
             (let [index (cast i64 reference) tile (get tiles index)

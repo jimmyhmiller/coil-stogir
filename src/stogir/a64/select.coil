@@ -23,6 +23,8 @@
 ;;; 54/55=MADD/MSUB, chosen by persistent matching for ADD/SUB of a single-use
 ;;; register MUL: left is the addend/minuend, right the multiplicand and the
 ;;; immediate holds the multiplier's graph reference (see multiplier).
+;;; 56=MUL by a literal as one or two shift/add/subtract steps (see product).
+;;; A rule 20/21 comparison with zero may instead be a bit test (see bit-test).
 ;;; Operands remain graph references until allocation. Immediate holds unsigned
 ;;; arithmetic bits/fields or the signed CMP/CMN displacement bit pattern.
 (defstruct Tile [(rule i32) (wide bool) (left i32) (right i32) (immediate u64)])
@@ -159,6 +161,14 @@
                                                     :left lhs
                                                     :right rhs
                                                     :immediate 0)))))))))))))))
+
+;;; Index of the lowest set bit; value must be nonzero.
+(defn trailing-zeros [(value u64)] (-> u64)
+  (let [(mut bits) value (mut count) (: 0 u64)]
+    (while (= (& bits 1) 0)
+      (set! bits (>> bits 1))
+      (set! count (+ count 1)))
+    count))
 
 (defn numeric-bits [(graph g/Graph) (reference i32)] (-> (Option u64))
   (if (>= reference 0)
@@ -383,6 +393,120 @@
                                     :immediate 32)
                               (Tile :rule 53 :wide true :left source :right 0
                                     :immediate 0))))))))))
+
+;;; Bit-test comparison tiles keep rule 20/21 (the tested value EQ/NE zero), so
+;;; every consumer of comparison flags applies. Their immediate is outside the
+;;; CMP/CMN displacement range:
+;;;   BIT-TEST + k, right = 0: bit k of left (TST left, #(1 << k)).
+;;;   BIT-TEST-SHIFTED: bit (right mod width) of left (LSR by right, TST #1).
+(def BIT-TEST (: 0x10000000000 u64))
+(def BIT-TEST-SHIFTED (: 0x20000000000 u64))
+
+(defn bit-test? [(tile Tile)] (-> bool)
+  (and (or (= (.rule tile) 20) (= (.rule tile) 21)) (>= (.immediate tile) BIT-TEST)
+       (<= (.immediate tile) BIT-TEST-SHIFTED)))
+
+(defn shifted-bit-test? [(tile Tile)] (-> bool)
+  (and (or (= (.rule tile) 20) (= (.rule tile) 21)) (= (.immediate tile) BIT-TEST-SHIFTED)))
+
+;;; Bit index of an unshifted bit-test tile.
+(defn tested-bit [(tile Tile)] (-> i32)
+  (cast i32 (- (.immediate tile) BIT-TEST)))
+
+;;; A value an instruction placed later may read: defined by an ordinary
+;;; instruction. RLOAD keeps its pinned position.
+(defn free-value? [(graph g/Graph) (reference i32)] (-> bool)
+  (and (> reference 0)
+       (!= (n/opcode (get (.instructions graph) (cast i64 reference))) 89)))
+
+;;; The count n of SHL(1, n) in the integer type ty, or zero.
+(defn unit-shift-count [(graph g/Graph) (reference i32) (ty u8)] (-> i32)
+  (if (<= reference 0)
+      0
+      (let [node (get (.instructions graph) (cast i64 reference))]
+        (if (and (= (n/opcode node) 49) (= (n/type-id node) ty)
+                 (free-value? graph (.op2 node))
+                 (match (numeric-bits graph (.op1 node))
+                   (Some [bits] (= bits 1))
+                   (None [] false)))
+            (.op2 node)
+            0))))
+
+;;; TILE is EQ/NE(a, 0) as comparison-immediate left it. When a is an AND of a
+;;; 32/64-bit integer type, the comparison is a bit test of the AND's input:
+;;;   AND(x, 2^k): bit k of x.
+;;;   AND(SHL(1, n), m): bit n of m. SHL masks its count to the type width, as
+;;;     LSR does, so (1 << n) & m is nonzero exactly when (m >> n) & 1 is.
+;;;   AND(TRUNC32(SHL64(1, n)), literal m): bit (n mod 64) of the zero-extended
+;;;     literal, which is clear for every count from 32 up, as the truncated
+;;;     bit is. A register m is excluded: its upper word is not specified.
+;;; The caller retires the AND once this was its last use and must replace the
+;;; machine uses before liveness.
+(defn bit-test [(graph g/Graph) (tile Tile)] (-> (Option Tile))
+  (if (or (not (or (= (.rule tile) 20) (= (.rule tile) 21)))
+          (!= (.right tile) 0) (!= (.immediate tile) 0) (<= (.left tile) 0))
+      (None)
+      (let [mask (get (.instructions graph) (cast i64 (.left tile)))
+            ty (n/type-id mask)
+            size (types/scalar-size (cast i32 ty) 8)]
+        (if (or (!= (n/opcode mask) 47) (not (types/integer? (cast i32 ty)))
+                (not (or (= size 4) (= size 8))))
+            (None)
+            (let [first-count (unit-shift-count graph (.op1 mask) ty)
+                  count (if (> first-count 0) first-count
+                            (unit-shift-count graph (.op2 mask) ty))
+                  other (if (> first-count 0) (.op2 mask) (.op1 mask))
+                  wide-first (if (= size 4) (truncated-unit-shift-count graph (.op1 mask)) 0)
+                  wide-count (if (or (> wide-first 0) (!= size 4)) wide-first
+                                 (truncated-unit-shift-count graph (.op2 mask)))
+                  wide-other (if (> wide-first 0) (.op2 mask) (.op1 mask))]
+              (cond (and (> count 0)
+                         (or (free-value? graph other)
+                             (match (numeric-bits graph other)
+                               (Some [bits] (!= bits 0))
+                               (None [] false))))
+                      (Some (Tile :rule (.rule tile) :wide (= size 8) :left other
+                                  :right count :immediate BIT-TEST-SHIFTED))
+                    (and (> wide-count 0)
+                         (match (numeric-bits graph wide-other)
+                           (Some [bits] (and (!= bits 0) (= (>> bits 32) 0)))
+                           (None [] false)))
+                      (Some (Tile :rule (.rule tile) :wide true :left wide-other
+                                  :right wide-count :immediate BIT-TEST-SHIFTED))
+                    :else
+                      (let [literal (match (numeric-bits graph (.op2 mask))
+                                      (Some [bits] (Some bits))
+                                      (None [] (numeric-bits graph (.op1 mask))))
+                            source (match (numeric-bits graph (.op2 mask))
+                                     (Some [_] (.op1 mask))
+                                     (None [] (.op2 mask)))]
+                        (match literal
+                          (None [] (None))
+                          (Some [raw]
+                            (let [bits (if (= size 8) raw (& raw 0xFFFFFFFF))]
+                              (if (or (= bits 0) (!= (& bits (- bits 1)) 0)
+                                      (not (free-value? graph source)))
+                                  (None)
+                                  (Some (Tile :rule (.rule tile) :wide (= size 8)
+                                              :left source :right 0
+                                              :immediate
+                                                (+ BIT-TEST
+                                                   (trailing-zeros bits)))))))))))))))
+
+;;; The count n of TRUNC32(SHL64(1, n)), or zero.
+(defn truncated-unit-shift-count [(graph g/Graph) (reference i32)] (-> i32)
+  (if (<= reference 0)
+      0
+      (let [node (get (.instructions graph) (cast i64 reference))
+            source (.op1 node)]
+        (if (or (!= (n/opcode node) 35) (<= source 0)
+                (not (types/integer? (cast i32 (n/type-id node)))))
+            0
+            (let [shift (get (.instructions graph) (cast i64 source))]
+              (if (and (types/integer? (cast i32 (n/type-id shift)))
+                       (= (types/scalar-size (cast i32 (n/type-id shift)) 8) 8))
+                  (unit-shift-count graph source (n/type-id shift))
+                  0))))))
 
 (defn swapped-condition [(condition i32)] (-> i32)
   (case condition 2 9 3 8 8 3 9 2 10 13 11 12 12 11 13 10 condition))
