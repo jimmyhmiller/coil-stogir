@@ -1,0 +1,188 @@
+(module stogir.tests.jit-select-diamond)
+;;; Diamonds whose arms hold no control become conditional selects when their
+;;; PHIs cost little; every integer comparison at both widths, executed
+;;; natively over boundary values. Variants:
+;;;   0  c ? y : z                         two parameters
+;;;   1  c ? 7 : z                         a literal
+;;;   2  c ? x + 1 : z                     one speculated operation
+;;;   3  (c ? x : y) + (c ? z - x : 9)     two PHIs
+;;;   4  (c ? z : x ^ y) + x + y           operands live across the choice
+;;;   5  c ? x*y + z - x*z : z             over the budget: stays a branch
+;;;   6  c ? (store 1; y) : z              a store in the arm: stays a branch
+;;;   7  p != 0 ? load p : z               a load in the arm: stays a branch
+;;; Variants 0..4 must contain no conditional branch and at least one select
+;;; per PHI; variants 5..7 must keep a branch. Variant 6 checks the store ran
+;;; exactly when the condition held, variant 7 runs with a null pointer.
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn need [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn word [(text (ArrayList u8)) (at i64)] (-> u32)
+  (| (cast u32 (get text at))
+     (<< (cast u32 (get text (+ at 1))) 8)
+     (<< (cast u32 (get text (+ at 2))) 16)
+     (<< (cast u32 (get text (+ at 3))) 24)))
+
+;;; B.cond, CBZ/CBNZ and TBZ/TBNZ words.
+(defn branches [(text (ArrayList u8))] (-> i64)
+  (let [(mut found) (: 0 i64) (mut at) (: 0 i64)]
+    (while (< (+ at 3) (len text))
+      (let [w (word text at)]
+        (when (or (= (& w (: 0xFF000010 u32)) (: 0x54000000 u32))
+                  (= (& w (: 0x7E000000 u32)) (: 0x34000000 u32))
+                  (= (& w (: 0x7E000000 u32)) (: 0x36000000 u32)))
+          (set! found (+ found 1))))
+      (set! at (+ at 4)))
+    found))
+
+;;; CSEL/CSINC/CSINV/CSNEG words, either width.
+(defn selects [(text (ArrayList u8))] (-> i64)
+  (let [(mut found) (: 0 i64) (mut at) (: 0 i64)]
+    (while (< (+ at 3) (len text))
+      (when (= (& (word text at) (: 0x3FE00000 u32)) (: 0x1A800000 u32))
+        (set! found (+ found 1)))
+      (set! at (+ at 4)))
+    found))
+
+(defn wide? [(ty i32)] (-> bool) (= ty 11))
+
+(defn signed-of [(ty i32) (x u64)] (-> i64)
+  (if (wide? ty) (cast i64 x) (cast i64 (cast i32 (cast u32 x)))))
+
+(defn unsigned-of [(ty i32) (x u64)] (-> u64)
+  (if (wide? ty) x (& x 0xFFFFFFFF)))
+
+(defn truth [(opcode i32) (ty i32) (x u64) (y u64)] (-> bool)
+  (let [sx (signed-of ty x) sy (signed-of ty y) ux (unsigned-of ty x) uy (unsigned-of ty y)]
+    (cond (= opcode 14) (= ux uy) (= opcode 15) (!= ux uy)
+          (= opcode 16) (< sx sy) (= opcode 17) (>= sx sy)
+          (= opcode 18) (<= sx sy) (= opcode 19) (> sx sy)
+          (= opcode 20) (< ux uy) (= opcode 21) (>= ux uy)
+          (= opcode 22) (<= ux uy) (= opcode 23) (> ux uy)
+          :else false)))
+
+(defn expected [(variant i32) (ty i32) (c bool) (x u64) (y u64) (z u64) (cell u64)] (-> u64)
+  (unsigned-of ty
+    (cond (= variant 0) (if c y z)
+          (= variant 1) (if c 7 z)
+          (= variant 2) (if c (p/iadd x 1) z)
+          (= variant 3) (p/iadd (if c x y) (if c (p/isub z x) 9))
+          (= variant 4) (p/iadd (p/iadd (if c z (^ x y)) x) y)
+          (= variant 5) (if c (p/isub (p/iadd (p/imul x y) z) (p/imul x z)) z)
+          (= variant 6) (if c y z)
+          :else (if c cell z))))
+
+(def values [(: 0 u64) 1 2 7 8 0x7FFFFFFF 0x80000000 0xFFFFFFFF 0x100000000
+             0x7FFFFFFFFFFFFFFF 0x8000000000000000 0xFFFFFFFFFFFFFFFF])
+
+(defstruct Tally [(answers i64) (failures i64)])
+
+(defn check [(ty i32) (opcode i32) (variant i32) (tally (mut Tally))] (-> void)
+  (let [a (malloc-allocator) (mut graph) (g/create a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        y (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 1]))
+        z (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 2]))
+        pointer (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 3]))
+        one (need (b/scalar-constant! (mut graph) ty 1 8))
+        seven (need (b/scalar-constant! (mut graph) ty 7 8))
+        nine (need (b/scalar-constant! (mut graph) ty 9 8))
+        null (need (b/scalar-constant! (mut graph) 6 0 8))
+        c (if (= variant 7) (need (b/emit! (mut graph) 15 1 [pointer null]))
+              (need (b/emit! (mut graph) opcode 1 [x y])))
+        branch (need (b/emit! (mut graph) 116 0 [start c]))
+        yes (need (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        no (need (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+        stored (if (= variant 6) (need (b/emit! (mut graph) 93 0 [yes pointer one])) yes)
+        loaded (if (= variant 7) (need (b/emit! (mut graph) 91 ty [yes pointer])) stored)
+        e1 (need (b/emit! (mut graph) 114 0 [loaded]))
+        e2 (need (b/emit! (mut graph) 114 0 [no]))
+        meet (need (b/emit! (mut graph) 112 0 [e1 e2]))
+        first (cond (= variant 0) y
+                    (= variant 1) seven
+                    (= variant 2) (need (b/emit! (mut graph) 26 ty [x one]))
+                    (= variant 3) x
+                    (= variant 4) z
+                    (= variant 5)
+                      (let [xy (need (b/emit! (mut graph) 28 ty [x y]))
+                            xz (need (b/emit! (mut graph) 28 ty [x z]))
+                            sum (need (b/emit! (mut graph) 26 ty [xy z]))]
+                        (need (b/emit! (mut graph) 27 ty [sum xz])))
+                    (= variant 6) y
+                    :else loaded)
+        second (cond (= variant 3) y
+                     (= variant 4) (need (b/emit! (mut graph) 48 ty [x y]))
+                     :else z)
+        phi (need (b/emit! (mut graph) 67 ty [meet first second]))
+        result (cond (= variant 3)
+                       (let [difference (need (b/emit! (mut graph) 27 ty [z x]))
+                             other (need (b/emit! (mut graph) 67 ty [meet difference nine]))]
+                         (need (b/emit! (mut graph) 26 ty [phi other])))
+                     (= variant 4)
+                       (let [sum (need (b/emit! (mut graph) 26 ty [phi x]))]
+                         (need (b/emit! (mut graph) 26 ty [sum y])))
+                     :else phi)
+        r (need (b/emit! (mut graph) 120 ty [meet result (: 0 i32)]))
+        (mut roots) (ArrayList::new [i32] a)]
+    (push! (mut roots) r)
+    (match (compile/vector-image graph start (slice roots) "_select_diamond" a)
+      (Err [e] (panic "select-diamond {} {} {}: {}" ty opcode variant e))
+      (Ok [value]
+        (let [(mut code) value
+              jumps (branches (.text code))
+              chosen (selects (.text code))]
+          (when (and (<= variant 4) (or (!= jumps 0) (< chosen (if (= variant 3) 2 1))))
+            (println "ty {} op {} variant {}: {} branches, {} selects" ty opcode variant jumps chosen)
+            (set! (.failures tally) (+ (.failures tally) 1)))
+          (when (and (>= variant 5) (= jumps 0))
+            (println "ty {} op {} variant {}: no branch kept" ty opcode variant)
+            (set! (.failures tally) (+ (.failures tally) 1)))
+          (match (jit/map-image code a)
+            (Err [e] (panic "{}" e))
+            (Ok [mapped]
+              (let [(mut loaded) mapped
+                    f (p/cast (fnptr (cc/C) [u64 u64 u64 (ptr u64)] u64) (.base (.memory loaded)))]
+                (for xv values
+                  (for yv values
+                    (for zv [(: 3 u64) 0xFFFFFFFFFFFFFFFF 0x80000000 0x7FFFFFFFFFFFFFFF]
+                      (for null? [false true]
+                        (when (or (= variant 7) (not null?))
+                          (let [(mut cell) (: 0x1122334455667788 u64)
+                                held (unsigned-of ty cell)
+                                condition (if (= variant 7) (not null?) (truth opcode ty xv yv))
+                                want (expected variant ty condition xv yv zv held)
+                                got (unsigned-of ty (if null? (f xv yv zv (cast (ptr u64) 0)) (f xv yv zv (mut cell))))
+                                kept (if (wide? ty) (: 1 u64) 0x1122334400000001)]
+                            (set! (.answers tally) (+ (.answers tally) 1))
+                            (when (!= got want)
+                              (println "ty {} op {} variant {} x {:x} y {:x} z {:x}: got {:x} want {:x}"
+                                       ty opcode variant xv yv zv got want)
+                              (set! (.failures tally) (+ (.failures tally) 1)))
+                            (when (and (= variant 6)
+                                       (!= cell (if condition kept 0x1122334455667788)))
+                              (println "ty {} op {} variant 6 x {:x} y {:x}: cell {:x}, condition {}"
+                                       ty opcode xv yv cell condition)
+                              (set! (.failures tally) (+ (.failures tally) 1)))))))))
+                (jit/release-image! (mut loaded)))))
+          (image/release! (mut code)))))
+    (free! (mut roots)) (g/release! (mut graph))))
+
+(defn main [] (-> i32)
+  (let [(mut tally) (Tally :answers 0 :failures 0)]
+    (for ty [(: 11 i32) 10]
+      (for [variant 0 8]
+        (for [opcode 14 24]
+          (when (or (!= variant 7) (= opcode 14))
+            (check ty (cast i32 opcode) (cast i32 variant) (mut tally))))))
+    (println "select diamonds: {} native answers, {} failures" (.answers tally) (.failures tally))
+    (if (= (.failures tally) 0) 0 1)))
