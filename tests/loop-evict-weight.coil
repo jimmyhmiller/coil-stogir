@@ -1,0 +1,246 @@
+;;; Loop evictions weighed by loop depth, and loop entries found across
+;;; lifetime holes.
+(module stogir.tests.loop-evict-weight)
+(import "stogir.allocation" :as a)
+(import "stogir.allocation-check" :as verify)
+(import "stogir.split-position" :as split)
+(import "stogir.interval" :as r)
+(import "stogir.constraints" :as c)
+(import "stogir.frame" :as f)
+(import "stogir.interval-queue" :as queue)
+(import "stogir.fixed-uses" :as fixed)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+;;; Register of the part covering position, or -2 when none covers it.
+(defn register-at [(parts (ArrayList a/Part)) (parent i32) (position i64)] (-> i32)
+  (let [(mut found) (: -2 i32)]
+    (for part parts
+      (when (and (= (.parent part) parent) (a/covers? part position))
+        (set! found (.register part))))
+    found))
+
+(defn release-all! [(parts (mut (ArrayList a/Part)))] (-> void)
+  (for [i 0 (len parts)] (a/release! (elem (mut parts) i)))
+  (free! (mut parts)))
+
+;;; An outer loop holding two inner loops, the second entered straight from
+;;; the first one's body: its header's dominator lies in a sibling loop.
+(defn depth-check [] (-> i64)
+  (let [blocks [(split/Block :start 0 :end 10 :depth 0 :header -1 :idom 0)
+                (split/Block :start 10 :end 20 :depth 1 :header 1 :idom 0)
+                (split/Block :start 20 :end 30 :depth 2 :header 2 :idom 1)
+                (split/Block :start 30 :end 40 :depth 2 :header 2 :idom 2)
+                (split/Block :start 40 :end 50 :depth 2 :header 4 :idom 3)
+                (split/Block :start 50 :end 60 :depth 2 :header 4 :idom 4)
+                (split/Block :start 60 :end 70 :depth 1 :header 1 :idom 4)
+                (split/Block :start 70 :end 80 :depth 0 :header -1 :idom 1)]
+        cases [[(: 25 i64) 35 2] [35 25 2] [25 45 1] [55 35 1] [45 55 2] [15 65 1]
+               [65 25 1] [5 25 0] [25 75 0] [5 75 0] [15 15 1] [45 45 2] [25 200 0]]
+        (mut failures) 0]
+    (unless (and (= (split/outer-loop blocks 2) 1) (= (split/outer-loop blocks 4) 1)
+                 (= (split/outer-loop blocks 1) -1))
+      (println "outer-loop: {} {} {}" (split/outer-loop blocks 2) (split/outer-loop blocks 4)
+               (split/outer-loop blocks 1))
+      (set! failures (+ failures 1)))
+    (for case cases
+      (let [got (split/shared-depth blocks (get case 0) (get case 1))]
+        (unless (= (cast i64 got) (get case 2))
+          (println "shared-depth {} {} = {} (want {})" (get case 0) (get case 1) got (get case 2))
+          (set! failures (+ failures 1)))))
+    failures))
+
+;;; Registers 0 and 1 are clobbered by the call at 30 in the inner loop;
+;;; registers 2 and 3 survive it. The first holder is used in the outer loop on
+;;; every iteration, the second only after both loops, a little earlier than
+;;; the first one's last use. The inner-loop value must take the register of
+;;; the holder unused in the loops, which then waits in its slot from before
+;;; the outer loop: nothing is stored or reloaded inside either loop. Choosing
+;;; by the farthest next use alone takes the outer loop's value instead.
+(defn victim-check [(reloads bool)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut parts) (ArrayList::new [a/Part] allocator)
+        (mut outer) (a/create 0 allocator)
+        (mut through) (a/create 1 allocator)
+        (mut hot) (a/create 2 allocator)
+        (mut layout) (f/create allocator)
+        (mut failures) 0
+        shape (a/SpillShape :size 8 :alignment 8)
+        blocks [(split/Block :start 0 :end 10 :depth 0 :header -1 :idom 0)
+                (split/Block :start 10 :end 20 :depth 1 :header 1 :idom 0)
+                (split/Block :start 20 :end 40 :depth 2 :header 2 :idom 1)
+                (split/Block :start 40 :end 50 :depth 1 :header 1 :idom 2)
+                (split/Block :start 50 :end 60 :depth 0 :header -1 :idom 1)]]
+    (r/add! (mut (.ranges outer)) 1 58)
+    (c/add! (mut (.uses outer)) 1 2 2)
+    (c/add! (mut (.uses outer)) 14 1 -1)
+    (c/add! (mut (.uses outer)) 56 1 -1)
+    (r/add! (mut (.ranges through)) 3 58)
+    (c/add! (mut (.uses through)) 3 2 3)
+    (c/add! (mut (.uses through)) 54 1 -1)
+    (r/add! (mut (.ranges hot)) 22 38)
+    (c/add! (mut (.uses hot)) 22 1 -1)
+    (c/add! (mut (.uses hot)) 26 1 -1)
+    (c/add! (mut (.uses hot)) 36 1 -1)
+    (push! (mut parts) outer)
+    (push! (mut parts) through)
+    (push! (mut parts) hot)
+    (a/reserve! (mut parts) 0 30 31 allocator)
+    (a/reserve! (mut parts) 1 30 31 allocator)
+    (match (a/run-shaped-with-tuning! (mut parts) (mut layout) 4 0xF [shape shape shape] [] blocks
+             (a/Tuning :late (a/no-late) :loop-reloads reloads :loop-evict-mask (: 12 u64)
+                       :call-holes false)
+             allocator)
+      (Err [msg] (do (println "allocation failed: {}" msg) (set! failures (+ failures 1))))
+      (Ok [_] 0))
+    (match (verify/verify parts 4 0xF)
+      (Err [msg] (do (println "allocation invalid: {}" msg) (set! failures (+ failures 1))))
+      (Ok [_] 0))
+    (unless (and (= (register-at parts 0 14) 2) (= (register-at parts 0 25) 2)
+                 (= (register-at parts 0 45) 2) (= (register-at parts 0 56) 2))
+      (println "outer value left register 2: {} {} {} {}" (register-at parts 0 14)
+               (register-at parts 0 25) (register-at parts 0 45) (register-at parts 0 56))
+      (set! failures (+ failures 1)))
+    (unless (and (= (register-at parts 2 26) 3) (= (register-at parts 2 36) 3))
+      (println "inner value not in register 3: {} {}" (register-at parts 2 26) (register-at parts 2 36))
+      (set! failures (+ failures 1)))
+    ; In its slot from the end of the outer loop's entry block through both
+    ; loops: no transfer on either back edge.
+    (unless (and (= (register-at parts 1 5) 3) (< (register-at parts 1 9) 0)
+                 (< (register-at parts 1 12) 0) (< (register-at parts 1 25) 0)
+                 (< (register-at parts 1 45) 0) (>= (register-at parts 1 54) 0))
+      (println "through value: {} {} {} {} {} {}" (register-at parts 1 5) (register-at parts 1 9)
+               (register-at parts 1 12) (register-at parts 1 25) (register-at parts 1 45)
+               (register-at parts 1 54))
+      (set! failures (+ failures 1)))
+    (release-all! (mut parts))
+    (f/release! (mut layout))
+    failures))
+
+;;; Inside a loop the register whose owner is anchored in the shallowest loop
+;;; is evicted even when another owner's next use is farther, and the current
+;;; part is spilled instead when its own next use lies outside the loop.
+(defn blocked-check [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut part) (a/create 0 allocator)
+        (mut next) (ArrayList::new [i64] allocator)
+        (mut fixed-at) (ArrayList::new [i64] allocator)
+        (mut costs) (ArrayList::new [i32] allocator)
+        (mut failures) 0
+        blocks [(split/Block :start 0 :end 10 :depth 0 :header -1 :idom 0)
+                (split/Block :start 10 :end 40 :depth 1 :header 1 :idom 0)
+                (split/Block :start 40 :end 70 :depth 0 :header -1 :idom 1)]]
+    (r/add! (mut (.ranges part)) 20 68)
+    (c/add! (mut (.uses part)) 30 1 -1)
+    (push! (mut next) 100) (push! (mut next) 50)
+    (push! (mut fixed-at) 0x7FFFFFFFFFFFFFFF) (push! (mut fixed-at) 0x7FFFFFFFFFFFFFFF)
+    (push! (mut costs) 1) (push! (mut costs) 0)
+    (let [plain (a/blocked-decision part next fixed-at 20 3)
+          weighed (a/blocked-decision-weighed part next fixed-at costs 20 3 blocks)]
+      (unless (and (= (.action plain) 1) (= (.register plain) 0))
+        (println "plain decision {} {}" (.action plain) (.register plain))
+        (set! failures (+ failures 1)))
+      (unless (and (= (.action weighed) 1) (= (.register weighed) 1) (= (.next-use weighed) 50))
+        (println "weighed decision {} {}" (.action weighed) (.register weighed))
+        (set! failures (+ failures 1))))
+    ; Equal costs keep the farthest-next-use rule.
+    (set! (mut costs) 1 1)
+    (let [weighed (a/blocked-decision-weighed part next fixed-at costs 20 3 blocks)]
+      (unless (and (= (.action weighed) 1) (= (.register weighed) 0))
+        (println "equal costs {} {}" (.action weighed) (.register weighed))
+        (set! failures (+ failures 1))))
+    ; The current part is next used after the loop, both owners inside it.
+    (clear! (mut (.uses part)))
+    (c/add! (mut (.uses part)) 60 1 -1)
+    (let [plain (a/blocked-decision part next fixed-at 20 3)
+          weighed (a/blocked-decision-weighed part next fixed-at costs 20 3 blocks)]
+      (unless (and (= (.action plain) 1) (= (.action weighed) 0) (= (.next-use weighed) 60))
+        (println "self spill {} {}" (.action plain) (.action weighed))
+        (set! failures (+ failures 1))))
+    ; A required use at the position still evicts, the cheapest owner first.
+    (set! (mut costs) 1 0)
+    (c/add! (mut (.uses part)) 20 1 -1)
+    (let [weighed (a/blocked-decision-weighed part next fixed-at costs 20 3 blocks)]
+      (unless (and (= (.action weighed) 1) (= (.register weighed) 1))
+        (println "required use {} {}" (.action weighed) (.register weighed))
+        (set! failures (+ failures 1))))
+    ; No evictable register: unsatisfiable.
+    (set! (mut fixed-at) 0 20) (set! (mut fixed-at) 1 20)
+    (let [weighed (a/blocked-decision-weighed part next fixed-at costs 20 3 blocks)]
+      (unless (= (.action weighed) 2)
+        (println "fixed registers {}" (.action weighed))
+        (set! failures (+ failures 1))))
+    (a/release! (mut part))
+    (free! (mut next)) (free! (mut fixed-at)) (free! (mut costs))
+    failures))
+
+;;; A value dead in a cold block between its spill and its next use in a loop.
+;;; Live at the loop's entry, it is reloaded there once; dead there, at the use.
+;;; The hole rule alone reloads it right after the spill.
+(defn hole-reload-check [(second-start i64) (want i64)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut parts) (ArrayList::new [a/Part] allocator)
+        (mut value) (a/create 0 allocator)
+        (mut layout) (f/create allocator)
+        (mut work) (ArrayList::new [queue/Item] allocator)
+        (mut failures) 0
+        blocks [(split/Block :start 0 :end 10 :depth 0 :header -1 :idom 0)
+                (split/Block :start 10 :end 20 :depth 1 :header 1 :idom 0)
+                (split/Block :start 20 :end 40 :depth 1 :header 1 :idom 1)
+                (split/Block :start 40 :end 50 :depth 0 :header -1 :idom 1)]]
+    (r/add! (mut (.ranges value)) 2 6)
+    (r/add! (mut (.ranges value)) second-start 48)
+    (c/add! (mut (.uses value)) 22 1 -1)
+    (c/add! (mut (.uses value)) 36 1 -1)
+    (push! (mut parts) value)
+    (match (a/spill-prefix-tracked! (mut parts) (mut work) 0 (mut layout) 8 8 allocator
+                                    (cast (ptr fixed/Index) 0) blocks -1)
+      (Err [msg] (println "spill failed: {}" msg) (set! failures (+ failures 1)))
+      (Ok [_] 0))
+    (unless (and (= (len parts) 2) (= (.start (get (.ranges (get parts 1)) 0)) want)
+                 (< (.register (get parts 0)) 0))
+      (println "hole from 6 to {}: suffix starts at {} (want {})" second-start
+               (if (= (len parts) 2) (.start (get (.ranges (get parts 1)) 0)) -1) want)
+      (set! failures (+ failures 1)))
+    (release-all! (mut parts)) (free! (mut work))
+    (f/release! (mut layout))
+    failures))
+
+;;; An owner evicted inside a loop it is live through but unused in moves to
+;;; its slot at the loop's entry, also when its lifetime has a hole before it.
+(defn hole-eviction-check [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut part) (a/create 0 allocator)
+        (mut failures) 0
+        blocks [(split/Block :start 0 :end 10 :depth 0 :header -1 :idom 0)
+                (split/Block :start 10 :end 20 :depth 1 :header 1 :idom 0)
+                (split/Block :start 20 :end 40 :depth 1 :header 1 :idom 1)
+                (split/Block :start 40 :end 50 :depth 0 :header -1 :idom 1)]]
+    (r/add! (mut (.ranges part)) 1 6)
+    (r/add! (mut (.ranges part)) 8 48)
+    (c/add! (mut (.uses part)) 3 1 -1)
+    (c/add! (mut (.uses part)) 46 1 -1)
+    (set! (.register part) 2)
+    (let [pinned (a/active-eviction-cut part 25 blocks false)
+          across (a/active-eviction-cut part 25 blocks true)]
+      (unless (and (= pinned 25) (= across 9))
+        (println "eviction cut pinned {} across holes {}" pinned across)
+        (set! failures (+ failures 1))))
+    ; Dead at the loop entry: the cut stays at the eviction.
+    (clear! (mut (.ranges part)))
+    (r/add! (mut (.ranges part)) 1 6)
+    (r/add! (mut (.ranges part)) 12 48)
+    (let [across (a/active-eviction-cut part 25 blocks true)]
+      (unless (= across 25)
+        (println "eviction cut dead at entry {}" across)
+        (set! failures (+ failures 1))))
+    (a/release! (mut part))
+    failures))
+
+(defn main [] (-> i64)
+  (let [failures (+ (depth-check) (victim-check false) (victim-check true) (blocked-check)
+                    (hole-reload-check 8 10) (hole-reload-check 12 22) (hole-eviction-check))]
+    (if (= failures 0)
+        (do (println "loop evictions weighed by depth, loop entries across lifetime holes: pass") 0)
+        (do (println "loop eviction weight: {} failures" failures) 1))))

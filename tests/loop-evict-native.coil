@@ -1,0 +1,208 @@
+;;; Nested loops under register pressure, with a callee that destroys every
+;;; caller-saved register and the flags: eight values carried by the outer
+;;; loop, eight by the inner loop, six live through both loops and used only
+;;; after them, and two loop-invariant values read in the inner loop. Calls sit
+;;; in the inner loop and, optionally, in the outer loop. Every value stays
+;;; observable, including zero-trip inner and outer loops, under each
+;;; allocation policy.
+(module stogir.tests.loop-evict-native)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.a64.constants" :as constants)
+(import "stogir.bytes" :as bytes)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn need [T] [(r (Result T (slice u8)))] (-> T)
+  (match r (Ok [v] v) (Err [e] (panic "{}" e))))
+(defn raw [(graph (mut g/Graph)) (code u8) (ty u8) (inputs (slice i32))] (-> i32)
+  (match (g/append-inputs! (mut graph) code ty inputs) (Some [r] r) (None [] (panic "append"))))
+(defn word! [(text (mut (ArrayList u8))) (r (Result u32 (slice u8)))] (-> void)
+  (match r (Ok [word] (bytes/append32! (mut text) word)) (Err [e] (panic "{}" e))))
+
+;;; Returns x0 + 7 and destroys x1..x17 and NZCV. x18 is the platform register.
+(defn clobber-target [] (-> (ArrayList u8))
+  (let [a (malloc-allocator) (mut text) (ArrayList::new [u8] a)]
+    (word! (mut text) (encode/add-sub-immediate true false false 0 0 7))
+    (for [r 1 18]
+      (need (constants/emit! (mut text) true (cast i32 r)
+                             (+ (: 0xFEDCBA9876540000 u64) (cast u64 r)))))
+    (word! (mut text) (encode/add-sub true true true 31 0 1))
+    (word! (mut text) (encode/ret 30))
+    text))
+
+(defn context [(policy i64)] (-> private/Context)
+  (case policy
+    0 (private/no-context)
+    1 (private/with-loop-reloads (private/with-loop-evict (private/no-context) true) true)
+    2 (private/with-rotate (private/with-loop-reloads
+        (private/with-loop-evict (private/no-context) true) true) true)
+    3 (private/with-prune-default (private/with-predict (private/with-loop-reloads
+        (private/with-loop-evict (private/no-context) true) true) true) true)
+    (private/with-loop-evict (private/no-context) true)))
+
+(defn fixture [(policy i64) (outer-call bool) (level i32) (a (dyn Allocator))] (-> image/Image)
+  (let [(mut graph) (g/create a) (mut initial) (ArrayList::new [i32] a)
+        (mut outer) (ArrayList::new [i32] a) (mut inner) (ArrayList::new [i32] a)
+        (mut addresses) (ArrayList::new [i32] a) (mut through) (ArrayList::new [i32] a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        pointer (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        outer-limit (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        inner-limit (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 2]))
+        function (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 3]))
+        zero (need (b/scalar-constant! (mut graph) 5 0 8))
+        one (need (b/scalar-constant! (mut graph) 5 1 8))
+        (mut effect) start]
+    (for [j 0 8]
+      (let [offset (need (b/scalar-constant! (mut graph) 5 (cast u64 (* j 8)) 8))
+            address (need (b/emit! (mut graph) 26 6 [pointer offset]))
+            value (need (b/emit! (mut graph) 91 5 [effect address]))]
+        (push! (mut addresses) address) (push! (mut initial) value) (set! effect value)))
+    ; Cells 16..21 are only used after the loops; cells 22 and 23 inside the inner one.
+    (for [j 16 24]
+      (let [offset (need (b/scalar-constant! (mut graph) 5 (cast u64 (* j 8)) 8))
+            address (need (b/emit! (mut graph) 26 6 [pointer offset]))
+            value (need (b/emit! (mut graph) 91 5 [effect address]))]
+        (push! (mut through) value) (set! effect value)))
+    (let [enter (need (b/emit! (mut graph) 114 0 [effect]))
+          oh (raw (mut graph) 113 0 [enter (: 0 i32)])
+          oi (raw (mut graph) 67 5 [oh zero (: 0 i32)])]
+      (for value initial (push! (mut outer) (raw (mut graph) 67 5 [oh value (: 0 i32)])))
+      (clear! (mut initial))
+      (let [test (need (b/emit! (mut graph) 20 1 [oi outer-limit]))
+            branch (need (b/emit! (mut graph) 116 0 [oh test]))
+            body (need (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+            exit (need (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))]
+        (set! effect body)
+        (for [j 0 8]
+          (let [offset (need (b/scalar-constant! (mut graph) 5 (cast u64 (* (+ j 8) 8)) 8))
+                address (need (b/emit! (mut graph) 26 6 [pointer offset]))
+                value (need (b/emit! (mut graph) 91 5 [effect address]))
+                initial-value (need (b/emit! (mut graph) 26 5 [value oi]))]
+            (push! (mut initial) initial-value) (set! effect value)))
+        (let [ie (need (b/emit! (mut graph) 114 0 [effect]))
+              ih (raw (mut graph) 113 0 [ie (: 0 i32)])
+              ii (raw (mut graph) 67 5 [ih zero (: 0 i32)])]
+          (for value initial (push! (mut inner) (raw (mut graph) 67 5 [ih value (: 0 i32)])))
+          (let [test (need (b/emit! (mut graph) 20 1 [ii inner-limit]))
+                branch (need (b/emit! (mut graph) 116 0 [ih test]))
+                body (need (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+                after (need (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+                (mut signature) (need (calls/create 9 5 [(: 5 u8)] a))
+                called (need (calls/emit! (mut graph) signature body function [(get inner 0)] a))
+                back (need (b/emit! (mut graph) 115 0 [called]))
+                next (need (b/emit! (mut graph) 26 5 [ii one]))]
+            (need (b/patch! (mut graph) ih 2 back)) (need (b/patch! (mut graph) ii 3 next))
+            (for [j 0 8]
+              (let [delta (need (b/scalar-constant! (mut graph) 5 (cast u64 (+ j 1)) 8))
+                    amount (need (b/emit! (mut graph) 26 5 [ii delta]))
+                    plain (need (b/emit! (mut graph) 26 5 [(if (= j 0) called (get inner j)) amount]))
+                    value (if (or (= j 1) (= j 2))
+                              (need (b/emit! (mut graph) 26 5 [plain (get through (+ j 5))]))
+                              plain)]
+                (need (b/patch! (mut graph) (get inner j) 3 value))))
+            (let [latch (if outer-call
+                            (need (calls/emit! (mut graph) signature after function [oi] a))
+                            after)
+                  back (need (b/emit! (mut graph) 115 0 [latch]))
+                  next (need (b/emit! (mut graph) 26 5 [oi one]))]
+              (calls/release! (mut signature))
+              (need (b/patch! (mut graph) oh 2 back)) (need (b/patch! (mut graph) oi 3 next))
+              (for [j 0 8]
+                (let [plain (need (b/emit! (mut graph) 26 5 [(get outer j) (get inner j)]))
+                      value (if (and outer-call (= j 1))
+                                (need (b/emit! (mut graph) 26 5 [plain latch]))
+                                plain)]
+                  (need (b/patch! (mut graph) (get outer j) 3 value)))))))
+          (set! effect exit)
+          (let [(mut sum) zero]
+            (for [j 0 8]
+              (set! effect (need (b/emit! (mut graph) 93 0 [effect (get addresses j) (get outer j)])))
+              (set! sum (need (b/emit! (mut graph) 26 5 [sum (get outer j)]))))
+            (for [j 0 6]
+              (set! sum (need (b/emit! (mut graph) 26 5 [sum (get through j)]))))
+            (let [ret (need (b/emit! (mut graph) 120 5 [effect sum (: 0 i32)]))
+                  (mut signature) (need (calls/create 9 5 [(: 6 u8) 5 5 6] a))]
+              (need (calls/function! (mut graph) signature a)) (calls/release! (mut signature))
+              (let [code (need (compile/image-with-private graph 1 [ret] "_stogir_loop_evict"
+                         (options/Options :level level) a (context policy)))]
+                (g/release! (mut graph)) (free! (mut initial)) (free! (mut outer))
+                (free! (mut inner)) (free! (mut addresses)) (free! (mut through)) code)))))))
+
+(defn execute [(code image/Image) (outer-call bool) (target u64) (a (dyn Allocator))] (-> i64)
+  (let [(mut module) (need (link/compose [code] a))
+        (mut loaded) (need (jit/map-image (.image module) a))
+        index (match (image/find-symbol (.image module) "_stogir_loop_evict")
+          (Some [i] i) (None [] (panic "symbol")))
+        function (p/cast (fnptr (cc/C) [(ptr u64) u64 u64 u64] u64)
+          (p/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))
+        (mut answers) 0]
+    (for count [(: 0 u64) 1 2 5]
+      (for trips [(: 0 u64) 1 2 7]
+        (for seed [(: 0 u64) 17 0x7FFFFFFFFFFFFF00 0xFFFFFFFFFFFFFF00]
+          (let [(mut cells) (ArrayList::new [u64] a) (mut expected) (ArrayList::new [u64] a)
+                (mut temporary) (ArrayList::new [u64] a) (mut sum) (: 0 u64)]
+            (for [j 0 24]
+              (push! (mut cells) (p/iadd seed (cast u64 (* j 13)))) (push! (mut expected) (get cells j)))
+            (for [j 0 8] (push! (mut temporary) 0))
+            (for [i (: 0 u64) count]
+              (for [j 0 8] (set! (mut temporary) j (p/iadd (get expected (+ j 8)) i)))
+              (for [k (: 0 u64) trips]
+                (for [j 0 8]
+                  (let [v (get temporary j)
+                        v (if (= j 0) (p/iadd v 7) v)
+                        v (p/iadd v (p/iadd k (cast u64 (+ j 1))))
+                        v (if (or (= j 1) (= j 2)) (p/iadd v (get expected (+ j 21))) v)]
+                    (set! (mut temporary) j v))))
+              (for [j 0 8]
+                (let [v (p/iadd (get expected j) (get temporary j))
+                      v (if (and outer-call (= j 1)) (p/iadd v (p/iadd i 7)) v)]
+                  (set! (mut expected) j v))))
+            (for [j 0 8] (set! sum (p/iadd sum (get expected j))))
+            (for [j 16 22] (set! sum (p/iadd sum (get expected j))))
+            (assert (= (function (.data cells) count trips target) sum))
+            (for [j 0 24] (assert (= (get cells j) (get expected j))))
+            (set! answers (+ answers 1))
+            (free! (mut cells)) (free! (mut expected)) (free! (mut temporary))))))
+    (jit/release-image! (mut loaded)) (link/release! (mut module))
+    answers))
+
+(defn main [] (-> i32)
+  (let [a (malloc-allocator) (mut target-code) (clobber-target)
+        (mut native-target) (need (jit/map-text (slice target-code)))
+        target (p/cast u64 (.base native-target))
+        (mut answers) 0 (mut plain) (ArrayList::new [u8] a) (mut differs) false
+        (mut hash) (: 1469598103934665603 u64)]
+    (for outer-call [false true]
+      (for level [(: 1 i32) 2 3]
+        (for [policy 0 5]
+          (let [(mut code) (fixture policy outer-call level a)]
+            (set! answers (+ answers (execute code outer-call target a)))
+            (when (and (= level 3) (> policy 0))
+              (for byte (.text code)
+                (set! hash (p/imul (^ hash (cast u64 byte)) 1099511628211))))
+            (when (and (= level 3) (not outer-call))
+              (if (= policy 0)
+                  (for byte (.text code) (push! (mut plain) byte))
+                  (when (= policy 1)
+                    (set! differs (!= (len plain) (len (.text code))))
+                    (unless differs
+                      (for [i 0 (len plain)]
+                        (unless (= (get plain i) (get (.text code) i)) (set! differs true)))))))
+            (image/release! (mut code))))))
+    ; The loop policies must actually change this function's allocation.
+    (assert differs)
+    (free! (mut plain)) (free! (mut target-code)) (jit/release! (mut native-target))
+    (println "loop eviction natively: {} nested-loop answers under pressure survive caller GPR/NZCV clobbers across inner and outer calls, five policies, three levels (policy code hash {:x})" answers hash))
+  0)
