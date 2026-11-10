@@ -134,3 +134,36 @@ callee still passes the existing full eligibility proof. This does not change
 cache keys, budgets, or selected specializations. The native specialization test
 also checks that an all-dynamic call still expands ordinarily and creates no
 context. No generation-time improvement is claimed until measured in Coil.
+
+
+### Reading a closed registry from several threads
+
+The cache admits 128 creation attempts in a registry's lifetime. When they are
+spent the registry is closed (`registry-closed?`): context selection can only
+pick an existing context, so an expansion reads the registry and writes nothing
+except the closed-control memo of a callee or context, which caches a pure
+predicate of that immutable graph. Four entry points make that a read-only
+operation that any number of threads can run at once, provided nothing registers
+or adopts meanwhile:
+
+- `optimize-frozen-specialized-policy` is `optimize-registered-specialized-policy`
+  without the memo write. A site (`FrozenSite`) names a registry handle or a
+  snapshot outside the registry. A snapshot has no contexts, exactly as a callee
+  registered after the registry closed has none. An open registry is an error.
+- `snapshot-create` validates and copies a callee as `register-proven!` does, into
+  the caller's allocator and without touching a registry, and answers the
+  closed-control question at once. `snapshot-borrow` does the same checks and
+  reads the provider's graph in place; it cannot be adopted.
+- `registry-adopt!` enters an owned snapshot in O(1): no copy and no second
+  validation. Its storage stays with the snapshot's allocator, which must outlive
+  the registry.
+- `registry-settle!` answers the memo for every callee and context not asked yet,
+  so the read-only entry does not recompute it at each site.
+
+The result of the read-only entry is the graph the registered entry returns for
+the same sites; `tests/jit-parameter-specialize.coil` compares content digests
+with a cached context, without one, through a handle, through owned and borrowed
+snapshots and through an adopted snapshot, and checks that only the registered
+entry leaves a memo behind. The Coil adapter uses these to finalize definitions,
+plan emission bodies and expand them on worker threads once its module registry
+is closed (see "Parallel emission" in Coil's `src/compiler/stogir/README.md`).
