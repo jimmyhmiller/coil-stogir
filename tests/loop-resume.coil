@@ -1,0 +1,350 @@
+;;; Where a value that loses its register inside a loop takes it back
+;;; (allocation/loop-resume-cut). The value comes round the loop's back edge
+;;; in the register it had at the header; left in its slot, or in another
+;;; register, to the end of its lifetime, it is moved back on the back edge in
+;;; every iteration, also in those that never came near the place it lost the
+;;; register. It resumes instead at the first block of the loop that the
+;;; losing block does not dominate.
+;;;
+;;; The first part drives the allocator's two splitting paths over hand-built
+;;; layouts. The second runs loops natively whose rare arm calls a target that
+;;; destroys every call-clobbered register and the flags, with more values
+;;; live through the loop than there are preserved registers.
+(module stogir.tests.loop-resume)
+(import "stogir.allocation" :as a)
+(import "stogir.split-position" :as split)
+(import "stogir.interval" :as r)
+(import "stogir.constraints" :as c)
+(import "stogir.frame" :as f)
+(import "stogir.interval-queue" :as queue)
+(import "stogir.fixed-uses" :as fixed)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.options" :as options)
+(import "stogir.link" :as link)
+(import "stogir.image" :as image)
+(import "stogir.bytes" :as bytes)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.encode" :as encode)
+(import "stogir.a64.constants" :as constants)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as p)
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; Layouts. Block 0 is the entry, block 1 the loop's header, the last block
+;;; the exit. Between them:
+;;; 0 = a cold block (2) and a latch (3) the header also reaches directly;
+;;; 1 = as 0, but the latch is reached only through the cold block;
+;;; 2 = the cold block is a loop of its own (2), followed by its exit block
+;;;     (3, reached only through it) and the latch (4);
+;;; 3 = as 0 with a block outside every loop (3, a path that never returns)
+;;;     laid out before the latch (4).
+(defn layout [(shape i32) (allocator (dyn Allocator))] (-> (ArrayList split/Block))
+  (let [(mut blocks) (ArrayList::new [split/Block] allocator)]
+    (push! (mut blocks) (split/Block :start 0 :end 10 :depth 0 :header -1 :idom 0))
+    (push! (mut blocks) (split/Block :start 10 :end 20 :depth 1 :header 1 :idom 0))
+    (cond (= shape 0)
+            (do (push! (mut blocks) (split/Block :start 20 :end 40 :depth 1 :header 1 :idom 1))
+                (push! (mut blocks) (split/Block :start 40 :end 50 :depth 1 :header 1 :idom 1))
+                (push! (mut blocks) (split/Block :start 50 :end 60 :depth 0 :header -1 :idom 1)))
+          (= shape 1)
+            (do (push! (mut blocks) (split/Block :start 20 :end 40 :depth 1 :header 1 :idom 1))
+                (push! (mut blocks) (split/Block :start 40 :end 50 :depth 1 :header 1 :idom 2))
+                (push! (mut blocks) (split/Block :start 50 :end 60 :depth 0 :header -1 :idom 1)))
+          (= shape 2)
+            (do (push! (mut blocks) (split/Block :start 20 :end 30 :depth 2 :header 2 :idom 1))
+                (push! (mut blocks) (split/Block :start 30 :end 40 :depth 1 :header 1 :idom 2))
+                (push! (mut blocks) (split/Block :start 40 :end 50 :depth 1 :header 1 :idom 1))
+                (push! (mut blocks) (split/Block :start 50 :end 60 :depth 0 :header -1 :idom 1)))
+          :else
+            (do (push! (mut blocks) (split/Block :start 20 :end 30 :depth 1 :header 1 :idom 1))
+                (push! (mut blocks) (split/Block :start 30 :end 40 :depth 0 :header -1 :idom 2))
+                (push! (mut blocks) (split/Block :start 40 :end 50 :depth 1 :header 1 :idom 1))
+                (push! (mut blocks) (split/Block :start 50 :end 60 :depth 0 :header -1 :idom 1))))
+    blocks))
+
+(defn release-parts! [(parts (mut (ArrayList a/Part)))] (-> void)
+  (let [(mut i) 0]
+    (while (< i (len parts))
+      (a/release! (elem (mut parts) i))
+      (set! i (+ i 1))))
+  (free! (mut parts)))
+
+;;; What the splits left: the number of parts, where the last begins, and the
+;;; register it prefers, as count * 10000 + start * 100 + (preferred + 1).
+(defn summary [(parts (ArrayList a/Part))] (-> i64)
+  (let [last (get parts (- (len parts) 1))]
+    (+ (* (len parts) 10000)
+       (* (.start (get (.ranges last) 0)) 100)
+       (cast i64 (+ (.preferred last) 1)))))
+
+;;; A value live over [from, 50) with a register use in the header, holding
+;;; register 5, is evicted at 22 in the cold block.
+(defn evicted [(shape i32) (from i64)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut parts) (ArrayList::new [a/Part] allocator)
+        (mut value) (a/create 0 allocator)
+        (mut area) (f/create allocator)
+        (mut work) (ArrayList::new [queue/Item] allocator)
+        (mut blocks) (layout shape allocator)]
+    (r/add! (mut (.ranges value)) from 50)
+    (c/add! (mut (.uses value)) 15 1 -1)
+    (set! (.register value) 5)
+    (push! (mut parts) value)
+    (match (a/evict-tracked! (mut parts) (mut work) 0 22 (mut area) 8 8 allocator
+                             (cast (ptr fixed/Index) 0) (slice blocks) 22)
+      (Err [message] (panic "eviction failed: {}" message))
+      (Ok [_] 0))
+    (let [result (summary parts)]
+      (release-parts! (mut parts)) (free! (mut work)) (free! (mut blocks))
+      (f/release! (mut area))
+      result)))
+
+;;; The same value, unassigned, when register 5 is free up to 22 only and no
+;;; other register is admissible. A value that begins before the loop is first
+;;; cut at the loop's entry (free-split-cut), so the cases here begin at the
+;;; header, as that cut's suffix does.
+(defn granted [(shape i32) (from i64)] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut parts) (ArrayList::new [a/Part] allocator)
+        (mut value) (a/create 0 allocator)
+        (mut work) (ArrayList::new [queue/Item] allocator)
+        (mut availability) (ArrayList::new [i64] allocator)
+        (mut limits) (ArrayList::new [i64] allocator)
+        (mut blocks) (layout shape allocator)]
+    (r/add! (mut (.ranges value)) from 50)
+    (c/add! (mut (.uses value)) 15 1 -1)
+    (push! (mut parts) value)
+    (for [i 0 8] (push! (mut availability) (if (= i 5) (: 22 i64) 0)))
+    (unless (a/grant-free-impl! (mut parts) (mut work) 0 availability (: 32 u64) allocator
+                                (cast (ptr fixed/Index) 0) 1 [] (mut limits) false
+                                (slice blocks) (a/no-late) true)
+      (panic "no register was granted"))
+    (unless (= (.register (get parts 0)) 5) (panic "the prefix did not take register 5"))
+    (let [result (summary parts)]
+      (release-parts! (mut parts)) (free! (mut work)) (free! (mut availability))
+      (free! (mut limits)) (free! (mut blocks))
+      result)))
+
+(defn expect [(got i64) (want i64) (label (slice u8))] (-> i64)
+  (if (= got want)
+      0
+      (do (println "{}: got {}, want {}" label got want) 1)))
+
+(defn split-checks [] (-> i64)
+  (+ ; The header reaches the latch around the cold block: three parts, the
+     ; last from the latch's start, preferring the register held before.
+     (expect (evicted 0 2) 34006 "evicted, bypassed latch")
+     (expect (granted 0 10) 34006 "granted, bypassed latch")
+     ; Every path to the latch passed the cold block: nothing to resume.
+     (expect (evicted 1 2) 22200 "evicted, dominated latch")
+     (expect (granted 1 10) 22200 "granted, dominated latch")
+     ; The value is defined inside the loop, after the header's start: it is
+     ; not in its register when the back edge arrives.
+     (expect (evicted 0 12) 22200 "evicted, defined in the loop")
+     (expect (granted 0 12) 22200 "granted, defined in the loop")
+     ; Evicted in a nested loop: its exit block is dominated by it, so the
+     ; value resumes at the outer loop's latch.
+     (expect (evicted 2 2) 34006 "evicted in a nested loop")
+     (expect (granted 2 10) 34006 "granted in a nested loop")
+     ; A block outside the loop laid out inside it is passed over.
+     (expect (evicted 3 2) 34006 "evicted, cold block between")
+     (expect (granted 3 10) 34006 "granted, cold block between")))
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn word! [(text (mut (ArrayList u8))) (r (Result u32 (slice u8)))] (-> void)
+  (match r (Ok [word] (bytes/append32! (mut text) word)) (Err [e] (panic "{}" e))))
+
+;;; x0 + 7, destroying x1..x17, d0..d7, d16..d31 and NZCV.
+(defn clobber-target [] (-> (ArrayList u8))
+  (let [a (malloc-allocator) (mut text) (ArrayList::new [u8] a)]
+    (word! (mut text) (encode/add-sub-immediate true false false 0 0 7))
+    (for [r 1 18]
+      (require (constants/emit! (mut text) true (cast i32 r)
+                                (+ (: 0xFEDCBA9876540000 u64) (cast u64 r)))))
+    (for [d 0 8] (bytes/append32! (mut text) (| (: 0x9E670020 u32) (cast u32 d))))
+    (for [d 16 32] (bytes/append32! (mut text) (| (: 0x9E670020 u32) (cast u32 d))))
+    (word! (mut text) (encode/add-sub true true true 31 0 1))
+    (word! (mut text) (encode/ret 30))
+    text))
+
+(defn word [(graph (mut g/Graph)) (value i64)] (-> i32)
+  (require (b/scalar-constant! (mut graph) 11 (p/cast u64 value) 8)))
+
+(defn binary [(graph (mut g/Graph)) (opcode i32) (left i32) (right i32)] (-> i32)
+  (require (b/emit! (mut graph) opcode 11 [left right])))
+
+(defn compare [(graph (mut g/Graph)) (opcode i32) (left i32) (right i32)] (-> i32)
+  (require (b/emit! (mut graph) opcode 1 [left right])))
+
+(defn emit [(graph (mut g/Graph)) (opcode i32) (inputs (slice i32))] (-> i32)
+  (require (b/emit! (mut graph) opcode 0 inputs)))
+
+(defn call! [(graph (mut g/Graph)) (control i32) (target i32) (value i32)
+             (a (dyn Allocator))] (-> i32)
+  (let [(mut signature) (match (calls/create 0 11 [(: 11 u8)] a)
+                          (Err [message] (panic "{}" message)) (Ok [s] s))
+        call (require (calls/emit! (mut graph) signature control target [value] a))]
+    (calls/release! (mut signature))
+    call))
+
+;;; COUNT values x + 1 .. x + COUNT live through a counted loop of n rounds.
+;;; Each round adds the first `hot` of them to s; when the low `mask` bits of
+;;; the sum are zero it calls the target with it, and with `nested` it then
+;;; calls again while the result is below 64. The loop's result and all the
+;;; values are summed with y afterwards.
+(defn model [(count i64) (hot i64) (mask i64) (nested bool) (x i64) (y i64) (n i64)] (-> i64)
+  (let [(mut s) (: 0 i64)]
+    (for [i 0 n]
+      (let [(mut s1) s]
+        (for [k 1 (+ hot 1)] (set! s1 (+ s1 x k)))
+        (when (= (& s1 mask) 0)
+          (set! s1 (+ s1 7))
+          (when nested
+            (while (< s1 64) (set! s1 (+ s1 7)))))
+        (set! s s1)))
+    (let [(mut total) (+ s y)]
+      (for [k 1 (+ count 1)] (set! total (+ total x k)))
+      total)))
+
+(defn build [(count i64) (hot i64) (mask i64) (nested bool)
+             (roots (mut (ArrayList i32))) (a (dyn Allocator))] (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        target (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        y (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        n (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 3]))
+        (mut signature) (match (calls/create 0 11 [(: 6 u8) 11 11 11] a)
+                          (Err [message] (panic "{}" message)) (Ok [s] s))
+        zero (word (mut graph) 0)
+        one (word (mut graph) 1)
+        (mut values) (ArrayList::new [i32] a)]
+    (require (calls/function! (mut graph) signature a))
+    (for [k 1 (+ count 1)]
+      (push! (mut values) (binary (mut graph) 26 x (word (mut graph) k))))
+    (let [entry (emit (mut graph) 114 [start])
+          loop (require (b/loop-begin! (mut graph) entry))
+          i (require (b/loop-phi! (mut graph) loop zero))
+          s (require (b/loop-phi! (mut graph) loop zero))
+          more (compare (mut graph) 16 i n)
+          test (emit (mut graph) 116 [loop more])
+          body (emit (mut graph) 107 [test (: 0 i32)])
+          done (emit (mut graph) 108 [test (: 0 i32)])
+          (mut s1) s]
+      (for [k 0 hot] (set! s1 (binary (mut graph) 26 s1 (get values k))))
+      (let [low (binary (mut graph) 47 s1 (word (mut graph) mask))
+            hit (compare (mut graph) 14 low zero)
+            inner (emit (mut graph) 116 [body hit])
+            rare (emit (mut graph) 107 [inner (: 0 i32)])
+            usual (emit (mut graph) 108 [inner (: 0 i32)])
+            r (call! (mut graph) rare target s1 a)
+            (mut rare-control) r
+            (mut rare-value) r]
+        (when nested
+          (let [enter (emit (mut graph) 114 [r])
+                again (require (b/loop-begin! (mut graph) enter))
+                t (require (b/loop-phi! (mut graph) again r))
+                small (compare (mut graph) 16 t (word (mut graph) 64))
+                check (emit (mut graph) 116 [again small])
+                round (emit (mut graph) 107 [check (: 0 i32)])
+                leave (emit (mut graph) 108 [check (: 0 i32)])
+                t2 (call! (mut graph) round target t a)
+                back (emit (mut graph) 115 [t2])]
+            (require (b/patch! (mut graph) again 2 back))
+            (require (b/patch! (mut graph) t 3 t2))
+            (set! rare-control leave)
+            (set! rare-value t)))
+        (let [rare-end (emit (mut graph) 114 [rare-control])
+              usual-end (emit (mut graph) 114 [usual])
+              join (emit (mut graph) 112 [rare-end usual-end])
+              s2 (require (b/emit! (mut graph) 67 11 [join rare-value s1]))
+              i2 (binary (mut graph) 26 i one)
+              back (emit (mut graph) 115 [join])]
+          (require (b/patch! (mut graph) loop 2 back))
+          (require (b/patch! (mut graph) i 3 i2))
+          (require (b/patch! (mut graph) s 3 s2))
+          (let [(mut total) (binary (mut graph) 26 s y)]
+            (for value values (set! total (binary (mut graph) 26 total value)))
+            (push! (mut roots)
+                   (require (b/emit! (mut graph) 120 11 [done total (: 0 i32)])))))))
+    (calls/release! (mut signature))
+    (free! (mut values))
+    graph))
+
+(defn context [(mode i32)] (-> private/Context)
+  (cond
+    (= mode 0) (private/no-context)
+    (= mode 1) (private/with-loop-reloads (private/with-loop-evict (private/no-context) true) true)
+    :else (private/with-frame-split
+        (private/with-shrink-wrap
+          (private/with-prune-default
+            (private/with-predict
+              (private/with-loop-reloads (private/with-loop-evict (private/no-context) true) true)
+              true)
+            true)
+          true)
+        true)))
+
+(defn check-native [(target u64)] (-> i64)
+  (let [a (malloc-allocator) (mut failures) (: 0 i64)]
+    (for count [(: 4 i64) 12 20]
+      (for hot [(: 0 i64) 2 4]
+        (for mask [(: 7 i64) 1 0]
+          (for shape [(: 0 i32) 1]
+            (for level [(: 1 i32) 2]
+              (for mode [(: 0 i32) 1 2]
+                (let [(mut roots) (ArrayList::new [i32] a)
+                      nested (= shape 1)
+                      (mut graph) (build count hot mask nested (mut roots) a)
+                      (mut code) (match (compile/image-with-private graph 1 (slice roots) "_lr_entry"
+                                           (options/Options :level level) a (context mode))
+                                   (Ok [c] c)
+                                   (Err [message] (panic "compile {} {} {} {}: {}" count hot mask shape message)))]
+                  (match (link/compose [code] a)
+                    (Err [message] (panic "compose: {}" message))
+                    (Ok [composed]
+                        (let [(mut module) composed]
+                          (match (jit/map-image (.image module) a)
+                            (Err [message] (panic "map: {}" message))
+                            (Ok [mapped]
+                                (let [(mut loaded) mapped
+                                      index (match (image/find-symbol (.image module) "_lr_entry")
+                                              (Some [id] id) (None [] (panic "entry symbol")))
+                                      f (p/cast (fnptr (cc/C) [u64 i64 i64 i64] i64)
+                                                (p/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))]
+                                  (for x [(: 0 i64) 1 3 8 -5 1000003]
+                                    (for y [(: 0 i64) -9]
+                                      (for n [(: 0 i64) 1 2 7 40 1000]
+                                        (let [got (call-ptr f target x y n)
+                                              want (model count hot mask nested x y n)]
+                                          (unless (= got want)
+                                            (println "count {} hot {} mask {} nested {} level {} mode {} x {} y {} n {}: got {} want {}"
+                                                     count hot mask nested level mode x y n got want)
+                                            (set! failures (+ failures 1)))))))
+                                  (jit/release-image! (mut loaded)))))
+                          (link/release! (mut module)))))
+                  (image/release! (mut code))
+                  (free! (mut roots))
+                  (g/release! (mut graph)))))))))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut target-code) (clobber-target)
+        (mut failures) (split-checks)]
+    (match (jit/map-text (slice target-code))
+      (Err [e] (panic "{}" e))
+      (Ok [owned]
+          (let [(mut native) owned]
+            (set! failures (+ failures (check-native (p/cast u64 (.base native)))))
+            (jit/release! (mut native)))))
+    (free! (mut target-code))
+    (println "loop-resume: {} failures" failures)
+    (if (= failures 0) 0 1)))
