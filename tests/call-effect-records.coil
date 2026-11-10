@@ -1,0 +1,520 @@
+;;; Effect records (call-groups/Effects): the prototype encoding, the summary
+;;; call-effects/summarize computes from a body for every rule and every case
+;;; that must break it, and promotion of a stack object whose address is passed
+;;; to callees that only read through it, executed natively.
+(module stogir.tests.call-effect-records)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.sccp" :as sccp)
+(import "stogir.node" :as n)
+(import "stogir.calls" :as calls)
+(import "stogir.call-groups" :as groups)
+(import "stogir.call-results" :as results)
+(import "stogir.call-effects" :as effects)
+(import "stogir.call-inline" :as inlining)
+(import "stogir.prototype-bytes" :as proto)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+(import "coil.var" :use [var-static])
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn check [(what (slice u8)) (condition bool)] (-> void)
+  (unless condition (panic "call-effect-records: {}" what)))
+
+(defn record [(unknown bool) (writes i32) (captures i32) (extent i64)] (-> groups/Effects)
+  (groups/Effects :present true :unknown unknown :writes writes :captures captures :extent extent))
+
+(defn same-record? [(left groups/Effects) (right groups/Effects)] (-> bool)
+  (and (= (.present left) (.present right)) (= (.unknown left) (.unknown right))
+       (= (.writes left) (.writes right)) (= (.captures left) (.captures right))
+       (= (.extent left) (.extent right))))
+
+;;; ---- The encoding -------------------------------------------------------
+
+(defn encoding! [(a (dyn Allocator))] (-> void)
+  (let [wanted (record false 5 2 24)
+        (mut out) (ArrayList::new [u8] a)]
+    ; A bare prototype, one with a register-pair group, one with an aggregate
+    ; result: each restated with the record keeps everything else it said.
+    (let [(mut plain) (match (calls/create 0 11 [(: 6 u8) 6 11] a)
+                        (Ok [p] p) (Err [m] (panic "{}" m)))
+          (mut bytes) (calls/encode plain a)]
+      (check "bare prototype has no record" (not (.present (groups/effects (slice bytes)))))
+      (check "bare restated" (groups/with-effects! (mut out) (slice bytes) wanted))
+      (check "bare restated valid" (proto/valid-bytes? (slice out)))
+      (check "bare record" (same-record? (groups/effects (slice out)) wanted))
+      (check "bare result role" (= (.kind (results/decode (slice out))) 0))
+      (check "bare groups" (= (groups/count (slice out)) 0))
+      (check "bare convention" (inlining/compatible? (slice out) (slice bytes)))
+      (check "bare convention reversed" (inlining/compatible? (slice bytes) (slice out)))
+      (free! (mut bytes)) (calls/release! (mut plain)))
+    (let [(mut grouped) (match (calls/create-grouped 0 11 [(: 6 u8) 5 5] [(groups/Group :first 1 :count 2 :alignment 8)] a)
+                          (Ok [p] p) (Err [m] (panic "{}" m)))
+          (mut bytes) (calls/encode grouped a)]
+      (check "grouped restated" (groups/with-effects! (mut out) (slice bytes) wanted))
+      (check "grouped restated valid" (proto/valid-bytes? (slice out)))
+      (check "grouped record" (same-record? (groups/effects (slice out)) wanted))
+      (check "grouped count" (= (groups/count (slice out)) 1))
+      (check "grouped first" (= (.first (groups/at (slice out) 0)) 1))
+      (check "grouped convention" (inlining/compatible? (slice out) (slice bytes)))
+      (free! (mut bytes)) (calls/release! (mut grouped)))
+    (let [(mut pieces) (match (calls/create-result 0 [(: 6 u8) 11] [] (results/pieces 11 2) a)
+                         (Ok [p] p) (Err [m] (panic "{}" m)))
+          (mut bytes) (calls/encode pieces a)
+          (mut other) (match (calls/create 0 0 [(: 6 u8) 11] a)
+                        (Ok [p] p) (Err [m] (panic "{}" m)))
+          (mut plain) (calls/encode other a)]
+      (check "aggregate restated" (groups/with-effects! (mut out) (slice bytes) wanted))
+      (check "aggregate restated valid" (proto/valid-bytes? (slice out)))
+      (check "aggregate record" (same-record? (groups/effects (slice out)) wanted))
+      (check "aggregate role" (and (= (.kind (results/decode (slice out))) 1)
+                                   (= (.count (results/decode (slice out))) 2)))
+      (check "aggregate convention" (inlining/compatible? (slice out) (slice bytes)))
+      ; The record never makes two different result roles agree.
+      (check "role still compared" (not (inlining/compatible? (slice out) (slice plain))))
+      ; Stating it twice replaces it.
+      (let [(mut again) (ArrayList::new [u8] a)]
+        (check "restated twice" (groups/with-effects! (mut again) (slice out) (record true 0 1 0)))
+        (check "second record" (same-record? (groups/effects (slice again)) (record true 0 1 0)))
+        (check "same length" (= (len again) (len out)))
+        (free! (mut again)))
+      (free! (mut plain)) (calls/release! (mut other))
+      (free! (mut bytes)) (calls/release! (mut pieces)))
+    (let [(mut variadic) (match (calls/create 16 11 [(: 6 u8)] a)
+                           (Ok [p] p) (Err [m] (panic "{}" m)))
+          (mut bytes) (calls/encode variadic a)
+          (mut builtin) (match (calls/create-builtin-move 0 a)
+                          (Ok [p] p) (Err [m] (panic "{}" m)))
+          (mut fixed) (calls/encode builtin a)]
+      (check "variadic takes no record" (not (groups/with-effects! (mut out) (slice bytes) wanted)))
+      (check "builtin takes no record" (not (groups/with-effects! (mut out) (slice fixed) wanted)))
+      (free! (mut fixed)) (calls/release! (mut builtin))
+      (free! (mut bytes)) (calls/release! (mut variadic)))
+    (let [(mut plain) (match (calls/create 0 11 [(: 6 u8)] a)
+                        (Ok [p] p) (Err [m] (panic "{}" m)))
+          (mut bytes) (calls/encode plain a)]
+      (check "extent too large" (not (groups/with-effects! (mut out) (slice bytes)
+                                                           (record false 1 0 4096))))
+      ; Extents round up to whole words.
+      (check "odd extent" (groups/with-effects! (mut out) (slice bytes) (record false 1 0 9)))
+      (check "odd extent rounded" (= (.extent (groups/effects (slice out))) 16))
+      (free! (mut bytes)) (calls/release! (mut plain)))
+    (free! (mut out))))
+
+;;; ---- Summaries ----------------------------------------------------------
+
+;;; A callee body f(p0: ADDR, p1: ADDR, p2: I64, p3: ADDR) -> ADDR, by SHAPE.
+;;; CALLEE-RECORD is the record on the prototype of the call the call shapes
+;;; make through p3 (absent for shape 7).
+(defn body [(shape i32) (callee-record groups/Effects) (a (dyn Allocator))] (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p0 (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        p1 (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        p2 (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 2]))
+        p3 (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 3]))
+        null (require (b/scalar-constant! (mut graph) 6 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        eight (require (b/scalar-constant! (mut graph) 11 8 8))
+        sixteen (require (b/scalar-constant! (mut graph) 11 16 8))
+        (mut returned) null
+        (mut control) start]
+    (let [(mut signature) (match (calls/create 0 6 [(: 6 u8) 6 11 6] a)
+                            (Err [message] (panic "{}" message)) (Ok [s] s))]
+      (require (calls/function! (mut graph) signature a))
+      (calls/release! (mut signature)))
+    (match shape
+      ; 0: reads through p0.
+      (0 (set! control (require (b/emit! (mut graph) 91 11 [control p0]))))
+      ; 1: stores a word at p0 + 8.
+      (1 (let [field (require (b/emit! (mut graph) 26 6 [p0 eight]))]
+           (set! control (require (b/emit! (mut graph) 93 0 [control field one])))))
+      ; 2: stores the pointer p0 through p1.
+      (2 (set! control (require (b/emit! (mut graph) 93 0 [control p1 p0]))))
+      ; 3: returns p0 + 8.
+      (3 (set! returned (require (b/emit! (mut graph) 26 6 [p0 eight]))))
+      ; 4: stores through a pointer read from p0.
+      (4 (let [inner (require (b/emit! (mut graph) 91 6 [control p0]))]
+           (set! control (require (b/emit! (mut graph) 93 0 [inner inner one])))))
+      ; 5: stores at p0 + p2, an offset that is not a literal.
+      (5 (let [element (require (b/emit! (mut graph) 26 6 [p0 p2]))]
+           (set! control (require (b/emit! (mut graph) 93 0 [control element one])))))
+      ; 6: calls p3(p0 + 16) under CALLEE-RECORD.
+      (6 (let [(mut sig) (match (calls/create 0 11 [(: 6 u8)] a)
+                           (Err [message] (panic "{}" message)) (Ok [sig] sig))
+               moved (require (b/emit! (mut graph) 26 6 [p0 sixteen]))]
+           (set! (.effects sig) callee-record)
+           (set! control (require (calls/emit! (mut graph) sig control p3 [moved] a)))
+           (calls/release! (mut sig))))
+      ; 7: calls p3(p0) with nothing known about the target (an indirect call).
+      (7 (let [(mut sig) (match (calls/create 0 11 [(: 6 u8)] a)
+                           (Err [message] (panic "{}" message)) (Ok [sig] sig))]
+           (set! control (require (calls/emit! (mut graph) sig control p3 [p0] a)))
+           (calls/release! (mut sig))))
+      ; 8: a volatile read through p0.
+      (8 (set! control (require (b/emit! (mut graph) 92 11 [control p0]))))
+      ; 9: stores only into its own stack object, whose address goes nowhere.
+      (9 (let [local (require (b/frame-object! (mut graph) control sixteen 8))
+               second (require (b/emit! (mut graph) 26 6 [local eight]))]
+           (set! control (require (b/emit! (mut graph) 93 0 [local second one])))))
+      ; 10: stores a selection between p0 and p1 through p3.
+      (10 (let [zero (require (b/scalar-constant! (mut graph) 11 0 8))
+                chosen (require (b/emit! (mut graph) 15 1 [p2 zero]))
+                either (require (b/emit! (mut graph) 60 6 [chosen p0 p1]))]
+            (set! control (require (b/emit! (mut graph) 93 0 [control p3 either])))))
+      ; 11: compares p0 with p1 and reads through whichever; nothing kept.
+      (11 (let [same (require (b/emit! (mut graph) 14 1 [p0 p1]))
+                branch (require (b/emit! (mut graph) 116 0 [control same]))
+                yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+                no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
+                left (require (b/emit! (mut graph) 91 11 [yes p0]))
+                right (require (b/emit! (mut graph) 91 11 [no p1]))
+                first (require (b/emit! (mut graph) 114 0 [left]))
+                second (require (b/emit! (mut graph) 114 0 [right]))]
+            (set! control (require (b/emit! (mut graph) 112 0 [first second])))))
+      ; 12: stores below the pointer, at p0 - 8.
+      (12 (let [field (require (b/emit! (mut graph) 27 6 [p0 eight]))]
+            (set! control (require (b/emit! (mut graph) 93 0 [control field one])))))
+      ; 13: calls p3(local) under CALLEE-RECORD: only its own stack is reachable.
+      (13 (let [local (require (b/frame-object! (mut graph) control sixteen 8))
+                (mut sig) (match (calls/create 0 11 [(: 6 u8)] a)
+                            (Err [message] (panic "{}" message)) (Ok [sig] sig))]
+            (set! (.effects sig) callee-record)
+            (set! control (require (calls/emit! (mut graph) sig local p3 [local] a)))
+            (calls/release! (mut sig))))
+      (_ (panic "unknown body shape")))
+    (require (b/emit! (mut graph) 120 6 [control returned (: 0 i32)]))
+    graph))
+
+(defn summary [(shape i32) (callee-record groups/Effects) (a (dyn Allocator))] (-> groups/Effects)
+  (let [(mut graph) (body shape callee-record a)
+        result (effects/summarize graph a)]
+    (g/release! (mut graph))
+    result))
+
+(defn expect-summary [(what (slice u8)) (got groups/Effects) (wanted groups/Effects)] (-> void)
+  (unless (same-record? got wanted)
+    (panic "summary {}: present {} unknown {} writes {} captures {} extent {}"
+           what (.present got) (.unknown got) (.writes got) (.captures got) (.extent got))))
+
+(defn summaries! [(a (dyn Allocator))] (-> void)
+  (let [none (groups/no-effects)
+        ; p3 is the callee address of the call shapes: calling through it does
+        ; not keep it only when the call's record says what the target does.
+        target (: 8 i32)]
+    (expect-summary "reads" (summary 0 none a) (record false 0 0 0))
+    (expect-summary "writes a field" (summary 1 none a) (record false 1 0 16))
+    (expect-summary "stores the pointer" (summary 2 none a) (record false 2 1 8))
+    (expect-summary "returns the pointer" (summary 3 none a) (record false 0 1 0))
+    (expect-summary "writes through a loaded pointer" (summary 4 none a) (record true 0 0 0))
+    ; The offset is a word parameter too, and a word used as an offset is a
+    ; use the walk does not follow.
+    (expect-summary "writes at a varying offset" (summary 5 none a) (record true 0 4 0))
+    (expect-summary "writes below the pointer" (summary 12 none a) (record true 0 0 0))
+    ; A callee that writes 8 bytes behind its argument, handed p0 + 16.
+    (expect-summary "passes on to a writer" (summary 6 (record false 1 0 8) a)
+                    (record false 1 target 24))
+    ; One that keeps its argument.
+    (expect-summary "passes on to a keeper" (summary 6 (record false 0 1 0) a)
+                    (record false 0 (| 1 target) 0))
+    ; One that only reads it but writes elsewhere.
+    (expect-summary "passes on to a reader that writes elsewhere" (summary 6 (record true 0 0 0) a)
+                    (record true 0 target 0))
+    ; One that only reads.
+    (expect-summary "passes on to a reader" (summary 6 (record false 0 0 0) a)
+                    (record false 0 target 0))
+    ; A writer whose extent would pass what a record can state.
+    (expect-summary "extent overflow" (summary 6 (record false 1 0 2032) a)
+                    (record true 0 target 0))
+    (expect-summary "indirect call" (summary 7 none a) (record true 0 (| 1 target) 0))
+    (check "volatile access gives no record" (not (.present (summary 8 none a))))
+    (expect-summary "own stack only" (summary 9 none a) (record false 0 0 0))
+    (expect-summary "stores a selection" (summary 10 none a) (record false 8 3 8))
+    (expect-summary "compares and reads" (summary 11 none a) (record false 0 0 0))
+    (expect-summary "hands its stack to a writer" (summary 13 (record false 1 0 16) a)
+                    (record false 0 target 0))
+    (expect-summary "hands its stack to anything" (summary 13 (record true 1 1 16) a)
+                    (record true 0 target 0))))
+
+;;; ---- Promotion beside reading callees -----------------------------------
+
+;;; Callees over a two-word record.
+(defn weigh [(cells (ptr u64))] (-> u64)
+  (primitive/iadd (load cells) (primitive/imul (load (primitive/index cells 1)) 3)))
+(defn bump [(cells (ptr u64))] (-> u64)
+  (store! cells (primitive/iadd (load cells) 100)) 7)
+(def KEPT (var-static u64 0))
+(defn keep [(cells (ptr u64))] (-> u64)
+  (set KEPT (primitive/cast u64 cells)) 1)
+(defn bump-kept [(cells (ptr u64))] (-> u64)
+  (let [kept (primitive/cast (ptr u64) (get KEPT))]
+    (when (!= (get KEPT) 0) (store! kept (primitive/iadd (load kept) 1000)))
+    (load cells)))
+
+;;; f(k, first, second) -> u64 over a 16-byte stack object L:
+;;;   L[0] = k; L[1] = k * 2; a = first(L); L[0] = L[0] + 1; b = second(L);
+;;;   return a + b * 5 + L[0] * 7 + L[1] * 11
+;;; Every value the callees see was stored just before their call. FIRST-RECORD
+;;; and SECOND-RECORD go on the two prototypes.
+(defn straight [(first-record groups/Effects) (second-record groups/Effects) (a (dyn Allocator))]
+  (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        k (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        first (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        second (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        two (require (b/scalar-constant! (mut graph) 11 2 8))
+        five (require (b/scalar-constant! (mut graph) 11 5 8))
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))
+        eight (require (b/scalar-constant! (mut graph) 11 8 8))
+        eleven (require (b/scalar-constant! (mut graph) 11 11 8))
+        sixteen (require (b/scalar-constant! (mut graph) 11 16 8))
+        local (require (b/frame-object! (mut graph) start sixteen 8))
+        upper (require (b/emit! (mut graph) 26 6 [local eight]))
+        doubled (require (b/emit! (mut graph) 28 11 [k two]))
+        s0 (require (b/emit! (mut graph) 93 0 [local local k]))
+        s1 (require (b/emit! (mut graph) 93 0 [s0 upper doubled]))]
+    (let [(mut signature) (match (calls/create 0 11 [(: 11 u8) 6 6] a)
+                            (Err [message] (panic "{}" message)) (Ok [s] s))]
+      (require (calls/function! (mut graph) signature a))
+      (calls/release! (mut signature)))
+    (let [(mut sig) (match (calls/create 0 11 [(: 6 u8)] a)
+                      (Err [message] (panic "{}" message)) (Ok [sig] sig))
+          _ (set! (.effects sig) first-record)
+          x (require (calls/emit! (mut graph) sig s1 first [local] a))
+          v (require (b/emit! (mut graph) 91 11 [x local]))
+          more (require (b/emit! (mut graph) 26 11 [v one]))
+          s2 (require (b/emit! (mut graph) 93 0 [v local more]))
+          _ (set! (.effects sig) second-record)
+          y (require (calls/emit! (mut graph) sig s2 second [local] a))
+          low (require (b/emit! (mut graph) 91 11 [y local]))
+          high (require (b/emit! (mut graph) 91 11 [low upper]))
+          t0 (require (b/emit! (mut graph) 28 11 [y five]))
+          t1 (require (b/emit! (mut graph) 28 11 [low seven]))
+          t2 (require (b/emit! (mut graph) 28 11 [high eleven]))
+          t3 (require (b/emit! (mut graph) 26 11 [x t0]))
+          t4 (require (b/emit! (mut graph) 26 11 [t3 t1]))
+          total (require (b/emit! (mut graph) 26 11 [t4 t2]))]
+      (calls/release! (mut sig))
+      (require (b/emit! (mut graph) 120 11 [high total (: 0 i32)])))
+    graph))
+
+;;; f(k, first, second) -> u64 with a counter that lives in a stack object the
+;;; loop passes to FIRST each iteration:
+;;;   L[0] = 0; sum = 0; while L[0] < k { sum += first(L); L[0] = L[0] + 1 }; return sum + L[0]
+(defn counting [(first-record groups/Effects) (a (dyn Allocator))] (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        k (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        first (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        _ (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 2]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        eight (require (b/scalar-constant! (mut graph) 11 8 8))
+        sixteen (require (b/scalar-constant! (mut graph) 11 16 8))
+        local (require (b/frame-object! (mut graph) start sixteen 8))
+        upper (require (b/emit! (mut graph) 26 6 [local eight]))
+        s0 (require (b/emit! (mut graph) 93 0 [local local zero]))
+        s1 (require (b/emit! (mut graph) 93 0 [s0 upper zero]))
+        enter (require (b/emit! (mut graph) 114 0 [s1]))
+        header (require (b/loop-begin! (mut graph) enter))
+        sum (require (b/loop-phi! (mut graph) header zero))
+        i (require (b/emit! (mut graph) 91 11 [header local]))
+        going (require (b/emit! (mut graph) 16 1 [i k]))
+        branch (require (b/emit! (mut graph) 116 0 [i going]))
+        yes (require (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
+        no (require (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))]
+    (let [(mut signature) (match (calls/create 0 11 [(: 11 u8) 6 6] a)
+                            (Err [message] (panic "{}" message)) (Ok [s] s))]
+      (require (calls/function! (mut graph) signature a))
+      (calls/release! (mut signature)))
+    (let [(mut sig) (match (calls/create 0 11 [(: 6 u8)] a)
+                      (Err [message] (panic "{}" message)) (Ok [sig] sig))
+          _ (set! (.effects sig) first-record)
+          x (require (calls/emit! (mut graph) sig yes first [local] a))
+          again (require (b/emit! (mut graph) 91 11 [x local]))
+          next (require (b/emit! (mut graph) 26 11 [again one]))
+          write (require (b/emit! (mut graph) 93 0 [again local next]))
+          added (require (b/emit! (mut graph) 26 11 [sum x]))
+          back (require (b/emit! (mut graph) 115 0 [write]))
+          last (require (b/emit! (mut graph) 91 11 [no local]))
+          total (require (b/emit! (mut graph) 26 11 [sum last]))]
+      (calls/release! (mut sig))
+      (require (b/patch! (mut graph) header 2 back))
+      (require (b/patch! (mut graph) sum 3 added))
+      (require (b/emit! (mut graph) 120 11 [last total (: 0 i32)])))
+    graph))
+
+(defn count-opcode [(graph g/Graph) (opcode u8)] (-> i64)
+  (let [(mut found) 0 (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (when (= (n/opcode (get (.instructions graph) r)) opcode) (set! found (+ found 1)))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    found))
+
+(defn returns [(graph g/Graph) (a (dyn Allocator))] (-> (ArrayList i32))
+  (let [(mut roots) (ArrayList::new [i32] a) (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (when (= (n/opcode (get (.instructions graph) r)) 120) (push! (mut roots) (cast i32 r)))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    roots))
+
+(defn run-native [(graph g/Graph) (roots (slice i32)) (level i32) (k u64)
+                  (first (fnptr (cc/C) [(ptr u64)] u64)) (second (fnptr (cc/C) [(ptr u64)] u64)) (a (dyn Allocator))] (-> u64)
+  (match (compile/image-with-private graph 1 roots "_cer_entry" (options/Options :level level) a
+                                     (private/no-context))
+    (Err [message] (panic "native compile level {}: {}" level message))
+    (Ok [code]
+      (let [(mut code) code (mut answer) (: 0 u64)]
+        (match (link/compose [code] a)
+          (Err [message] (panic "compose: {}" message))
+          (Ok [module]
+            (let [(mut module) module]
+              (match (jit/map-image (.image module) a)
+                (Err [message] (panic "map: {}" message))
+                (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        index (match (image/find-symbol (.image module) "_cer_entry")
+                                (Some [id] id) (None [] (panic "symbol")))
+                        function (primitive/cast
+                                   (fnptr (cc/C) [u64 (fnptr (cc/C) [(ptr u64)] u64) (fnptr (cc/C) [(ptr u64)] u64)] u64)
+                                   (primitive/cast (ptr u8) (get (.addresses loaded) (cast i64 index))))]
+                    (set! answer (function k first second))
+                    (jit/release-image! (mut loaded)))))
+              (link/release! (mut module)))))
+        (image/release! (mut code))
+        answer))))
+
+;;; What `straight` computes when FIRST and SECOND are the given callees:
+;;; 0 weigh, 1 bump, 2 keep, 3 bump-kept.
+(defn straight-expected [(k u64) (first i32) (second i32)] (-> u64)
+  (let [(mut c0) k (mut c1) (primitive/imul k 2) (mut kept) false
+        (mut x) (: 0 u64) (mut y) (: 0 u64)]
+    (for [turn 0 2]
+      (let [which (if (= turn 0) first second)
+            result (match which
+                     (0 (primitive/iadd c0 (primitive/imul c1 3)))
+                     (1 (do (set! c0 (primitive/iadd c0 100)) (: 7 u64)))
+                     (2 (do (set! kept true) (: 1 u64)))
+                     (_ (do (when kept (set! c0 (primitive/iadd c0 1000))) c0)))]
+        (if (= turn 0)
+            (do (set! x result) (set! c0 (primitive/iadd c0 1)))
+            (set! y result))))
+    (primitive/iadd (primitive/iadd (primitive/iadd x (primitive/imul y 5)) (primitive/imul c0 7))
+                    (primitive/imul c1 11))))
+
+(defn callee-of [(which i32)] (-> (fnptr (cc/C) [(ptr u64)] u64))
+  (match which
+    (0 (fnptr-of weigh)) (1 (fnptr-of bump)) (2 (fnptr-of keep)) (_ (fnptr-of bump-kept))))
+
+;;; The true record of each callee: weigh reads; bump writes its first word;
+;;; keep stores the pointer in a global; bump-kept writes through that global.
+(defn record-of [(which i32)] (-> groups/Effects)
+  (match which
+    (0 (record false 0 0 0))
+    (1 (record false 1 0 8))
+    (2 (record true 0 1 0))
+    (_ (record true 0 0 0))))
+
+(defn promotion! [(a (dyn Allocator))] (-> i64)
+  (let [(mut answers) 0]
+    ; Every pairing of callees, with their true records and with none at all.
+    (for [first 0 4]
+      (for [second 0 4]
+        (for [described 0 2]
+          (let [(mut graph) (straight (if (= described 1) (record-of (cast i32 first)) (groups/no-effects))
+                                      (if (= described 1) (record-of (cast i32 second)) (groups/no-effects))
+                                      a)
+                (mut roots) (returns graph a)]
+            (match (sccp/optimize-memory graph 8 (slice roots) true a)
+              (Err [message] (panic "straight {} {}: {}" first second message))
+              (Ok [optimized]
+                (let [(mut optimized) optimized
+                      loads (count-opcode (.graph optimized) 91)
+                      stores (count-opcode (.graph optimized) 93)
+                      ; Only two readers leave the object the function's own:
+                      ; weigh, and bump-kept, which writes what was kept and
+                      ; is never handed anything to keep.
+                      reading (and (or (= first 0) (= first 3)) (or (= second 0) (= second 3)))
+                      wanted (if (and (= described 1) reading) 0 -1)]
+                  (when (and (= wanted 0) (!= loads 0))
+                    (panic "straight: {} loads remain beside two readers" loads))
+                  (when (and (= wanted 0) (!= stores 3))
+                    (panic "straight: {} stores, the callees read all three" stores))
+                  (when (and (= described 1) (not reading) (= loads 0))
+                    (panic "straight {} {}: every load was replaced beside a writer or keeper"
+                           first second))
+                  (when (and (= described 0) (= loads 0))
+                    (panic "straight: loads replaced beside unknown callees"))
+                  (for [level 1 3]
+                    (for [k 0 4]
+                      (let [(mut source) (returns (.graph optimized) a)
+                            value (primitive/imul (cast u64 k) 0x10001)
+                            ; Nothing is kept from an earlier run's dead frame.
+                            _ (set KEPT 0)
+                            got (run-native (.graph optimized) (slice (.roots optimized)) (cast i32 level)
+                                            value (callee-of (cast i32 first))
+                                            (callee-of (cast i32 second)) a)
+                            want (straight-expected value (cast i32 first) (cast i32 second))]
+                        (free! (mut source))
+                        (unless (= got want)
+                          (panic "straight {} {} described {} level {} k {}: got {}, expected {}"
+                                 first second described level value got want))
+                        (set! answers (+ answers 1)))))
+                  (g/release! (mut (.graph optimized)))
+                  (free! (mut (.roots optimized))))))
+            (free! (mut roots))
+            (g/release! (mut graph))))))
+    ; The counter in memory: with a reading callee its loads become a PHI and
+    ; the store stays for the callee; with a writer they stay loads.
+    (for [which 0 2]
+      (let [(mut graph) (counting (record-of (cast i32 which)) a)
+            (mut roots) (returns graph a)]
+        (match (sccp/optimize-memory graph 8 (slice roots) true a)
+          (Err [message] (panic "counting {}: {}" which message))
+          (Ok [optimized]
+            (let [(mut optimized) optimized
+                  loads (count-opcode (.graph optimized) 91)]
+              (when (and (= which 0) (!= loads 0))
+                (panic "counting: {} loads remain beside a reader" loads))
+              (when (and (= which 0) (< (count-opcode (.graph optimized) 93) 2))
+                (panic "counting: the reader's stores were removed"))
+              (when (and (= which 1) (= loads 0))
+                (panic "counting: loads replaced beside a writer"))
+              (for [level 1 3]
+                (for [k 0 5]
+                  (let [got (run-native (.graph optimized) (slice (.roots optimized)) (cast i32 level)
+                                        (cast u64 k) (callee-of (cast i32 which)) (fnptr-of weigh) a)
+                        ; weigh returns the counter (the second word stays 0);
+                        ; bump adds 100 to it and returns 7, so one trip ends the loop.
+                        want (if (= which 0)
+                                 (cast u64 (+ (/ (* k (- k 1)) 2) k))
+                                 (if (= k 0) (: 0 u64) (: 108 u64)))]
+                    (unless (= got want)
+                      (panic "counting {} level {} k {}: got {}, expected {}" which level k got want))
+                    (set! answers (+ answers 1)))))
+              (g/release! (mut (.graph optimized)))
+              (free! (mut (.roots optimized))))))
+        (free! (mut roots))
+        (g/release! (mut graph))))
+    answers))
+
+(defn main [] (-> i32)
+  (let [a (malloc-allocator)]
+    (encoding! a)
+    (summaries! a)
+    (let [answers (promotion! a)]
+      (println "call-effect-records: encoding, 19 summaries, {} native answers pass" answers))
+    0))

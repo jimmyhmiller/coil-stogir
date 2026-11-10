@@ -6,6 +6,7 @@
 (import "stogir.sccp-rewrite" :as rewrite)
 (import "stogir.node" :as n)
 (import "stogir.calls" :as calls)
+(import "stogir.call-groups" :as groups)
 (import "stogir.options" :as options)
 (import "stogir.image" :as image)
 (import "stogir.link" :as link)
@@ -37,10 +38,30 @@
 ;;; The callee of modes 3 and 14 writes the cell it is handed.
 (defn clobber [(cell (ptr u64))] (-> u64) (store! cell 2) 0)
 
+;;; Modes 25 to 30 call through a prototype carrying an effect record
+;;; (call-groups/Effects) instead of a flag.
+(defn recorded? [(mode i32)] (-> bool)
+  (and (>= mode 25) (<= mode 30)))
+
+;;; The record of a mode: what its callee really does to the cell it is handed.
+(defn record [(mode i32)] (-> groups/Effects)
+  (match mode
+    ; clobber: writes the first eight bytes behind parameter 0.
+    (25 (groups/Effects :present true :unknown false :writes 1 :captures 0 :extent 8))
+    (26 (groups/Effects :present true :unknown false :writes 1 :captures 0 :extent 8))
+    ; peek: writes nothing.
+    (27 (groups/Effects :present true :unknown false :writes 0 :captures 0 :extent 0))
+    ; clobber again, described only as "may write anything".
+    (28 (groups/Effects :present true :unknown true :writes 0 :captures 0 :extent 0))
+    ; peek, with a write the record cannot place.
+    (29 (groups/Effects :present true :unknown true :writes 0 :captures 0 :extent 0))
+    ; clobber handed the second cell of a two-cell record that it may write whole.
+    (_ (groups/Effects :present true :unknown false :writes 1 :captures 0 :extent 16))))
+
 ;;; The callee of modes 16 and 17 only reads it, as its PURE_FUNC declaration says.
 (defn peek [(cell (ptr u64))] (-> u64) (load cell))
 
-(def MODES 25)
+(def MODES 31)
 
 ;;; f(p, q, k, callee) -> i64 over 64-bit cells. In the loop modes i counts
 ;;; from zero and sum adds what the read in question returned each iteration.
@@ -73,6 +94,13 @@
 ;;; 23 as 22, the body then stores 2 through q                (kept in the loop: q may be p)
 ;;; 24 as 0, the header reads cell 0 of FIXED through its literal address  (moved: a constant
 ;;;                                                            address has no use list)
+;;; Modes 25 to 30 are mode 0 with a body call whose prototype carries the record of `record`:
+;;; 25 callee(q) writes behind its argument                   (kept: q may be p; the write is seen)
+;;; 26 callee(&local) writes behind its argument              (moved: a frame object is not p[0])
+;;; 27 callee(q) writes nothing                               (moved)
+;;; 28 callee(q) may write anything                           (kept; the write is seen)
+;;; 29 callee(&local) may write anything, and only reads      (kept: nothing says it cannot write p)
+;;; 30 callee(&local + 8) may write sixteen bytes behind its argument, past the object  (kept)
 (defn build [(mode i32) (a (dyn Allocator))] (-> Fixture)
   (let [(mut graph) (g/create a) (mut roots) (ArrayList::new [i32] a)
         start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
@@ -158,9 +186,16 @@
           (require (b/patch! (mut graph) header 2 back))
           (push! (mut roots) (require (b/emit! (mut graph) 120 11 [again total (: 0 i32)]))))
       :else
-        (let [before (if (or (= mode 12) (= mode 13))
-                         (require (b/emit! (mut graph) 91 11 [start p]))
-                         start)
+        (let [; A sixteen-byte frame object for the modes that pass one.
+              local (if (or (= mode 26) (= mode 29) (= mode 30))
+                        (require (b/frame-object!
+                                   (mut graph) start
+                                   (require (b/scalar-constant! (mut graph) 11 16 8)) 8))
+                        (: 0 i32))
+              before (cond (or (= mode 12) (= mode 13))
+                             (require (b/emit! (mut graph) 91 11 [start p]))
+                           (> local 0) local
+                           :else start)
               enter (require (b/emit! (mut graph) 114 0 [before]))
               header (if (merge-headed? mode)
                          (require (b/emit! (mut graph) 112 0 [enter enter]))
@@ -222,6 +257,19 @@
                           call (require (calls/emit! (mut graph) sig yes callee [q] a))]
                       (calls/release! (mut sig))
                       (if (= mode 17) (require (b/emit! (mut graph) 93 0 [call q two])) call))
+                  (recorded? mode)
+                    (let [(mut sig) (match (calls/create 0 11 [(: 6 u8)] a)
+                                      (Err [message] (panic "{}" message)) (Ok [sig] sig))
+                          second (if (= mode 30) (require (b/emit! (mut graph) 26 6 [local eight]))
+                                     (: 0 i32))
+                          before (cond (= mode 30) (require (b/emit! (mut graph) 93 0 [yes second two]))
+                                       (> local 0) (require (b/emit! (mut graph) 93 0 [yes local two]))
+                                       :else yes)
+                          _ (set! (.effects sig) (record mode))
+                          call (require (calls/emit! (mut graph) sig before callee
+                                                     [(cond (= mode 30) second (> local 0) local :else q)]
+                                                     a))]
+                      (calls/release! (mut sig)) call)
                   (= mode 4) (require (b/emit! (mut graph) 93 0 [yes next-cell i]))
                   (or (= mode 5) (= mode 21))
                     (do (set! read (require (b/emit! (mut graph) 91 11 [yes p]))) read)
@@ -341,13 +389,19 @@
     (22 (Shape :loads 1 :under-join -1 :in-loop 0))
     (23 (Shape :loads 1 :under-join -1 :in-loop 1))
     (24 (Shape :loads 1 :under-join 0 :in-loop 0))
+    (25 (Shape :loads 1 :under-join 1 :in-loop 1))
+    (26 (Shape :loads 1 :under-join 0 :in-loop 0))
+    (27 (Shape :loads 1 :under-join 0 :in-loop 0))
+    (28 (Shape :loads 1 :under-join 1 :in-loop 1))
+    (29 (Shape :loads 1 :under-join 1 :in-loop 1))
+    (30 (Shape :loads 1 :under-join 1 :in-loop 1))
     (_ (Shape :loads -1 :under-join -1 :in-loop -1))))
 
 (defstruct Answer [(result u64) (cells (array u64 6))])
 
 (defn initial-cells [(mode i32) (k u64)] (-> (array u64 6))
   (let [first (if (or (= mode 0) (= mode 1) (= mode 3) (= mode 4) (= mode 7) (= mode 8) (= mode 9)
-                      (= mode 16) (= mode 17) (= mode 24))
+                      (= mode 16) (= mode 17) (= mode 24) (recorded? mode))
                   k
                   6)]
     [first (: 9 u64) 0x33 0x44 0 0x55]))
@@ -398,7 +452,8 @@
         (do
           (while (< (cast i64 i) (cast i64 (get c 0)))
             (set! sum (+ sum (get c 0)))
-            (when (or (= mode 1) (= mode 3) (= mode 8) (= mode 17)) (set! (mut c) qi 2))
+            (when (or (= mode 1) (= mode 3) (= mode 8) (= mode 17) (= mode 25) (= mode 28))
+              (set! (mut c) qi 2))
             (when (and (= mode 2) (= i k)) (set! (mut c) qi 2))
             (when (= mode 4) (set! (mut c) 1 i))
             (when (and (= mode 15) (= i k)) (set! (mut c) 1 i))
@@ -439,7 +494,7 @@
                         _ (when (= mode 24)
                             (for [i 0 6] (store! (primitive/index (fixed-cells) i) (get cells i))))
                         result (function first other k
-                                         (if (or (= mode 16) (= mode 17))
+                                         (if (or (= mode 16) (= mode 17) (= mode 27) (= mode 29))
                                              (fnptr-of peek) (fnptr-of clobber)))]
                     (set! answer (Answer :result result :cells cells))
                     (unless (= (get box 0) (primitive/cast u64 base))
