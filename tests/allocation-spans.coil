@@ -1,0 +1,130 @@
+;;; allocation-spans/cut! on hand-made lifetimes, followed by the scan.
+;;; Positions: blocks [0,10) [10,20) [20,30) [30,40) [40,50). The framed span
+;;; is [10,40); its last block is [30,40). Calls are defined at 15 and 35 and
+;;; clobber registers 0 and 1; registers 2 and 3 survive them.
+(module stogir.tests.allocation-spans)
+(import "stogir.allocation" :as a)
+(import "stogir.allocation-spans" :as spans)
+(import "stogir.allocation-check" :as verify)
+(import "stogir.interval" :as r)
+(import "stogir.constraints" :as c)
+(import "stogir.frame" :as f)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+;;; Register of the part of parent covering position, or -2 when none does.
+(defn register-at [(parts (ArrayList a/Part)) (parent i32) (position i64)] (-> i32)
+  (let [(mut found) (: -2 i32)]
+    (for part parts
+      (when (and (= (.parent part) parent) (a/covers? part position))
+        (set! found (.register part))))
+    found))
+
+;;; Number of parts of parent.
+(defn pieces [(parts (ArrayList a/Part)) (parent i32)] (-> i64)
+  (let [(mut count) (: 0 i64)]
+    (for part parts (when (= (.parent part) parent) (set! count (+ count 1))))
+    count))
+
+(defn expect [(failures (mut i64)) (what (slice u8)) (got i64) (want i64)] (-> void)
+  (unless (= got want)
+    (println "{}: got {} want {}" what got want)
+    (set! failures (+ failures 1))))
+
+(defn main [] (-> i64)
+  (let [allocator (malloc-allocator)
+        (mut parts) (ArrayList::new [a/Part] allocator)
+        (mut parents) (ArrayList::new [i32] allocator)
+        (mut layout) (f/create allocator)
+        (mut failures) (: 0 i64)
+        framed [(r/Range :start 10 :end 40)]
+        last [(r/Range :start 30 :end 40)]
+        calls [(: 15 i64) 35]
+        ; 0: a parameter in register 0, live everywhere, crossing both calls.
+        (mut everywhere) (a/create 0 allocator)
+        ; 1: crosses the call at 15 and dies as an operand of the call at 35.
+        (mut dying) (a/create 1 allocator)
+        ; 2: lives only inside the span, crossing the call at 15.
+        (mut inner) (a/create 2 allocator)
+        ; 3: live from the entry to the last block's call, crossing none.
+        (mut argument) (a/create 3 allocator)
+        ; 4: defined by the call at 15 (starts there), dead before the next.
+        (mut result) (a/create 4 allocator)]
+    (r/add! (mut (.ranges everywhere)) 1 48)
+    (c/add! (mut (.uses everywhere)) 1 2 0)
+    (c/add! (mut (.uses everywhere)) 12 1 -1)
+    (c/add! (mut (.uses everywhere)) 46 1 -1)
+    (r/add! (mut (.ranges dying)) 3 35)
+    (c/add! (mut (.uses dying)) 3 1 -1)
+    (c/add! (mut (.uses dying)) 34 1 -1)
+    (r/add! (mut (.ranges inner)) 11 28)
+    (c/add! (mut (.uses inner)) 11 1 -1)
+    (c/add! (mut (.uses inner)) 26 1 -1)
+    (r/add! (mut (.ranges argument)) 5 10)
+    (r/add! (mut (.ranges argument)) 30 35)
+    (c/add! (mut (.uses argument)) 5 1 -1)
+    (c/add! (mut (.uses argument)) 34 1 -1)
+    (r/add! (mut (.ranges result)) 15 33)
+    (c/add! (mut (.uses result)) 15 1 -1)
+    (c/add! (mut (.uses result)) 32 1 -1)
+    (push! (mut parts) everywhere)
+    (push! (mut parts) dying)
+    (push! (mut parts) inner)
+    (push! (mut parts) argument)
+    (push! (mut parts) result)
+    (a/reserve! (mut parts) 0 15 16 allocator)
+    (a/reserve! (mut parts) 1 15 16 allocator)
+    (a/reserve! (mut parts) 0 35 36 allocator)
+    (a/reserve! (mut parts) 1 35 36 allocator)
+    (let [made (spans/cut! (mut parts) calls framed last (mut parents) allocator)]
+      ; Values 0 and 1 are cut; 2 lives only inside, 3 and 4 cross no call.
+      (expect (mut failures) "parts cut" (cast i64 made) 2)
+      (expect (mut failures) "cut parents" (len parents) 2)
+      (expect (mut failures) "pieces of 0" (pieces parts 0) 2)
+      (expect (mut failures) "pieces of 1" (pieces parts 1) 2)
+      (expect (mut failures) "pieces of 2" (pieces parts 2) 1)
+      (expect (mut failures) "pieces of 3" (pieces parts 3) 1)
+      (expect (mut failures) "pieces of 4" (pieces parts 4) 1)
+      ; Value 0: the original keeps [1,10) and [40,48); its child has [10,40)
+      ; and the use at 12.
+      (let [rest (at parts 0)]
+        (expect (mut failures) "0 rest ranges" (len (.ranges rest)) 2)
+        (expect (mut failures) "0 rest first end" (.end (at (.ranges rest) 0)) 10)
+        (expect (mut failures) "0 rest second start" (.start (at (.ranges rest) 1)) 40)
+        (expect (mut failures) "0 rest uses" (len (.uses rest)) 2))
+      ; Value 1 does not live through the last block's call, so the original
+      ; keeps [3,10) and [30,35) and the child has only [10,30).
+      (let [rest (at parts 1)]
+        (expect (mut failures) "1 rest ranges" (len (.ranges rest)) 2)
+        (expect (mut failures) "1 rest second start" (.start (at (.ranges rest) 1)) 30)
+        (expect (mut failures) "1 rest second end" (.end (at (.ranges rest) 1)) 35)))
+    (match (a/run-shaped-with-tuning! (mut parts) (mut layout) 4 0xF
+             [(a/SpillShape :size 8 :alignment 8) (a/SpillShape :size 8 :alignment 8)
+              (a/SpillShape :size 8 :alignment 8) (a/SpillShape :size 8 :alignment 8)
+              (a/SpillShape :size 8 :alignment 8)]
+             [(: 15 i64) 35] [] (a/plain-tuning) allocator)
+      (Err [msg] (do (println "allocation failed: {}" msg) (set! failures (+ failures 1))))
+      (Ok [_] 0))
+    (match (verify/verify parts 4 0xF)
+      (Err [msg] (do (println "allocation invalid: {}" msg) (set! failures (+ failures 1))))
+      (Ok [_] 0))
+    ; The parameter keeps register 0 on both sides of the span: the calls
+    ; inside it no longer push the whole value into a surviving register.
+    (expect (mut failures) "0 before the span" (cast i64 (register-at parts 0 5)) 0)
+    (expect (mut failures) "0 after the span" (cast i64 (register-at parts 0 44)) 0)
+    ; Inside, across the calls, it is in a register the calls preserve, or
+    ; in its slot (-1): never in a clobbered register.
+    (for position [(: 14 i64) 15 16 34 35 36]
+      (let [reg (register-at parts 0 position)]
+        (when (or (= reg 0) (= reg 1))
+          (println "0 at {} is in clobbered register {}" position reg)
+          (set! failures (+ failures 1)))))
+    (let [reg (register-at parts 1 15)]
+      (when (or (= reg 0) (= reg 1))
+        (println "1 at 15 is in clobbered register {}" reg)
+        (set! failures (+ failures 1))))
+    (for [i 0 (len parts)] (a/release! (elem (mut parts) i)))
+    (free! (mut parts)) (free! (mut parents)) (f/release! (mut layout))
+    (println "allocation-spans: {} failures" failures)
+    (if (= failures 0) 0 1)))

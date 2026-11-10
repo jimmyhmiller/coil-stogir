@@ -14,8 +14,9 @@
 ;;; half-open allocation position ranges. The allocator cuts values that cross
 ;;; calls at these spans (stogir.allocation-spans), so the frameless regions
 ;;; hold them in call-clobbered registers. Both lists are empty when the entry
-;;; block itself needs the frame or no block does: there is then nothing to
-;;; keep frameless. A wrong estimate costs transfers, never correctness:
+;;; block itself needs the frame, no block does, no RETURN lies in a frameless
+;;; region (there is then nothing to keep frameless), or some path runs framed
+;;; from the entry region to a frameless block without a frame use. A wrong estimate costs transfers, never correctness:
 ;;; allocation and shrink-wrapping decide the real regions afterwards.
 ;;;
 ;;; last lists the framed blocks none of whose successors can reach another
@@ -41,6 +42,7 @@
 (def AFTER (: 4 u8))   ; no frame use on any path onward
 (def REACHED (: 8 u8)) ; AFTER, and reached from the entry region without one
 (def MEMORY (: 16 u8)) ; accesses memory
+(def PASSING (: 32 u8)) ; framed, with a way to a frameless block past no frame use
 
 (defn has? [(states (ArrayList u8)) (block i32) (flag u8)] (-> bool)
   (!= (& (get states (cast i64 block)) flag) 0))
@@ -68,6 +70,7 @@
         order (.order prepared)
         (mut states) (ArrayList::new [u8] allocator)
         (mut addressable) false
+        (mut returns) false
         (mut any) false]
     (when (> (len order) 1)
       (fill/append! (mut states) (len (.instructions graph)) (: 0 u8))
@@ -140,28 +143,68 @@
                            (not (has? states target REACHED)))
                   (raise! (mut states) target REACHED)
                   (push! (mut work) target))))))
+        ; Nothing is gained unless some RETURN runs without the frame:
+        ; shrink-wrapping then builds it at entry, and a cut would only add
+        ; transfers.
+        (for block order
+          (when (or (has? states block BEFORE) (has? states block REACHED))
+            (let [span (get (.ranges scheduled) (cast i64 block))]
+              (when (and (> (.count span) 0)
+                         (= (n/opcode (get (.instructions graph)
+                                           (cast i64 (get (.nodes scheduled)
+                                                          (- (+ (.offset span) (.count span)) 1)))))
+                            120))
+                (set! returns true)))))
+        ; A framed block that needs no frame itself, entered from the entry
+        ; region, and from which a frameless block is reached without passing a
+        ; frame use, lies on a path that runs framed yet makes no call. Values
+        ; cut there would move to preserved registers and back for nothing, so
+        ; such a function is left uncut. PASSING marks framed blocks with a
+        ; frame-use-free way out; sweeps in reverse order settle forward edges.
+        (let [(mut changed) true]
+          (while changed
+            (set! changed false)
+            (let [(mut i) (- (len order) 1)]
+              (while (>= i 0)
+                (let [block (get order i)
+                      out (get (.ranges successors) (cast i64 block))]
+                  (when (= (& (get states (cast i64 block)) (| NEEDS BEFORE REACHED PASSING)) 0)
+                    (for [k 0 (.count out)]
+                      (let [target (.to (get edges (get (.edges successors) (+ (.offset out) k))))]
+                        (when (and (or (has? states target REACHED) (has? states target PASSING))
+                                   (not (has? states block PASSING)))
+                          (raise! (mut states) block PASSING)
+                          (set! changed true))))))
+                (set! i (- i 1))))))
+        (for block order
+          (when (has? states block BEFORE)
+            (let [out (get (.ranges successors) (cast i64 block))]
+              (for [k 0 (.count out)]
+                (when (has? states (.to (get edges (get (.edges successors) (+ (.offset out) k)))) PASSING)
+                  (set! returns false))))))
         ; The schedule lays blocks out in this order, so framed blocks arrive
         ; by ascending position and extend the last span or follow it.
-        (for block order
-          (unless (or (has? states block BEFORE) (has? states block REACHED))
-            (let [span (get (.ranges scheduled) (cast i64 block))
-                  start (* (.offset span) 2)
-                  end (* (+ (.offset span) (.count span)) 2)
-                  last (- (len result) 1)]
-              (when (> (.count span) 0)
-                (if (and (>= last 0) (>= (.end (get result last)) start))
-                    (range/add! (mut result) start end)
-                    (push! (mut result) (range/Range :start start :end end)))
-                (let [out (get (.ranges successors) (cast i64 block))
-                      (mut final) true]
-                  (for [k 0 (.count out)]
-                    (unless (has? states (.to (get edges (get (.edges successors) (+ (.offset out) k)))) AFTER)
-                      (set! final false)))
-                  ; One entry per block, ascending as the schedule is.
-                  (when (and final
-                             (or (= (len tails) 0)
-                                 (<= (.end (get tails (- (len tails) 1))) start)))
-                    (push! (mut tails) (range/Range :start start :end end))))))))
+        (when returns
+          (for block order
+            (unless (or (has? states block BEFORE) (has? states block REACHED))
+              (let [span (get (.ranges scheduled) (cast i64 block))
+                    start (* (.offset span) 2)
+                    end (* (+ (.offset span) (.count span)) 2)
+                    last (- (len result) 1)]
+                (when (> (.count span) 0)
+                  (if (and (>= last 0) (>= (.end (get result last)) start))
+                      (range/add! (mut result) start end)
+                      (push! (mut result) (range/Range :start start :end end)))
+                  (let [out (get (.ranges successors) (cast i64 block))
+                        (mut final) true]
+                    (for [k 0 (.count out)]
+                      (unless (has? states (.to (get edges (get (.edges successors) (+ (.offset out) k)))) AFTER)
+                        (set! final false)))
+                    ; One entry per block, ascending as the schedule is.
+                    (when (and final
+                               (or (= (len tails) 0)
+                                   (<= (.end (get tails (- (len tails) 1))) start)))
+                      (push! (mut tails) (range/Range :start start :end end)))))))))
         (adj/release! (mut successors))
         (free! (mut work))))
     (free! (mut states))
