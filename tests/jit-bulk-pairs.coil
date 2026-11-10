@@ -1,0 +1,134 @@
+(module stogir.tests.jit-bulk-pairs)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.bulk" :as bulk)
+(import "stogir.node" :as n)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(extern reserve :as "mmap" :cc (cc/C) [(ptr u8) i64 i32 i32 i32 i64] (-> (ptr u8)))
+(extern protect :as "mprotect" :cc (cc/C) [(ptr u8) i64 i32] (-> i32))
+(extern page-size :as "getpagesize" :cc (cc/C) [] (-> i32))
+
+(defn require [(r (Result i32 (slice u8)))] (-> i32)
+  (match r (Ok [x] x) (Err [e] (panic "{}" e))))
+
+(defn at [(base (ptr u8)) (offset i64)] (-> (ptr u8))
+  (p/cast (ptr u8) (+ (p/cast u64 base) (cast u64 offset))))
+
+(defn pattern [(index i64)] (-> u8)
+  (cast u8 (% (+ (* index 37) 19) 251)))
+
+;;; One fixed copy inside the readable region [base, base+capacity) between
+;;; two inaccessible pages, compared in full with a model. The model copies
+;;; forward byte by byte, which is exact for disjoint and identical ranges and
+;;; for a destination below an overlapping source.
+(defn case [(f (fnptr (cc/C) [(ptr u8) (ptr u8)] void))
+            (base (ptr u8))
+            (model (ptr u8))
+            (capacity i64)
+            (destination i64)
+            (source i64)
+            (size i64)] (-> i64)
+  (let [(mut failures) 0]
+    (for [i 0 capacity]
+      (store! (at base i) (pattern i))
+      (store! (at model i) (pattern i)))
+    (for [i 0 size]
+      (store! (at model (+ destination i)) (load (at model (+ source i)))))
+    (call-ptr f (at base destination) (at base source))
+    (for [i 0 capacity]
+      (when (!= (load (at base i)) (load (at model i)))
+        (set! failures (+ failures 1))))
+    failures))
+
+;;; An inline copy of at least two chunks loads two and then stores two: the
+;;; chain from the last store back to START is S S L L ... for whole pairs,
+;;; with a single trailing chunk as S L.
+(defn paired? [(graph g/Graph) (last i32) (start i32) (size i64)] (-> bool)
+  (let [(mut chunks) (: 0 i64) (mut remaining) size]
+    (while (> remaining 0)
+      (set! remaining
+            (- remaining (if (>= remaining 8) 8 (if (>= remaining 4) 4 (if (>= remaining 2) 2 1)))))
+      (set! chunks (+ chunks 1)))
+    (let [(mut cursor) last (mut good) true (mut left) chunks]
+      ; a trailing single chunk first, then whole pairs
+      (while (and good (> left 0))
+        (let [group (if (= (% left 2) 1) 1 2)]
+          (for [i 0 group]
+            (let [node (get (.instructions graph) (cast i64 cursor))]
+              (when (!= (n/opcode node) 93) (set! good false))
+              (set! cursor (.op1 node))))
+          (for [i 0 group]
+            (let [node (get (.instructions graph) (cast i64 cursor))]
+              (when (!= (n/opcode node) 91) (set! good false))
+              (set! cursor (.op1 node))))
+          (set! left (- left group))))
+      (and good (= cursor start)))))
+
+(defn check [(size i64) (base (ptr u8)) (model (ptr u8)) (capacity i64)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        destination (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        source (require (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        count (require (b/scalar-constant! (mut graph) 5 (cast u64 size) 8))
+        control (require (bulk/copy! (mut graph) start destination source count))
+        ret (require (b/emit! (mut graph) 120 0 [control (: 0 i32) 0]))
+        (mut failures) 0]
+    (when (and (<= (cast u64 size) (bulk/inline-limit))
+               (not (paired? graph control start size)))
+      (println "size {}: the copy is not built in pairs" size)
+      (set! failures (+ failures 1)))
+    (match (compile/text graph start [ret] a)
+      (Err [e] (panic "size {}: {}" size e))
+      (Ok [bytes]
+        (let [(mut code) bytes]
+          (match (jit/map-text (slice code))
+            (Err [_] (panic "size {}: cannot map" size))
+            (Ok [loaded]
+              (let [(mut owned) loaded
+                    f (p/cast (fnptr (cc/C) [(ptr u8) (ptr u8)] void) (.base owned))
+                    last (- capacity size)]
+                ; Disjoint ranges at both ends of the readable region and at
+                ; every small misalignment.
+                (set! failures (+ failures (case f base model capacity 0 last size)))
+                (set! failures (+ failures (case f base model capacity last 0 size)))
+                (for [shift 1 18]
+                  (set! failures
+                        (+ failures (case f base model capacity shift (- last (* shift 3)) size)))
+                  (set! failures
+                        (+ failures (case f base model capacity (- last shift) (+ shift 1) size))))
+                ; Identical ranges.
+                (set! failures (+ failures (case f base model capacity 3 3 size)))
+                (set! failures (+ failures (case f base model capacity last last size)))
+                ; A destination below an overlapping source, at every distance:
+                ; reading ahead never loses a source byte.
+                (for [distance 1 (+ size 1)]
+                  (set! failures
+                        (+ failures (case f base model capacity 5 (+ 5 distance) size)))
+                  (set! failures
+                        (+ failures (case f base model capacity (- last distance) last size))))
+                (jit/release! (mut owned)))))
+          (free! (mut code)))))
+    (g/release! (mut graph))
+    (when (> failures 0) (println "size {}: {} failures" size failures))
+    failures))
+
+(defn main [] (-> i64)
+  (let [page (cast i64 (page-size))
+        region (reserve (p/cast (ptr u8) 0) (* 3 page) 0 0x1002 -1 0)
+        model (reserve (p/cast (ptr u8) 0) page 3 0x1002 -1 0)
+        (mut failures) 0]
+    (when (or (= (p/cast i64 region) -1) (= (p/cast i64 model) -1)
+              (!= (protect (at region page) page 3) 0))
+      (panic "cannot reserve the guarded region"))
+    ; Every size through the inline limit and across it.
+    (for [size 0 141]
+      (set! failures (+ failures (check size (at region page) model page))))
+    (println "native paired copy checks: {} failures" failures)
+    (if (= failures 0) 0 1)))
