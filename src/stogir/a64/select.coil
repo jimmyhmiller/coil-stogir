@@ -351,7 +351,8 @@
                     :immediate exponent)))))))
 
 ;;; Constant shifts and multiply-by-power-of-two need no constant register.
-;;; Narrow (<32-bit) shifts retain their width-specific lowering path.
+;;; Narrow (<32-bit) shifts by a literal keep their width-specific operand and
+;;; result normalization around the constant-shift rule.
 (defn arithmetic [(graph g/Graph) (reference i32)] (-> (Result Tile (slice u8)))
   (match (arithmetic-register graph reference)
     (Err [message] (Err message))
@@ -371,7 +372,16 @@
                         (not (or (= rule 3) (and (>= rule 9) (<= rule 13)))))
                     (Ok (if (and (>= rule 14) (<= rule 17))
                             (division-power graph tile (* size 8))
-                            tile))
+                            ; A byte or halfword shift counts modulo its own
+                            ; width; a literal count needs no count register.
+                            (match (if (and (>= rule 9) (<= rule 11) (> (.left tile) 0))
+                                       literal
+                                       (None))
+                              (None [] tile)
+                              (Some [count]
+                                (Tile :rule (+ 38 (- rule 9)) :wide false :left (.left tile)
+                                      :right 0
+                                      :immediate (& count (cast u64 (- (* size 8) 1))))))))
                     (match literal
                       (None [] (Ok tile))
                       (Some [value]
@@ -665,17 +675,43 @@
                                 (cast i64 (- 64 width)))
                             (cast i64
                                   (& bits (- (<< (: 1 u64) (cast u64 width)) 1)))))]
-              (if (or (< value -16773120) (> value 16773120))
-                  tile
-                  (let [magnitude (if (< value 0) (- (: 0 i64) value) value)]
-                    (if (or (<= magnitude 4095) (= (% magnitude 4096) 0))
+              (if (displacement? value)
+                  (Tile
+                    :rule (+ 20 condition)
+                    :wide (.wide tile)
+                    :left source
+                    :right 0
+                    :immediate (cast u64 value))
+                  ; An ordered comparison with a literal next to an encodable
+                  ; one compares with that neighbor: x > c is x >= c + 1 and
+                  ; x >= c is x > c - 1, in both orders. The neighbor is small,
+                  ; so a signed literal cannot wrap; the largest unsigned
+                  ; literal has no successor and zero no predecessor.
+                  (let [unsigned (or (= condition 2) (= condition 3)
+                                     (= condition 8) (= condition 9))
+                        up (or (= condition 12) (= condition 13)
+                               (= condition 8) (= condition 9))
+                        ; Far literals have no encodable neighbor; leave
+                        ; them alone rather than step past the i64 range.
+                        neighbor (if (or (< value -16773121) (> value 16773121)) value
+                                     (if up (+ value 1) (- value 1)))]
+                    (if (and (>= width 32) (>= condition 2)
+                             (not (and unsigned (= value (if up (: -1 i64) 0))))
+                             (displacement? neighbor))
                         (Tile
-                          :rule (+ 20 condition)
+                          :rule (+ 20 (case condition 12 10 13 11 10 12 11 13
+                                            8 2 9 3 2 8 3 9 condition))
                           :wide (.wide tile)
                           :left source
                           :right 0
-                          :immediate (cast u64 value))
+                          :immediate (cast u64 neighbor))
                         tile))))))))
+
+;;; A signed CMP/CMN displacement: twelve bits, optionally shifted by twelve.
+(defn displacement? [(value i64)] (-> bool)
+  (and (>= value -16773120) (<= value 16773120)
+       (let [magnitude (if (< value 0) (- (: 0 i64) value) value)]
+         (or (<= magnitude 4095) (= (% magnitude 4096) 0)))))
 
 ;;; The 32-bit source of a SEXT/ZEXT into a 64-bit integer word, or zero.
 ;;; Narrower sources are excluded: their register bits above the value are

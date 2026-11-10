@@ -1,0 +1,212 @@
+;;; Literal operands that need no scratch register: an ordered comparison with
+;;; a literal one away from an encodable CMP/CMN displacement compares with
+;;; that neighbor, and a byte or halfword shift by a literal uses the
+;;; constant-shift instruction.
+(module stogir.tests.jit-literal-operands)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.types" :as types)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(defn need [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [x] x) (Err [message] (panic "{}" message))))
+
+(defn read [(text (slice u8)) (at i64)] (-> u32)
+  (| (cast u32 (get text at))
+     (<< (cast u32 (get text (+ at 1))) 8)
+     (<< (cast u32 (get text (+ at 2))) 16)
+     (<< (cast u32 (get text (+ at 3))) 24)))
+
+;;; kind 0: MOVN/MOVZ/MOVK into x16/x17. 1: LSLV/LSRV/ASRV/RORV.
+(defn words [(text (slice u8)) (kind i32)] (-> i64)
+  (let [(mut count) 0 (mut at) 0]
+    (while (< (+ at 3) (len text))
+      (let [word (read text at)]
+        (when (case kind
+                0 (and (= (& word (: 0x1F800000 u32)) (: 0x12800000 u32))
+                       (!= (& word (: 0x60000000 u32)) (: 0x20000000 u32))
+                       (>= (& word 31) 16) (<= (& word 31) 17))
+                1 (= (& word (: 0x7FE0F000 u32)) (: 0x1AC02000 u32))
+                false)
+          (set! count (+ count 1))))
+      (set! at (+ at 4)))
+    count))
+
+(defn displacement? [(value i64)] (-> bool)
+  (let [magnitude (if (< value 0) (- (: 0 i64) value) value)]
+    (and (>= value -16773120) (<= value 16773120)
+         (or (<= magnitude 4095) (= (% magnitude 4096) 0)))))
+
+(defn holds? [(opcode i32) (left u64) (right u64)] (-> bool)
+  (let [sl (p/cast i64 left) sr (p/cast i64 right)]
+    (case opcode
+      14 (= left right) 15 (!= left right)
+      16 (< sl sr) 17 (>= sl sr) 18 (<= sl sr) 19 (> sl sr)
+      20 (< left right) 21 (>= left right) 22 (<= left right) 23 (> left right)
+      (panic "unknown comparison"))))
+
+;;; A word of type ty as a 64-bit comparison operand. The comparison opcode,
+;;; not the type, carries signedness: signed orders read a 32-bit word signed.
+(defn typed [(ty i32) (opcode i32) (value u64)] (-> u64)
+  (cond (or (= ty 5) (= ty 11)) value
+        (and (>= opcode 16) (<= opcode 19) (>= (& value 0xFFFFFFFF) 0x80000000))
+          (| (& value 0xFFFFFFFF) 0xFFFFFFFF00000000)
+        :else (& value 0xFFFFFFFF)))
+
+;;; The literal is the right operand, or the left one when swapped. mode 0
+;;; returns the Boolean and mode 1 branches on it.
+(defn comparison [(ty i32) (opcode i32) (literal i64) (swapped bool) (mode i32)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut roots) (ArrayList::new [i32] a)
+        width (* 8 (types/scalar-size ty 8))
+        full (if (= width 64) (: 0xFFFFFFFFFFFFFFFF u64) 0xFFFFFFFF)
+        bits (& (p/cast u64 literal) full)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        argument (need (b/emit! (mut graph) 71 ty [start (: 0 i32) 0]))
+        constant (need (b/scalar-constant! (mut graph) ty bits 8))
+        test (need (b/emit! (mut graph) opcode 1
+                            (if swapped [constant argument] [argument constant])))
+        ; With the literal on the right: does the comparison move its literal
+        ; up (x > c, x <= c) or down (x >= c, x < c)? Swapping the operands
+        ; swaps the direction.
+        right-up (or (= opcode 18) (= opcode 19) (= opcode 22) (= opcode 23))
+        ordered (>= opcode 16)
+        unsigned (>= opcode 20)
+        up (!= right-up swapped)
+        ; The literal as CMP sees it: sign-extended from the operand width.
+        value (if (and (= width 32) (>= bits 0x80000000))
+                  (p/cast i64 (| bits 0xFFFFFFFF00000000))
+                  (p/cast i64 bits))
+        scratch-free (or (displacement? value)
+                         (and ordered
+                              (not (and unsigned (= value (if up (: -1 i64) 0))))
+                              (displacement? (if up (+ value 1) (- value 1)))))
+        (mut checked) 0]
+    (if (= mode 0)
+        (push! (mut roots) (need (b/emit! (mut graph) 120 1 [start test (: 0 i32)])))
+        (let [split (need (b/emit! (mut graph) 116 0 [start test]))
+              yes (need (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+              no (need (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+              one (need (b/scalar-constant! (mut graph) 5 1 8))
+              zero (need (b/scalar-constant! (mut graph) 5 0 8))]
+          (push! (mut roots) (need (b/emit! (mut graph) 120 5 [yes one (: 0 i32)])))
+          (push! (mut roots) (need (b/emit! (mut graph) 120 5 [no zero (: 0 i32)])))))
+    (match (compile/text graph start (slice roots) a)
+      (Err [message] (panic "{}" message))
+      (Ok [text]
+          (let [(mut text) text
+                moves (words (slice text) 0)]
+            (when (!= (= moves 0) scratch-free)
+              (panic "type={} op={} literal={} swapped={} mode={}: {} scratch moves"
+                     ty opcode literal swapped mode moves))
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "{}" message))
+              (Ok [image]
+                  (let [(mut image) image
+                        function (p/cast (fnptr (cc/C) [u64] u64) (.base image))]
+                    (for base [bits (: 0 u64) 0x7FFFFFFF 0x80000000 0xFFFFFFFF
+                               0x7FFFFFFFFFFFFFFF 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
+                      (for [delta (: -3 i64) 4]
+                        (let [input (& (+ base (p/cast u64 delta)) full)
+                              mine (typed ty opcode input)
+                              other (typed ty opcode bits)
+                              yes (if swapped (holds? opcode other mine)
+                                      (holds? opcode mine other))
+                              got (function (| input (if (= width 32) (: 0xABCDEF0100000000 u64) 0)))]
+                          (set! checked (+ checked 1))
+                          (when (!= got (if yes (: 1 u64) 0))
+                            (panic "type={} op={} literal={} swapped={} mode={} input={} got={}"
+                                   ty opcode literal swapped mode input got)))))
+                    (jit/release! (mut image)))))
+            (free! (mut text)))))
+    (free! (mut roots))
+    (g/release! (mut graph))
+    checked))
+
+;;; opcode 49 = SHL, 50 = SHR, 51 = SAR of a byte or halfword by a literal.
+;;; The count is taken modulo the type width; SAR shifts the sign-extended
+;;; value whatever the type. The result is extended by the type's signedness.
+(defn narrow-shift [(ty i32) (opcode i32) (count u64) (shared bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut roots) (ArrayList::new [i32] a)
+        width (* 8 (types/scalar-size ty 8))
+        full (- (<< (: 1 u64) (cast u64 width)) 1)
+        signed (types/signed? ty)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        argument (need (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        x (need (b/emit! (mut graph) 35 ty [argument]))
+        constant (need (b/scalar-constant! (mut graph) ty (& count full) 8))
+        shift (need (b/emit! (mut graph) opcode ty [x constant]))
+        result (if shared (need (b/emit! (mut graph) 48 ty [shift x])) shift)
+        value (need (b/emit! (mut graph) (if signed 33 34) 5 [result]))
+        amount (& count (cast u64 (- width 1)))
+        (mut checked) 0]
+    (push! (mut roots) (need (b/emit! (mut graph) 120 5 [start value (: 0 i32)])))
+    (match (compile/text graph start (slice roots) a)
+      (Err [message] (panic "{}" message))
+      (Ok [text]
+          (let [(mut text) text]
+            (when (or (!= (words (slice text) 0) 0) (!= (words (slice text) 1) 0))
+              (panic "type={} op={} count={} shared={}: {} scratch moves, {} variable shifts"
+                     ty opcode count shared (words (slice text) 0) (words (slice text) 1)))
+            (match (jit/map-text (slice text))
+              (Err [message] (panic "{}" message))
+              (Ok [image]
+                  (let [(mut image) image
+                        function (p/cast (fnptr (cc/C) [u64] u64) (.base image))]
+                    (for [low (: 0 u64) 0x10000]
+                      (when (or (< low 0x200) (= (% low 251) 0) (> low 0xFE00)
+                                (and (>= low 0x7F00) (<= low 0x8100)))
+                        (let [input (| (& low full) 0xDEADBEEF12340000)
+                              v (& low full)
+                              top (!= (& v (<< (: 1 u64) (cast u64 (- width 1)))) 0)
+                              extended (if top (| v (^ full 0xFFFFFFFFFFFFFFFF)) v)
+                              raw (case opcode
+                                    49 (<< v amount)
+                                    50 (>> v amount)
+                                    (p/cast u64 (>> (p/cast i64 extended) (p/cast i64 amount))))
+                              shifted (& (if shared (^ raw v) raw) full)
+                              negative (and signed
+                                            (!= (& shifted (<< (: 1 u64) (cast u64 (- width 1)))) 0))
+                              want (if negative (| shifted (^ full 0xFFFFFFFFFFFFFFFF)) shifted)
+                              got (function input)]
+                          (set! checked (+ checked 1))
+                          (when (!= got want)
+                            (panic "type={} op={} count={} shared={} input={} expected={} got={}"
+                                   ty opcode count shared low want got)))))
+                    (jit/release! (mut image)))))
+            (free! (mut text)))))
+    (free! (mut roots))
+    (g/release! (mut graph))
+    checked))
+
+(defn main [] (-> i32)
+  (let [(mut comparisons) (: 0 i64) (mut shifts) (: 0 i64) (mut answers) (: 0 i64)]
+    (for ty [(: 4 i32) 10 5 11]
+      (for [opcode (: 14 i32) 24]
+        (for literal [(: 0 i64) 1 -1 4095 4096 4097 -4095 -4096 -4097 0xFFFF 0x10000 0x10001
+                      0xFFEFFF 0xFFF000 0xFFF001 -0xFFEFFF -0xFFF000 -0xFFF001 0x1000FFF
+                      0x12345 0x12000 0x12001 0x11FFF 0x7FFFFFFF 0x80000000 0x80000001
+                      0xFFFFFFFF 0xFFFFEFFF 0xFFFFF000 0xFFFFF001 0x7FFFFFFFFFFFFFFF
+                      -0x7FFFFFFFFFFFFFFF -0x8000000000000000 -2 2]
+          (for swapped [false true]
+            (for [mode (: 0 i32) 2]
+              (set! answers (+ answers (comparison ty opcode literal swapped mode)))
+              (set! comparisons (+ comparisons 1)))))))
+    (for ty [(: 2 i32) 3 8 9]
+      (for [opcode (: 49 i32) 52]
+        (for [count (: 0 u64) 40]
+          (for shared [false true]
+            (set! answers (+ answers (narrow-shift ty opcode count shared)))
+            (set! shifts (+ shifts 1))))))
+    (println "literal operands: {} comparisons, {} narrow shifts; {} native answers"
+             comparisons shifts answers))
+  0)
