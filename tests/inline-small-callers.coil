@@ -1,0 +1,374 @@
+(module stogir.tests.inline-small-callers)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.symbols" :as symbols)
+(import "stogir.strings" :as strings)
+(import "stogir.call-inline" :as inlining)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.a64.compile" :as compile)
+(import "stogir.jit.darwin" :as jit)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as p)
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; Inline policy shapes keyed on the caller's own size: keep-cells (a small
+;;; caller takes no callee larger than the bound), small-callers (the
+;;; loop-scoped small exemption applies everywhere in a small caller) and
+;;; small-charged (an exempt site is charged while the budget lasts). Every
+;;; expansion is checked for which calls remain, validated, linked with the
+;;; functions it still calls and executed natively, through both the plain
+;;; and the registered (cost-supplying) entry points.
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn signature [(a (dyn Allocator))] (-> calls/Prototype)
+  (match (calls/create 0 11 [(: 11 u8)] a)
+    (Err [message] (panic "signature: {}" message))
+    (Ok [owned] owned)))
+
+;;; _sc_small(x) = x + 3: one cell.
+(defn small-graph [(a (dyn Allocator))] (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        three (require (b/scalar-constant! (mut graph) 11 3 8))
+        value (require (b/emit! (mut graph) 26 11 [x three]))
+        (mut one) (signature a)]
+    (require (calls/function! (mut graph) one a))
+    (calls/release! (mut one))
+    (require (b/emit! (mut graph) 120 11 [start value (: 0 i32)]))
+    graph))
+
+;;; What _sc_big computes: six rounds of v = v * 3 + x, starting from x.
+(defn big [(x i64)] (-> i64)
+  (let [(mut v) x]
+    (for [_ 0 6] (set! v (p/iadd (p/imul v 3) x)))
+    v))
+
+;;; _sc_big(x): twelve cells, no call.
+(defn big-graph [(a (dyn Allocator))] (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        three (require (b/scalar-constant! (mut graph) 11 3 8))
+        (mut v) x
+        (mut one) (signature a)]
+    (for [_ 0 6]
+      (let [scaled (require (b/emit! (mut graph) 28 11 [v three]))]
+        (set! v (require (b/emit! (mut graph) 26 11 [scaled x])))))
+    (require (calls/function! (mut graph) one a))
+    (calls/release! (mut one))
+    (require (b/emit! (mut graph) 120 11 [start v (: 0 i32)]))
+    graph))
+
+;;; What _sc_wrap and _sc_wide compute, the latter with PADDING more
+;;; increments.
+(defn wrapped [(x i64) (padding i64)] (-> i64)
+  (p/iadd (p/iadd (big (p/iadd x 3)) 1) padding))
+
+;;; _sc_wrap(x) = _sc_big(_sc_small(x)) + 1 + PADDING, the padding added one
+;;; at a time: three cells of its own plus one per padding step.
+(defn wrap-graph [(padding i64) (a (dyn Allocator))] (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        (mut own) (signature a)
+        _ (require (calls/function! (mut graph) own a))
+        small (require (symbols/function! (mut graph) "_sc_small" 0))
+        large (require (symbols/function! (mut graph) "_sc_big" 0))
+        first (require (calls/emit! (mut graph) own start small [x] a))
+        second (require (calls/emit! (mut graph) own first large [first] a))
+        (mut value) (require (b/emit! (mut graph) 26 11 [second one]))]
+    (for [_ 0 padding]
+      (set! value (require (b/emit! (mut graph) 26 11 [value one]))))
+    (calls/release! (mut own))
+    (require (b/emit! (mut graph) 120 11 [second value (: 0 i32)]))
+    graph))
+
+;;; _sc_loop(x): s = small(small(x)); three times s = small(small(s)); s.
+;;; Two calls before the loop and two inside it: x + 24.
+(defn loop-graph [(a (dyn Allocator))] (-> g/Graph)
+  (let [(mut graph) (g/create a)
+        entry (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        input (require (b/emit! (mut graph) 71 11 [entry (: 0 i32) 0]))
+        function (require (symbols/function! (mut graph) "_sc_small" 0))
+        (mut own) (signature a)
+        _ (require (calls/function! (mut graph) own a))
+        cold1 (require (calls/emit! (mut graph) own entry function [input] a))
+        cold2 (require (calls/emit! (mut graph) own cold1 function [cold1] a))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        limit (require (b/scalar-constant! (mut graph) 11 3 8))
+        enter (require (b/emit! (mut graph) 114 0 [cold2]))
+        loop (require (b/loop-begin! (mut graph) enter))
+        index (require (b/loop-phi! (mut graph) loop zero))
+        sum (require (b/loop-phi! (mut graph) loop cold2))
+        condition (require (b/emit! (mut graph) 16 1 [index limit]))
+        split (require (b/emit! (mut graph) 116 0 [loop condition]))
+        body (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        done (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        hot1 (require (calls/emit! (mut graph) own body function [sum] a))
+        hot2 (require (calls/emit! (mut graph) own hot1 function [hot1] a))
+        next (require (b/emit! (mut graph) 26 11 [index one]))
+        back (require (b/emit! (mut graph) 115 0 [hot2]))]
+    (require (b/emit! (mut graph) 120 11 [done sum (: 0 i32)]))
+    (require (b/patch! (mut graph) loop 2 back))
+    (require (b/patch! (mut graph) index 3 next))
+    (require (b/patch! (mut graph) sum 3 hot2))
+    (calls/release! (mut own))
+    graph))
+
+(defn find-return [(graph g/Graph)] (-> i32)
+  (let [(mut found) (: 0 i32) (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (when (= (n/opcode (get (.instructions graph) r)) 120) (set! found (cast i32 r)))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    found))
+
+(defn find-start [(graph g/Graph)] (-> i32)
+  (let [(mut found) (: 0 i32) (mut r) (: 1 i64)]
+    (while (and (= found 0) (< r (len (.instructions graph))))
+      (when (= (n/opcode (get (.instructions graph) r)) 104) (set! found (cast i32 r)))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    found))
+
+;;; The direct calls of GRAPH whose target is named NAME, in reference order.
+(defn calls-of [(graph g/Graph) (name (slice u8)) (a (dyn Allocator))] (-> (ArrayList i32))
+  (let [(mut found) (ArrayList::new [i32] a) (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (let [node (get (.instructions graph) r)]
+        (when (= (n/opcode node) 79)
+          (match (g/lookup graph (.op2 node))
+            (None [] (panic "call target missing"))
+            (Some [function]
+                  (when (= (n/opcode function) 74)
+                    (match (strings/lookup (.strings graph) (cast i32 (n/constant-bits function)))
+                      (None [] (panic "call target name missing"))
+                      (Some [text] (when (= text name) (push! (mut found) (cast i32 r))))))))))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    found))
+
+(defn compiled [(graph g/Graph) (roots (slice i32)) (name (slice u8)) (a (dyn Allocator))]
+  (-> image/Image)
+  (match (compile/image graph 1 roots name a)
+    (Err [message] (panic "compile {}: {}" name message))
+    (Ok [code] code)))
+
+;;; The result expected of the caller of KIND: 0 _sc_wrap, 1 _sc_wide, 2 _sc_loop.
+(defn want [(kind i32) (x i64)] (-> i64)
+  (cond (= kind 0) (wrapped x 0)
+        (= kind 1) (wrapped x 10)
+        (= kind 2) (p/iadd x 24)
+        :else (panic "unknown caller kind {}" kind)))
+
+;;; Compile GRAPH as NAME, link it with SUPPORT, and check NAME(x) against
+;;; want of KIND natively for boundary values.
+(defn execute-failures [(label (slice u8)) (graph g/Graph) (roots (slice i32))
+                        (name (slice u8)) (support (slice image/Image))
+                        (kind i32) (a (dyn Allocator))] (-> i64)
+  (let [(mut failures) (: 0 i64)
+        (mut images) (ArrayList::new [image/Image] a)
+        (mut code) (compiled graph roots name a)]
+    (push! (mut images) code)
+    (for extra support (push! (mut images) extra))
+    (match (link/compose (slice images) a)
+      (Err [message] (panic "compose {}: {}" label message))
+      (Ok [owned]
+          (let [(mut module) owned]
+            (match (jit/map-image (.image module) a)
+              (Err [message] (panic "map {}: {}" label message))
+              (Ok [mapped]
+                  (let [(mut loaded) mapped
+                        function
+                          (match (image/find-symbol (.image module) name)
+                            (None [] (panic "symbol {} missing" name))
+                            (Some [id]
+                                  (p/cast (fnptr (cc/C) [i64] i64)
+                                          (p/cast (ptr u8) (get (.addresses loaded) (cast i64 id))))))]
+                    (for x [(: 0 i64) 1 -1 7 -40 1000000007 -1099511627776
+                            9223372036854775807 -9223372036854775808]
+                      (let [got (function x) expected (want kind x)]
+                        (unless (= got expected)
+                          (println "{}: x {} got {} want {}" label x got expected)
+                          (set! failures (+ failures 1)))))
+                    (jit/release-image! (mut loaded)))))
+            (link/release! (mut module)))))
+    (image/release! (mut code))
+    (free! (mut images))
+    failures))
+
+;;; Check one expansion: the number of changes, which of CALLS stayed CALLs,
+;;; validity, and native results.
+(defn checked-failures [(label (slice u8)) (expanded rewrite/Rewritten) (changes i32)
+                        (calls (slice i32)) (stays (slice bool)) (name (slice u8))
+                        (support (slice image/Image)) (kind i32)
+                        (a (dyn Allocator))] (-> i64)
+  (let [(mut failures) (: 0 i64) graph (.graph expanded)]
+    (unless (= (.changes expanded) changes)
+      (println "{}: {} changes, want {}" label (.changes expanded) changes)
+      (set! failures (+ failures 1)))
+    (for [i 0 (len calls)]
+      (let [call (= (n/opcode (get (.instructions graph) (cast i64 (get calls i)))) 79)]
+        (unless (= call (get stays i))
+          (println "{}: site {} CALL {}, want {}" label i call (get stays i))
+          (set! failures (+ failures 1)))))
+    (match (rewrite/validate graph 8 a)
+      (Err [message] (println "{}: invalid graph: {}" label message)
+                     (set! failures (+ failures 1)))
+      (Ok [_] 0))
+    (+ failures (execute-failures label graph (slice (.roots expanded)) name support kind a))))
+
+(defn policy [(budget i32) (small i32) (keep i32) (callers i32) (charged bool) (always bool)]
+  (-> inlining/Policy)
+  (inlining/Policy :budget budget :small-cells small :small-anywhere false :small-leaf true
+                   :indirect-calls false :pair-result-calls false :honor-always always
+                   :hoist-frames false :call-cells 0 :sparse-cells 0 :forwarders false
+                   :keep-cells keep :small-callers callers :small-charged charged))
+
+
+;;; CALLER's calls of _sc_small then of _sc_big, expanded under POLICY through
+;;; the plain entry point (REGISTRY zero state) or the registered, prioritized
+;;; one, which supplies each callee's clone size.
+(defn expand [(label (slice u8)) (caller g/Graph) (registry inlining/Registry)
+              (registered bool) (small inlining/Callee) (large inlining/Callee)
+              (small-handle i64) (large-handle i64) (policy inlining/Policy)
+              (a (dyn Allocator))] (-> rewrite/Rewritten)
+  (let [(mut smalls) (calls-of caller "_sc_small" a)
+        (mut larges) (calls-of caller "_sc_big" a)
+        ret (find-return caller)
+        result
+          (if registered
+              (let [(mut sites) (ArrayList::new [inlining/RegisteredSite] a)]
+                (for r smalls
+                  (push! (mut sites) (inlining/RegisteredSite :reference r :callee small-handle)))
+                (for r larges
+                  (push! (mut sites) (inlining/RegisteredSite :reference r :callee large-handle)))
+                (let [outcome (inlining/optimize-registered-prioritized-policy
+                                registry caller (find-start caller) [ret] (slice sites) policy a)]
+                  (free! (mut sites))
+                  (match outcome
+                    (Err [message] (panic "{}: {}" label message))
+                    (Ok [maybe]
+                        (match maybe
+                          (Some [owned] owned)
+                          ; Nothing changed: the caller itself, as the plain
+                          ; entry point returns it.
+                          (None []
+                                (match (inlining/optimize-sites-policy caller [ret] [] 8 policy a)
+                                  (Err [message] (panic "{}: {}" label message))
+                                  (Ok [same] same))))))))
+              (let [(mut sites) (ArrayList::new [inlining/Site] a)]
+                (for r smalls (push! (mut sites) (inlining/Site :reference r :target small)))
+                (for r larges (push! (mut sites) (inlining/Site :reference r :target large)))
+                (let [outcome (inlining/optimize-sites-policy caller [ret] (slice sites) 8 policy a)]
+                  (free! (mut sites))
+                  (match outcome
+                    (Err [message] (panic "{}: {}" label message))
+                    (Ok [owned] owned)))))]
+    (free! (mut smalls))
+    (free! (mut larges))
+    result))
+
+(defn main [] (-> i32)
+  (let [a (malloc-allocator) (mut failures) (: 0 i64)
+        (mut small) (small-graph a) (mut large) (big-graph a)
+        (mut wrap) (wrap-graph 0 a) (mut wide) (wrap-graph 10 a) (mut loop) (loop-graph a)
+        small-return (find-return small) large-return (find-return large)
+        (mut small-code) (compiled small [small-return] "_sc_small" a)
+        (mut large-code) (compiled large [large-return] "_sc_big" a)
+        support [small-code large-code]
+        (mut registry) (inlining/registry-create 8 a)]
+    (for always [false true]
+      (let [small-callee (inlining/Callee :name "_sc_small" :graph small :entry (find-start small)
+                                          :roots [small-return] :observed [small-return]
+                                          :never false :always false :sparse false)
+            large-callee (inlining/Callee :name "_sc_big" :graph large :entry (find-start large)
+                                          :roots [large-return] :observed [large-return]
+                                          :never false :always always :sparse false)
+            small-handle (match (inlining/register! (mut registry) small-callee)
+                           (Err [message] (panic "register small: {}" message))
+                           (Ok [handle] handle))
+            large-handle (match (inlining/register! (mut registry) large-callee)
+                           (Err [message] (panic "register big: {}" message))
+                           (Ok [handle] handle))]
+        (for registered [false true]
+          ; keep-cells. The wrapper has three cells of its own, the wide
+          ; caller thirteen; the small callee clones one cell, the big one
+          ; twelve. [keep, honor-always, wide caller] -> is the big call kept?
+          (let [keeps [(: 0 i32) 8 8 12 11 8 8]
+                honors [false false false false false true true]
+                wides [false false true false false false true]
+                budgets [(: 512 i32) 512 512 512 512 512 0]]
+            (for [i 0 (len keeps)]
+              (let [caller (if (get wides i) wide wrap)
+                    name (if (get wides i) "_sc_wide" "_sc_wrap")
+                    budget (get budgets i)
+                    ; Held: a small caller, a callee over the bound, and no
+                    ; honored :inline (Always).
+                    held (and (> (get keeps i) 0) (not (get wides i)) (< (get keeps i) 12)
+                              (not (and always (get honors i))))
+                    stays-small (= budget 0)
+                    stays-large (or (= budget 0) held)
+                    (mut smalls) (calls-of caller "_sc_small" a)
+                    (mut larges) (calls-of caller "_sc_big" a)
+                    (mut expanded)
+                      (expand "keep" caller registry registered small-callee large-callee
+                              small-handle large-handle
+                              (policy budget 0 (get keeps i) 0 false (get honors i)) a)]
+                (set! failures
+                      (+ failures
+                         (checked-failures (if registered "keep registered" "keep") expanded
+                                           (+ (if stays-small (: 0 i32) 1) (if stays-large (: 0 i32) 1))
+                                           [(get smalls 0) (get larges 0)]
+                                           [stays-small stays-large]
+                                           name support
+                                           (if (get wides i) 1 0)
+                                           a)))
+                (rewrite/release! (mut expanded))
+                (free! (mut smalls))
+                (free! (mut larges)))))
+          ; The loop caller: two calls before the loop, two inside, each
+          ; cloning one cell. Site order here: cold1 cold2 hot1 hot2.
+          ; [budget, small-callers, charged] -> which calls stay.
+          (when registered
+            (let [budgets [(: 1 i32) 1 1 2 2 2 0]
+                  callers [(: 0 i32) 4 64 0 0 64 64]
+                  charges [false false false false true true false]
+                  ; Loop sites are ranked first. Uncharged, they leave the
+                  ; budget to the calls before the loop; charged, they spend
+                  ; it and stay exempt themselves once it is gone. A caller
+                  ; within small-callers is exempt at every site.
+                  expected [[false true false false] [false true false false]
+                            [false false false false] [false false false false]
+                            [true true false false] [false false false false]
+                            [true true true true]]]
+              (for [i 0 (len budgets)]
+                (let [stays (get expected i)
+                      (mut sites) (calls-of loop "_sc_small" a)
+                      (mut changes) (: 0 i32)
+                      (mut expanded)
+                        (expand "loop" loop registry true small-callee large-callee
+                                small-handle large-handle
+                                (policy (get budgets i) 40 0 (get callers i) (get charges i) false)
+                                a)]
+                  (for stay stays (unless stay (set! changes (+ changes 1))))
+                  (set! failures
+                        (+ failures
+                           (checked-failures "loop" expanded changes (slice sites) stays
+                                             "_sc_loop" support 2 a)))
+                  (rewrite/release! (mut expanded))
+                  (free! (mut sites)))))))))
+    (inlining/registry-release! (mut registry))
+    (image/release! (mut small-code)) (image/release! (mut large-code))
+    (g/release! (mut small)) (g/release! (mut large))
+    (g/release! (mut wrap)) (g/release! (mut wide)) (g/release! (mut loop))
+    (println "inline small callers: {} failures" failures)
+    (if (= failures 0) 0 1)))
