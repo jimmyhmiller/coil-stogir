@@ -10,11 +10,11 @@
 (import "stogir.sccp-rewrite" :as rewrite)
 (import "stogir.image" :as image)
 (import "stogir.jit.darwin" :as jit)
-(import "coil.alloc" :use [malloc-allocator])
+(import "coil.alloc" :use [malloc-allocator Allocator])
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.primitive" :as p)
 (import "coil.cc" :as cc)
-(import "coil.result" :use [Result Ok Err])
+(import "coil.result" :use [Result Ok Err Option Some None])
 
 (defn require [(value (Result i32 (slice u8)))] (-> i32)
   (match value (Ok [x] x) (Err [message] (panic "{}" message))))
@@ -74,6 +74,117 @@
         (Some [owned]
           (let [(mut owned) owned]
             (rewrite/release! (mut owned)) (panic "invalid inline request expanded")))))))
+
+;;; Content digest of an expansion's graph; zero when nothing expanded.
+(defn outcome-hash [(result (Result (Option rewrite/Rewritten) (slice u8)))] (-> u128)
+  (match result
+    (Err [message] (panic "{}" message))
+    (Ok [outcome]
+      (match outcome
+        (None [] 0)
+        (Some [owned]
+          (let [(mut owned) owned
+                hash (rewrite/content-hash (.graph owned) 8)]
+            (assert (!= hash 0))
+            (rewrite/release! (mut owned))
+            hash))))))
+
+(defn snapshot-of [(result (Result inlining/Snapshot (slice u8)))] (-> inlining/Snapshot)
+  (match result (Err [message] (panic "{}" message)) (Ok [x] x)))
+
+(defn handle-of [(result (Result i64 (slice u8)))] (-> i64)
+  (match result (Err [message] (panic "{}" message)) (Ok [x] x)))
+
+(defn refuse-handle [(result (Result i64 (slice u8)))] (-> void)
+  (match result (Err [_] 0) (Ok [_] (panic "invalid adoption accepted"))))
+
+;;; The read-only entry over a closed registry: REGISTRY has spent its creation
+;;; attempts, HANDLE has contexts (one for ZERO, none for FRESH).
+(defn closed-registry-checks [(registry (mut inlining/Registry)) (caller (mut g/Graph))
+                              (start i32) (returned i32) (called i32) (handle i64)
+                              (zero i32) (fresh i32) (target inlining/Callee)
+                              (a (dyn Allocator))] (-> void)
+  (let [policy (inlining/default-policy 128)
+        none (inlining/Snapshot :state (p/cast (ptr u8) 0))
+        registered (inlining/RegisteredSite :reference called :callee handle)
+        frozen (inlining/FrozenSite :reference called :callee handle :snapshot none)]
+    (assert (inlining/registry-closed? registry))
+    ; Same graph as the registered entry, with a cached context and without.
+    (for literal [zero fresh]
+      (assert (g/set-operand! (mut caller) called 4 literal))
+      (let [expected (outcome-hash (inlining/optimize-registered-specialized-policy
+                                     registry caller start [returned] [registered] policy 0 a))]
+        (assert (!= expected 0))
+        (assert (= expected (outcome-hash (inlining/optimize-frozen-specialized-policy
+                                            registry caller start [returned] [frozen] policy 0 a))))))
+    (assert (= (inlining/specialization-count registry) 128))
+    ; Invalid sites and budgets are refused as the registered entry refuses them.
+    (reject-inline (inlining/optimize-frozen-specialized-policy registry caller start [returned]
+                     [frozen frozen] policy 0 a))
+    (reject-inline (inlining/optimize-frozen-specialized-policy registry caller start [999999]
+                     [frozen] policy 0 a))
+    (reject-inline (inlining/optimize-frozen-specialized-policy registry caller start [returned]
+                     [(inlining/FrozenSite :reference called :callee 999999 :snapshot none)] policy 0 a))
+    (reject-inline (inlining/optimize-frozen-specialized-policy registry caller start [returned]
+                     [(inlining/FrozenSite :reference called :callee 0 :snapshot none)] policy 0 a))
+    (reject-inline (inlining/optimize-frozen-specialized-policy registry caller start [returned]
+                     [frozen] (inlining/default-policy -1) 0 a))
+    (reject-inline (inlining/optimize-frozen-specialized-policy registry caller 0 [returned]
+                     [frozen] policy 0 a))
+    (assert (= (outcome-hash (inlining/optimize-frozen-specialized-policy
+                               registry caller start [returned] [frozen]
+                               (inlining/default-policy 0) 0 a)) 0))
+    ; Settling answers what was not asked; a second pass finds nothing.
+    (handle-of (inlining/registry-settle! (mut registry) a))
+    (assert (= (handle-of (inlining/registry-settle! (mut registry) a)) 0))
+    ; The read-only entry leaves the memo alone, the registered one fills it.
+    (let [read (handle-of (inlining/register! (mut registry) target))
+          written (handle-of (inlining/register! (mut registry) target))]
+      (assert (g/set-operand! (mut caller) called 4 zero))
+      (let [expected (outcome-hash (inlining/optimize-frozen-specialized-policy
+                                     registry caller start [returned]
+                                     [(inlining/FrozenSite :reference called :callee read :snapshot none)]
+                                     policy 0 a))]
+        (assert (!= expected 0))
+        (assert (= expected (outcome-hash (inlining/optimize-registered-specialized-policy
+                                            registry caller start [returned]
+                                            [(inlining/RegisteredSite :reference called :callee written)]
+                                            policy 0 a))))
+        (assert (= (handle-of (inlining/registry-settle! (mut registry) a)) 1))
+        ; A snapshot outside the registry is a callee registered after it closed.
+        (let [owned (snapshot-of (inlining/snapshot-create target 0 8 a a))
+              borrowed (snapshot-of (inlining/snapshot-borrow target 0 8 a a))
+              narrow (snapshot-of (inlining/snapshot-create target 0 4 a a))]
+          (for snapshot [owned borrowed]
+            (assert (= expected (outcome-hash (inlining/optimize-frozen-specialized-policy
+                                                registry caller start [returned]
+                                                [(inlining/FrozenSite :reference called :callee 0
+                                                                      :snapshot snapshot)]
+                                                policy 0 a)))))
+          (reject-inline (inlining/optimize-frozen-specialized-policy registry caller start [returned]
+                           [(inlining/FrozenSite :reference called :callee 0 :snapshot narrow)]
+                           policy 0 a))
+          (refuse-handle (inlining/registry-adopt! (mut registry) borrowed))
+          (refuse-handle (inlining/registry-adopt! (mut registry) narrow))
+          (refuse-handle (inlining/registry-adopt! (mut registry) none))
+          (let [adopted (handle-of (inlining/registry-adopt! (mut registry) owned))]
+            (assert (= adopted (+ written 1)))
+            (refuse-handle (inlining/registry-adopt! (mut registry) owned))
+            ; Adopted with its answer: nothing is left to settle.
+            (assert (= (handle-of (inlining/registry-settle! (mut registry) a)) 0))
+            (assert (= expected (outcome-hash (inlining/optimize-registered-specialized-policy
+                                                registry caller start [returned]
+                                                [(inlining/RegisteredSite :reference called
+                                                                          :callee adopted)]
+                                                policy 0 a))))))))
+    ; A bad callee is refused as a snapshot too.
+    (match (inlining/snapshot-create
+             (inlining/Callee :name (.name target) :graph (.graph target) :entry (.entry target)
+                              :roots [999999] :observed [999999] :never false :always false
+                              :sparse false)
+             0 8 a a)
+      (Err [_] 0)
+      (Ok [_] (panic "invalid snapshot accepted")))))
 
 (defn applied [(result (Result (Option rewrite/Rewritten) (slice u8)))
                (bound u64) (zero-result bool)] (-> void)
@@ -163,6 +274,12 @@
             (reject-inline (inlining/optimize-registered-specialized-if-changed registry caller start [returned]
                             [site] -1 a))
             (assert (= (inlining/specialization-count registry) 0))
+            ; An open registry has no read-only entry: its cache can still change.
+            (assert (not (inlining/registry-closed? registry)))
+            (reject-inline (inlining/optimize-frozen-specialized-policy registry caller start [returned]
+                            [(inlining/FrozenSite :reference called :callee handle
+                                                  :snapshot (inlining/Snapshot :state (p/cast (ptr u8) 0)))]
+                            (inlining/default-policy 128) 0 a))
             ; All actuals dynamic: use ordinary expansion, create no context.
             (assert (g/set-operand! (mut caller) called 4 x))
             (match (inlining/optimize-registered-specialized-if-changed registry caller start [returned] [site] 128 a)
@@ -246,6 +363,9 @@
             (applied (inlining/optimize-registered-specialized-if-changed registry caller start [returned]
                        [site] new-min a) 0 true)
             (assert (= (inlining/specialization-count registry) 128))
+            (let [fresh (require (b/scalar-constant! (mut caller) 5 131 8))]
+              (closed-registry-checks (mut registry) (mut caller) start returned called handle
+                                      zero fresh original-target a))
             (inlining/registry-release! (mut registry))
             (assert (= (inlining/specialization-count registry) 0)))
           (let [(mut registry) (inlining/registry-create 8 a)
