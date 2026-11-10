@@ -10,8 +10,10 @@
 ;;;   5  c ? x*y + z - x*z : z             over the budget: stays a branch
 ;;;   6  c ? (store 1; y) : z              a store in the arm: stays a branch
 ;;;   7  p != 0 ? load p : z               a load in the arm: stays a branch
-;;; Variants 0..4 must contain no conditional branch and at least one select
-;;; per PHI; variants 5..7 must keep a branch. Variant 6 checks the store ran
+;;;   8  u = x*y + z - x*z; (u OP y) ? u : z   over the budget, but the
+;;;      condition is computed from u, so selecting it speculates nothing
+;;; Variants 0..4 and 8 must contain no conditional branch and at least one
+;;; select per PHI; variants 5..7 must keep a branch. Variant 6 checks the store ran
 ;;; exactly when the condition held, variant 7 runs with a null pointer.
 (import "stogir.graph" :as g)
 (import "stogir.builder" :as b)
@@ -80,7 +82,11 @@
           (= variant 4) (p/iadd (p/iadd (if c z (^ x y)) x) y)
           (= variant 5) (if c (p/isub (p/iadd (p/imul x y) z) (p/imul x z)) z)
           (= variant 6) (if c y z)
+          (= variant 8) (if c (costly x y z) z)
           :else (if c cell z))))
+
+(defn costly [(x u64) (y u64) (z u64)] (-> u64)
+  (p/isub (p/iadd (p/imul x y) z) (p/imul x z)))
 
 (def values [(: 0 u64) 1 2 7 8 0x7FFFFFFF 0x80000000 0xFFFFFFFF 0x100000000
              0x7FFFFFFFFFFFFFFF 0x8000000000000000 0xFFFFFFFFFFFFFFFF])
@@ -98,8 +104,13 @@
         seven (need (b/scalar-constant! (mut graph) ty 7 8))
         nine (need (b/scalar-constant! (mut graph) ty 9 8))
         null (need (b/scalar-constant! (mut graph) 6 0 8))
-        c (if (= variant 7) (need (b/emit! (mut graph) 15 1 [pointer null]))
-              (need (b/emit! (mut graph) opcode 1 [x y])))
+        costly-value (let [xy (need (b/emit! (mut graph) 28 ty [x y]))
+                           xz (need (b/emit! (mut graph) 28 ty [x z]))
+                           sum (need (b/emit! (mut graph) 26 ty [xy z]))]
+                       (need (b/emit! (mut graph) 27 ty [sum xz])))
+        c (cond (= variant 7) (need (b/emit! (mut graph) 15 1 [pointer null]))
+                (= variant 8) (need (b/emit! (mut graph) opcode 1 [costly-value y]))
+                :else (need (b/emit! (mut graph) opcode 1 [x y])))
         branch (need (b/emit! (mut graph) 116 0 [start c]))
         yes (need (b/emit! (mut graph) 107 0 [branch (: 0 i32)]))
         no (need (b/emit! (mut graph) 108 0 [branch (: 0 i32)]))
@@ -113,11 +124,7 @@
                     (= variant 2) (need (b/emit! (mut graph) 26 ty [x one]))
                     (= variant 3) x
                     (= variant 4) z
-                    (= variant 5)
-                      (let [xy (need (b/emit! (mut graph) 28 ty [x y]))
-                            xz (need (b/emit! (mut graph) 28 ty [x z]))
-                            sum (need (b/emit! (mut graph) 26 ty [xy z]))]
-                        (need (b/emit! (mut graph) 27 ty [sum xz])))
+                    (or (= variant 5) (= variant 8)) costly-value
                     (= variant 6) y
                     :else loaded)
         second (cond (= variant 3) y
@@ -141,10 +148,10 @@
         (let [(mut code) value
               jumps (branches (.text code))
               chosen (selects (.text code))]
-          (when (and (<= variant 4) (or (!= jumps 0) (< chosen (if (= variant 3) 2 1))))
+          (when (and (or (<= variant 4) (= variant 8)) (or (!= jumps 0) (< chosen (if (= variant 3) 2 1))))
             (println "ty {} op {} variant {}: {} branches, {} selects" ty opcode variant jumps chosen)
             (set! (.failures tally) (+ (.failures tally) 1)))
-          (when (and (>= variant 5) (= jumps 0))
+          (when (and (>= variant 5) (<= variant 7) (= jumps 0))
             (println "ty {} op {} variant {}: no branch kept" ty opcode variant)
             (set! (.failures tally) (+ (.failures tally) 1)))
           (match (jit/map-image code a)
@@ -159,7 +166,9 @@
                         (when (or (= variant 7) (not null?))
                           (let [(mut cell) (: 0x1122334455667788 u64)
                                 held (unsigned-of ty cell)
-                                condition (if (= variant 7) (not null?) (truth opcode ty xv yv))
+                                condition (cond (= variant 7) (not null?)
+                                                (= variant 8) (truth opcode ty (costly xv yv zv) yv)
+                                                :else (truth opcode ty xv yv))
                                 want (expected variant ty condition xv yv zv held)
                                 got (unsigned-of ty (if null? (f xv yv zv (cast (ptr u64) 0)) (f xv yv zv (mut cell))))
                                 kept (if (wide? ty) (: 1 u64) 0x1122334400000001)]
@@ -180,7 +189,7 @@
 (defn main [] (-> i32)
   (let [(mut tally) (Tally :answers 0 :failures 0)]
     (for ty [(: 11 i32) 10]
-      (for [variant 0 8]
+      (for [variant 0 9]
         (for [opcode 14 24]
           (when (or (!= variant 7) (= opcode 14))
             (check ty (cast i32 opcode) (cast i32 variant) (mut tally))))))
