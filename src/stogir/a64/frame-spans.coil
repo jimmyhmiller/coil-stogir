@@ -6,18 +6,24 @@
 ;;; successors. Every other block runs with the frame built. Which blocks those
 ;;; are depends on the allocation, but calls decide most of it, and they are
 ;;; known now: a block needs the frame when it calls, uses a frame operation
-;;; or reads a stack parameter.
+;;; or reads a stack parameter, and when the function has addressable frame
+;;; storage a block that accesses memory cannot follow the frame's release.
 ;;;
-;;; framed returns the maximal runs, adjacent in the schedule, of blocks
-;;; outside both frameless regions under that estimate, as ascending half-open
-;;; allocation position ranges. The allocator cuts values that cross calls at
-;;; these spans (stogir.allocation-cold), so the frameless regions hold them in
-;;; call-clobbered registers. The result is empty when the entry block itself
-;;; needs the frame or no block does: there is then nothing to keep frameless.
-;;; A wrong estimate costs transfers, never correctness: allocation and
-;;; shrink-wrapping decide the real regions afterwards.
+;;; estimate returns, as framed, the maximal runs, adjacent in the schedule, of
+;;; blocks outside both frameless regions under that estimate, as ascending
+;;; half-open allocation position ranges. The allocator cuts values that cross
+;;; calls at these spans (stogir.allocation-spans), so the frameless regions
+;;; hold them in call-clobbered registers. Both lists are empty when the entry
+;;; block itself needs the frame or no block does: there is then nothing to
+;;; keep frameless. A wrong estimate costs transfers, never correctness:
+;;; allocation and shrink-wrapping decide the real regions afterwards.
+;;;
+;;; last lists the framed blocks none of whose successors can reach another
+;;; frame use: once such a block is entered, no later call follows it. A value
+;;; that only dies there (an argument of its call, say) need not leave its
+;;; call-clobbered register for it.
 (module stogir.a64.frame-spans)
-(export framed)
+(export Estimate estimate release!)
 (import "stogir.fill" :as fill)
 (import "stogir.graph" :as g)
 (import "stogir.node" :as n)
@@ -34,6 +40,7 @@
 (def BEFORE (: 2 u8))  ; entry region
 (def AFTER (: 4 u8))   ; no frame use on any path onward
 (def REACHED (: 8 u8)) ; AFTER, and reached from the entry region without one
+(def MEMORY (: 16 u8)) ; accesses memory
 
 (defn has? [(states (ArrayList u8)) (block i32) (flag u8)] (-> bool)
   (!= (& (get states (cast i64 block)) flag) 0))
@@ -44,21 +51,30 @@
 (defn raise! [(states (mut (ArrayList u8))) (block i32) (flag u8)] (-> void)
   (set! (mut states) (cast i64 block) (| (get states (cast i64 block)) flag)))
 
-(defn framed [(graph g/Graph)
-              (prepared pipeline/Prepared)
-              (requirements (ArrayList constraints/Value))
-              (allocator (dyn Allocator))]
-  (-> (ArrayList range/Range))
+(defstruct Estimate [(framed (ArrayList range/Range)) (last (ArrayList range/Range))])
+
+(defn release! [(estimate (mut Estimate))] (-> void)
+  (free! (mut (.framed estimate)))
+  (free! (mut (.last estimate))))
+
+(defn estimate [(graph g/Graph)
+                (prepared pipeline/Prepared)
+                (requirements (ArrayList constraints/Value))
+                (allocator (dyn Allocator))]
+  (-> Estimate)
   (let [(mut result) (ArrayList::new [range/Range] allocator)
+        (mut tails) (ArrayList::new [range/Range] allocator)
         scheduled (.schedule prepared)
         order (.order prepared)
         (mut states) (ArrayList::new [u8] allocator)
+        (mut addressable) false
         (mut any) false]
     (when (> (len order) 1)
       (fill/append! (mut states) (len (.instructions graph)) (: 0 u8))
       (for block order
         (let [span (get (.ranges scheduled) (cast i64 block))
-              (mut needs) false]
+              (mut needs) false
+              (mut memory) false]
           (for [k 0 (.count span)]
             (let [reference (get (.nodes scheduled) (+ (.offset span) k))
                   opcode (cast i32 (n/opcode (get (.instructions graph) (cast i64 reference))))]
@@ -66,10 +82,16 @@
                         (and (= opcode 71)
                              (let [kind (.kind (.parameter (get requirements (cast i64 reference))))]
                                (not (or (= kind 0) (= kind 2))))))
-                (set! needs true))))
+                (set! needs true))
+              (when (shrink/addressable-opcode? opcode) (set! addressable true))
+              (when (shrink/memory-opcode? opcode) (set! memory true))))
           (if needs
               (do (set! (mut states) (cast i64 block) NEEDS) (set! any true))
-              (set! (mut states) (cast i64 block) (| BEFORE AFTER))))))
+              (set! (mut states) (cast i64 block)
+                    (| BEFORE AFTER (if memory MEMORY (: 0 u8)))))))
+      (when addressable
+        (for block order
+          (when (has? states block MEMORY) (drop! (mut states) block AFTER)))))
     (when (and any (not (has? states (get order 0) NEEDS)))
       (let [(mut successors) (adj/build (.blocks prepared) false allocator)
             (mut work) (ArrayList::new [i32] allocator)
@@ -129,8 +151,18 @@
               (when (> (.count span) 0)
                 (if (and (>= last 0) (>= (.end (get result last)) start))
                     (range/add! (mut result) start end)
-                    (push! (mut result) (range/Range :start start :end end)))))))
+                    (push! (mut result) (range/Range :start start :end end)))
+                (let [out (get (.ranges successors) (cast i64 block))
+                      (mut final) true]
+                  (for [k 0 (.count out)]
+                    (unless (has? states (.to (get edges (get (.edges successors) (+ (.offset out) k)))) AFTER)
+                      (set! final false)))
+                  ; One entry per block, ascending as the schedule is.
+                  (when (and final
+                             (or (= (len tails) 0)
+                                 (<= (.end (get tails (- (len tails) 1))) start)))
+                    (push! (mut tails) (range/Range :start start :end end))))))))
         (adj/release! (mut successors))
         (free! (mut work))))
     (free! (mut states))
-    result))
+    (Estimate :framed result :last tails)))

@@ -80,21 +80,39 @@
     (set! (.uses part) kept-uses)
     child))
 
-;;; A part lives through the call defined at the odd position q when one of
-;;; its ranges holds both q - 1, where the call's operands are read, and q,
-;;; where its results appear (adjacent ranges are merged).
-;;;
+;;; Whether a lifetime passes through a call inside [start, end): one of its
+;;; ranges holds both q - 1, where the call at the odd position q reads its operands,
+;;; and q, where its results appear (adjacent ranges are merged).
+(defn crosses? [(ranges (ArrayList range/Range)) (calls (slice i64)) (start i64) (end i64)]
+  (-> bool)
+  (let [(mut k) (first-call calls start)
+        (mut found) false]
+    (while (and (not found) (< k (len calls)) (< (get calls k) end))
+      (let [q (get calls k)]
+        (when (and (range/covers? ranges q) (range/covers? ranges (- q 1)))
+          (set! found true)))
+      (set! k (+ k 1)))
+    found))
+
 ;;; calls are the ascending odd definition positions of the function's calls;
-;;; spans the ascending, disjoint framed spans. Parents of cut parts are
+;;; spans the ascending, disjoint framed spans; last the ascending blocks
+;;; inside them after which no call follows. A part is cut when it lives
+;;; through a call and is also live outside the spans. Its child takes its
+;;; lifetime inside the spans, except in the blocks of last whose call it does
+;;; not live through: nothing later needs it preserved, and no path leads from
+;;; there back to a block where its child lives. Parents of cut parts are
 ;;; appended to parents in part order. Returns the number of parts cut.
-;;; Reservations, assigned parts and empty parts are never cut.
+;;; Reservations, assigned parts and empty parts are never cut, nor is a part
+;;; that lives through a call outside every span.
 (defn cut! [(parts (mut (ArrayList a/Part)))
             (calls (slice i64))
             (spans (slice range/Range))
+            (last (slice range/Range))
             (parents (mut (ArrayList i32)))
             (allocator (dyn Allocator))] (-> i32)
   (let [original (len parts)
         (mut made) (: 0 i32)
+        (mut pieces) (ArrayList::new [range/Range] allocator)
         ; Whether some call lies outside every span; otherwise the first
         ; crossed call settles a part.
         (mut stray) false]
@@ -126,8 +144,40 @@
                     (when (or (< span 0) (< (.end (get spans span)) (.end live)))
                       (set! outside true)))))
               (when (and crossed outside (not whole))
-                (let [child (carve! (elem (mut parts) index) spans allocator)]
+                ; The spans the part meets, less the last blocks it only
+                ; dies in.
+                (clear! (mut pieces))
+                (let [first (.start (at (.ranges part) 0))
+                      final (.end (at (.ranges part) (- count 1)))
+                      (mut s) (let [(mut lo) 0 (mut hi) (len spans)]
+                                (while (< lo hi)
+                                  (let [mid (+ lo (/ (- hi lo) 2))]
+                                    (if (<= (.end (get spans mid)) first)
+                                        (set! lo (+ mid 1)) (set! hi mid))))
+                                lo)
+                      (mut t) (let [(mut lo) 0 (mut hi) (len last)]
+                                (while (< lo hi)
+                                  (let [mid (+ lo (/ (- hi lo) 2))]
+                                    (if (<= (.end (get last mid)) first)
+                                        (set! lo (+ mid 1)) (set! hi mid))))
+                                lo)]
+                  (while (and (< s (len spans)) (< (.start (get spans s)) final))
+                    (let [span (get spans s)
+                          (mut cursor) (.start span)]
+                      (while (and (< t (len last)) (< (.start (get last t)) (.end span)))
+                        (let [block (get last t)]
+                          (when (and (>= (.start block) cursor)
+                                     (not (crosses? (.ranges part) calls (.start block) (.end block))))
+                            (when (< cursor (.start block))
+                              (push! (mut pieces) (range/Range :start cursor :end (.start block))))
+                            (set! cursor (.end block))))
+                        (set! t (+ t 1)))
+                      (when (< cursor (.end span))
+                        (push! (mut pieces) (range/Range :start cursor :end (.end span)))))
+                    (set! s (+ s 1))))
+                (let [child (carve! (elem (mut parts) index) (slice pieces) allocator)]
                   (push! (mut parts) child)
                   (push! (mut parents) (.parent (at parts index)))
                   (set! made (+ made 1)))))))))
+    (free! (mut pieces))
     made))

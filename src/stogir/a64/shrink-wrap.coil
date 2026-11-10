@@ -29,6 +29,16 @@
 ;;; and releases it at most once, as before. The after region replaces shared
 ;;; return tails, which are the after-region blocks of a single RETURN.
 ;;;
+;;; Releasing the frame before the RETURN must not be observable. Spill slots
+;;; and preserved registers are covered by the block test. Storage whose
+;;; address the program holds is not: a pointer into an ALLOCA, a variable or
+;;; the frame itself may have been copied anywhere before the frame is
+;;; released. So when the function has any such storage (addressable?), an
+;;; after-region block may not access memory at all (memory-opcode?); a
+;;; function whose frame holds only the compiler's own slots has no such
+;;; limit. With that, frame-split also wraps anchored frames (dynamic stack
+;;; objects): the release restores the fixed SP like any epilogue.
+;;;
 ;;; ignore-preserved answers whether preserved registers alone stand in the
 ;;; way: the allocator can then be asked to assign them late and retried.
 ;;;
@@ -58,6 +68,18 @@
       (and (>= opcode 82) (<= opcode 90))    ; AFREE..RSTORE
       (= opcode 95)                          ; TLS_ADDR
       (and (>= opcode 97) (<= opcode 103)))) ; VA_*, GUARD*, SNAPSHOT
+
+;;; Opcodes that create storage in the frame whose address the program holds:
+;;; ALLOCA, VADDR, FRAME_ADDR and the variadic cursor operations.
+(defn addressable-opcode? [(opcode i32)] (-> bool)
+  (or (= opcode 81) (= opcode 65) (= opcode 66)
+      (and (>= opcode 97) (<= opcode 100))))
+
+;;; Opcodes that read or write memory through an address held in a value:
+;;; LOAD and STORE forms, inline assembly and the atomic operations.
+(defn memory-opcode? [(opcode i32)] (-> bool)
+  (or (and (>= opcode 91) (<= opcode 94))
+      (and (>= opcode 122) (<= opcode 130))))
 
 ;;; A frame-address recipe: the value is recomputed from x29 or SP at each use.
 (defn frame-recipe? [(assigned allocate/Assigned) (value i32)] (-> bool)
@@ -119,7 +141,7 @@
           (if (or (not (needs-frame? assigned size))
                   (>= (.entry-slot assigned) 0)
                   (> (.alignment assigned) 16)
-                  (!= (.reg (.base assigned)) 31)
+                  (and (!= (.reg (.base assigned)) 31) (not (.frame-split assigned)))
                   (>= (.result-slot assigned) 0)
                   (= (len (.nodes scheduled)) 0)
                   (!= (n/opcode (get (.instructions graph)
@@ -258,6 +280,17 @@
                     (fill/append! (mut after) count false)
                     (for start starts
                       (set! (mut after) (cast i64 start) (not (get bad (cast i64 start)))))
+                    ; Addressable frame storage: no memory access after release.
+                    (let [(mut addressable) false]
+                      (for reference (.nodes scheduled)
+                        (when (addressable-opcode?
+                                (cast i32 (n/opcode (get (.instructions graph) (cast i64 reference)))))
+                          (set! addressable true)))
+                      (when addressable
+                        (for reference (.nodes scheduled)
+                          (when (memory-opcode?
+                                  (cast i32 (n/opcode (get (.instructions graph) (cast i64 reference)))))
+                            (set! (mut after) (cast i64 (get block-of (cast i64 reference))) false)))))
                     (let [(mut changed) true]
                       (while changed
                         (set! changed false)

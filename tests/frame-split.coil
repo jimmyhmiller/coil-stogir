@@ -45,6 +45,8 @@
 
 (defn clobbered [(v i64)] (-> i64) (+ v 7))
 
+(def CELL (: 4242 i64))
+
 ;;; What each shape computes. Shapes:
 ;;; 0 = values cross a call only on the slow arm, which returns by itself;
 ;;; 1 = the slow arm rejoins the fast path at a merge with a PHI and more work;
@@ -53,7 +55,11 @@
 ;;; 4 = a slow arm holding a second, nested slow arm, both rejoining;
 ;;; 5 = the slow arm calls and then never returns (not run), the fast returns;
 ;;; 6 = as 1 with twenty-four more values live across the slow arm;
-;;; 8 = recursion on the slow arm, rejoining a merge (run 20000 deep).
+;;; 8 = recursion on the slow arm, rejoining a merge (run 20000 deep);
+;;; 9 = a dynamic stack object on the slow arm (an anchored frame), rejoining;
+;;; 10 = the slow arm stores through a frame object's address and the merge
+;;; reads through a PHI of that address and a caller's cell (y is its address
+;;; and holds CELL): the merge must still run with the frame.
 (defn model [(shape i32) (x i64) (y i64) (n i64)] (-> i64)
   (cond (= shape 0) (if (< x 100) (+ (* x 2) y) (+ (clobbered x) x y))
         (= shape 1) (let [t (+ x y)
@@ -74,6 +80,8 @@
                       (+ v y))
         (= shape 5) (+ x y)
         (= shape 6) (+ (if (< x 100) x (clobbered x)) (* 24 x) 300 y)
+        (= shape 9) (+ (if (< x 100) x (+ (clobbered x) x)) y)
+        (= shape 10) (+ (if (< x 100) CELL (clobbered x)) x)
         :else (let [(mut total) (+ x n y) (mut k) (: 1 i64)]
                 (while (<= k n) (set! total (+ total k y)) (set! k (+ k 1)))
                 total)))
@@ -218,6 +226,40 @@
               join (emit (mut graph) 112 [fast-end slow-end])
               v (require (b/emit! (mut graph) 67 11 [join x w2]))]
           (ret! (mut graph) (mut roots) join (binary (mut graph) 26 v y)))
+      (= shape 9)
+        (let [small (compare (mut graph) 16 x hundred)
+              split (emit (mut graph) 116 [start small])
+              fast (emit (mut graph) 107 [split (: 0 i32)])
+              slow (emit (mut graph) 108 [split (: 0 i32)])
+              size (require (b/emit! (mut graph) 36 5 [x]))
+              object (require (b/stack-allocate! (mut graph) slow size 16))
+              stored (emit (mut graph) 93 [object object x])
+              r (call! (mut graph) stored target x a)
+              loaded (require (b/emit! (mut graph) 91 11 [r object]))
+              u (binary (mut graph) 26 r loaded)
+              fast-end (emit (mut graph) 114 [fast])
+              slow-end (emit (mut graph) 114 [loaded])
+              join (emit (mut graph) 112 [fast-end slow-end])
+              v (require (b/emit! (mut graph) 67 11 [join x u]))]
+          (ret! (mut graph) (mut roots) join (binary (mut graph) 26 v y)))
+      (= shape 10)
+        (let [sixteen (require (b/scalar-constant! (mut graph) 5 16 8))
+              eight (require (b/scalar-constant! (mut graph) 5 8 8))
+              object (require (b/frame-object! (mut graph) start sixteen (: 8 i32)))
+              small (compare (mut graph) 16 x hundred)
+              split (emit (mut graph) 116 [object small])
+              fast (emit (mut graph) 107 [split (: 0 i32)])
+              slow (emit (mut graph) 108 [split (: 0 i32)])
+              cell (require (b/emit! (mut graph) 36 6 [y]))
+              r (call! (mut graph) slow target x a)
+              inner (require (b/emit! (mut graph) 26 6 [object eight]))
+              stored (emit (mut graph) 93 [r inner r])
+              fast-end (emit (mut graph) 114 [fast])
+              slow-end (emit (mut graph) 114 [stored])
+              join (emit (mut graph) 112 [fast-end slow-end])
+              address (require (b/emit! (mut graph) 67 6 [join cell inner]))
+              loaded (require (b/emit! (mut graph) 91 11 [join address]))]
+          (ret! (mut graph) (mut roots) loaded (binary (mut graph) 26 loaded x)))
       (= shape 5)
         (let [never (compare (mut graph) 14 x (word (mut graph) 123456789))
               split (emit (mut graph) 116 [start never])
@@ -283,13 +325,14 @@
   (let [shift (- (: 64 u32) bits)]
     (>> (<< (cast i64 value) (cast i64 shift)) (cast i64 shift))))
 
-(defstruct Walk [(faults i64) (frameless-return bool)])
+(defstruct Walk [(faults i64) (frameless-return bool) (late-accesses i64)])
 
 ;;; Walks NAME's machine code from its entry along every branch, tracking
 ;;; whether the frame is built (0 = entry state). Faults: a RET with the frame,
 ;;; a frame build with it or release without it, a call without it, and a join
 ;;; reached in both states. frameless-return: some RET is reached on a path
-;;; that never built the frame. Indirect jumps and BRK end a path.
+;;; that never built the frame. late-accesses: loads and stores reached after
+;;; the frame was built and released. Indirect jumps and BRK end a path.
 (defn walk [(source image/Image) (name (slice u8))] (-> Walk)
   (match (image/find-symbol source name)
     (None [] (panic "missing symbol {}" name))
@@ -302,6 +345,7 @@
                 (mut seen) (ArrayList::new [i8] a)
                 (mut work) (ArrayList::new [i64] a)
                 (mut faults) (: 0 i64)
+                (mut late) (: 0 i64)
                 (mut clean) false]
             (for [i 0 limit] (push! (mut seen) (: -1 i8)))
             (push! (mut work) (* base 4))
@@ -348,9 +392,13 @@
                                          (+ (* (+ at (* 4 (signed (& (>> w 5) 0x3FFF) 14))) 4)
                                             state (* 2 built)))
                                   (set! at (+ at 4)))
-                            :else (set! at (+ at 4)))))))))
+                            :else
+                              (do (when (and (= state 0) (= built 1)
+                                             (= (& w 0x0A000000) 0x08000000))
+                                    (set! late (+ late 1)))
+                                  (set! at (+ at 4))))))))))
             (free! (mut seen)) (free! (mut work))
-            (Walk :faults faults :frameless-return clean)))))
+            (Walk :faults faults :frameless-return clean :late-accesses late)))))
 
 (defn context [(split bool)] (-> private/Context)
   (private/with-frame-split (private/with-shrink-wrap (private/no-context) true) split))
@@ -371,6 +419,11 @@
     ; With frame splitting the path that makes no call never builds the frame.
     (when (and split frameless (not (.frameless-return walked)))
       (println "shape {} level {}: no return is reached without the frame" label level)
+      (set! failures (+ failures 1)))
+    ; Shapes 9 and 10 hold addresses of frame storage.
+    (when (and (or (= label 9) (= label 10)) (> (.late-accesses walked) 0))
+      (println "shape {} level {} split {}: {} memory accesses after the frame's release"
+               label level split (.late-accesses walked))
       (set! failures (+ failures 1)))
     (match (link/compose [code] a)
       (Err [message] (panic "compose: {}" message))
@@ -396,7 +449,9 @@
         (let [(mut roots) (ArrayList::new [i32] a)
               (mut graph) (build shape (mut roots) a)
               ; Shapes whose call-free path can run without the frame.
-              frameless (or (= shape 0) (= shape 1) (= shape 4) (= shape 5) (= shape 8))
+              frameless (or (= shape 0) (= shape 1) (= shape 4) (= shape 5) (= shape 8)
+                            (= shape 9))
+              (mut cell) CELL
               (mut loaded) (load-shape graph (slice roots) level (= mode 1) frameless shape a)
               f (p/cast (fnptr (cc/C) [u64 i64 i64 i64] i64) (.entry loaded))]
           (set! failures (+ failures (.failures loaded)))
@@ -404,7 +459,9 @@
             (for y [(: 0 i64) 5 -3]
               (for n [(: 0 i64) 1 2 9 40 20000]
                 (when (or (= n 0) (= shape 3) (= shape 8))
-                  (let [got (call-ptr f target x y n) want (model shape x y n)]
+                  (let [got (call-ptr f target x
+                                      (if (= shape 10) (p/cast i64 (p/cast (ptr i64) (mut cell))) y) n)
+                        want (model shape x y n)]
                     (unless (= got want)
                       (println "shape {} level {} split {} x {} y {} n {}: got {} want {}"
                                shape level mode x y n got want)
@@ -444,7 +501,7 @@
       (Ok [owned]
           (let [(mut native) owned
                 target (p/cast u64 (.base native))]
-            (for shape [(: 0 i32) 1 2 3 4 5 6 8]
+            (for shape [(: 0 i32) 1 2 3 4 5 6 8 9 10]
               (set! failures (+ failures (check-shape shape target))))
             (set! failures (+ failures (check-float target)))
             (jit/release! (mut native)))))
