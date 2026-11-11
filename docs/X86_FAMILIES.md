@@ -19,7 +19,7 @@ whose entry points currently return a clear `Err`.
 | `LOCALS` | `x64/locals.coil` | VAR, VADDR, VLOAD, VSTORE |
 | `STACK` | `x64/stack.coil` | ALLOCA, AFREE, BLOCK_BEGIN, BLOCK_END, FRAME_ADDR |
 | `CALL` | `x64/call.coil`, `x64/call-abi.coil` | CALL, TAILCALL, ARGVAL, PROTO, EXITCALL, VA_* |
-| `FLOATING` | `x64/floating.coil` | every node of FLOAT/DOUBLE type or reading one |
+| `FLOATING` | `x64/floating.coil`, `x64/fcompare.coil`, `x64/float-memory.coil`, `x64/pool.coil` | every node of FLOAT/DOUBLE type or reading one (implemented, except FMA) |
 | `VECTOR` | `x64/vector.coil` | every node of a vector type or reading one |
 | `ATOMIC` | `x64/atomic.coil` | ATOMIC_LOAD/STORE/RMW/CMPXCHG/FENCE |
 | `CHECKED` | `x64/checked.coil` | ADD_OV, SUB_OV, MUL_OV, OVERFLOW |
@@ -28,7 +28,10 @@ whose entry points currently return a clear `Err`.
 | (rule hook) | `x64/reciprocal.coil` | DIV/MOD by a constant without `div` |
 
 Each placeholder module's header lists its operations, the interface it must
-implement and the notes specific to it.
+implement and the notes specific to it. The floating family is implemented
+and is the worked example of a family: selection of a tile another stage
+fuses (`fcompare/tile`), constraints, emitters with operand folding, and the
+places it meets the core (listed under "Families with a different shape").
 
 ## Where the dispatch is
 
@@ -167,11 +170,15 @@ the location view, the frame base, the plan, the frame and the frame size.
   displacement), for values of any class; `address/plain!` is `[value]` for
   a node that takes an address operand. Both emit only `mov`/`lea`, may
   write r10 and r11, and return an operand that names at most r10, so r11 is
-  free afterwards. To give a floating or vector LOAD/STORE to its family,
-  route it in `families/of` (the accesses' address tables and machine inputs
-  are already built for every value class) and emit `movss`/`movsd`/`movups`
-  on `address/operand!`; until then `memory/constrain!` reports them.
-  VLOAD/VSTORE of those classes use `locals/slot`.
+  free afterwards. A LOAD/STORE of another value class is routed to its
+  family in `families/of` (floating: `float-memory/claims?`); the accesses'
+  address tables and machine inputs are built for every value class, so the
+  family constrains the selected base and index (`address/parts`) and emits
+  its move on `address/operand!`, as `x64/float-memory.coil` does. It must
+  not read the node's own address operand, which may have been absorbed.
+- A constraints builder that reads the condition tile of an IF or COND uses
+  `address/tile-operands`, never the tile's `left`/`right`: the comparison
+  may read a fused load.
 - References to named symbols: an integer operand that is a FUNC, SYM or STR
   needs nothing: `emit/operand!` and `value/constant!` rebuild it
   (`code/reference-address!`). For anything else use the helpers in
@@ -203,11 +210,32 @@ the location view, the frame base, the plan, the frame and the frame size.
   `allocate.coil` then builds the rbp base and `function.coil`'s
   `prologue!`/`epilogue!` establish and release it. A frame object or VAR
   raises the alignment through its `uses/Local`.
-- **Floating/vector** registers already allocate (the bridge switches to the
+- **Floating** (`x64/floating.coil`) meets the core in these places, each a
+  few delimited lines:
+  - `families/of` sends floating LOAD/STORE and floating locals to it
+    (`float-memory/claims?`) ahead of the memory and locals families;
+  - the matcher lets its comparison tile (`select/RULE-FCOMPARE`) fuse into
+    IF, integer COND and floating COND like an integer comparison;
+  - `emit/flags!` and `truth/flags!` return an *extended condition* for a
+    floating comparison or value (`x64/fcompare.coil`: a condition code,
+    possibly combined with the parity flag). Every flag consumer must accept
+    one: `edges/branch-edge-parity!` for branches, `fcompare/boolean!` for a
+    BOOL, `conditional/parity!` for `cmovcc`, `fcompare/jump-if!` for a short
+    jump inside a node;
+  - the driver emits floating PARAM (`incoming.coil`), RETURN (xmm0) and IF
+    itself, because they need its state; the family only constrains them;
+  - edges build floating PHI constants (`edges.coil`), and
+    `typed-transfers.coil` holds an XMM cycle in xmm15;
+  - `function.coil` ends with `pool/finish!`, which appends the function's
+    floating constant pool and patches its loads.
+  Floating operands: `value/float-register!`, `float-into!`,
+  `float-destination`, `float-constant!`, and `float-apply!` (an SSE
+  instruction with its second operand in a register, a spill slot or the
+  constant pool). Short jumps inside one node: `x64/local.coil`.
+- **Vector** registers already allocate (the bridge switches to the
   48-register domain when a value of those types is live) and move
-  (`x64/transfers.coil`); constants, parameters (`incoming.coil` places them,
-  kind 2), returns and PHI constants of those types report a clear error at
-  the place to extend.
+  (`x64/transfers.coil`); constants, parameters, returns and PHI constants
+  of vector types report a clear error at the place to extend.
 
 ## Tests
 
@@ -216,7 +244,12 @@ Tests are `tests/x64-NAME.coil`, run on the Linux host with
 is the shared support: graph shorthands, an independent reference evaluator
 for integer operations, `compiled` / `expect!` / `invoke` (every function is
 called through one twelve-argument signature), `dirty` (garbage above a
-narrow argument) and a tally.
+narrow argument) and a tally. For floating values it has a bit-exact
+reference evaluator with the x86-64 NaN rules (`float-binary`, `float-unary`,
+`float-compare`, the conversions), `float-specials`, and `invoke-mixed` /
+`invoke-floating` (twelve floating arguments, then twelve integers; the
+result in rax or xmm0). The floating family's tests (`tests/x64-float-*.coil`)
+follow the pattern below.
 
 For a new family, follow the core's pattern:
 

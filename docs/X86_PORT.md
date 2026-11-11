@@ -137,7 +137,16 @@ rule is written out at the top of `x64/value.coil`.
      any instruction once its last flag consumer is emitted (DIV zeroes edx
      with `xor`).
    - Floating compares use `ucomiss/ucomisd` and handle the parity flag for
-     unordered operands exactly as upstream's `ir_emit_cmp_fp` does.
+     unordered operands exactly as upstream's `ir_emit_cmp_fp` does
+     (`x64/fcompare.coil`): each predicate picks the operand order whose one
+     condition code is right for unordered operands, and only EQ and NE need
+     parity too. A condition handed to a flag consumer is therefore an
+     *extended condition*: a condition code, or a code "and not parity" / "or
+     parity". IF takes two branches for those (`edges/branch-edge-parity!`),
+     a BOOL two `setcc`, an integer COND two `cmovcc`.
+   - SSE instructions other than the compares never write EFLAGS, so `xorps`
+     zeroing, `movaps`/`movss`/`movsd`, `andps`, `pcmpeqd` and the like may
+     sit between a flag producer and its consumer, unlike `xor r, r`.
 4. **Variable-length code.** Offsets are bytes. A branch is emitted as rel32
    with a fixup record; shrinking to rel8 and loop alignment are a separate
    pass over records, not word arithmetic. There are no veneers in text.
@@ -165,6 +174,62 @@ rule is written out at the top of `x64/value.coil`.
      rbp and at most r10, so r11 is free for the instruction's other operand.
    `lea` for add-with-shift and three-operand adds of values (not addresses)
    is still to do.
+
+## Floating point
+
+Scalar f32/f64 live in the low bytes of XMM registers (`x64/floating.coil`;
+operand helpers in `x64/value.coil`, "Floating values").
+
+- **Constants.** +0.0 is `xorps x, x`, anywhere (it writes no flags). Every
+  other constant is loaded from a per-function constant pool with
+  `movss/movsd x, [rip + disp32]`, or read from it directly as the memory
+  operand of an arithmetic or compare instruction, as compilers do. The pool
+  is appended to the function's own text after its last instruction
+  (`x64/pool.coil`: 8-byte entries, then 4-byte ones, identical bit patterns
+  shared, padded to 8 bytes, recorded as a text data range), so the
+  displacement is fixed when the function is finished and no image
+  relocation or data symbol is involved. While the function is emitted a
+  load carries a `code/Reference` (kind PC32, addend -4, target the
+  constant's graph reference), which `pool/finish!` resolves and removes.
+  Constants the emitters need themselves (sign masks, 2^52, 2^63, one half)
+  are built without memory: `pcmpeqd` + shift, or `mov r10, imm` + `movq`.
+  A floating PHI constant bound for a spill slot is stored through r10.
+- **Two-address arithmetic.** `rd = left OP right` is `movaps rd, left;
+  op rd, right`, the right operand read from its register, its spill slot or
+  the pool. When rd is the right operand's register ADD and MUL commute and
+  SUB and DIV go through xmm14.
+- **NaNs.** Arithmetic follows the hardware: a NaN operand is returned
+  quieted (the first operand of the instruction when both are NaNs, so the
+  commuted forms make the choice between two different NaNs unspecified, as
+  it is for constant folding), and an invalid operation gives the x86
+  default NaN, whose sign bit is set (AArch64's is clear). The selecting
+  MIN/MAX and FMIN/FMAX/FMINNM/FMAXNM give the AArch64 backend's results bit
+  for bit, NaNs and signed zeros included; so do NEG, ABS and the roundings.
+- **No conditional move for XMM.** Floating COND and the selecting MIN/MAX
+  are a compare and a short forward branch over a `movaps`. Jumps inside one
+  node are rel8 and patched locally (`x64/local.coil`); they never span a
+  fixup record, so branch relaxation cannot move anything between them.
+- **SSE2 only.** ROUND_EVEN/UP/DOWN/ZERO/AWAY are exact inline sequences
+  (no `roundsd`): magnitudes of 2^52 (2^23) and above are returned as they
+  are, smaller ones go through `cvttsd2si`/`cvtsi2sd` or the add-and-subtract
+  2^52 identity and keep the operand's sign. They assume MXCSR's default
+  round-to-nearest mode, like every other arithmetic instruction. FMA has no
+  baseline instruction and is rejected with a clear error until the call
+  family can call libm's `fma`/`fmaf` from inside a node (which also needs an
+  image, not bare text).
+- **Conversions.** INT2FP is exact for every integer type (u64 with the top
+  bit set is halved with a sticky low bit and the result doubled). FP2INT is
+  `cvttss2si/cvttsd2si`; u64 results add a second conversion of `x - 2^63`.
+  The IR leaves NaN and out-of-range inputs undefined (constant folding
+  folds none of them): AArch64 saturates there, x86-64 returns what the
+  instruction gives. Every defined input agrees with constant folding.
+- **Memory.** `families/of` routes LOAD/STORE and VAR/VLOAD/VSTORE of a
+  floating type to the floating family (`x64/float-memory.coil`: one base
+  register, no displacement folding) until the memory and locals families
+  handle every type; those accesses should then go through the memory
+  family's address-mode selection.
+- **Parameters and results.** xmm0..xmm7, then 8-byte stack slots; a result
+  in xmm0. The driver emits floating PARAM, RETURN and IF itself.
 
 ## Frame
 

@@ -136,7 +136,8 @@
 ;;; definition (`position + 1`). `frame-size` is the rsp adjustment of the
 ;;; prologue and `base` the frame base, which together locate the first
 ;;; stack argument (stogir.x64.frame-address/parameter!). Register
-;;; parameters are already in place and emit nothing.
+;;; parameters (general and XMM) are already in place and emit nothing. A
+;;; floating stack parameter is loaded with movss/movsd.
 (defn emit-entry-with-locations! [(out (mut code/Buffer))
                                   (graph g/Graph)
                                   (parts locations/View)
@@ -146,11 +147,25 @@
                                   (base frame/Base)] (-> (Result i32 (slice u8)))
   (let [begin (len (.text out))
         ty (value/type-of graph (.reference parameter))]
-    (cond (= (.kind parameter) 0) (Ok 0)
-          (!= (.kind parameter) 1)
-            (Err "x86-64 backend: floating parameters are not implemented yet (floating family)")
+    (cond (or (= (.kind parameter) 0) (= (.kind parameter) 2)) (Ok 0)
+          (!= (.kind parameter) 1) (Err "invalid x86-64 parameter location")
+          ; ---- floating family: a FLOAT or DOUBLE passed on the stack ----
+          (types/floating? ty)
+            (match (value/float-destination graph parts (.reference parameter) position)
+              (Err [message] (Err message))
+              (Ok [destination]
+                  ; r10 carries the anchor of an over-aligned frame.
+                  (match (frame/parameter! (mut (.text out)) base frame-size
+                                           (.offset parameter) registers/SCRATCH-GPR)
+                    (Err [message] (Err message))
+                    (Ok [m]
+                        (match (encode/sse-mov-rm (mut (.text out)) (value/float-move ty)
+                                                  destination m)
+                          (Err [message] (Err message))
+                          (Ok [_] (Ok (cast i32 (- (len (.text out)) begin)))))))))
+          ; ---- end floating family ----
           (not (types/integer? ty))
-            (Err "x86-64 backend: floating stack parameters are not implemented yet (floating family)")
+            (Err "x86-64 backend: vector stack parameters are not implemented yet (call family)")
           :else
             (match (value/destination graph parts (.reference parameter) position)
               (Err [message] (Err message))

@@ -9,6 +9,10 @@
 ;;; keeps their low bits (stogir.x64.value). The 32-bit form zeroes the upper
 ;;; half of rd even when the condition is false, which is unspecified anyway.
 ;;;
+;;; The condition may be a floating comparison or the truth of a floating
+;;; value: its flags are then an extended condition (stogir.x64.fcompare),
+;;; and a two-flag one takes two `cmovcc` (`parity!`).
+;;;
 ;;; Floating and vector selections belong to their families.
 (module stogir.x64.conditional)
 (import "stogir.conditional" :as cond)
@@ -17,11 +21,45 @@
 (import "stogir.x64.context" :as context)
 (import "stogir.x64.emit" :as emit)
 (import "stogir.x64.encode" :as encode)
+(import "stogir.x64.fcompare" :as fcompare)
 (import "stogir.x64.plan" :as plan)
 (import "stogir.x64.registers" :as registers)
 (import "stogir.x64.truth" :as truth)
 (import "stogir.x64.value" :as value)
 (import "coil.result" :use [Result Ok Err])
+
+;;; rd = `condition` ? yes : no for a two-flag condition. With the condition
+;;; in its "cc or parity" form (the "cc and not parity" form is its inverse
+;;; with the arms exchanged), rd starts as the other arm and takes the chosen
+;;; one under `cmovcc` and under `cmovp`. When rd already holds the chosen
+;;; arm the selection is built in r11.
+(defn parity! [(out (mut code/Buffer)) (cx context/Context) (position i64) (bits i32)
+               (condition i32) (yes i32) (no i32) (rd i32)] (-> (Result i32 (slice u8)))
+  (let [swap (fcompare/and-np? condition)
+        either (if swap (fcompare/invert condition) condition)
+        chosen (if swap no yes)
+        other (if swap yes no)
+        cc (fcompare/code-of either)
+        (mut error) ""]
+    (if (= (value/register-of (.graph cx) (.parts cx) chosen position) rd)
+        (do
+          (code/accept-count! (mut error)
+                              (emit/into! (mut out) cx other position registers/SCRATCH-GPR-2))
+          (code/accept! (mut error)
+                        (encode/cmov-rr (mut (.text out)) cc bits registers/SCRATCH-GPR-2 rd))
+          (code/accept! (mut error)
+                        (encode/cmov-rr (mut (.text out)) encode/CC-P bits
+                                        registers/SCRATCH-GPR-2 rd))
+          (emit/move! (mut out) (mut error) bits rd registers/SCRATCH-GPR-2))
+        (do
+          (code/accept-count! (mut error) (emit/into! (mut out) cx other position rd))
+          (match (emit/operand! (mut out) cx chosen position registers/SCRATCH-GPR)
+            (Err [message] (set! error message))
+            (Ok [source]
+                (code/accept! (mut error) (encode/cmov-rr (mut (.text out)) cc bits rd source))
+                (code/accept! (mut error)
+                              (encode/cmov-rr (mut (.text out)) encode/CC-P bits rd source))))))
+    (if (= error "") (Ok 0) (Err error))))
 
 (defn emit! [(out (mut code/Buffer)) (cx context/Context) (reference i32) (position i64)]
   (-> (Result i32 (slice u8)))
@@ -46,7 +84,11 @@
                                 ryes (value/register-of (.graph cx) (.parts cx) yes position)
                                 rno (value/register-of (.graph cx) (.parts cx) no position)
                                 (mut error) ""]
-                            (cond (= ryes rd)
+                            (cond (not (fcompare/simple? cc))
+                                    (code/accept-count! (mut error)
+                                                        (parity! (mut out) cx position bits cc
+                                                                 yes no rd))
+                                  (= ryes rd)
                                     ; rd already holds the true arm.
                                     (match (emit/operand! (mut out) cx no position
                                                           registers/SCRATCH-GPR)

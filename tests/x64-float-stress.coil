@@ -1,0 +1,469 @@
+(module stogir.tests.x64-float-stress)
+(import "stogir.graph" :as g)
+(import "stogir.types" :as types)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.x64.compile" :as compile)
+(import "stogir.x64.testing" :as t)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; Differential stress test of the x86-64 floating family. A seeded
+;;; generator builds random functions over f32, f64 and the integer types:
+;;; up to twelve floating parameters (four on the stack) and six integer
+;;; ones, then dozens of floating operations (arithmetic, the selecting and
+;;; the IEEE extrema, NEG ABS SQRT, the five roundings), comparisons of
+;;; every predicate, INT2FP from every integer type, FP2INT to every integer
+;;; type (of an operand clamped into the target's range with MIN and MAX,
+;;; since the IR leaves the rest undefined), FP2FP, BITCAST both ways, COND
+;;; on comparisons, on floating values and on integers, diamonds with PHIs,
+;;; and counted loops whose floating PHIs rotate. Constants include zeros,
+;;; NaNs with payloads, infinities and subnormals. Many values stay live to
+;;; the end, far more than there are XMM registers.
+;;;
+;;; Each function is described twice from the same random choices: as a
+;;; graph for the backend and as `Op` records for the interpreter below,
+;;; which uses the reference evaluator of stogir.x64.testing. Both run on
+;;; several argument sets, at optimization level one (the graph as given)
+;;; and level two (after SCCP), and the 64-bit results, which mix the bit
+;;; patterns of the visible values, must be identical. The one exception is
+;;; a run in which ADD or MUL met two different NaNs: which payload survives
+;;; is unspecified there (the backend may commute, so may constant folding),
+;;; so that run is not compared.
+
+;;; kind: 0 floating parameter (a = its index), 1 integer parameter (a = its
+;;; index), 2 constant (bits), 3 floating binary (a, b), 4 floating unary
+;;; (a), 5 floating comparison (a, b), 6 conversion (a), 7 COND and 8 diamond
+;;; PHI (a = condition, b, c), 9 integer binary (a, b), 10 loop (a, b = the
+;;; initial x and y, c = trip count; `opcode` combines x and y, `bits` holds
+;;; the accumulator's opcode; the record is x at the exit and the next two
+;;; records, kind 11, are y and the accumulator).
+(defstruct Op
+  [(kind i32) (opcode i32) (ty i32) (a i32) (b i32) (c i32) (bits u64) (reference i32)])
+
+(defstruct Program
+  [(ops (ArrayList Op))
+   (graph g/Graph)
+   (state u64)
+   (control i32)])
+
+(defstruct Tally [(checks i64) (failures i64) (functions i64) (skipped i64)])
+
+(defn random [(program (mut Program)) (bound u64)] (-> u64)
+  (% (t/random! (mut (.state program))) bound))
+
+(defn chance [(program (mut Program)) (percent u64)] (-> bool)
+  (< (random (mut program) 100) percent))
+
+(defn push-op! [(program (mut Program)) (op Op)] (-> i32)
+  (push! (mut (.ops program)) op)
+  (cast i32 (- (len (.ops program)) 1)))
+
+(defn blank [(kind i32) (ty i32)] (-> Op)
+  (Op :kind kind :opcode 0 :ty ty :a 0 :b 0 :c 0 :bits 0 :reference 0))
+
+(defn type-at [(program Program) (index i32)] (-> i32)
+  (.ty (get (.ops program) (cast i64 index))))
+
+(defn reference-at [(program Program) (index i32)] (-> i32)
+  (.reference (get (.ops program) (cast i64 index))))
+
+(defn float-type [(program (mut Program))] (-> i32)
+  (if (chance (mut program) 50) 12 13))
+
+(defn interesting-float [(program (mut Program)) (ty i32)] (-> u64)
+  (if (chance (mut program) 60)
+      (t/float-specials ty (cast i64 (random (mut program) (cast u64 t/FLOAT-SPECIALS))))
+      (& (t/random! (mut (.state program))) (t/mask ty))))
+
+(defn constant-op! [(program (mut Program)) (ty i32) (value u64)] (-> i32)
+  (let [(mut op) (blank 2 ty)
+        masked (if (= ty 1) (& value 1) (& value (t/mask ty)))]
+    (set! (.bits op) masked)
+    (set! (.reference op) (t/constant! (mut (.graph program)) ty masked))
+    (push-op! (mut program) op)))
+
+;;; Some earlier value of type `ty`, or a new constant of it.
+(defn pick [(program (mut Program)) (ty i32)] (-> i32)
+  (let [(mut found) (: -1 i32)]
+    (for [attempt 0 8]
+      (let [index (cast i32 (random (mut program) (cast u64 (len (.ops program)))))]
+        (when (and (< found 0) (= (type-at program index) ty)) (set! found index))))
+    (if (and (>= found 0) (not (chance (mut program) 12)))
+        found
+        (constant-op! (mut program) ty
+                      (if (types/floating? ty)
+                          (interesting-float (mut program) ty)
+                          (t/random! (mut (.state program))))))))
+
+(defn binary-op! [(program (mut Program)) (kind i32) (opcode i32) (ty i32) (a i32) (b i32)]
+  (-> i32)
+  (let [(mut op) (blank kind ty)]
+    (set! (.opcode op) opcode)
+    (set! (.a op) a)
+    (set! (.b op) b)
+    (set! (.reference op)
+          (if (= kind 5)
+              (t/compare! (mut (.graph program)) opcode (reference-at program a)
+                          (reference-at program b))
+              (t/binary! (mut (.graph program)) opcode ty (reference-at program a)
+                         (reference-at program b))))
+    (push-op! (mut program) op)))
+
+(defn unary-op! [(program (mut Program)) (kind i32) (opcode i32) (ty i32) (a i32)] (-> i32)
+  (let [(mut op) (blank kind ty)]
+    (set! (.opcode op) opcode)
+    (set! (.a op) a)
+    (set! (.reference op) (t/unary! (mut (.graph program)) opcode ty (reference-at program a)))
+    (push-op! (mut program) op)))
+
+;;; The limits of integer type `ty` as floating constants every floating
+;;; type represents exactly: FP2INT of a value between them is defined.
+(defn lower-limit [(ty i32)] (-> f64)
+  (cond (not (types/signed? ty)) 0.0
+        (= (t/bits ty) 8) -128.0
+        (= (t/bits ty) 16) -32768.0
+        (= (t/bits ty) 32) -2147483648.0
+        :else -9223372036854775808.0))
+
+(defn upper-limit [(ty i32)] (-> f64)
+  (let [width (t/bits ty)]
+    (if (types/signed? ty)
+        (cond (= width 8) 127.0
+              (= width 16) 32767.0
+              (= width 32) 2147483520.0
+              :else 9223371487098961920.0)
+        (cond (= width 8) 255.0
+              (= width 16) 65535.0
+              (= width 32) 4294967040.0
+              :else 18446742974197923840.0))))
+
+(defn float-constant! [(program (mut Program)) (ty i32) (value f64)] (-> i32)
+  (constant-op! (mut program) ty
+                (if (= ty 12) (t/f64-bits value) (t/f32-bits (cast f32 value)))))
+
+;;; `index` (floating) converted to integer type `target`, clamped first.
+(defn to-integer! [(program (mut Program)) (index i32) (target i32)] (-> i32)
+  (let [ty (type-at program index)
+        high (float-constant! (mut program) ty (upper-limit target))
+        low (float-constant! (mut program) ty (lower-limit target))
+        below (binary-op! (mut program) 3 58 ty index high)
+        within (binary-op! (mut program) 3 59 ty below low)]
+    (unary-op! (mut program) 6 38 target within)))
+
+;;; `index` as a U64: the bits of a floating value, an integer extended by
+;;; its signedness.
+(defn as-word! [(program (mut Program)) (index i32)] (-> i32)
+  (let [ty (type-at program index)]
+    (cond (= ty 5) index
+          (= ty 12) (unary-op! (mut program) 6 36 5 index)
+          (= ty 13) (unary-op! (mut program) 6 34 5 (unary-op! (mut program) 6 36 4 index))
+          (= (t/bits ty) 64) (unary-op! (mut program) 6 36 5 index)
+          :else (unary-op! (mut program) 6 (if (types/signed? ty) 33 34) 5 index))))
+
+;;; A condition: a floating comparison, a floating value or an integer.
+(defn condition! [(program (mut Program))] (-> i32)
+  (let [choice (random (mut program) 10)
+        ty (float-type (mut program))]
+    (cond (< choice 6)
+            (binary-op! (mut program) 5 (cast i32 (+ 14 (random (mut program) 12))) 1
+                        (pick (mut program) ty) (pick (mut program) ty))
+          (< choice 8) (pick (mut program) ty)
+          :else (pick (mut program) 11))))
+
+(defn select-op! [(program (mut Program)) (kind i32) (ty i32)] (-> i32)
+  (let [condition (condition! (mut program))
+        yes (pick (mut program) ty)
+        no (pick (mut program) ty)
+        (mut op) (blank kind ty)]
+    (set! (.a op) condition)
+    (set! (.b op) yes)
+    (set! (.c op) no)
+    (if (= kind 7)
+        (set! (.reference op)
+              (t/select! (mut (.graph program)) ty (reference-at program condition)
+                         (reference-at program yes) (reference-at program no)))
+        (let [branch (t/if! (mut (.graph program)) (.control program)
+                            (reference-at program condition))
+              taken (t/if-true! (mut (.graph program)) branch)
+              other (t/if-false! (mut (.graph program)) branch)
+              region (t/merge! (mut (.graph program)) (t/end! (mut (.graph program)) taken)
+                               (t/end! (mut (.graph program)) other))]
+          (set! (.control program) region)
+          (set! (.reference op)
+                (t/phi! (mut (.graph program)) ty region (reference-at program yes)
+                        (reference-at program no)))))
+    (push-op! (mut program) op)))
+
+(defn loop-opcode [(program (mut Program))] (-> i32)
+  (get [(: 26 i32) 27 28 58 59 133 136 26] (cast i64 (random (mut program) 8))))
+
+;;; for (i = 0; i < trips; i++) { acc = acc OP2 x; (x, y) = (y, x OP y) }
+(defn loop-op! [(program (mut Program))] (-> i32)
+  (let [ty (float-type (mut program))
+        first (pick (mut program) ty)
+        second (pick (mut program) ty)
+        start (constant-op! (mut program) ty
+                            (if (chance (mut program) 50) 0 (interesting-float (mut program) ty)))
+        trips (binary-op! (mut program) 9 47 11 (pick (mut program) 11)
+                          (constant-op! (mut program) 11 3))
+        combine (loop-opcode (mut program))
+        gather (loop-opcode (mut program))
+        header (t/loop-begin! (mut (.graph program)) (t/end! (mut (.graph program)) (.control program)))
+        i (t/loop-phi! (mut (.graph program)) header (t/constant! (mut (.graph program)) 11 0))
+        x (t/loop-phi! (mut (.graph program)) header (reference-at program first))
+        y (t/loop-phi! (mut (.graph program)) header (reference-at program second))
+        acc (t/loop-phi! (mut (.graph program)) header (reference-at program start))
+        branch (t/if! (mut (.graph program)) header (t/compare! (mut (.graph program)) 16 i (reference-at program trips)))
+        body (t/if-true! (mut (.graph program)) branch)
+        exit (t/if-false! (mut (.graph program)) branch)
+        next-i (t/binary! (mut (.graph program)) 26 11 i (t/constant! (mut (.graph program)) 11 1))
+        next-y (t/binary! (mut (.graph program)) combine ty x y)
+        next-acc (t/binary! (mut (.graph program)) gather ty acc x)
+        back (t/loop-end! (mut (.graph program)) body)
+        (mut op) (blank 10 ty)]
+    (t/patch! (mut (.graph program)) header 2 back)
+    (t/patch! (mut (.graph program)) i 3 next-i)
+    (t/patch! (mut (.graph program)) x 3 y)
+    (t/patch! (mut (.graph program)) y 3 next-y)
+    (t/patch! (mut (.graph program)) acc 3 next-acc)
+    (set! (.control program) exit)
+    (set! (.opcode op) combine)
+    (set! (.bits op) (cast u64 gather))
+    (set! (.a op) first)
+    (set! (.b op) second)
+    (set! (.c op) trips)
+    (set! (.reference op) x)
+    (let [index (push-op! (mut program) op)
+          (mut second-result) (blank 11 ty)
+          (mut third-result) (blank 11 ty)]
+      ; The accumulator's start is recorded in the first projection.
+      (set! (.reference second-result) y)
+      (set! (.a second-result) start)
+      (set! (.reference third-result) acc)
+      (push-op! (mut program) second-result)
+      (push-op! (mut program) third-result)
+      index)))
+
+(defn integer-type [(program (mut Program))] (-> i32)
+  (cast i32 (+ 1 (random (mut program) 11))))
+
+(defn step! [(program (mut Program))] (-> void)
+  (let [choice (random (mut program) 100)
+        ty (float-type (mut program))]
+    (cond (< choice 28)
+            (binary-op! (mut program) 3
+                        (get [(: 26 i32) 27 28 29 58 59 133 134 135 136 26 28]
+                             (cast i64 (random (mut program) 12)))
+                        ty (pick (mut program) ty) (pick (mut program) ty))
+          (< choice 42)
+            (unary-op! (mut program) 4
+                       (get [(: 31 i32) 32 131 137 138 139 140 141]
+                            (cast i64 (random (mut program) 8)))
+                       ty (pick (mut program) ty))
+          (< choice 50)
+            (binary-op! (mut program) 5 (cast i32 (+ 14 (random (mut program) 12))) 1
+                        (pick (mut program) ty) (pick (mut program) ty))
+          (< choice 58)
+            (let [source (integer-type (mut program))]
+              (unary-op! (mut program) 6 37 ty (pick (mut program) source)))
+          (< choice 66) (to-integer! (mut program) (pick (mut program) ty)
+                                     (integer-type (mut program)))
+          (< choice 71)
+            (unary-op! (mut program) 6 39 ty (pick (mut program) (if (= ty 12) 13 12)))
+          (< choice 75)
+            ; The bits of a floating value as an integer, and back.
+            (if (chance (mut program) 50)
+                (unary-op! (mut program) 6 36 (if (= ty 12) 11 10) (pick (mut program) ty))
+                (unary-op! (mut program) 6 36 ty (pick (mut program) (if (= ty 12) 5 4))))
+          (< choice 84) (select-op! (mut program) 7 (if (chance (mut program) 75) ty 11))
+          (< choice 92) (select-op! (mut program) 8 (if (chance (mut program) 75) ty 11))
+          (< choice 96)
+            (binary-op! (mut program) 9 (get [(: 26 i32) 27 48 28] (cast i64 (random (mut program) 4)))
+                        11 (pick (mut program) 11) (pick (mut program) 11))
+          :else (loop-op! (mut program)))
+    0))
+
+(defn truth [(ty i32) (value u64)] (-> bool)
+  (if (types/floating? ty) (t/float-truth ty value) (!= (& value (t/mask ty)) 0)))
+
+;;; Interpret the records; `floats` and `integers` are the arguments. True
+;;; when the run met arithmetic on two different NaNs.
+(defn evaluate! [(ops (ArrayList Op)) (values (mut (ArrayList u64))) (floats (slice u64))
+                 (integers (slice u64))] (-> bool)
+  (let [(mut unsure) false]
+    (for [index 0 (len ops)]
+      (let [op (get ops index)
+            ty (.ty op)
+            a (get values (cast i64 (.a op)))
+            b (get values (cast i64 (.b op)))
+            c (get values (cast i64 (.c op)))
+            source (.ty (get ops (cast i64 (.a op))))]
+        (cond (= (.kind op) 0)
+                (set! (mut values) index (& (get floats (cast i64 (.a op))) (t/mask ty)))
+              (= (.kind op) 1)
+                (set! (mut values) index (& (get integers (cast i64 (.a op))) (t/mask ty)))
+              (= (.kind op) 2) (set! (mut values) index (.bits op))
+              (= (.kind op) 3)
+                (do
+                  (when (and (or (= (.opcode op) 26) (= (.opcode op) 28))
+                             (t/float-ambiguous? ty a b))
+                    (set! unsure true))
+                  (set! (mut values) index (t/float-binary (.opcode op) ty a b)))
+              (= (.kind op) 4) (set! (mut values) index (t/float-unary (.opcode op) ty a))
+              (= (.kind op) 5) (set! (mut values) index (t/float-compare (.opcode op) source a b))
+              (= (.kind op) 6)
+                (set! (mut values) index
+                      (cond (= (.opcode op) 37) (t/float-from-integer source ty a)
+                            (= (.opcode op) 38)
+                              (match (t/float-to-integer source ty a)
+                                (Some [bits] bits)
+                                (None [] (panic "x64 float stress: undefined FP2INT generated")))
+                            (= (.opcode op) 39) (t/float-to-float source ty a)
+                            (or (types/floating? ty) (types/floating? source)) a
+                            :else (t/convert (.opcode op) source ty a)))
+              (or (= (.kind op) 7) (= (.kind op) 8))
+                (set! (mut values) index (if (truth source a) b c))
+              (= (.kind op) 9) (set! (mut values) index (t/binary (.opcode op) ty a b))
+              (= (.kind op) 10)
+                (let [(mut x) a
+                      (mut y) b
+                      (mut acc) (get values (cast i64 (.a (get ops (+ index 1)))))
+                      gather (cast i32 (.bits op))]
+                  (for [trip 0 (cast i64 (& c 3))]
+                    (when (or (and (or (= gather 26) (= gather 28)) (t/float-ambiguous? ty acc x))
+                              (and (or (= (.opcode op) 26) (= (.opcode op) 28))
+                                   (t/float-ambiguous? ty x y)))
+                      (set! unsure true))
+                    (let [next (t/float-binary (.opcode op) ty x y)]
+                      (set! acc (t/float-binary gather ty acc x))
+                      (set! x y)
+                      (set! y next)))
+                  (set! (mut values) index x)
+                  (set! (mut values) (+ index 1) y)
+                  (set! (mut values) (+ index 2) acc))
+              :else 0)))
+    unsure))
+
+(defn compare-run! [(tally (mut Tally)) (text (slice u8)) (program Program) (result i32)
+                    (floating i64) (whole i64) (case i64) (level i32) (seed u64)] (-> void)
+  (match (t/map text)
+    (Err [message]
+         (println "case {} level {}: map failed: {}" case level message)
+         (set! (.failures tally) (+ (.failures tally) 1)))
+    (Ok [mapped]
+        (let [(mut mapped) mapped
+              (mut state) (^ seed 0x7654321)
+              (mut floats) (ArrayList::new [u64] (.alc (.ops program)))
+              (mut integers) (ArrayList::new [u64] (.alc (.ops program)))
+              (mut values) (ArrayList::new [u64] (.alc (.ops program)))]
+          (for [run 0 10]
+            (clear! (mut floats))
+            (clear! (mut integers))
+            (for [p 0 floating]
+              (let [ty (.ty (get (.ops program) p))]
+                (push! (mut floats)
+                       (cond (= run 0) 0
+                             (= run 1) (t/float-specials ty (+ 6 (% p 8)))
+                             (< run 6)
+                               (t/float-specials ty (cast i64 (% (t/random! (mut state))
+                                                                 (cast u64 t/FLOAT-SPECIALS))))
+                             :else (t/random! (mut state))))))
+            (for [p 0 whole]
+              (let [raw (cond (= run 0) 0
+                              (= run 1) (cast u64 (+ p 1))
+                              (= run 2) 0xFFFFFFFFFFFFFFFF
+                              (= run 3) 0x8000000000000000
+                              :else (t/random! (mut state)))]
+                ; A BOOL argument is 0 or 1 in its byte.
+                (push! (mut integers)
+                       (if (= (.ty (get (.ops program) (+ floating p))) 1)
+                           (& raw 0xFFFFFFFFFFFFFF01)
+                           raw))))
+            (clear! (mut values))
+            (for [i 0 (len (.ops program))] (push! (mut values) 0))
+            (if (evaluate! (.ops program) (mut values) (slice floats) (slice integers))
+                (set! (.skipped tally) (+ (.skipped tally) 1))
+                (let [expected (get values (cast i64 result))
+                      actual (t/invoke-mixed mapped (slice floats) (slice integers))]
+                  (set! (.checks tally) (+ (.checks tally) 1))
+                  (when (!= actual expected)
+                    (when (< (.failures tally) 12)
+                      (println "case {} level {} run {}: got {:x} expected {:x} ({} records)"
+                               case level run actual expected (len (.ops program))))
+                    (set! (.failures tally) (+ (.failures tally) 1))))))
+          (free! (mut floats))
+          (free! (mut integers))
+          (free! (mut values))
+          (t/unmap! (mut mapped))))))
+
+(defn run-case! [(tally (mut Tally)) (case i64) (allocator (dyn Allocator))] (-> void)
+  (let [seed (+ (* (cast u64 case) 0x9E3779B97F4A7C15) 0xF10A7)
+        (mut program)
+          (Program
+            :ops (ArrayList::new [Op] allocator)
+            :graph (g/create allocator)
+            :state seed
+            :control 0)
+        start (t/start! (mut (.graph program)))
+        floating (cast i64 (+ 1 (random (mut program) 12)))
+        whole (cast i64 (+ 1 (random (mut program) 6)))
+        budget (+ 6 (random (mut program) 50))]
+    (set! (.control program) start)
+    ; Floating parameters come first, then the integer ones, as
+    ; stogir.x64.testing/invoke-mixed passes them.
+    (for [p 0 floating]
+      (let [(mut op) (blank 0 (float-type (mut program)))]
+        (set! (.a op) (cast i32 p))
+        (set! (.reference op) (t/param! (mut (.graph program)) start (.ty op) (cast i32 p)))
+        (push-op! (mut program) op)))
+    (for [p 0 whole]
+      (let [(mut op) (blank 1 (if (chance (mut program) 40) 11 (integer-type (mut program))))]
+        (set! (.a op) (cast i32 p))
+        (set! (.reference op)
+              (t/param! (mut (.graph program)) start (.ty op) (cast i32 (+ floating p))))
+        (push-op! (mut program) op)))
+    (for [k 0 (cast i64 budget)] (step! (mut program)))
+    ; Fold many values into the result so they stay live to the end.
+    (let [(mut total) (constant-op! (mut program) 5 0)
+          folds (+ 6 (random (mut program) 24))]
+      (for [k 0 (cast i64 folds)]
+        (let [source (cast i32 (random (mut program) (cast u64 (len (.ops program)))))
+              word (as-word! (mut program) source)]
+          (set! total (binary-op! (mut program) 9 (if (chance (mut program) 50) 26 48) 5
+                                  total word))))
+      (let [ret (t/return! (mut (.graph program)) (.control program) 5
+                           (reference-at program total))]
+        (set! (.functions tally) (+ (.functions tally) 1))
+        (match (compile/text (.graph program) start [ret] allocator)
+          (Err [message]
+               (println "case {} level 1: compile failed: {}" case message)
+               (set! (.failures tally) (+ (.failures tally) 1)))
+          (Ok [text]
+              (let [(mut bytes) text]
+                (compare-run! (mut tally) (slice bytes) program total floating whole case 1 seed)
+                (free! (mut bytes)))))
+        (match (compile/image-with-options (.graph program) start [ret] "stress"
+                                           (options/Options :level 2) allocator)
+          (Err [message]
+               (println "case {} level 2: compile failed: {}" case message)
+               (set! (.failures tally) (+ (.failures tally) 1)))
+          (Ok [compiled]
+              (let [(mut compiled) compiled]
+                (compare-run! (mut tally) (slice (.text compiled)) program total floating whole
+                              case 2 seed)
+                (image/release! (mut compiled)))))))
+    (free! (mut (.ops program)))
+    (g/release! (mut (.graph program)))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 float stress: skipped, not an x86-64 host") 0)
+      (let [allocator (malloc-allocator)
+            (mut tally) (Tally :checks 0 :failures 0 :functions 0 :skipped 0)]
+        (for [case 0 2000]
+          (run-case! (mut tally) case allocator))
+        (println "x64 float stress: {} functions, {} checks, {} runs not compared (two different NaNs), {} failures"
+                 (.functions tally) (.checks tally) (.skipped tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))
