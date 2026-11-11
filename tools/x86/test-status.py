@@ -38,8 +38,10 @@ FAMILY = {
         jit-floating-incoming jit-floating-loop jit-floating-memory jit-floating-phi
         jit-floating-pressure jit-floating-varargs jit-numeric-conversions jit-scalar-truth
         jit-select-floating""",
-    "vector": """jit-loop-guard jit-loop-vectorize jit-loop-vectorize-stencil jit-vector-bitcasts
-        jit-vector-lane-returns jit-vector-select-returns vector-locals""",
+    "vector": """jit-bulk-pressure jit-loop-guard jit-loop-vectorize jit-loop-vectorize-stencil
+        jit-vector-arithmetic jit-vector-bitcasts jit-vector-constants jit-vector-lane-returns
+        jit-vector-locals jit-vector-select-returns jit-vector-transport jit-vector-unary
+        vector-locals""",
     "switch+control": """forwarded-return-tail jit-equality-chain jit-loop jit-return-tail
         jit-select-dispatch jit-switch jit-switch-direct jit-switch-loop jit-switch-pressure
         jit-termination loop-carried-update-order rotated-test-block switch-prune-default
@@ -65,9 +67,14 @@ NOTES = {
     "jit-hva-abi": "AArch64 HVA convention; x86-64 expectations to be decided",
     "jit-hva-incoming": "AArch64 HVA convention; Linux Coil compiler aborts (SysV SSEUP unimplemented)",
     "jit-hva-outgoing": "AArch64 HVA convention; Linux Coil compiler aborts (SysV SSEUP unimplemented)",
-    "jit-vector-lane-returns": "Linux Coil compiler aborts (SysV SSEUP unimplemented)",
-    "jit-vector-select-returns": "Linux Coil compiler aborts (SysV SSEUP unimplemented)",
-    "vector-locals": "expects the compile to be refused; passes against the placeholder",
+    "jit-vector-lane-returns": "x86-64 passes the vector arguments through a machine-code probe (the Linux Coil compiler cannot: SysV SSEUP unimplemented)",
+    "jit-vector-select-returns": "x86-64 passes the vector arguments through a machine-code probe (the Linux Coil compiler cannot: SysV SSEUP unimplemented)",
+    "jit-bulk-pressure": "calls a machine-code probe: needs the call family",
+    "jit-vector-arithmetic": "pressure graphs call a machine-code probe: needs the call family; x86-64 leaves out trapping divisions",
+    "jit-vector-constants": "call graphs need the call family; x86-64 pool census excludes all-zero and all-ones constants",
+    "jit-vector-locals": "pressure graphs call a machine-code probe: needs the call family",
+    "jit-vector-transport": "pressure graphs call a machine-code probe: needs the call family",
+    "jit-vector-unary": "pressure graphs call a machine-code probe: needs the call family",
     "module-execution": "prefix image filler is `ret`+`nop` bytes per machine",
 }
 
@@ -145,6 +152,11 @@ def main():
             if "target/arch-pick (" in text:
                 guarded.append(name)
                 note = (note + "; " if note else "") + "AArch64 instruction-shape checks guarded"
+        elif name.startswith("x64-"):
+            # Tests of the x86-64 backend's own modules (and of the layers
+            # below it); a few name AArch64 modules for comparison.
+            category = "host-layer"
+            note = "x86-64 backend internals or the image, JIT and object layers"
         elif a64:
             category = "a64-internal"
             internal = [m for m in a64 if m not in ("compile", "private-leaf")]
@@ -179,7 +191,7 @@ def main():
         "ported-to-facade": "Import `stogir.native.compile` / `stogir.native.private-leaf` / `stogir.jit.native`. Must pass on both hosts; the gate for the x86-64 backend.",
         "a64-internal": "AArch64 backend internals, hand-encoded AArch64 code, or Mach-O. Not expected to run on x86-64.",
         "link-partner": "Links objects that a generator test wrote to /tmp; runs with `--link-flag` (README). Works on Linux once its generators pass there.",
-        "host-layer": "Image, JIT and object-writer layers below the backend, including the `x64-*` tests.",
+        "host-layer": "Image, JIT and object-writer layers below the backend, and the `x64-*` tests of the x86-64 backend's own modules.",
     }
     for category in ["neutral-IR", "ported-to-facade", "a64-internal", "link-partner", "host-layer"]:
         out.append(f"| {category} | {counts.get(category, 0)} | {meaning[category]} |")
