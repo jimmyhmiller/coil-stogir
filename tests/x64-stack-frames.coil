@@ -1,0 +1,267 @@
+(module stogir.tests.x64-stack-frames)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.x64.testing" :as t)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; Anchored (rbp) frames of the x86-64 backend, where rsp moves under the
+;;; function: dynamic and constant ALLOCA with and without over-alignment,
+;;; next to stack parameters, spilled values, preserved registers and local
+;;; variables that must all be found from rbp afterwards; BLOCK_BEGIN /
+;;; BLOCK_END and AFREE in loops that would run out of stack if they did
+;;; not restore it; static frame objects as COND arms, PHI inputs and stored
+;;; values (their addresses are rebuilt, never held in a register);
+;;; FRAME_ADDR.
+
+(defn emit! [(graph (mut g/Graph)) (opcode i32) (ty i32) (inputs (slice i32))] (-> i32)
+  (t/require (b/emit! (mut graph) opcode ty inputs)))
+
+(defn check! [(tally (mut t/Tally)) (label (slice u8)) (got u64) (wanted u64)] (-> void)
+  (set! (.checks tally) (+ (.checks tally) 1))
+  (when (!= got wanted)
+    (when (< (.failures tally) 20)
+      (println "{}: got {:x} expected {:x}" label got wanted))
+    (t/fail! (mut tally))))
+
+;;; f(p0 .. p9): ten parameters (four on the stack), `pressure` values
+;;; loaded before an ALLOCA of `alignment` (a runtime size when `dynamic`)
+;;; and used after the last one, so that they are spilled across both, the last stack parameters stored into and read
+;;; back from the new memory, a variable of `variable-alignment` written
+;;; before and read after, and a second constant ALLOCA. The result adds
+;;; the low bits of both addresses that their alignments make zero.
+(defn frame-case! [(tally (mut t/Tally)) (alignment i32) (variable-alignment i32)
+                   (dynamic bool) (pressure i64) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        (mut parameters) (primitive/zeroed (array i32 10))
+        (mut total) (: 0 i32)]
+    (for [j 0 10] (set! (mut parameters) j (t/param! (mut graph) start 11 (cast i32 j))))
+    (let [variable (t/require (b/variable! (mut graph) 5 start "kept" variable-alignment))
+          written (emit! (mut graph) 87 0 [start variable (get parameters 9)])
+          size (if dynamic
+                   (t/binary! (mut graph) 46 11
+                              (t/binary! (mut graph) 47 11 (get parameters 0)
+                                         (t/constant! (mut graph) 11 0xFF0))
+                              (t/constant! (mut graph) 11 16))
+                   (t/constant! (mut graph) 11 48))
+          (mut control) written
+          (mut early) (primitive/zeroed (array i32 32))
+          region (do
+                   ; Volatile loads of the variable (parameter 9) stay where
+                   ; they are: one value each, defined before the ALLOCA.
+                   (for [j 0 pressure]
+                     (set! control (emit! (mut graph) 86 11 [control variable]))
+                     (set! (mut early) j control))
+                   (t/require (b/stack-allocate! (mut graph) control size alignment)))
+          second (emit! (mut graph) 26 6 [region (t/constant! (mut graph) 11 8)])
+          s1 (emit! (mut graph) 93 0 [region region (get parameters 7)])
+          s2 (emit! (mut graph) 93 0 [s1 second (get parameters 8)])
+          l1 (emit! (mut graph) 91 11 [s2 second])
+          l0 (emit! (mut graph) 91 11 [l1 region])
+          kept (emit! (mut graph) 85 11 [l0 variable])
+          other (t/require (b/stack-allocate! (mut graph) kept (t/constant! (mut graph) 5 32) 0))
+          s3 (emit! (mut graph) 93 0 [other other (get parameters 6)])
+          l2 (emit! (mut graph) 91 11 [s3 other])
+          low (t/binary! (mut graph) 47 11 (t/unary! (mut graph) 36 11 region)
+                         (t/constant! (mut graph) 11
+                                      (cast u64 (- (if (> alignment 16) alignment 16) 1))))
+          place (emit! (mut graph) 65 6 [variable])
+          low-variable (t/binary! (mut graph) 47 11 (t/unary! (mut graph) 36 11 place)
+                                  (t/constant! (mut graph) 11
+                                               (cast u64 (- (if (> variable-alignment 8)
+                                                                variable-alignment
+                                                                8)
+                                                            1))))]
+      (set! total (t/binary! (mut graph) 26 11 l0 l1))
+      (set! total (t/binary! (mut graph) 26 11 total kept))
+      (set! total (t/binary! (mut graph) 26 11 total l2))
+      (set! total (t/binary! (mut graph) 26 11 total low))
+      (set! total (t/binary! (mut graph) 26 11 total low-variable))
+      (for [j 0 pressure]
+        (let [value (t/binary! (mut graph) 26 11
+                               (t/binary! (mut graph) 28 11 (get early j)
+                                          (t/constant! (mut graph) 11 (cast u64 (+ j 3))))
+                               (get parameters (% (+ j 1) 10)))]
+          (set! total (t/binary! (mut graph) 48 11 total value))))
+      (let [ret (t/return! (mut graph) l2 11 total)]
+        (match (t/compiled (mut tally) "frame" graph start [ret] a)
+          (None []
+                (println "  alignment {} variable {} dynamic {} pressure {}"
+                         alignment variable-alignment dynamic pressure)
+                0)
+          (Some [mapped]
+                (let [(mut mapped) mapped
+                      (mut state) (: 0x51A7 u64)]
+                  (for [run 0 6]
+                    (let [(mut arguments) (primitive/zeroed (array u64 10))
+                          (mut wanted) (: 0 u64)]
+                      (for [j 0 10]
+                        (set! (mut arguments) j
+                              (cond (= run 0) (: 0 u64)
+                                    (= run 1) 0xFFFFFFFFFFFFFFFF
+                                    (= run 2) (cast u64 (+ j 1))
+                                    :else (t/random! (mut state)))))
+                      (set! wanted (primitive/iadd
+                                     (primitive/iadd (get arguments 7) (get arguments 8))
+                                     (primitive/iadd (get arguments 9) (get arguments 6))))
+                      (for [j 0 pressure]
+                        (set! wanted
+                              (^ wanted
+                                 (primitive/iadd
+                                   (primitive/imul (get arguments 9) (cast u64 (+ j 3)))
+                                   (get arguments (% (+ j 1) 10))))))
+                      (check! (mut tally) "frame"
+                              (t/invoke mapped
+                                        [(get arguments 0) (get arguments 1) (get arguments 2)
+                                         (get arguments 3) (get arguments 4) (get arguments 5)
+                                         (get arguments 6) (get arguments 7) (get arguments 8)
+                                         (get arguments 9)])
+                              wanted)))
+                  (t/unmap! (mut mapped)))))))
+    (g/release! (mut graph))))
+
+;;; f(n): a loop of n iterations, each allocating `bytes` and storing and
+;;; loading in the new memory; `scope` true: inside BLOCK_BEGIN/BLOCK_END,
+;;; false: released with AFREE. Returns the sum 0 + 1 + ... + (n - 1).
+(defn loop-case! [(tally (mut t/Tally)) (scope bool) (dynamic bool) (alignment i32)
+                  (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        n (t/param! (mut graph) start 5 0)
+        bytes (t/param! (mut graph) start 5 1)
+        zero (t/constant! (mut graph) 5 0)
+        one (t/constant! (mut graph) 5 1)
+        size (if dynamic bytes (t/constant! (mut graph) 5 4096))
+        entry (t/end! (mut graph) start)
+        header (t/loop-begin! (mut graph) entry)
+        counter (t/loop-phi! (mut graph) header zero)
+        sum (t/loop-phi! (mut graph) header zero)
+        branch (t/if! (mut graph) header (t/compare! (mut graph) 20 counter n))
+        body (t/if-true! (mut graph) branch)
+        exit (t/if-false! (mut graph) branch)
+        saved (if scope (t/require (b/stack-save! (mut graph) body)) body)
+        region (t/require (b/stack-allocate! (mut graph) saved size alignment))
+        last (emit! (mut graph) 26 6 [region (t/constant! (mut graph) 11 4088)])
+        store (emit! (mut graph) 93 0 [region last counter])
+        load (emit! (mut graph) 91 5 [store last])
+        released (if scope
+                     (t/require (b/stack-restore! (mut graph) load saved))
+                     (t/require (b/stack-free! (mut graph) load size)))
+        next-sum (t/binary! (mut graph) 26 5 sum load)
+        next-counter (t/binary! (mut graph) 26 5 counter one)
+        back (t/loop-end! (mut graph) released)
+        ret (t/return! (mut graph) exit 5 sum)]
+    (t/patch! (mut graph) header 2 back)
+    (t/patch! (mut graph) counter 3 next-counter)
+    (t/patch! (mut graph) sum 3 next-sum)
+    (match (t/compiled (mut tally) "stack loop" graph start [ret] a)
+      (None [] 0)
+      (Some [mapped]
+            (let [(mut mapped) mapped]
+              ; 200000 iterations of 4096 bytes: 800 MB unless each is released.
+              (for count [(: 0 u64) 1 7 200000]
+                (check! (mut tally) "stack loop" (t/invoke mapped [count 4096])
+                        (if (= count 0) (: 0 u64) (/ (* count (- count 1)) 2))))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+;;; f(selector, x): two static frame objects (the second over-aligned when
+;;; `alignment` > 16) hold x and x + 1. Their addresses are the arms of a
+;;; COND, the inputs of a PHI and a stored value; the function loads
+;;; through each and returns cond + 3 * phi + 5 * through-stored-address
+;;; plus the low address bits the alignment makes zero.
+(defn object-case! [(tally (mut t/Tally)) (alignment i32) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        selector (t/param! (mut graph) start 11 0)
+        x (t/param! (mut graph) start 11 1)
+        first (t/require (b/frame-object! (mut graph) start (t/constant! (mut graph) 5 32) 16))
+        second (t/require (b/frame-object! (mut graph) first (t/constant! (mut graph) 5 16)
+                                           alignment))
+        chosen (t/compare! (mut graph) 15 selector (t/constant! (mut graph) 11 0))
+        s1 (emit! (mut graph) 93 0 [second first x])
+        s2 (emit! (mut graph) 93 0
+                  [s1 second (t/binary! (mut graph) 26 11 x (t/constant! (mut graph) 11 1))])
+        link (emit! (mut graph) 26 6 [first (t/constant! (mut graph) 11 16)])
+        s3 (emit! (mut graph) 93 0 [s2 link second])
+        by-cond (emit! (mut graph) 91 11 [s3 (t/select! (mut graph) 6 chosen first second)])
+        branch (t/if! (mut graph) by-cond chosen)
+        yes (t/if-true! (mut graph) branch)
+        no (t/if-false! (mut graph) branch)
+        merge (t/merge! (mut graph) (t/end! (mut graph) yes) (t/end! (mut graph) no))
+        phi (t/phi! (mut graph) 6 merge first second)
+        by-phi (emit! (mut graph) 91 11 [merge phi])
+        stored (emit! (mut graph) 91 6 [by-phi link])
+        by-stored (emit! (mut graph) 91 11 [stored stored])
+        low (t/binary! (mut graph) 47 11 (t/unary! (mut graph) 36 11 second)
+                       (t/constant! (mut graph) 11 (cast u64 (- alignment 1))))
+        result (t/binary! (mut graph) 26 11
+                          (t/binary! (mut graph) 26 11 by-cond
+                                     (t/binary! (mut graph) 28 11 by-phi
+                                                (t/constant! (mut graph) 11 3)))
+                          (t/binary! (mut graph) 26 11 low
+                                     (t/binary! (mut graph) 28 11 by-stored
+                                                (t/constant! (mut graph) 11 5))))
+        ret (t/return! (mut graph) by-stored 11 result)]
+    (match (t/compiled (mut tally) "frame objects" graph start [ret] a)
+      (None [] 0)
+      (Some [mapped]
+            (let [(mut mapped) mapped]
+              (for selector-value [(: 0 u64) 1 0xFFFFFFFF00000000]
+                (for x-value [(: 0 u64) 41 0x7FFFFFFFFFFFFFF0]
+                  (let [picked (if (= selector-value 0) (+ x-value 1) x-value)]
+                    (check! (mut tally) "frame objects"
+                            (t/invoke mapped [selector-value x-value])
+                            (primitive/iadd (primitive/imul picked 4)
+                                            (primitive/imul (+ x-value 1) 5))))))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+;;; f() = FRAME_ADDR, with a variable of `alignment`: the anchor is 16-byte
+;;; aligned (it is the address of the saved rbp, 16 below the caller's rsp
+;;; at the call) and lies just below this caller's frame.
+(defn anchor-case! [(tally (mut t/Tally)) (alignment i32) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        x (t/param! (mut graph) start 11 0)
+        variable (t/require (b/variable! (mut graph) 5 start "padding" alignment))
+        written (emit! (mut graph) 87 0 [start variable x])
+        anchor (t/require (b/frame-address! (mut graph)))
+        ret (t/return! (mut graph) written 6 anchor)]
+    (match (t/compiled (mut tally) "frame address" graph start [ret] a)
+      (None [] 0)
+      (Some [mapped]
+            (let [(mut mapped) mapped
+                  (mut local) (: 0 u64)
+                  here (primitive/cast u64 (primitive/cast (ptr u64) (mut local)))
+                  got (t/invoke mapped [5])]
+              (set! (.checks tally) (+ (.checks tally) 1))
+              (unless (and (= (& got 15) 0) (< got here) (> got (- here 4096)))
+                (println "frame address {:x} is not an anchor below {:x}" got here)
+                (t/fail! (mut tally)))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 stack frames: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (for alignment [(: 0 i32) 16 32 64 4096]
+          (for variable-alignment [(: 8 i32) 16 64 4096]
+            (for dynamic [false true]
+              (for pressure [(: 0 i64) 4 18]
+                (frame-case! (mut tally) alignment variable-alignment dynamic pressure a)))))
+        (for scope [false true]
+          (for dynamic [false true]
+            (for alignment [(: 0 i32) 64]
+              (loop-case! (mut tally) scope dynamic alignment a))))
+        (for alignment [(: 16 i32) 64 256]
+          (object-case! (mut tally) alignment a))
+        (for alignment [(: 8 i32) 256]
+          (anchor-case! (mut tally) alignment a))
+        (println "x64 stack frames: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))

@@ -1,0 +1,252 @@
+(module stogir.tests.x64-memory-named)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.symbols" :as symbols)
+(import "stogir.image" :as image)
+(import "stogir.jit.native" :as jit)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.compile" :as compile)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.image" :as emitted)
+(import "stogir.x64.testing" :as t)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; Named constants on x86-64: a function or data symbol is read from its
+;;; private 8-byte address slot with `mov r64, [rip + slot]` (PC32 to the
+;;; slot, ABS64 in the slot against the symbol), a string is addressed with
+;;; `lea r64, [rip + bytes]`, a direct call or jump is PLT32 against the
+;;; function, and a RIP-relative operand followed by an immediate carries
+;;; the addend that accounts for it. Each image's relocations are inspected
+;;; and the image is loaded and run.
+
+(extern labs :cc (cc/C) [i64] (-> i64))
+
+(defn emit! [(graph (mut g/Graph)) (opcode i32) (ty i32) (inputs (slice i32))] (-> i32)
+  (t/require (b/emit! (mut graph) opcode ty inputs)))
+
+(defn expect! [(tally (mut t/Tally)) (label (slice u8)) (what (slice u8)) (holds bool)] (-> void)
+  (set! (.checks tally) (+ (.checks tally) 1))
+  (unless holds
+    (println "{}: expected {}" label what)
+    (t/fail! (mut tally))))
+
+;;; How many relocations of `kind` in `section` the image has, and whether
+;;; each has addend `addend` and targets a symbol that is defined exactly
+;;; when `defined`.
+(defn relocations [(source image/Image) (section i32) (kind i32) (addend i64) (defined bool)]
+  (-> i64)
+  (let [(mut count) (: 0 i64)]
+    (for record (.relocations source)
+      (when (and (= (.section record) section) (= (.kind record) kind))
+        (let [symbol (get (.symbols source) (cast i64 (.symbol record)))]
+          (if (and (= (.addend record) addend) (= (!= (.section symbol) 0) defined))
+              (set! count (+ count 1))
+              (set! count -1000)))))
+    count))
+
+;;; Load `source` with every undefined symbol named `first` bound to
+;;; `first-address` and every other one to `other-address`.
+(defn bind [(tally (mut t/Tally)) (label (slice u8)) (source image/Image) (first (slice u8))
+            (first-address u64) (other-address u64) (a (dyn Allocator))]
+  (-> (Result jit/Loaded (slice u8)))
+  (let [(mut addresses) (ArrayList::new [u64] a)
+        (mut present) (ArrayList::new [bool] a)
+        chosen (match (image/find-symbol source first) (Some [index] index) (None [] -1))]
+    (for [i 0 (len (.symbols source))]
+      (push! (mut addresses) (if (= (cast i32 i) chosen) first-address other-address))
+      (push! (mut present) true))
+    (let [result (jit/map-image-resolved source (slice addresses) (slice present) a)]
+      (free! (mut addresses))
+      (free! (mut present))
+      result)))
+
+(defstruct Cells [(first i64) (second i64) (third i64)])
+
+;;; mode 0: f() = address of data symbol "cell"; 1: f() = *cell;
+;;; 2: f(x): cell[2] = x, returns cell[1] + cell[2] (two more reads of the
+;;; same symbol); 3: f() = address of function "labs"; 4: f(i) = the byte
+;;; "stogir"[i]; 5: f(x) = (cell == &x) is false, via a compare of the symbol.
+(defn graph-case! [(tally (mut t/Tally)) (label (slice u8)) (mode i32) (a (dyn Allocator))]
+  (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        x (t/param! (mut graph) start 11 0)
+        cell (t/require (symbols/symbol! (mut graph) "cell"))
+        function (t/require (symbols/function! (mut graph) "labs" 0))
+        text (t/require (symbols/string! (mut graph) "stogir"))
+        eight (t/constant! (mut graph) 11 8)
+        sixteen (t/constant! (mut graph) 11 16)
+        ret (cond (= mode 0) (t/return! (mut graph) start 6 cell)
+                  (= mode 1)
+                    (let [load (emit! (mut graph) 91 11 [start cell])]
+                      (t/return! (mut graph) load 11 load))
+                  (= mode 2)
+                    (let [third (emit! (mut graph) 26 6 [cell sixteen])
+                          second (emit! (mut graph) 26 6 [cell eight])
+                          store (emit! (mut graph) 93 0 [start third x])
+                          one (emit! (mut graph) 91 11 [store second])
+                          two (emit! (mut graph) 91 11 [one third])]
+                      (t/return! (mut graph) two 11 (t/binary! (mut graph) 26 11 one two)))
+                  (= mode 3) (t/return! (mut graph) start 6 function)
+                  (= mode 4)
+                    (let [load (emit! (mut graph) 91 2 [start (emit! (mut graph) 26 6 [text x])])]
+                      (t/return! (mut graph) load 5 (t/unary! (mut graph) 34 5 load)))
+                  :else
+                    (let [same (t/compare! (mut graph) 14 cell (t/unary! (mut graph) 36 6 x))]
+                      (t/return! (mut graph) start 11
+                                 (t/select! (mut graph) 11 same eight sixteen))))]
+    (set! (.functions tally) (+ (.functions tally) 1))
+    (match (compile/image graph start [ret] "named_entry" a)
+      (Err [message]
+           (println "{}: compile failed: {}" label message)
+           (t/fail! (mut tally)))
+      (Ok [compiled]
+          (let [(mut compiled) compiled
+                (mut cells) (Cells :first 1111 :second 2222 :third 3333)
+                cell-address (primitive/cast u64 (primitive/cast (ptr i64) (mut cells)))
+                labs-address (primitive/cast u64 (primitive/cast (ptr u8) (fnptr-of labs)))
+                pc32 (relocations compiled 1 image/X64-PC32 -4 true)
+                slots (relocations compiled 2 image/ABS64 0 false)]
+            (expect! (mut tally) label "the PC32 references, addend -4, to private data"
+                     (= pc32 (cond (= mode 2) (: 3 i64) :else 1)))
+            (expect! (mut tally) label "one ABS64 address slot per symbol"
+                     (= slots (if (= mode 4) (: 0 i64) 1)))
+            (expect! (mut tally) label "no other relocation"
+                     (= (len (.relocations compiled)) (+ pc32 slots)))
+            (when (= mode 4)
+              (expect! (mut tally) label "the string bytes and their terminator in data"
+                       (and (= (len (.data compiled)) 7) (= (get (.data compiled) 0) #\s)
+                            (= (get (.data compiled) 5) #\r) (= (get (.data compiled) 6) 0))))
+            (match (bind (mut tally) label compiled "cell" cell-address labs-address a)
+              (Err [message]
+                   (println "{}: load failed: {}" label message)
+                   (t/fail! (mut tally)))
+              (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        f (primitive/cast (fnptr (cc/C) [u64] u64) (.base (.memory loaded)))]
+                    (cond (= mode 0)
+                            (expect! (mut tally) label "the symbol's address"
+                                     (= (call-ptr f 0) cell-address))
+                          (= mode 1)
+                            (expect! (mut tally) label "the symbol's first word" (= (call-ptr f 0) 1111))
+                          (= mode 2)
+                            (do
+                              (expect! (mut tally) label "the sum of the second and stored third word"
+                                       (= (call-ptr f 40) 2262))
+                              (expect! (mut tally) label "the store through the symbol"
+                                       (and (= (.third cells) 40) (= (.first cells) 1111))))
+                          (= mode 3)
+                            (expect! (mut tally) label "the function's address"
+                                     (= (call-ptr f 0) labs-address))
+                          (= mode 4)
+                            (for [i 0 7]
+                              (expect! (mut tally) label "the string's bytes"
+                                       (= (call-ptr f (cast u64 i))
+                                          (cast u64 (get "stogir\0" i)))))
+                          :else
+                            (do
+                              (expect! (mut tally) label "the symbol differs from another address"
+                                       (= (call-ptr f 5) 16))
+                              (expect! (mut tally) label "the symbol equals its own address"
+                                       (= (call-ptr f cell-address) 8))))
+                    (jit/release-image! (mut loaded)))))
+            (image/release! (mut compiled)))))
+    (g/release! (mut graph))))
+
+(defn accept! [(tally (mut t/Tally)) (result (Result i64 (slice u8)))] (-> void)
+  (match result
+    (Err [message] (println "encode failed: {}" message) (t/fail! (mut tally)))
+    (Ok [_] 0)))
+
+;;; Hand-emitted code through the reference helpers. mode 0: f(x) = labs(x)
+;;; by `call` (PLT32); 1: the same by a tail `jmp`; 2: f() = whether the
+;;; first four string bytes are "stog", by `cmp dword [rip + s], imm32`
+;;; (addend -8); 3: whether the first byte is 's', by `cmp byte [rip + s],
+;;; imm8` (addend -5).
+(defn code-case! [(tally (mut t/Tally)) (label (slice u8)) (mode i32) (a (dyn Allocator))]
+  (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        function (t/require (symbols/function! (mut graph) "labs" 0))
+        text (t/require (symbols/string! (mut graph) "stogir"))
+        (mut out) (code/create a)
+        rsp (: 4 i32)
+        rax (: 0 i32)]
+    (set! (.functions tally) (+ (.functions tally) 1))
+    (cond (= mode 0)
+            (do
+              (accept! (mut tally) (encode/alu-ri (mut (.text out)) encode/SUB 64 rsp 8))
+              (match (code/direct-call! (mut out) graph function)
+                (Err [message] (println "{}: {}" label message) (t/fail! (mut tally)))
+                (Ok [_] 0))
+              (accept! (mut tally) (encode/alu-ri (mut (.text out)) encode/ADD 64 rsp 8))
+              (accept! (mut tally) (encode/ret (mut (.text out)))))
+          (= mode 1)
+            (match (code/direct-jump! (mut out) graph function)
+              (Err [message] (println "{}: {}" label message) (t/fail! (mut tally)))
+              (Ok [_] 0))
+          :else
+            (match (if (= mode 2)
+                       (encode/alu-mi (mut (.text out)) encode/CMP 32 (encode/mem-rip 0) 0x676F7473)
+                       (encode/alu-mi (mut (.text out)) encode/CMP 8 (encode/mem-rip 0) 0x73))
+              (Err [message] (println "{}: {}" label message) (t/fail! (mut tally)))
+              (Ok [field]
+                  (match (code/rip-reference! (mut out) field text)
+                    (Err [message] (println "{}: {}" label message) (t/fail! (mut tally)))
+                    (Ok [_] 0))
+                  (accept! (mut tally) (encode/setcc-r (mut (.text out)) encode/CC-E rax))
+                  (accept! (mut tally) (encode/movzx-rr (mut (.text out)) 32 8 rax rax))
+                  (accept! (mut tally) (encode/ret (mut (.text out)))))))
+    (match (emitted/finish! (mut out) graph "code_entry" a)
+      (Err [message]
+           (println "{}: image failed: {}" label message)
+           (t/fail! (mut tally)))
+      (Ok [compiled]
+          (let [(mut compiled) compiled
+                labs-address (primitive/cast u64 (primitive/cast (ptr u8) (fnptr-of labs)))]
+            (expect! (mut tally) label "exactly the one relocation with its addend"
+                     (and (= (len (.relocations compiled)) 1)
+                          (= (cond (<= mode 1) (relocations compiled 1 image/X64-PLT32 -4 false)
+                                   (= mode 2) (relocations compiled 1 image/X64-PC32 -8 true)
+                                   :else (relocations compiled 1 image/X64-PC32 -5 true))
+                             1)))
+            (match (bind (mut tally) label compiled "labs" labs-address labs-address a)
+              (Err [message]
+                   (println "{}: load failed: {}" label message)
+                   (t/fail! (mut tally)))
+              (Ok [loaded]
+                  (let [(mut loaded) loaded
+                        f (primitive/cast (fnptr (cc/C) [i64] i64) (.base (.memory loaded)))]
+                    (if (<= mode 1)
+                        (for x [(: -9 i64) 0 12]
+                          (expect! (mut tally) label "labs of the argument"
+                                   (= (call-ptr f x) (labs x))))
+                        (expect! (mut tally) label "the comparison with the string to hold"
+                                 (= (call-ptr f 0) 1)))
+                    (jit/release-image! (mut loaded)))))
+            (image/release! (mut compiled)))))
+    (code/release! (mut out))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 memory named: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (graph-case! (mut tally) "symbol address" 0 a)
+        (graph-case! (mut tally) "load through a symbol" 1 a)
+        (graph-case! (mut tally) "store and loads at symbol offsets" 2 a)
+        (graph-case! (mut tally) "function address" 3 a)
+        (graph-case! (mut tally) "string bytes" 4 a)
+        (graph-case! (mut tally) "symbol comparison" 5 a)
+        (code-case! (mut tally) "direct call" 0 a)
+        (code-case! (mut tally) "direct jump" 1 a)
+        (code-case! (mut tally) "rip operand with imm32" 2 a)
+        (code-case! (mut tally) "rip operand with imm8" 3 a)
+        (println "x64 memory named: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))
