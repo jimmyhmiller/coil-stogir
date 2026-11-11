@@ -4,6 +4,7 @@
 (import "stogir.options" :as options)
 (import "stogir.image" :as image)
 (import "stogir.x64.compile" :as compile)
+(import "stogir.x64.code" :as buffer)
 (import "stogir.x64.testing" :as t)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [Allocator malloc-allocator])
@@ -13,27 +14,39 @@
 ;;; random integer functions: up to ten parameters of random integer types
 ;;; (so some arrive on the stack), dozens of arithmetic, shift, division,
 ;;; comparison, conversion and selection nodes with constant and repeated
-;;; operands, diamonds with PHIs, and counted loops (nested up to two deep)
-;;; whose PHIs include swaps. Many values stay live to the end, far more
-;;; than there are registers. Each function is described twice from the same
-;;; random choices: as a graph for the backend and as a list of `Op` records
-;;; for the small interpreter below. Both are run on several argument sets,
-;;; at optimization level one (the graph as given) and level two (after
-;;; SCCP), and must agree.
+;;; operands, diamonds with PHIs, switches (dense, sparse and windowed
+;;; cases, ranges, cases that share a block, on every integer type) and
+;;; counted loops (nested up to three deep) whose PHIs include swaps. Many
+;;; values stay live to the end, far more than there are registers. Each
+;;; function is described twice from the same random choices: as a graph for
+;;; the backend and as a list of `Op` records for the small interpreter
+;;; below. Both are run on several argument sets, at optimization level one
+;;; (the graph as given), level two (after SCCP) and level three (after its
+;;; graph stages), and must agree. The emission summaries of the level-one
+;;; code are added up, to show that edge stubs, entry-placed edge moves,
+;;; jump tables, short and long jumps and reused flags all occurred.
 
 ;;; kind: 0 parameter (a = ordinal), 1 constant (bits), 2 binary (a, b),
 ;;; 3 unary (a), 4 conversion (a), 5 COND (a = condition, b, c),
 ;;; 6 diamond PHI (a = condition, b = taken value, c = other value),
 ;;; 7 loop PHI (a = initial value, b = value carried round the loop),
 ;;; 8 loop (a = trip count; the PHIs are records [c, own index) with the
-;;; counter first; the body is records [first, last)).
+;;; counter first; the body is records [first, last)),
+;;; 9 switch PHI (a = selector, c = the default's value; its cases are
+;;; `cases[first .. last)`).
 (defstruct Op
   [(kind i32) (opcode i32) (ty i32) (a i32) (b i32) (c i32) (bits u64)
    (reference i32) (first i32) (last i32)])
 
+;;; One case of a switch: its bounds as order keys of the selector type (the
+;;; value with the sign bit flipped for a signed type, so that keys compare
+;;; unsigned), and the record whose value the switch PHI takes for it.
+(defstruct Choice [(low u64) (high u64) (value i32)])
+
 (defstruct Program
   [(ops (ArrayList Op))
    (visible (ArrayList i32))
+   (cases (ArrayList Choice))
    (graph g/Graph)
    (state u64)
    (parameters i32)
@@ -207,6 +220,113 @@
                                (reference-at program yes) (reference-at program no)))
               (push-op! (mut program) op)))))
 
+;;; The order key of `value` in `ty`, and back.
+(defn order-key [(ty i32) (value u64)] (-> u64)
+  (^ (& value (t/mask ty))
+     (if (types/signed? ty) (<< (: 1 u64) (cast u64 (- (t/bits ty) 1))) 0)))
+
+;;; A switch on a visible value in block `control`: one to a dozen cases
+;;; (sometimes several dozen dense ones), singletons and ranges, grouped
+;;; onto up to four blocks, plus the default. Every group and the default
+;;; end in one MERGE whose PHI takes a visible value per group. Returns the
+;;; MERGE.
+(defn switch! [(program (mut Program)) (control i32)] (-> i32)
+  (let [ty (random-type (mut program))
+        selector (pick! (mut program) ty)
+        result-ty (random-type (mut program))
+        limit (t/mask ty)
+        style (random (mut program) 3)
+        wanted (if (and (= style 0) (chance (mut program) 15))
+                   (+ 20 (random (mut program) 40))
+                   (+ 1 (random (mut program) 12)))
+        groups (cast i64 (+ 1 (random (mut program) 4)))
+        base (order-key ty (interesting (mut program) ty))
+        (mut keys) (ArrayList::new [u64] (.alc (.ops program)))
+        (mut group-ends) (ArrayList::new [i32] (.alc (.ops program)))
+        (mut merged) (ArrayList::new [i32] (.alc (.ops program)))
+        (mut values) (ArrayList::new [i32] (.alc (.ops program)))
+        (mut inputs) (ArrayList::new [i32] (.alc (.ops program)))
+        first-case (cast i32 (len (.cases program)))]
+    ; Distinct keys: dense from a base, anywhere, or inside a 64-value
+    ; window. A key past the type's last value is dropped.
+    (for [k 0 (cast i64 wanted)]
+      (let [key (cond (= style 0) (+ base (cast u64 k))
+                      (= style 1) (order-key ty (t/random! (mut (.state program))))
+                      :else (+ base (random (mut program) 64)))
+            (mut fresh) (and (>= key base) (<= key limit))]
+        (when (= style 1) (set! fresh true))
+        (for existing keys (when (= existing key) (set! fresh false)))
+        (when fresh (push! (mut keys) key))))
+    ; Sorted, so that a case can grow into a range up to the next one.
+    (for [i 1 (len keys)]
+      (let [key (get keys i)
+            (mut j) i]
+        (while (and (> j 0) (> (get keys (- j 1)) key))
+          (set! (mut keys) j (get keys (- j 1)))
+          (set! j (- j 1)))
+        (set! (mut keys) j key)))
+    (for [g 0 groups]
+      (push! (mut values) (pick! (mut program) result-ty)))
+    (let [default-value (pick! (mut program) result-ty)
+          sign (order-key ty 0)
+          switch (t/switch! (mut (.graph program)) control (reference-at program selector))]
+      (for [g 0 groups]
+        (clear! (mut group-ends))
+        (for [i 0 (len keys)]
+          (when (= (% i groups) g)
+            (let [low (get keys i)
+                  room (if (< (+ i 1) (len keys))
+                           (- (- (get keys (+ i 1)) low) 1)
+                           (- limit low))
+                  span (if (and (> room 0) (chance (mut program) 25))
+                           (+ 1 (random (mut program) (if (> room 9) 9 room)))
+                           0)
+                  high (+ low span)
+                  low-constant (t/constant! (mut (.graph program)) ty (^ low sign))
+                  projection (if (= span 0)
+                                 (t/case-value! (mut (.graph program)) switch low-constant)
+                                 (t/case-range! (mut (.graph program)) switch low-constant
+                                                (t/constant! (mut (.graph program)) ty
+                                                             (^ high sign))))]
+              (push! (mut (.cases program))
+                     (Choice :low low :high high :value (get values g)))
+              (push! (mut group-ends) (t/end! (mut (.graph program)) projection)))))
+        ; A group of several cases meets in a block of its own, which every
+        ; one of them forwards to.
+        (cond (= (len group-ends) 1)
+                (do (push! (mut merged) (get group-ends 0))
+                    (push! (mut inputs) (reference-at program (get values g))))
+              (> (len group-ends) 1)
+                (do (push! (mut merged)
+                           (t/end! (mut (.graph program))
+                                   (t/merge-all! (mut (.graph program)) (slice group-ends))))
+                    (push! (mut inputs) (reference-at program (get values g))))
+              :else 0))
+      (push! (mut merged)
+             (t/end! (mut (.graph program)) (t/case-default! (mut (.graph program)) switch)))
+      (push! (mut inputs) (reference-at program default-value))
+      (let [(mut op) (blank 9 result-ty)
+            single (= (len merged) 1)
+            merge (if single
+                      (t/begin! (mut (.graph program)) (get merged 0))
+                      (t/merge-all! (mut (.graph program)) (slice merged)))]
+        (set! (.a op) selector)
+        (set! (.c op) default-value)
+        (set! (.first op) first-case)
+        (set! (.last op) (cast i32 (len (.cases program))))
+        (set! (.reference op)
+              (if single
+                  (reference-at program default-value)
+                  (t/phi-all! (mut (.graph program)) result-ty merge (slice inputs)
+                              (.alc (.ops program)))))
+        (push-op! (mut program) op)
+        (free! (mut keys))
+        (free! (mut group-ends))
+        (free! (mut merged))
+        (free! (mut values))
+        (free! (mut inputs))
+        merge))))
+
 ;;; Random nodes and control structure starting in block `control`. Returns
 ;;; the block control ends in.
 (defn segment! [(program (mut Program)) (control i32) (depth i32) (length i32)] (-> i32)
@@ -215,7 +335,9 @@
       (when (> (.budget program) 0)
         (set! (.budget program) (- (.budget program) 1))
         (let [which (random (mut program) 100)]
-          (cond (< which 78) (do (node! (mut program)) 0)
+          (cond (< which 74) (do (node! (mut program)) 0)
+                (< which 80)
+                  (do (set! current (switch! (mut program) current)) 0)
                 (< which 90)
                   ; A diamond: both arms are empty blocks; whatever only one
                   ; PHI input needs is placed into its arm by scheduling.
@@ -240,7 +362,7 @@
                     (push-op! (mut program) op)
                     (set! current merge)
                     0)
-                (< depth 2)
+                (< depth 3)
                   (set! current (loop! (mut program) current depth))
                 :else (do (node! (mut program)) 0)))))
     current))
@@ -319,7 +441,8 @@
             exit))))))
 
 ;;; Evaluate records [first, last) into `values`.
-(defn evaluate! [(ops (ArrayList Op)) (values (mut (ArrayList u64))) (arguments (slice u64))
+(defn evaluate! [(ops (ArrayList Op)) (cases (ArrayList Choice))
+                 (values (mut (ArrayList u64))) (arguments (slice u64))
                  (first i32) (last i32)] (-> void)
   (let [(mut index) first]
     (while (< index last)
@@ -342,6 +465,14 @@
               (or (= kind 5) (= kind 6))
                 (set! (mut values) (cast i64 index) (if (!= a 0) b c))
               (= kind 7) 0
+              (= kind 9)
+                (let [key (order-key (.ty (get ops (cast i64 (.a op)))) a)
+                      (mut chosen) (.c op)]
+                  (for [k (cast i64 (.first op)) (cast i64 (.last op))]
+                    (let [choice (get cases k)]
+                      (when (and (>= key (.low choice)) (<= key (.high choice)))
+                        (set! chosen (.value choice)))))
+                  (set! (mut values) (cast i64 index) (get values (cast i64 chosen))))
               :else
                 (let [limit a
                       phis (.c op)
@@ -350,7 +481,7 @@
                     (set! (mut values) p
                           (get values (cast i64 (.a (get ops p))))))
                   (while (< (get values (cast i64 phis)) limit)
-                    (evaluate! ops (mut values) arguments (.first op) (.last op))
+                    (evaluate! ops cases (mut values) arguments (.first op) (.last op))
                     (clear! (mut next))
                     (for [p (cast i64 phis) (cast i64 index)]
                       (push! (mut next) (get values (cast i64 (.b (get ops p))))))
@@ -360,7 +491,9 @@
                   (set! index (- (.last op) 1))))
         (set! index (+ index 1))))))
 
-(defstruct Tally [(checks i64) (failures i64) (functions i64) (framed i64) (bytes i64)])
+(defstruct Tally
+  [(checks i64) (failures i64) (functions i64) (framed i64) (bytes i64)
+   (jumps i64) (short i64) (tables i64) (stubs i64) (entries i64) (fused i64) (padding i64)])
 
 ;;; Whether the function starts with `sub rsp, N`: it has spill slots or
 ;;; saves preserved registers.
@@ -398,7 +531,7 @@
                            raw))))
             (clear! (mut values))
             (for [i 0 (len (.ops program))] (push! (mut values) 0))
-            (evaluate! (.ops program) (mut values) (slice arguments) 0
+            (evaluate! (.ops program) (.cases program) (mut values) (slice arguments) 0
                        (cast i32 (len (.ops program))))
             (let [expected (t/returned ty (get values (cast i64 result)))
                   actual (& (t/invoke mapped (slice arguments)) (t/returned-mask ty))]
@@ -418,6 +551,7 @@
           (Program
             :ops (ArrayList::new [Op] allocator)
             :visible (ArrayList::new [i32] allocator)
+            :cases (ArrayList::new [Choice] allocator)
             :graph (g/create allocator)
             :state seed
             :parameters 0
@@ -448,37 +582,61 @@
             result (coerce! (mut program) total ty)
             ret (t/return! (mut (.graph program)) control ty (reference-at program result))]
         (set! (.functions tally) (+ (.functions tally) 1))
-        (match (compile/text (.graph program) start [ret] allocator)
+        (match (compile/generate (.graph program) start [ret] allocator)
           (Err [message]
                (println "case {} level 1: compile failed: {}" case message)
                (set! (.failures tally) (+ (.failures tally) 1)))
-          (Ok [text]
-              (let [(mut bytes) text]
-                (when (framed? (slice bytes)) (set! (.framed tally) (+ (.framed tally) 1)))
-                (set! (.bytes tally) (+ (.bytes tally) (len bytes)))
-                (compare-run! (mut tally) (slice bytes) program result ty case 1 seed)
-                (free! (mut bytes)))))
-        (match (compile/image-with-options (.graph program) start [ret] "stress"
-                                           (options/Options :level 2) allocator)
-          (Err [message]
-               (println "case {} level 2: compile failed: {}" case message)
-               (set! (.failures tally) (+ (.failures tally) 1)))
-          (Ok [compiled]
-              (let [(mut compiled) compiled]
-                (compare-run! (mut tally) (slice (.text compiled)) program result ty case 2 seed)
-                (image/release! (mut compiled)))))))
+          (Ok [emitted]
+              (let [(mut emitted) emitted
+                    summary (.summary emitted)]
+                (when (framed? (slice (.text emitted)))
+                  (set! (.framed tally) (+ (.framed tally) 1)))
+                (set! (.bytes tally) (+ (.bytes tally) (len (.text emitted))))
+                (set! (.jumps tally)
+                      (+ (.jumps tally) (.conditional summary) (.unconditional summary)))
+                (set! (.short tally) (+ (.short tally) (.short summary)))
+                (set! (.tables tally) (+ (.tables tally) (.tables summary)))
+                (set! (.stubs tally) (+ (.stubs tally) (.stubs summary)))
+                (set! (.entries tally) (+ (.entries tally) (.entries summary)))
+                (set! (.fused tally) (+ (.fused tally) (.fused-tests summary)))
+                (set! (.padding tally) (+ (.padding tally) (.padding summary)))
+                (compare-run! (mut tally) (slice (.text emitted)) program result ty case 1 seed)
+                (buffer/release! (mut emitted)))))
+        (for level [(: 2 i32) 3]
+          (match (compile/image-with-options (.graph program) start [ret] "stress"
+                                             (options/Options :level level) allocator)
+            (Err [message]
+                 (println "case {} level {}: compile failed: {}" case level message)
+                 (set! (.failures tally) (+ (.failures tally) 1)))
+            (Ok [compiled]
+                (let [(mut compiled) compiled]
+                  (compare-run! (mut tally) (slice (.text compiled)) program result ty case
+                                level seed)
+                  (image/release! (mut compiled))))))))
     (free! (mut (.ops program)))
     (free! (mut (.visible program)))
+    (free! (mut (.cases program)))
     (g/release! (mut (.graph program)))))
 
 (defn main [] (-> i64)
   (if (not (t/host?))
       (do (println "x64 core stress: skipped, not an x86-64 host") 0)
       (let [allocator (malloc-allocator)
-            (mut tally) (Tally :checks 0 :failures 0 :functions 0 :framed 0 :bytes 0)]
+            (mut tally) (Tally :checks 0 :failures 0 :functions 0 :framed 0 :bytes 0
+                               :jumps 0 :short 0 :tables 0 :stubs 0 :entries 0 :fused 0
+                               :padding 0)]
         (for [case 0 2000]
           (run-case! (mut tally) case allocator))
         (println "x64 core stress: {} functions ({} with a frame, {} bytes at level one), {} checks, {} failures"
                  (.functions tally) (.framed tally) (.bytes tally) (.checks tally)
                  (.failures tally))
+        (println "  level one: {} jumps ({} short), {} jump tables, {} edge stubs, {} entry-placed edges, {} compares dropped, {} bytes of padding"
+                 (.jumps tally) (.short tally) (.tables tally) (.stubs tally) (.entries tally)
+                 (.fused tally) (.padding tally))
+        ; Every control-flow path of the driver was taken somewhere.
+        (unless (and (> (.short tally) 0) (> (.jumps tally) (.short tally))
+                     (> (.tables tally) 0) (> (.stubs tally) 0) (> (.entries tally) 0)
+                     (> (.fused tally) 0) (> (.padding tally) 0))
+          (println "  a path of the driver was never taken")
+          (set! (.failures tally) (+ (.failures tally) 1)))
         (if (= (.failures tally) 0) 0 1))))
