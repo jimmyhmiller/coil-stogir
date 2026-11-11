@@ -244,11 +244,27 @@ UNARY_OPS = ["fsqrt", "frintn", "frintp", "frintm", "frintz", "frinta"]
 BINARY_OPS = ["fmin", "fmax", "fminnm", "fmaxnm"]
 
 
-def table(name, values):
+def table(name, values, group):
+    """An array of u64, `group` values to a paragraph, laid out as `coil fmt`
+    fills a vector of numbers (80 columns)."""
     print("(def %s" % name)
-    for i, v in enumerate(values):
-        head = "  [(: 0x%X u64)" % v if i == 0 else "   0x%X" % v
-        print(head + ("])" if i == len(values) - 1 else ""))
+    lines = []
+    for start in range(0, len(values), group):
+        if start:
+            lines.append("")
+        line = ""
+        for v in values[start:start + group]:
+            word = "0x%X" % v
+            # the vector's elements start in column 6; "]" closes the last line
+            if line and 6 + len(line) + 1 + len(word) > 80 - (start + group >= len(values)):
+                lines.append(line)
+                line = word
+            else:
+                line = line + " " + word if line else word
+        lines.append(line)
+    text = "\n".join(("      " + line if line else "") for line in lines)
+    print("  (: [" + text[6:] + "]")
+    print("     (array u64 %d)))" % len(values))
     print()
 
 
@@ -262,24 +278,24 @@ def main():
     for width, label, column in ((64, "WIDE", 0), (32, "NARROW", 1)):
         f = Fmt(width)
         p = [x[column] for x in PATTERNS]
-        table("%s-PATTERNS" % label, p)
+        table("%s-PATTERNS" % label, p, len(p))
         unary = []
         for op in UNARY_OPS:
             for a in p:
                 unary.append(f.sqrt(a) if op == "fsqrt" else f.rint(op, a))
-        table("%s-UNARY" % label, unary)
+        table("%s-UNARY" % label, unary, len(p))
         binary = []
         for op in BINARY_OPS:
             for a in p[:BINARY]:
                 for b in p[:BINARY]:
                     binary.append(f.minmax(op, a, b))
-        table("%s-BINARY" % label, binary)
+        table("%s-BINARY" % label, binary, BINARY)
         ternary = []
         for a in p[:TERNARY]:
             for b in p[:TERNARY]:
                 for c in p[:TERNARY]:
                     ternary.append(f.fma(a, b, c))
-        table("%s-TERNARY" % label, ternary)
+        table("%s-TERNARY" % label, ternary, TERNARY)
 
 
 main()
