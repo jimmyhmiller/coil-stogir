@@ -1,0 +1,341 @@
+(module stogir.tests.x64-relax-functions)
+(import "stogir.graph" :as g)
+(import "stogir.x64.testing" :as t)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; Branch relaxation and alignment in compiled functions, executed. (The
+;;; driver verifies every branch of every function it emits against its
+;;; label; tests/x64-relax-records.coil checks the pass byte for byte. Here
+;;; the relaxed code runs.)
+;;;
+;;;   * a guarded loop whose size sweeps across the rel8 limits behind
+;;;     straight-line code of every length modulo 16: a forward jump over
+;;;     the padded loop top and a backward jump to it, each short exactly
+;;;     while it fits, at every padding amount
+;;;   * a chain of nested conditionals: each forward jump spans the ones
+;;;     inside it, so their sizes depend on each other
+;;;   * functions of more than 64 KB: thousands of small loops inside one
+;;;     large loop (short jumps next to long backward and forward ones),
+;;;     diamonds and early exits whose far arms sit behind the main path,
+;;;     and a jump table reached across the whole body
+
+(defn add [(x u64) (y u64)] (-> u64) (primitive/iadd x y))
+
+(defn mul [(x u64) (y u64)] (-> u64) (primitive/imul x y))
+
+;;; x = (i32) p; lead times: x += k + 1;  v = (i64) x
+;;; if (n != 0) do { v = v * 3 + n; body times: v += 7 + j; n -= 1; } while (n != 0);
+;;; return v
+;;; Returns the number of short jumps, or -1 when it did not compile.
+(defn sweep! [(tally (mut t/Tally)) (lead i64) (body i64) (a (dyn Allocator))] (-> i64)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        p (t/param! (mut graph) start 11 0)
+        n (t/param! (mut graph) start 11 1)
+        (mut x) (t/unary! (mut graph) 35 10 p)
+        (mut shorts) (: -1 i64)]
+    (for [k 0 lead]
+      (set! x (t/binary! (mut graph) 26 10 x (t/constant! (mut graph) 10 (cast u64 (+ k 1))))))
+    (let [seed (t/unary! (mut graph) 33 11 x)
+          zero (t/constant! (mut graph) 11 0)
+          guard (t/if! (mut graph) start (t/compare! (mut graph) 15 n zero))
+          enter (t/if-true! (mut graph) guard)
+          skip (t/if-false! (mut graph) guard)
+          header (t/loop-begin! (mut graph) (t/end! (mut graph) enter))
+          i (t/loop-phi! (mut graph) header n)
+          value (t/loop-phi! (mut graph) header seed)
+          (mut next-value) (t/binary! (mut graph) 26 11
+                                      (t/binary! (mut graph) 28 11 value
+                                                 (t/constant! (mut graph) 11 3))
+                                      i)]
+      (for [j 0 body]
+        (set! next-value (t/binary! (mut graph) 26 11 next-value
+                                    (t/constant! (mut graph) 11 (cast u64 (+ 7 j))))))
+      (let [next-i (t/binary! (mut graph) 27 11 i (t/constant! (mut graph) 11 1))
+            branch (t/if! (mut graph) header (t/compare! (mut graph) 15 next-i zero))
+            again (t/if-true! (mut graph) branch)
+            done (t/if-false! (mut graph) branch)
+            back (t/loop-end! (mut graph) again)
+            merge (t/merge! (mut graph) (t/end! (mut graph) skip) (t/end! (mut graph) done))
+            result (t/phi! (mut graph) 11 merge seed next-value)
+            ret (t/return! (mut graph) merge 11 result)]
+        (t/patch! (mut graph) header 2 back)
+        (t/patch! (mut graph) i 3 next-i)
+        (t/patch! (mut graph) value 3 next-value)
+        (match (t/generated (mut tally) "sweep" graph start [ret] a)
+          (None [] 0)
+          (Some [made]
+                (let [(mut mapped) (.mapped made)
+                      summary (.summary made)]
+                  (set! shorts (.short summary))
+                  ; The guard and the loop's own jump; nothing else.
+                  (t/check! (mut tally) (= (.conditional summary) 2) "sweep: conditional jumps"
+                            (.conditional summary) 2)
+                  (t/check! (mut tally) (= (.unconditional summary) 0) "sweep: jmp"
+                            (.unconditional summary) 0)
+                  (t/check! (mut tally) (<= (.padding summary) 10) "sweep: padding"
+                            (.padding summary) 10)
+                  (for count [(: 0 u64) 1 2 5]
+                    (let [(mut model) (: 9 u64)
+                          (mut k) count]
+                      (for [j 0 lead]
+                        (set! model (& (add model (cast u64 (+ j 1))) 0xFFFFFFFF)))
+                      (set! model (cast u64 (cast i64 (t/signed 10 model))))
+                      (while (> k 0)
+                        (set! model (add (mul model 3) k))
+                        (for [j 0 body] (set! model (add model (cast u64 (+ 7 j)))))
+                        (set! k (- k 1)))
+                      (t/expect! (mut tally) "sweep" mapped 11 [9 count] model)))
+                  (t/unmap! (mut mapped)))))))
+    (g/release! (mut graph))
+    shorts))
+
+;;; depth nested conditionals around one addition:
+;;;   if (p & 1) { v += 1; if (p & 2) { v += 2; ... } v ^= k; }
+;;; Each IF's forward jump spans every IF inside it.
+(defn nest! [(tally (mut t/Tally)) (depth i64) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        p (t/param! (mut graph) start 11 0)
+        zero (t/constant! (mut graph) 11 0)
+        (mut control) start
+        (mut value) (t/param! (mut graph) start 11 1)
+        (mut skips) (ArrayList::new [i32] a)
+        (mut skipped) (ArrayList::new [i32] a)]
+    ; Going in: each level tests its bit and adds its number.
+    (for [k 0 depth]
+      (let [bit (t/binary! (mut graph) 47 11 p
+                           (t/constant! (mut graph) 11 (<< (: 1 u64) (cast u64 k))))
+            branch (t/if! (mut graph) control (t/compare! (mut graph) 15 bit zero))]
+        (push! (mut skips) (t/if-false! (mut graph) branch))
+        (push! (mut skipped) value)
+        (set! control (t/if-true! (mut graph) branch))
+        (set! value (t/binary! (mut graph) 26 11 value
+                               (t/constant! (mut graph) 11 (cast u64 (+ k 1)))))))
+    ; Coming out: each level joins its skip path and mixes the result.
+    (for [step 0 depth]
+      (let [k (- (- depth 1) step)
+            merge (t/merge! (mut graph) (t/end! (mut graph) control)
+                            (t/end! (mut graph) (get skips k)))
+            joined (t/phi! (mut graph) 11 merge value (get skipped k))]
+        (set! control merge)
+        (set! value (t/binary! (mut graph) 48 11 joined
+                               (t/constant! (mut graph) 11 (cast u64 (* (+ k 1) 0x101)))))))
+    (let [ret (t/return! (mut graph) control 11 value)]
+      (match (t/generated (mut tally) "nest" graph start [ret] a)
+        (None [] 0)
+        (Some [made]
+              (let [(mut mapped) (.mapped made)
+                    (mut state) (: 0xACE u64)]
+                (t/check! (mut tally) (= (.conditional (.summary made)) depth) "nest: jumps"
+                          (.conditional (.summary made)) depth)
+                (for [run 0 80]
+                  (let [bits (if (< run 2)
+                                 (if (= run 0) 0 0xFFFFFFFFFFFFFFFF)
+                                 (t/random! (mut state)))
+                        seed (t/random! (mut state))
+                        ; How many levels are entered: the low set bits.
+                        (mut entered) (: 0 i64)
+                        (mut model) seed]
+                    (while (and (< entered depth)
+                                (!= (& bits (<< (: 1 u64) (cast u64 entered))) 0))
+                      (set! model (add model (cast u64 (+ entered 1))))
+                      (set! entered (+ entered 1)))
+                    ; The value skipped at the first level not entered is
+                    ; the value before its addition, which is what `model`
+                    ; holds; every level from there outward mixes.
+                    (for [step 0 depth]
+                      (let [k (- (- depth 1) step)]
+                        (when (<= k entered)
+                          (when (or (< k entered) (< entered depth))
+                            (set! model (^ model (cast u64 (* (+ k 1) 0x101))))))))
+                    (t/expect! (mut tally) "nest" mapped 11 [bits seed] model)))
+                (t/unmap! (mut mapped))))))
+    (free! (mut skips))
+    (free! (mut skipped))
+    (g/release! (mut graph))))
+
+;;; A function of `elements` small loops inside one large loop, with a jump
+;;; table first, a diamond at every eighth element and an early exit at
+;;; every 64th:
+;;;   acc = p0
+;;;   switch (p2 & 7) { case k: acc += 1000 * (k + 1) }     (jump table)
+;;;   for (round = 0; round != p1; round++)
+;;;     for k in 0 .. elements:
+;;;       c = (acc & 3) + 1; do { acc = acc * 3 + k; c -= 1; } while (c != 0);
+;;;       k % 8 == 7:   if (acc & 1) acc ^= k; else acc += k * 256 + 5;
+;;;       k % 64 == 63: if (acc == p3) return k;
+;;;   return acc
+;;; The small loops' jumps are short. A function of this many blocks is laid
+;;; out with one arm of each diamond and every exit behind the main path, so
+;;; those jumps, and the large loop's own, are long.
+(defn large! [(tally (mut t/Tally)) (elements i64) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        p0 (t/param! (mut graph) start 11 0)
+        rounds (t/param! (mut graph) start 11 1)
+        selector (t/param! (mut graph) start 11 2)
+        stop (t/param! (mut graph) start 11 3)
+        zero (t/constant! (mut graph) 11 0)
+        one (t/constant! (mut graph) 11 1)
+        three (t/constant! (mut graph) 11 3)
+        (mut roots) (ArrayList::new [i32] a)
+        switch (t/switch! (mut graph) start
+                          (t/binary! (mut graph) 47 11 selector (t/constant! (mut graph) 11 7)))
+        (mut ends) (ArrayList::new [i32] a)
+        (mut values) (ArrayList::new [i32] a)]
+    (for [k 0 8]
+      (let [projection (t/case-value! (mut graph) switch
+                                      (t/constant! (mut graph) 11 (cast u64 k)))]
+        (push! (mut ends) (t/end! (mut graph) projection))
+        (push! (mut values)
+               (t/binary! (mut graph) 26 11 p0
+                          (t/constant! (mut graph) 11 (cast u64 (* 1000 (+ k 1))))))))
+    (push! (mut ends) (t/end! (mut graph) (t/case-default! (mut graph) switch)))
+    (push! (mut values) p0)
+    (let [merge (t/merge-all! (mut graph) (slice ends))
+          seeded (t/phi-all! (mut graph) 11 merge (slice values) a)
+          header (t/loop-begin! (mut graph) (t/end! (mut graph) merge))
+          round (t/loop-phi! (mut graph) header zero)
+          carried (t/loop-phi! (mut graph) header seeded)
+          guard (t/if! (mut graph) header (t/compare! (mut graph) 15 round rounds))
+          body (t/if-true! (mut graph) guard)
+          exit (t/if-false! (mut graph) guard)
+          (mut control) body
+          (mut acc) carried]
+      (for [k 0 elements]
+        (let [number (t/constant! (mut graph) 11 (cast u64 k))
+              count (t/binary! (mut graph) 26 11 (t/binary! (mut graph) 47 11 acc three) one)
+              inner (t/loop-begin! (mut graph) (t/end! (mut graph) control))
+              c (t/loop-phi! (mut graph) inner count)
+              v (t/loop-phi! (mut graph) inner acc)
+              next-v (t/binary! (mut graph) 26 11 (t/binary! (mut graph) 28 11 v three) number)
+              next-c (t/binary! (mut graph) 27 11 c one)
+              again (t/if! (mut graph) inner (t/compare! (mut graph) 15 next-c zero))
+              back (t/loop-end! (mut graph) (t/if-true! (mut graph) again))]
+          (t/patch! (mut graph) inner 2 back)
+          (t/patch! (mut graph) c 3 next-c)
+          (t/patch! (mut graph) v 3 next-v)
+          (set! control (t/if-false! (mut graph) again))
+          (set! acc next-v)
+          (when (= (% k 8) 7)
+            (let [branch (t/if! (mut graph) control
+                                (t/compare! (mut graph) 15
+                                            (t/binary! (mut graph) 47 11 acc one) zero))
+                  yes (t/if-true! (mut graph) branch)
+                  no (t/if-false! (mut graph) branch)
+                  mixed (t/binary! (mut graph) 48 11 acc number)
+                  bumped (t/binary! (mut graph) 26 11 acc
+                                    (t/constant! (mut graph) 11 (cast u64 (+ (* k 256) 5))))
+                  join (t/merge! (mut graph) (t/end! (mut graph) yes) (t/end! (mut graph) no))]
+              (set! acc (t/phi! (mut graph) 11 join mixed bumped))
+              (set! control join)))
+          (when (= (% k 64) 63)
+            (let [leave (t/if! (mut graph) control (t/compare! (mut graph) 14 acc stop))]
+              (push! (mut roots)
+                     (t/return! (mut graph) (t/if-true! (mut graph) leave) 11 number))
+              (set! control (t/if-false! (mut graph) leave))))))
+      (let [next-round (t/binary! (mut graph) 26 11 round one)
+            back (t/loop-end! (mut graph) control)]
+        (t/patch! (mut graph) header 2 back)
+        (t/patch! (mut graph) round 3 next-round)
+        (t/patch! (mut graph) carried 3 acc)
+        (push! (mut roots) (t/return! (mut graph) exit 11 carried))))
+    (match (t/generated (mut tally) "large" graph start (slice roots) a)
+      (None [] 0)
+      (Some [made]
+            (let [(mut mapped) (.mapped made)
+                  summary (.summary made)
+                  jumps (+ (.conditional summary) (.unconditional summary))
+                  (mut state) (: 0xB16 u64)]
+              (println "  large: {} elements, {} bytes, {} jumps of which {} short, {} padding"
+                       elements (.size made) jumps (.short summary) (.padding summary))
+              (t/check! (mut tally) (> (.size made) (* elements 24)) "large: size"
+                        (.size made) (* elements 24))
+              (t/check! (mut tally) (= (.tables summary) 1) "large: table" (.tables summary) 1)
+              (t/check! (mut tally) (>= (.short summary) elements) "large: short jumps"
+                        (.short summary) elements)
+              (t/check! (mut tally) (>= (- jumps (.short summary)) (/ elements 16))
+                        "large: long jumps" (- jumps (.short summary)) (/ elements 16))
+              (for [run 0 40]
+                (let [seed (t/random! (mut state))
+                      count (cast u64 (% run 4))
+                      selector (t/random! (mut state))
+                      ; Some runs stop at a value the model reaches.
+                      wanted (if (= (% run 5) 4) (+ 1 (cast i64 (% (t/random! (mut state)) 6))) 0)
+                      model (add seed (* 1000 (+ (& selector 7) 1)))
+                      (mut result) (: 0 u64)
+                      (mut left) wanted
+                      (mut target) (: 0xDEAD00000000BEEF u64)
+                      (mut returned) false]
+                  ; The first pass (when an early exit is wanted) finds the
+                  ; value at the `wanted`-th exit test; the second runs with
+                  ; that value as the stop.
+                  (for [pass 0 2]
+                    (when (or (= pass 1) (> wanted 0))
+                      (let [stop (if (= pass 1) target (: 0xDEAD00000000BEEF u64))
+                            (mut acc) model
+                            (mut done) false]
+                        (set! left wanted)
+                        (for [r 0 (cast i64 count)]
+                          (for [k 0 elements]
+                            (unless done
+                              (let [(mut c) (+ (& acc 3) 1)]
+                                (while (> c 0)
+                                  (set! acc (add (mul acc 3) (cast u64 k)))
+                                  (set! c (- c 1))))
+                              (when (= (% k 8) 7)
+                                (set! acc (if (!= (& acc 1) 0)
+                                              (^ acc (cast u64 k))
+                                              (add acc (cast u64 (+ (* k 256) 5))))))
+                              (when (= (% k 64) 63)
+                                (when (and (= pass 0) (> left 0))
+                                  (set! left (- left 1))
+                                  (when (= left 0) (set! target acc)))
+                                (when (and (= pass 1) (= acc stop))
+                                  (set! result (cast u64 k))
+                                  (set! returned true)
+                                  (set! done true))))))
+                        (when (and (= pass 1) (not returned)) (set! result acc)))))
+                  (t/expect! (mut tally) "large" mapped 11 [seed count selector target]
+                             result)))
+              (t/unmap! (mut mapped)))))
+    (free! (mut roots))
+    (free! (mut ends))
+    (free! (mut values))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 relax functions: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)
+            (mut both) (: 0 i64)
+            (mut none) (: 0 i64)]
+        ; The loop grows four bytes at a time across both rel8 limits, at
+        ; every alignment of its top.
+        (for [lead 0 16]
+          (let [(mut previous) (: 2 i64)]
+            (for [body 14 44]
+              (let [shorts (sweep! (mut tally) lead body a)]
+                ; A longer loop never makes a jump short again.
+                (t/check! (mut tally) (and (>= shorts 0) (<= shorts previous))
+                          "sweep: short jumps grew with the loop" shorts previous)
+                (when (= shorts 2) (set! both (+ both 1)))
+                (when (= shorts 0) (set! none (+ none 1)))
+                (set! previous shorts)))))
+        ; Both ends of the sweep were reached at every lead.
+        (t/check! (mut tally) (>= both 16) "sweep: both jumps short" both 16)
+        (t/check! (mut tally) (>= none 16) "sweep: both jumps long" none 16)
+        (for depth [(: 1 i64) 2 3 8 20 40 41 42 43 44 45 60]
+          (nest! (mut tally) depth a))
+        (large! (mut tally) 64 a)
+        (large! (mut tally) 400 a)
+        ; Over 64 KB of code.
+        (large! (mut tally) 3000 a)
+        (println "x64 relax functions: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))
