@@ -1,0 +1,337 @@
+(module stogir.tests.x64-vector-emit)
+(import "stogir.types" :as types)
+(import "stogir.vector-arithmetic" :as va)
+(import "stogir.vector-comparison" :as vc)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.simd-lanes" :as simd)
+(import "stogir.x64.testing" :as t)
+(import "stogir.x64.vector-arithmetic" :as arithmetic)
+(import "stogir.x64.vector-comparison" :as comparison)
+(import "stogir.x64.vector-extrema" :as extrema)
+(import "stogir.x64.vector-lanes" :as lanes)
+(import "stogir.x64.vector-shift" :as shift)
+(import "stogir.x64.vector-testing" :as vt)
+(import "stogir.x64.vector-unary" :as unary)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+;;; The vector emitters under hand-made register assignments. The allocator
+;;; reaches most aliasings only by chance; here each is built: the result
+;;; register equal to the left operand, to the right one, to both, operands
+;;; sharing a register, operands in the scratch registers xmm14/xmm15 (a
+;;; constant or a reload), low and high registers.
+;;;
+;;; A function under test is f(out, pa, pb, s1, s2):
+;;;   every XMM register = the sentinel at pa[32..48); a = pa[0..16);
+;;;   b = pb[0..16); the emitter's code; out[16 r ..] = xmm r for r = 0..15.
+;;; Three things are checked: the result register's lanes against the
+;;; reference evaluator; that an operand register which is neither the
+;;; result nor a scratch still holds its operand; and that every other
+;;; register still holds the sentinel, except xmm14/xmm15 and the
+;;; temporaries the emitter's module declares (`temporaries`): that is the
+;;; promise the constraints make to the allocator on its behalf.
+;;;
+;;; Emitters that go through memory get a slot in the red zone below rsp.
+
+(const RDI 7)
+
+(const RSI 6)
+
+(const RDX 2)
+
+(const RCX 1)
+
+(const R8 8)
+
+(const R9 9)
+
+(const RSP 4)
+
+(const X14 46)
+
+(const X15 47)
+
+;;; kind: what is emitted.
+(const BINARY 0)
+
+(const COMPARE 1)
+
+(const EXTREMUM 2)
+
+(const UNARY 3)
+
+;;; A uniform shift; `aux` picks the count's register: 0 rcx, 1 r10, 2 r11.
+(const UNIFORM 4)
+
+(const DIVIDE 5)
+
+(const VARIABLE 6)
+
+(const LEADING 7)
+
+;;; SPLAT; `aux` 0: the scalar in rcx (or register a for floating lanes),
+;;; 1: in r11 (or xmm15).
+(const SPLAT 8)
+
+;;; REPLACE of literal lane `aux`; the scalar in rcx, or register b for
+;;; floating lanes.
+(const REPLACE 9)
+
+;;; REPLACE at the run-time index in rcx (`aux` 1: moved to r10 first); the
+;;; scalar in r8, or register b for floating lanes.
+(const REPLACE-DYNAMIC 10)
+
+(defstruct Shape [(rd i32) (a i32) (b i32)])
+
+(defn slot [] (-> encode/Mem)
+  (encode/mem RSP -64))
+
+(defn temporaries [(kind i32) (opcode i32) (ty i32)] (-> i32)
+  (cond (= kind BINARY) (arithmetic/temporaries opcode ty)
+        (= kind COMPARE) (comparison/temporaries opcode ty)
+        (= kind EXTREMUM) (extrema/temporaries opcode ty)
+        (= kind UNARY) (unary/temporaries opcode ty)
+        (= kind UNIFORM) (shift/temporaries opcode ty true)
+        (or (= kind REPLACE) (= kind REPLACE-DYNAMIC)) (lanes/temporaries 62 ty)
+        :else 0))
+
+(defn build [(kind i32) (opcode i32) (ty i32) (shape Shape) (aux i32) (a (dyn Allocator))]
+  (-> (Result (ArrayList u8) (slice u8)))
+  (let [(mut out) (code/create a)
+        (mut error) ""
+        rd (.rd shape)
+        xa (.a shape)
+        xb (.b shape)
+        floating (simd/floating? ty)]
+    (code/accept! (mut error) (encode/mov-rr (mut (.text out)) 64 R9 RDI))
+    (for [r 32 48]
+      (simd/read! (mut out) (mut error) (cast i32 r) (encode/mem RSI 32) 16))
+    (simd/read! (mut out) (mut error) xa (encode/mem RSI 0) 16)
+    (when (and (>= xb 0) (!= xb xa))
+      (simd/read! (mut out) (mut error) xb (encode/mem RDX 0) 16))
+    (cond (= kind BINARY)
+            (arithmetic/emit-registers! (mut out) (mut error) opcode ty rd xa xb)
+          (= kind COMPARE)
+            (comparison/emit-registers! (mut out) (mut error) opcode ty rd xa xb)
+          (= kind EXTREMUM)
+            (extrema/emit-registers! (mut out) (mut error) opcode ty rd xa xb)
+          (= kind UNARY) (unary/emit-registers! (mut out) (mut error) opcode ty rd xa)
+          (= kind UNIFORM)
+            (let [count (case aux 0 (: RCX i32) 1 simd/R10 simd/R11)]
+              (when (!= count RCX)
+                (code/accept! (mut error) (encode/mov-rr (mut (.text out)) 64 count RCX)))
+              (shift/uniform! (mut out) (mut error) opcode ty rd xa count))
+          (= kind DIVIDE)
+            (arithmetic/divide! (mut out) (mut error) opcode ty (slot) rd xa xb)
+          (= kind VARIABLE)
+            (shift/variable! (mut out) (mut error) opcode ty (slot) rd xa xb)
+          (= kind LEADING) (unary/leading-zeros! (mut out) (mut error) ty (slot) rd xa)
+          (= kind SPLAT)
+            (if floating
+                (do
+                  (when (= aux 1) (simd/move! (mut out) (mut error) X15 xa))
+                  (lanes/splat! (mut out) (mut error) ty rd (if (= aux 1) X15 xa)))
+                (do
+                  (when (= aux 1)
+                    (code/accept! (mut error) (encode/mov-rr (mut (.text out)) 64 simd/R11 RCX)))
+                  (lanes/splat! (mut out) (mut error) ty rd (if (= aux 1) simd/R11 RCX))))
+          (= kind REPLACE)
+            (lanes/replace! (mut out) (mut error) ty aux rd xa (if floating xb RCX))
+          :else
+            (let [index (if (= aux 1) (: simd/R10 i32) RCX)]
+              (when (= aux 1)
+                (code/accept! (mut error) (encode/mov-rr (mut (.text out)) 64 index RCX)))
+              (lanes/replace-dynamic! (mut out) (mut error) ty 5 (slot) rd xa index
+                                      (if floating xb R8))))
+    (for [r 32 48]
+      (simd/write! (mut out) (mut error) (encode/mem R9 (* (- r 32) 16)) (cast i32 r) 16))
+    (code/accept! (mut error) (encode/ret (mut (.text out))))
+    (if (= error "")
+        (let [text (code/take-text! (mut out) a)]
+          (code/release! (mut out))
+          (Ok text))
+        (do (code/release! (mut out)) (Err error)))))
+
+(const SENTINEL 0xC3)
+
+(defn left-lane [(base i32) (lane i64) (seed i64)] (-> u64)
+  (vt/special base (% (+ lane seed) vt/SPECIALS)))
+
+(defn right-lane [(kind i32) (opcode i32) (base i32) (lane i64) (seed i64) (left u64)] (-> u64)
+  (let [(mut k) (% (+ (* lane 3) seed 5) vt/SPECIALS)]
+    (when (= kind DIVIDE)
+      (while (not (vt/lane-defined? opcode base left (vt/special base k)))
+        (set! k (% (+ k 1) vt/SPECIALS))))
+    (vt/special base k)))
+
+(defn case! [(tally (mut t/Tally)) (kind i32) (opcode i32) (ty i32) (shape Shape) (aux i32)
+             (a (dyn Allocator))] (-> void)
+  (let [base (types/base-type ty)
+        size (vt/lane-bytes base)
+        lanes (cast i64 (types/lanes ty))
+        all (/ 16 (cast i64 size))
+        rd (.rd shape)
+        xa (.a shape)
+        xb (.b shape)
+        shared (= xa xb)
+        temps (temporaries kind opcode ty)]
+    (set! (.functions tally) (+ (.functions tally) 1))
+    (match (build kind opcode ty shape aux a)
+      (Err [message]
+           (println "x64 vector emit: kind {} opcode {} type {} rd {} a {} b {}: {}"
+                    kind opcode ty rd xa xb message)
+           (t/fail! (mut tally)))
+      (Ok [text]
+          (let [(mut bytes) text]
+            (match (t/map (slice bytes))
+              (Err [message] (println "x64 vector emit: map failed: {}" message)
+                   (t/fail! (mut tally)))
+              (Ok [mapped]
+                  (let [(mut mapped) mapped
+                        (mut first) (vt/buffer 48 SENTINEL a)
+                        (mut second) (vt/buffer 16 0 a)
+                        (mut output) (vt/buffer 256 0 a)]
+                    (for [seed 0 5]
+                      (for [i 0 all]
+                        (let [p (left-lane base i seed)
+                              usable (if (and (= kind DIVIDE) shared
+                                              (not (vt/lane-defined? opcode base p p)))
+                                         (: 1 u64)
+                                         p)]
+                          (vt/put! (mut first) (* i (cast i64 size)) size usable)
+                          (vt/put! (mut second) (* i (cast i64 size)) size
+                                   (right-lane kind opcode base i seed usable))))
+                      (let [s1 (cond (= kind UNIFORM)
+                                       (| (cast u64 (* seed 7)) 0xABCD00000000FF00)
+                                     (= kind REPLACE-DYNAMIC) (cast u64 (% (* seed 3) (+ lanes 2)))
+                                     :else (if (= base 1) (cast u64 (% seed 2))
+                                               (vt/special base (% (+ seed 9) vt/SPECIALS))))
+                            s2 (if (= base 1) (cast u64 (% seed 2))
+                                   (vt/special base (% (+ seed 9) vt/SPECIALS)))]
+                        (t/invoke mapped [(vt/address output 0) (vt/address first 0)
+                                          (vt/address second 0) s1 s2])
+                        (for [i 0 lanes]
+                          (let [p (vt/word (slice first) (* i (cast i64 size)) size)
+                                q (if shared p (vt/word (slice second) (* i (cast i64 size)) size))
+                                ; A floating scalar is lane 0 of register b.
+                                given (vt/word (slice second) 0 size)
+                                scalar (if (simd/floating? ty) given (& s1 (vt/lane-mask base)))
+                                wanted
+                                  (cond (or (= kind BINARY) (= kind COMPARE) (= kind EXTREMUM)
+                                            (= kind DIVIDE) (= kind VARIABLE))
+                                          (vt/lane-binary opcode base p q)
+                                        (= kind UNARY) (vt/lane-unary opcode base p)
+                                        (= kind LEADING) (vt/lane-unary 55 base p)
+                                        (= kind UNIFORM) (vt/lane-binary opcode base p s1)
+                                        (= kind SPLAT)
+                                          (if (simd/floating? ty)
+                                              (vt/word (slice first) 0 size)
+                                              (& s1 (vt/lane-mask base)))
+                                        (= kind REPLACE) (if (= i (cast i64 aux)) scalar p)
+                                        :else
+                                          (if (= (cast u64 i) s1)
+                                              (if (simd/floating? ty)
+                                                  given
+                                                  (& s2 (vt/lane-mask base)))
+                                              p))]
+                            (unless (and (= kind BINARY) (vt/lane-ambiguous? opcode base p q))
+                              (vt/expect! (mut tally) "emit result" ty opcode (cast i64 kind) i
+                                          (vt/word (slice output)
+                                                   (+ (* (cast i64 (- rd 32)) 16)
+                                                      (* i (cast i64 size)))
+                                                   size)
+                                          wanted))))
+                        ; Every other register: its operand, or the sentinel.
+                        (for [r 32 48]
+                          (let [register (cast i32 r)
+                                written (or (= register rd) (= register X14) (= register X15)
+                                            (and (>= temps 1) (= register simd/T1))
+                                            (and (>= temps 2) (= register simd/T2))
+                                            (and (>= temps 3) (= register simd/T3)))]
+                            (unless written
+                              (for [k 0 2]
+                                (vt/expect! (mut tally) "emit preserved" ty opcode
+                                            (cast i64 kind) (- r 32)
+                                            (vt/word (slice output) (+ (* (- r 32) 16) (* k 8)) 8)
+                                            (cond (= register xa) (vt/word (slice first) (* k 8) 8)
+                                                  (= register xb) (vt/word (slice second) (* k 8) 8)
+                                                  :else 0xC3C3C3C3C3C3C3C3))))))))
+                    (free! (mut first))
+                    (free! (mut second))
+                    (free! (mut output))
+                    (t/unmap! (mut mapped)))))
+            (free! (mut bytes)))))))
+
+;;; Result and operand registers of a binary emitter: every aliasing.
+(defn binary-shape [(index i64)] (-> Shape)
+  (case index
+    0 (Shape :rd 32 :a 33 :b 34)
+    1 (Shape :rd 41 :a 42 :b 40)
+    2 (Shape :rd 35 :a 35 :b 37)
+    3 (Shape :rd 36 :a 38 :b 36)
+    4 (Shape :rd 39 :a 39 :b 39)
+    5 (Shape :rd 34 :a 37 :b 37)
+    6 (Shape :rd 33 :a X14 :b 34)
+    7 (Shape :rd 34 :a 35 :b X15)
+    8 (Shape :rd 37 :a X14 :b X15)
+    9 (Shape :rd 38 :a X14 :b 38)
+    (Shape :rd 42 :a 42 :b X15)))
+
+(const BINARY-SHAPES 11)
+
+(defn unary-shape [(index i64)] (-> Shape)
+  (case index
+    0 (Shape :rd 32 :a 33 :b -1)
+    1 (Shape :rd 35 :a 35 :b -1)
+    2 (Shape :rd 41 :a X14 :b -1)
+    (Shape :rd 42 :a 40 :b -1)))
+
+(const UNARY-SHAPES 4)
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 vector emit: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (for [index 0 vt/TYPES]
+          (let [ty (vt/vector-type index)
+                base (types/base-type ty)
+                lanes (types/lanes ty)]
+            (for [s 0 BINARY-SHAPES]
+              (let [shape (binary-shape s)]
+                (for opcode [(: 26 i32) 27 28 29 30 46 47 48]
+                  (when (va/valid-type? opcode ty)
+                    (case! (mut tally)
+                           (if (arithmetic/lane-expanded? opcode ty) DIVIDE BINARY)
+                           opcode ty shape 0 a)))
+                (for opcode [(: 58 i32) 59]
+                  (when (va/valid-type? opcode ty)
+                    (case! (mut tally) EXTREMUM opcode ty shape 0 a)))
+                (for opcode [(: 14 i32) 15 16 17 18 19 20 21 22 23 24 25]
+                  (when (vc/valid-type? opcode ty)
+                    (case! (mut tally) COMPARE opcode ty shape 0 a)))
+                (for opcode [(: 49 i32) 50 51 52 53]
+                  (when (va/valid-type? opcode ty)
+                    (case! (mut tally) VARIABLE opcode ty shape 0 a)))
+                ; Floating lanes take their scalar from register b.
+                (when (!= (.a shape) (.b shape))
+                  (case! (mut tally) REPLACE 0 ty shape (- lanes 1) a)
+                  (case! (mut tally) REPLACE 0 ty shape 0 a)
+                  (case! (mut tally) REPLACE-DYNAMIC 0 ty shape (cast i32 (% s 2)) a))))
+            (for [s 0 UNARY-SHAPES]
+              (let [shape (unary-shape s)]
+                (for opcode [(: 31 i32) 32 45 54 56 57]
+                  (when (va/valid-type? opcode ty)
+                    (case! (mut tally) UNARY opcode ty shape 0 a)))
+                (when (va/valid-type? 55 ty) (case! (mut tally) LEADING 55 ty shape 0 a))
+                (for opcode [(: 49 i32) 50 51 52 53]
+                  (when (va/valid-type? opcode ty)
+                    (for count [(: 0 i32) 1 2]
+                      (case! (mut tally) UNIFORM opcode ty shape count a))))
+                (case! (mut tally) SPLAT 0 ty shape 0 a)
+                (case! (mut tally) SPLAT 0 ty shape 1 a)))))
+        (println "x64 vector emit: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))

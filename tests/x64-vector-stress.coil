@@ -1,0 +1,280 @@
+(module stogir.tests.x64-vector-stress)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.types" :as types)
+(import "stogir.vector-arithmetic" :as va)
+(import "stogir.vector-comparison" :as vc)
+(import "stogir.x64.testing" :as t)
+(import "stogir.x64.vector-testing" :as vt)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; Seeded differential stress test of the x86-64 vector family: random
+;;; straight-line functions over one vector type and its mask type (the
+;;; unsigned integer vector of the same geometry), checked bit for bit
+;;; against the lane-wise reference evaluator.
+;;;
+;;;   f(out, in, count, index): four vectors are loaded from `in`; then a
+;;;   random sequence of lane arithmetic and logic, division (only where
+;;;   every lane is defined), unary operations and bit counts, uniform and
+;;;   per-lane shifts and rotates, comparisons, extrema, vector COND on an
+;;;   extracted lane, BITCAST between the two types, EXTRACT feeding REPLACE
+;;;   and SPLAT with literal and run-time indexes, constants; every value is
+;;;   stored to `out` at the end.
+;;;
+;;; Storing every value keeps all of them live to the end, so each function
+;;; runs out of XMM registers and spills, and operands arrive in registers,
+;;; spill slots and as constants in every combination. A step whose result
+;;; the IR leaves to the machine (floating arithmetic on two different NaNs)
+;;; is not generated. Each failure prints the seed that reproduces it.
+
+(const LANES 16)
+
+;;; The values of one generated function: graph reference, which of the two
+;;; types (0 the vector type, 1 its mask type) and the expected lanes.
+(defstruct Pool
+  [(references (ArrayList i32))
+   (kinds (ArrayList i32))
+   (lanes (ArrayList u64))])
+
+(defn create [(a (dyn Allocator))] (-> Pool)
+  (Pool :references (ArrayList::new [i32] a)
+        :kinds (ArrayList::new [i32] a)
+        :lanes (ArrayList::new [u64] a)))
+
+(defn release! [(pool (mut Pool))] (-> void)
+  (free! (mut (.references pool)))
+  (free! (mut (.kinds pool)))
+  (free! (mut (.lanes pool))))
+
+(defn lane [(pool Pool) (value i64) (index i64)] (-> u64)
+  (get (.lanes pool) (+ (* value LANES) index)))
+
+;;; Add a value; its lanes are in `staged` (LANES entries).
+(defn add! [(pool (mut Pool)) (reference i32) (kind i32) (staged (ArrayList u64))] (-> void)
+  (push! (mut (.references pool)) reference)
+  (push! (mut (.kinds pool)) kind)
+  (for [i 0 LANES] (push! (mut (.lanes pool)) (get staged i))))
+
+;;; A random value of `kind`; -1 when there is none.
+(defn pick [(pool Pool) (kind i32) (state (mut u64))] (-> i64)
+  (let [count (len (.references pool))
+        start (cast i64 (% (t/random! (mut state)) (cast u64 count)))
+        (mut found) (: -1 i64)]
+    (for [k 0 count]
+      (let [at (% (+ start k) count)]
+        (when (and (< found 0) (= (get (.kinds pool) at) kind)) (set! found at))))
+    found))
+
+;;; A random lane pattern of lane type `base`: edge values often.
+(defn random-lane [(base i32) (state (mut u64))] (-> u64)
+  (let [roll (% (t/random! (mut state)) 4)]
+    (if (= roll 0)
+        (& (t/random! (mut state)) (vt/lane-mask base))
+        (vt/special base (cast i64 (% (t/random! (mut state)) (cast u64 vt/SPECIALS)))))))
+
+;;; Build and check one function for seed `seed` on vector type `ty`.
+(defn run! [(tally (mut t/Tally)) (ty i32) (seed u64) (a (dyn Allocator))] (-> void)
+  (let [(mut state) (^ seed (* (cast u64 ty) 0x9E3779B97F4A7C15))
+        base (types/base-type ty)
+        count (cast i64 (types/lanes ty))
+        size (vt/lane-bytes base)
+        mask-base (vt/integer-of base false)
+        mask-type (types/vector-type mask-base (types/lanes ty))
+        (mut pool) (create a)
+        (mut stage) (ArrayList::new [u64] a)
+        (mut graph) (g/create a)
+        start (t/start! (mut graph))
+        out (t/param! (mut graph) start 6 0)
+        in (t/param! (mut graph) start 6 1)
+        shift-count (t/param! (mut graph) start 5 2)
+        run-index (t/param! (mut graph) start 5 3)
+        passed-count (t/random! (mut state))
+        passed-index (% (t/random! (mut state)) (cast u64 (+ count 2)))
+        (mut input) (vt/buffer 64 0 a)
+        (mut control) start
+        steps (+ 24 (cast i64 (% (t/random! (mut state)) 24)))]
+    (for [i 0 LANES] (push! (mut stage) 0))
+    ; Four loaded vectors.
+    (for [k 0 4]
+      (for [i 0 LANES] (set! (mut stage) i 0))
+      (for [i 0 (/ 16 (cast i64 size))]
+        (let [value (random-lane base (mut state))]
+          (vt/put! (mut input) (+ (* k 16) (* i (cast i64 size))) size value)
+          (when (< i count) (set! (mut stage) i value))))
+      (set! control (vt/load! (mut graph) ty control (vt/offset! (mut graph) in (* k 16))))
+      (add! (mut pool) control 0 stage))
+    (for [step 0 steps]
+      (let [roll (% (t/random! (mut state)) 13)
+            kind (cast i32 (% (t/random! (mut state)) 2))
+            ; The lane type of the operand's kind.
+            lane-type (if (= kind 0) base mask-base)
+            vector (if (= kind 0) ty mask-type)
+            x (pick pool kind (mut state))
+            y (pick pool kind (mut state))]
+        (when (and (>= x 0) (>= y 0))
+          (let [rx (get (.references pool) x)
+                ry (get (.references pool) y)
+                (mut made) (: 0 i32)
+                (mut made-kind) kind]
+            (for [i 0 LANES] (set! (mut stage) i 0))
+            (cond
+              ; Binary arithmetic, logic and extrema.
+              (< roll 4)
+                (let [candidates [(: 26 i32) 27 28 29 30 46 47 48 58 59]
+                      opcode (get candidates (cast i64 (% (t/random! (mut state)) 10)))
+                      (mut usable) (va/valid-type? opcode vector)]
+                  (for [i 0 count]
+                    (let [p (lane pool x i)
+                          q (lane pool y i)]
+                      (when (or (not (vt/lane-defined? opcode lane-type p q))
+                                (vt/lane-ambiguous? opcode lane-type p q))
+                        (set! usable false))))
+                  (when usable
+                    (for [i 0 count]
+                      (set! (mut stage) i
+                            (vt/lane-binary opcode lane-type (lane pool x i) (lane pool y i))))
+                    (set! made
+                          (t/require (b/vector-binary! (mut graph) opcode vector rx ry
+                                                       (if (or (= opcode 29) (= opcode 30))
+                                                           start
+                                                           (: 0 i32)))))))
+              ; Unary operations.
+              (< roll 6)
+                (let [candidates [(: 31 i32) 32 45 54 55 56 57]
+                      opcode (get candidates (cast i64 (% (t/random! (mut state)) 7)))]
+                  (when (va/valid-type? opcode vector)
+                    (for [i 0 count]
+                      (set! (mut stage) i (vt/lane-unary opcode lane-type (lane pool x i))))
+                    (set! made (t/require (b/vector-unary! (mut graph) opcode vector rx)))))
+              ; Shifts and rotates: the run-time scalar count, a constant
+              ; count, or one count per lane.
+              (< roll 8)
+                (let [opcode (cast i32 (+ 49 (% (t/random! (mut state)) 5)))
+                      form (% (t/random! (mut state)) 3)
+                      fixed (t/random! (mut state))]
+                  (when (va/valid-type? opcode vector)
+                    (for [i 0 count]
+                      (set! (mut stage) i
+                            (vt/lane-binary opcode lane-type (lane pool x i)
+                                            (case form
+                                              0 passed-count
+                                              1 fixed
+                                              (lane pool y i)))))
+                    (set! made
+                          (t/require (b/vector-binary! (mut graph) opcode vector rx
+                                                       (case form
+                                                         0 shift-count
+                                                         1 (t/constant! (mut graph) 5 fixed)
+                                                         ry)
+                                                       0)))))
+              ; A comparison: its mask is a value of the mask type.
+              (= roll 8)
+                (let [opcode (cast i32 (+ 14 (% (t/random! (mut state)) 12)))]
+                  (when (vc/valid-type? opcode vector)
+                    (for [i 0 count]
+                      (set! (mut stage) i
+                            (vt/lane-binary opcode lane-type (lane pool x i) (lane pool y i))))
+                    (set! made-kind 1)
+                    (set! made
+                          (t/require (b/vector-compare! (mut graph) opcode mask-type 8 rx ry)))))
+              ; COND on a lane extracted from a mask-type value.
+              (= roll 9)
+                (let [chooser (pick pool 1 (mut state))
+                      at (cast i64 (% (t/random! (mut state)) (cast u64 count)))]
+                  (when (>= chooser 0)
+                    (let [truth (!= (lane pool chooser at) 0)
+                          condition
+                            (t/require (b/vector-extract! (mut graph) mask-base 8
+                                                          (get (.references pool) chooser)
+                                                          (t/constant! (mut graph) 10
+                                                                       (cast u64 at))))]
+                      (for [i 0 count]
+                        (set! (mut stage) i (if truth (lane pool x i) (lane pool y i))))
+                      (set! made (t/select! (mut graph) vector condition rx ry)))))
+              ; BITCAST to the other type: the lanes keep their bits.
+              (= roll 10)
+                (do
+                  (for [i 0 count] (set! (mut stage) i (lane pool x i)))
+                  (set! made-kind (- 1 kind))
+                  (set! made (t/unary! (mut graph) 36 (if (= kind 0) mask-type ty) rx)))
+              ; REPLACE one lane of x with a lane extracted from y; the
+              ; replaced lane is a literal or the run-time index.
+              (= roll 11)
+                (let [from (cast i64 (% (t/random! (mut state)) (cast u64 count)))
+                      dynamic (= (% (t/random! (mut state)) 2) 0)
+                      to (if dynamic passed-index (% (t/random! (mut state)) (cast u64 count)))
+                      scalar (t/require (b/vector-extract! (mut graph) lane-type 8 ry
+                                                           (t/constant! (mut graph) 10
+                                                                        (cast u64 from))))]
+                  (for [i 0 count]
+                    (set! (mut stage) i
+                          (if (= (cast u64 i) to) (lane pool y from) (lane pool x i))))
+                  (set! made
+                        (t/require (b/vector-replace! (mut graph) vector 8 rx
+                                                      (if dynamic
+                                                          run-index
+                                                          (t/constant! (mut graph) 10 to))
+                                                      scalar))))
+              ; SPLAT of a lane extracted at the run-time index (zero when
+              ; it is out of range), or a constant vector.
+              :else
+                (if (= (% (t/random! (mut state)) 2) 0)
+                    (let [value (if (< passed-index (cast u64 count))
+                                    (lane pool x (cast i64 passed-index))
+                                    0)
+                          scalar (t/require (b/vector-extract! (mut graph) lane-type 8 rx
+                                                               run-index))]
+                      (for [i 0 count] (set! (mut stage) i value))
+                      (set! made (t/require (b/vector-splat! (mut graph) vector 8 scalar))))
+                    (let [uniform (% (t/random! (mut state)) 4)]
+                      (for [i 0 count]
+                        (set! (mut stage) i
+                              (case uniform
+                                0 (: 0 u64)
+                                1 (vt/lane-mask lane-type)
+                                (random-lane lane-type (mut state)))))
+                      (set! made (vt/constant! (mut graph) vector (slice stage) a)))))
+            (when (!= made 0) (add! (mut pool) made made-kind stage))))))
+    ; Every value is stored, in order.
+    (let [values (len (.references pool))]
+      (for [k 0 values]
+        (set! control
+              (vt/save! (mut graph) control (vt/offset! (mut graph) out (* k 16))
+                        (get (.references pool) k))))
+      (let [ret (t/return! (mut graph) control 0 0)]
+        (match (vt/compiled (mut tally) "x64 vector stress" graph start [ret] a)
+          (None [] (println "  (type {} seed {})" ty seed))
+          (Some [code]
+                (let [(mut code) code
+                      (mut output) (vt/buffer (* values 16) 0xA5 a)
+                      before (.failures tally)]
+                  (vt/invoke code [(vt/address output 0) (vt/address input 0) passed-count
+                                   passed-index])
+                  (for [k 0 values]
+                    (let [value-base (if (= (get (.kinds pool) k) 0) base mask-base)]
+                      (for [i 0 count]
+                        (vt/expect! (mut tally) "stress" ty (cast i32 k) (cast i64 seed) i
+                                    (vt/word (slice output) (+ (* k 16) (* i (cast i64 size))) size)
+                                    (& (lane pool k i) (vt/lane-mask value-base))))))
+                  (when (and (!= (.failures tally) before) (< before 3))
+                    (println "  reproduce: type {} seed {}" ty seed))
+                  (free! (mut output))
+                  (vt/release! (mut code)))))))
+    (free! (mut input))
+    (free! (mut stage))
+    (release! (mut pool))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 vector stress: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (for [index 0 vt/TYPES]
+          (for [seed 0 160]
+            (run! (mut tally) (vt/vector-type index) (cast u64 (+ seed 1)) a)))
+        (println "x64 vector stress: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))
