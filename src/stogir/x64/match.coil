@@ -15,6 +15,9 @@
 ;;;     family) fuses the same way, into IF, integer COND and floating COND.
 ;;;   * Every other node goes to its operation family
 ;;;     (stogir.x64.families/select!).
+;;;   * Afterwards the memory family selects address modes, folds single-use
+;;;     loads into the tiles above as memory operands and forms
+;;;     read-modify-write stores (stogir.x64.families/fuse!, /inputs!).
 ;;;
 ;;; The a64 matcher is not shared: almost all of it is AArch64 rule selection
 ;;; (logical immediates, MADD, bit tests, address modes, word views). The
@@ -52,7 +55,8 @@
   (free! (mut (.omitted state)))
   (free! (mut (.counts state)))
   (free! (mut (.blocks state)))
-  (free! (mut (.protected state))))
+  (free! (mut (.protected state)))
+  (free! (mut (.switch-extensions state))))
 
 ;;; Let IF or COND `reference` read the flags of the comparison `source`.
 (defn fuse! [(state (mut plan/Matching)) (graph g/Graph) (reference i32) (source i32)
@@ -100,7 +104,8 @@
             :omitted (ArrayList::new [bool] a)
             :counts (ArrayList::new [i64] a)
             :blocks (ArrayList::new [i32] a)
-            :protected (ArrayList::new [bool] a))
+            :protected (ArrayList::new [bool] a)
+            :switch-extensions (ArrayList::new [i32] a))
         (mut block) (: 0 i32)
         (mut error) ""]
     (fill/append! (mut (.tiles state)) cells (select/none))
@@ -166,6 +171,7 @@
                 :else 0))))
     ; Fusion, in schedule order.
     (when (and fuse (= error ""))
+      (switch/retire-extensions! (mut state) graph scheduled)
       (for reference (.nodes scheduled)
         (let [node (get (.instructions graph) (cast i64 reference))
               opcode (cast i32 (n/opcode node))]
@@ -180,10 +186,18 @@
                            (types/floating? (cast i32 (n/type-id node)))))
                     (fuse! (mut state) graph reference (.op1 node) true)
                   :else 0)))))
+    ; Memory operands, once every tile and comparison fusion is final.
+    (when (and fuse (= error ""))
+      (match (families/fuse! (mut state) graph scheduled a)
+        (Err [message] (set! error message))
+        (Ok [_] 0)))
     (if (!= error "")
         (do (release-matching! (mut state)) (Err error))
         (let [(mut operands) (machine/build graph scheduled (.omitted state)
                                             (.comparisons state) a)]
+          ; Accesses and tiles with a memory operand read their selected
+          ; base and index.
+          (families/inputs! (mut operands) state graph scheduled)
           ; A fused COND reads its comparison's operands (which the redirect
           ; put in place of its own inputs) and its two arms.
           (for reference (.nodes scheduled)
@@ -202,6 +216,7 @@
           (free! (mut (.counts state)))
           (free! (mut (.blocks state)))
           (free! (mut (.protected state)))
+          (free! (mut (.switch-extensions state)))
           (Ok (plan/Plan
                 :operands operands
                 :tiles (.tiles state)

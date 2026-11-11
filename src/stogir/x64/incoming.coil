@@ -195,11 +195,10 @@
 
 ;;; Make parameter `parameter` available in its allocated register at its PARAM
 ;;; definition (`position + 1`). `frame-size` is the rsp adjustment of the
-;;; prologue, so the first stack argument is at rsp + frame-size + 8;
-;;; `base` is the frame base and `result-slot` the logical frame offset of
-;;; the register-piece result buffer (kind 3 only). Register parameters are
-;;; already in place. Stack arguments are addressed from rsp, which holds for
-;;; the fixed frame; a frame with another base is rejected.
+;;; prologue and `base` the frame base, which together locate the first
+;;; stack argument (stogir.x64.frame-address/parameter!); `result-slot` is
+;;; the logical frame offset of the register-piece result buffer (kind 3
+;;; only). Register parameters are already in place.
 (defn emit-entry-with-locations! [(out (mut code/Buffer))
                                   (graph g/Graph)
                                   (parts locations/View)
@@ -214,30 +213,37 @@
     (cond (or (= kind 0) (= kind 2)) (Ok 0)
           (or (< kind 0) (> kind 4)) (Err "invalid x86-64 parameter kind")
           (and (= kind 3) (< result-slot 0)) (Err "x86-64 result buffer has no frame slot")
-          (and (!= kind 3) (!= (.reg base) registers/RSP))
-            (Err "x86-64 backend: stack parameters of a frame that is not rsp-based are not implemented (stack family)")
           :else
             (match (locations/resolve parts (.reference parameter) (+ position 1))
               (Err [message] (Err message))
               (Ok [location]
-                  (let [destination (cast i32 (.value location))
-                        incoming (encode/mem registers/RSP (+ frame-size 8 (.offset parameter)))]
-                    (match
-                      (cond (or (!= (.kind location) 0)
-                                (not (registers/allocatable? ty destination)))
-                              (Err [i64 (slice u8)] "stack parameter definition requires a register of its class")
-                            (= kind 3)
+                  (let [destination (cast i32 (.value location))]
+                    (if (or (!= (.kind location) 0) (not (registers/allocatable? ty destination)))
+                        (Err "stack parameter definition requires a register of its class")
+                        (match
+                          (if (= kind 3)
                               (match (frame/slot base result-slot)
                                 (Err [message] (Err [i64 (slice u8)] message))
                                 (Ok [buffer] (encode/lea (mut (.text out)) 64 destination buffer)))
-                            (= kind 4) (encode/lea (mut (.text out)) 64 destination incoming)
-                            (types/integer? ty)
-                              (encode/mov-rm (mut (.text out)) (value/operation-bits ty)
-                                             destination incoming)
-                            (= ty 12)
-                              (encode/sse-mov-rm (mut (.text out)) encode/MOVSD destination incoming)
-                            (= ty 13)
-                              (encode/sse-mov-rm (mut (.text out)) encode/MOVSS destination incoming)
-                            :else (Err "x86-64 backend: stack parameters of this type are not implemented"))
-                      (Err [message] (Err message))
-                      (Ok [_] (Ok (cast i32 (- (len (.text out)) begin)))))))))))
+                              ; The anchor of an over-aligned frame goes through
+                              ; the destination itself, or r10 for an XMM one.
+                              (match (frame/parameter! (mut (.text out)) base frame-size
+                                                       (.offset parameter)
+                                                       (if (registers/gpr? destination)
+                                                           destination
+                                                           (: registers/SCRATCH-GPR i32)))
+                                (Err [message] (Err [i64 (slice u8)] message))
+                                (Ok [incoming]
+                                    (cond (= kind 4)
+                                            (encode/lea (mut (.text out)) 64 destination incoming)
+                                          (types/integer? ty)
+                                            (encode/mov-rm (mut (.text out))
+                                                           (value/operation-bits ty)
+                                                           destination incoming)
+                                          (types/floating? ty)
+                                            (encode/sse-mov-rm (mut (.text out))
+                                                               (value/float-move ty)
+                                                               destination incoming)
+                                          :else (Err "x86-64 backend: vector stack parameters are not implemented (vector family)")))))
+                          (Err [message] (Err message))
+                          (Ok [_] (Ok (cast i32 (- (len (.text out)) begin))))))))))))

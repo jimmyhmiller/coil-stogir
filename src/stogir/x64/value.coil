@@ -23,8 +23,13 @@
 ;;;
 ;;; Constants are graph references below zero. A numeric constant is rebuilt
 ;;; where it is used with `mov`, which never writes flags; `xor` zeroing is not
-;;; used here. Named constants (functions, symbols, strings) need relocations
-;;; and belong to the memory and call families.
+;;; used here. A named constant (FUNC, SYM, STR) is rebuilt the same way from
+;;; its RIP-relative reference (stogir.x64.code/reference-address!: `mov` from
+;;; the symbol's address slot, or `lea` of a string), which records a pending
+;;; relocation in the code buffer and writes no flags either.
+;;;
+;;; A static frame object is a value without a register: its location is the
+;;; rematerialized address of its frame slot, rebuilt with `lea`.
 (module stogir.x64.value)
 (import "stogir.graph" :as g)
 (import "stogir.node" :as n)
@@ -97,8 +102,9 @@
       (Err [message] (Err message))
       (Ok [_] (Ok (cast i32 (- (len (.text out)) begin)))))))
 
-;;; Build the numeric integer constant `reference` in general register
-;;; `destination` with `mov`. Flags are untouched.
+;;; Build the integer constant `reference`, numeric or named, in general
+;;; register `destination` with `mov` (or `lea` for a string). Flags are
+;;; untouched.
 (defn constant! [(out (mut code/Buffer)) (graph g/Graph) (reference i32) (destination i32)]
   (-> (Result i32 (slice u8)))
   (match (g/lookup graph reference)
@@ -111,7 +117,7 @@
                   (not (types/integer? ty))
                     (Err "x86-64 backend: floating and vector constants are not implemented yet (floating/vector families)")
                   (not (symbols/numeric? node))
-                    (Err "x86-64 backend: named constants (functions, symbols, strings) are not implemented yet (memory/call families)")
+                    (code/reference-address! (mut out) graph reference destination)
                   :else
                     (bits! (mut out) destination (n/constant-bits node) (type-bits ty)))))))
 
@@ -150,7 +156,12 @@
                                     (Err [message] (Err message))
                                     (Ok [_] (Ok scratch)))
                                 (loc/rematerialized? location)
-                                  (Err "x86-64 backend: frame-address operands are not implemented yet (stack family)")
+                                  (match (frame/slot base (.value location))
+                                    (Err [message] (Err message))
+                                    (Ok [m]
+                                        (match (encode/lea (mut (.text out)) 64 scratch m)
+                                          (Err [message] (Err message))
+                                          (Ok [_] (Ok scratch)))))
                                 (= (.kind location) 1)
                                   (match (spill location base)
                                     (Err [message] (Err message))

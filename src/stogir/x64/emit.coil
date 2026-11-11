@@ -7,6 +7,13 @@
 ;;; register and moved to rd. Constants that do not fit an immediate are
 ;;; built in r10 (first operand) or r11 (second operand) with `mov`.
 ;;;
+;;; Memory operands: a tile whose second operand is a fused LOAD (the memory
+;;; family's RULE-ALU-RM, RULE-MUL-RM and RULE-COMPARE-RM/MR/MI) reads it
+;;; in place through stogir.x64.address/operand!, at the load's own width.
+;;; The address is formed first, with `mov` and `lea` only; when the result
+;;; register is one the address names, the address is collapsed into r10
+;;; before the result is written.
+;;;
 ;;; Flags: every instruction emitted for one node is a unit. Nothing here
 ;;; leaves a flag value for another node, and `flags!` emits every operand
 ;;; load before the compare, so its caller places the consumer (jcc, setcc,
@@ -16,6 +23,7 @@
 (import "stogir.node" :as n)
 (import "stogir.types" :as types)
 (import "stogir.locations" :as loc)
+(import "stogir.x64.address" :as address)
 (import "stogir.x64.code" :as code)
 (import "stogir.x64.context" :as context)
 (import "stogir.x64.encode" :as encode)
@@ -47,13 +55,59 @@
   (when (!= destination source)
     (code/accept! (mut error) (encode/mov-rr (mut (.text out)) bits destination source))))
 
+;;; What an ALU instruction leaves in the flags for its result
+;;; (stogir.x64.code/Flags): AND, OR and XOR clear CF and OF as `test` does;
+;;; ADD and SUB set them by the operation.
+(defn alu-flags [(operation i32)] (-> i32)
+  (cond (or (= operation encode/AND) (= operation encode/OR) (= operation encode/XOR))
+          code/FLAGS-LOGIC
+        (or (= operation encode/ADD) (= operation encode/SUB)) code/FLAGS-RESULT
+        :else code/FLAGS-NONE))
+
+;;; The condition that reads from flags of `kind`, left by the instruction
+;;; that produced a register's value, what `cc` reads after `test r, r` of
+;;; that register; -1 when those flags cannot answer it.
+;;;
+;;; `test` leaves ZF and SF of the value and CF = OF = 0. FLAGS-LOGIC is the
+;;; same state. With FLAGS-RESULT only ZF and SF are the value's, so the
+;;; conditions that need nothing else are rewritten onto them (x < 0 is SF,
+;;; x <= 0 unsigned is x = 0) and the others are refused: `jle`/`jg` read OF,
+;;; `jb`/`jae` read CF. FLAGS-EXACT adds OF = 0, which `jle`/`jg` need.
+(defn zero-condition [(kind i32) (cc i32)] (-> i32)
+  (cond (= kind code/FLAGS-LOGIC) cc
+        (and (!= kind code/FLAGS-RESULT) (!= kind code/FLAGS-EXACT)) -1
+        (or (= cc encode/CC-E) (= cc encode/CC-NE) (= cc encode/CC-S) (= cc encode/CC-NS)) cc
+        (= cc encode/CC-L) encode/CC-S
+        (= cc encode/CC-GE) encode/CC-NS
+        (= cc encode/CC-BE) encode/CC-E
+        (= cc encode/CC-A) encode/CC-NE
+        (and (= kind code/FLAGS-EXACT) (or (= cc encode/CC-LE) (= cc encode/CC-G))) cc
+        :else -1))
+
+;;; Flags for "`register` at `bits` compared with zero", read by `cc`:
+;;; `test register, register`, unless the instruction just emitted produced
+;;; that register's value at that width and left flags that answer `cc`.
+;;; Returns the condition to read.
+(defn zero-flags! [(out (mut code/Buffer)) (error (mut (slice u8))) (bits i32)
+                   (register i32) (cc i32)] (-> i32)
+  (let [fused (zero-condition (code/flags-for out register bits) cc)]
+    (if (>= fused 0)
+        (do
+          (set! (.fused-tests (.summary out)) (+ (.fused-tests (.summary out)) 1))
+          fused)
+        (do
+          (code/accept! (mut error) (encode/test-rr (mut (.text out)) bits register register))
+          cc))))
+
 ;;; One two-operand instruction `op rd, rb` of the ALU or imul family.
 (defn apply! [(out (mut code/Buffer)) (error (mut (slice u8))) (tile select/Tile)
               (rd i32) (rb i32)] (-> void)
-  (code/accept! (mut error)
-                (if (= (.rule tile) select/RULE-MUL-RR)
-                    (encode/imul-rr (mut (.text out)) (.bits tile) rd rb)
-                    (encode/alu-rr (mut (.text out)) (.operation tile) (.bits tile) rd rb))))
+  (if (= (.rule tile) select/RULE-MUL-RR)
+      (code/accept! (mut error) (encode/imul-rr (mut (.text out)) (.bits tile) rd rb))
+      (do
+        (code/accept! (mut error)
+                      (encode/alu-rr (mut (.text out)) (.operation tile) (.bits tile) rd rb))
+        (code/note-flags! (mut out) rd (.bits tile) (alu-flags (.operation tile))))))
 
 ;;; rd = left OP right for RULE-ALU-RR and RULE-MUL-RR, every aliasing case.
 (defn register-binary! [(out (mut code/Buffer)) (cx context/Context) (position i64)
@@ -189,24 +243,76 @@
                                  registers/RDX))))))))
     (if (= error "") (Ok 0) (Err error))))
 
+;;; rd = left OP [load] for RULE-ALU-RM and RULE-MUL-RM.
+(defn memory-binary! [(out (mut code/Buffer)) (cx context/Context) (position i64)
+                      (tile select/Tile) (rd i32)] (-> (Result i32 (slice u8)))
+  (let [(mut error) ""]
+    (match (address/operand! (mut out) cx (.right tile) position)
+      (Err [message] (set! error message))
+      (Ok [found]
+          (match (if (address/names? found rd)
+                     (address/collapse! (mut out) found)
+                     (Ok [encode/Mem (slice u8)] found))
+            (Err [message] (set! error message))
+            (Ok [m]
+                (code/accept-count! (mut error) (into! (mut out) cx (.left tile) position rd))
+                (code/accept! (mut error)
+                              (if (= (.rule tile) select/RULE-MUL-RM)
+                                  (encode/imul-rm (mut (.text out)) (.bits tile) rd m)
+                                  (encode/alu-rm (mut (.text out)) (.operation tile)
+                                                 (.bits tile) rd m)))))))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; The flags of a comparison with a fused load (RULE-COMPARE-RM/MR/MI).
+(defn memory-flags! [(out (mut code/Buffer)) (cx context/Context) (position i64)
+                     (tile select/Tile)] (-> (Result i32 (slice u8)))
+  (let [(mut error) ""
+        rule (.rule tile)]
+    (match (address/operand! (mut out) cx (select/memory-operand tile) position)
+      (Err [message] (set! error message))
+      (Ok [m]
+          (if (= rule select/RULE-COMPARE-MI)
+              (code/accept! (mut error)
+                            (encode/alu-mi (mut (.text out)) encode/CMP (.bits tile) m
+                                           (.immediate tile)))
+              ; The address never names r11.
+              (match (operand! (mut out) cx (select/register-operand tile) position
+                               registers/SCRATCH-GPR-2)
+                (Err [message] (set! error message))
+                (Ok [register]
+                    (code/accept! (mut error)
+                                  (if (= rule select/RULE-COMPARE-RM)
+                                      (encode/alu-rm (mut (.text out)) encode/CMP (.bits tile)
+                                                     register m)
+                                      (encode/alu-mr (mut (.text out)) encode/CMP (.bits tile)
+                                                     m register))))))))
+    (if (= error "") (Ok (.operation tile)) (Err error))))
+
 ;;; Emit the flags of comparison `tile`, reading its operands at `position`,
 ;;; and return the condition that holds when the comparison is true: a
 ;;; condition code for an integer comparison, an extended condition
 ;;; (stogir.x64.fcompare: a code possibly combined with the parity flag) for
 ;;; a floating one. Every operand load precedes the compare; the caller's
-;;; consumer follows it.
+;;; consumer follows it. An integer comparison with zero emits nothing when
+;;; the instruction before it left the answer (zero-flags!); the returned
+;;; condition then reads those flags.
 (defn integer-flags! [(out (mut code/Buffer)) (cx context/Context) (position i64)
                       (tile select/Tile)] (-> (Result i32 (slice u8)))
-  (let [(mut error) ""]
-    (if (or (not (select/comparison-rule? (.rule tile)))
-            (= (.rule tile) select/RULE-FCOMPARE))
+  (let [(mut error) ""
+        (mut condition) (.operation tile)]
+    (cond
+      (or (not (select/comparison-rule? (.rule tile)))
+          (= (.rule tile) select/RULE-FCOMPARE))
         (set! error "x86-64 flags requested from a tile that is not an integer comparison")
+      (!= (select/memory-operand tile) 0)
+        (code/accept-count! (mut error) (memory-flags! (mut out) cx position tile))
+      :else
         (match (operand! (mut out) cx (.left tile) position registers/SCRATCH-GPR)
           (Err [message] (set! error message))
           (Ok [ra]
               (cond (= (.rule tile) select/RULE-COMPARE-ZERO)
-                      (code/accept! (mut error)
-                                    (encode/test-rr (mut (.text out)) (.bits tile) ra ra))
+                      (set! condition
+                            (zero-flags! (mut out) (mut error) (.bits tile) ra (.operation tile)))
                     (= (.rule tile) select/RULE-COMPARE-RI)
                       (code/accept! (mut error)
                                     (encode/alu-ri (mut (.text out)) encode/CMP (.bits tile)
@@ -219,7 +325,7 @@
                             (code/accept! (mut error)
                                           (encode/alu-rr (mut (.text out)) encode/CMP
                                                          (.bits tile) ra rb))))))))
-    (if (= error "") (Ok (.operation tile)) (Err error))))
+    (if (= error "") (Ok condition) (Err error))))
 
 (defn flags! [(out (mut code/Buffer)) (cx context/Context) (position i64)
               (tile select/Tile)] (-> (Result i32 (slice u8)))
@@ -246,12 +352,15 @@
               (mut error) ""]
           (cond (or (= rule select/RULE-ALU-RR) (= rule select/RULE-MUL-RR))
                   (code/accept-count! (mut error) (register-binary! (mut out) cx position tile rd))
+                (or (= rule select/RULE-ALU-RM) (= rule select/RULE-MUL-RM))
+                  (code/accept-count! (mut error) (memory-binary! (mut out) cx position tile rd))
                 (= rule select/RULE-ALU-RI)
                   (do
                     (code/accept-count! (mut error) (into! (mut out) cx (.left tile) position rd))
                     (code/accept! (mut error)
                                   (encode/alu-ri (mut (.text out)) (.operation tile)
-                                                 (.bits tile) rd (.immediate tile))))
+                                                 (.bits tile) rd (.immediate tile)))
+                    (code/note-flags! (mut out) rd (.bits tile) (alu-flags (.operation tile))))
                 (= rule select/RULE-MUL-RI)
                   (match (operand! (mut out) cx (.left tile) position registers/SCRATCH-GPR)
                     (Err [message] (set! error message))
@@ -266,7 +375,13 @@
                       (code/accept! (mut error)
                                     (encode/shift-ri (mut (.text out)) (.operation tile)
                                                      (.bits tile) rd
-                                                     (cast i32 (.immediate tile))))))
+                                                     (cast i32 (.immediate tile))))
+                      ; A shift by a nonzero constant sets ZF and SF by its
+                      ; result; a rotate leaves them alone.
+                      (when (or (= (.operation tile) encode/SHL)
+                                (= (.operation tile) encode/SHR)
+                                (= (.operation tile) encode/SAR))
+                        (code/note-flags! (mut out) rd (.bits tile) code/FLAGS-RESULT))))
                 (or (= rule select/RULE-SHIFT-RC) (= rule select/RULE-SHIFT-MASKED))
                   (code/accept-count! (mut error) (variable-shift! (mut out) cx position tile rd))
                 (= rule select/RULE-DIVIDE)
