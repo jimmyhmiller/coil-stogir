@@ -262,6 +262,10 @@
                                    (if (= (.bits key) 64) 64 32) register (cast i64 limit)))))
 
 ;;; Half-open case interval [begin, end); recursion depth is O(log n).
+;;; The middle case is tested first; a selector below it continues at a
+;;; label behind the code for the cases above it. When no case is above the
+;;; middle one, a selector above it goes straight to the fallback and the
+;;; lower cases follow in line, with no label and no jump around them.
 (defn tree! [(out (mut code/Buffer))
              (control (mut edges/Control))
              (key Key)
@@ -276,25 +280,47 @@
         (branch! (mut out) (mut control) (mut error) fallback fixups/JUMP)
         (let [middle (+ begin (/ (- end begin) 2))
               item (get (.cases dispatch) middle)
-              left-label (if (= begin middle) fallback (cast i32 (len (.labels control))))]
-          (when (!= begin middle) (push! (mut (.labels control)) -1))
-          (compare! (mut out) (mut error) key (.low item))
-          (if (= (.low item) (.high item))
+              single (= (.low item) (.high item))]
+          (if (and (!= begin middle) (= (+ middle 1) end))
               (do
-                (branch! (mut out) (mut control) (mut error) (get stubs middle) encode/CC-E)
+                (if single
+                    (do
+                      (compare! (mut out) (mut error) key (.low item))
+                      (branch! (mut out) (mut control) (mut error) (get stubs middle)
+                               encode/CC-E)
+                      (branch! (mut out) (mut control) (mut error) fallback
+                               (encode/invert (below key))))
+                    (do
+                      (compare! (mut out) (mut error) key (.high item))
+                      (branch! (mut out) (mut control) (mut error) fallback
+                               (encode/invert (not-above key)))
+                      (compare! (mut out) (mut error) key (.low item))
+                      (branch! (mut out) (mut control) (mut error) (get stubs middle)
+                               (encode/invert (below key)))))
+                (tree! (mut out) (mut control) key dispatch stubs fallback begin middle
+                       (mut error)))
+              (let [left-label (if (= begin middle)
+                                   fallback
+                                   (cast i32 (len (.labels control))))]
+                (when (!= begin middle) (push! (mut (.labels control)) -1))
+                (compare! (mut out) (mut error) key (.low item))
+                (if single
+                    (do
+                      (branch! (mut out) (mut control) (mut error) (get stubs middle)
+                               encode/CC-E)
+                      (when (!= begin middle)
+                        (branch! (mut out) (mut control) (mut error) left-label (below key))))
+                    (do
+                      (branch! (mut out) (mut control) (mut error) left-label (below key))
+                      (compare! (mut out) (mut error) key (.high item))
+                      (branch! (mut out) (mut control) (mut error) (get stubs middle)
+                               (not-above key))))
+                (tree! (mut out) (mut control) key dispatch stubs fallback (+ middle 1) end
+                       (mut error))
                 (when (!= begin middle)
-                  (branch! (mut out) (mut control) (mut error) left-label (below key))))
-              (do
-                (branch! (mut out) (mut control) (mut error) left-label (below key))
-                (compare! (mut out) (mut error) key (.high item))
-                (branch! (mut out) (mut control) (mut error) (get stubs middle)
-                         (not-above key))))
-          (tree! (mut out) (mut control) key dispatch stubs fallback (+ middle 1) end
-                 (mut error))
-          (when (!= begin middle)
-            (set! (mut (.labels control)) (cast i64 left-label) (len (.text out)))
-            (tree! (mut out) (mut control) key dispatch stubs fallback begin middle
-                   (mut error)))))))
+                  (set! (mut (.labels control)) (cast i64 left-label) (len (.text out)))
+                  (tree! (mut out) (mut control) key dispatch stubs fallback begin middle
+                         (mut error)))))))))
 
 (defn singletons? [(dispatch switch/Dispatch)] (-> bool)
   (let [(mut all) true]
