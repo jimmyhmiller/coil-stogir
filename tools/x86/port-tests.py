@@ -6,8 +6,10 @@ facade, so the same files gate the x86-64 backend.
     tools/x86/port-tests.py --list     print what would be ported, and why not
 
 A test is portable when the only `stogir.a64.*` modules it imports are
-`compile` and `private-leaf`, it is not in EXCLUDED, and it defines no function
-as AArch64 machine code. A ported file no
+`compile` and `private-leaf`, it is not in EXCLUDED, and every function it
+defines as AArch64 machine code has an x86-64 alternative (the two definitions
+are the arms of a top-level `target/arch-pick`; the x86-64 bytes come from
+tools/x86/asm-bytes.sh). A ported file no
 longer imports `stogir.a64.*`, so running the script again changes nothing.
 
 What a port does:
@@ -38,9 +40,15 @@ EXCLUDED = {
     "private-leaf": "registers hand-encoded AArch64 leaves and checks their register masks",
 }
 
-# A probe function written as AArch64 bytes does not compile for another machine.
+# A probe function written as AArch64 bytes does not compile for another
+# machine, unless the test also carries its x86-64 bytes.
 MACHINE_CODE = re.compile(r"machine-code\s+\(Aarch64\)")
+MACHINE_CODE_X64 = re.compile(r"machine-code\s+\(X86_64\)")
 MACHINE_CODE_REASON = "calls a probe function written as AArch64 machine code"
+
+
+def machine_code_only_a64(text):
+    return (len(MACHINE_CODE.findall(text)) > len(MACHINE_CODE_X64.findall(text)))
 
 # file -> [(text the statement starts with, which occurrence or None for all,
 #           x86-64 replacement)]
@@ -95,6 +103,9 @@ TRAP_SIGNAL = ("(signal 5", "(signal (target/arch-pick 5 4)")
 BUS_SIGNAL = ("(signal 10 handler)", "(signal (target/os-pick 10 7) handler)", 1)
 ANONYMOUS_MAPPING = (" 0x1002 -1 0)", " (target/os-pick 0x1002 0x22) -1 0)", 2)
 
+# The calling-convention number of a prototype: 9 is AArch64 Darwin, 8 System V.
+CONVENTION = ("(calls/create 9 5 ", "(calls/create (target/arch-pick 9 8) 5 ")
+
 # file -> [(old, new, expected count)]
 REWRITES = {
     # A never-executed prefix image: one return and padding to 5004 bytes.
@@ -110,7 +121,12 @@ REWRITES = {
     "jit-stack-invalid": [TRAP_SIGNAL + (1,)],
     "jit-bulk": [BUS_SIGNAL, ANONYMOUS_MAPPING],
     "jit-bulk-pairs": [ANONYMOUS_MAPPING],
-    "jit-vector-transport": [BUS_SIGNAL, ANONYMOUS_MAPPING],
+    "jit-vector-transport": [BUS_SIGNAL, ANONYMOUS_MAPPING, CONVENTION + (2,)],
+    "jit-vector-arithmetic": [CONVENTION + (1,)],
+    "jit-vector-constants": [CONVENTION + (2,)],
+    "jit-vector-locals": [CONVENTION + (2,)],
+    "jit-vector-unary": [CONVENTION + (1,)],
+    "jit-bulk-pressure": [CONVENTION + (1,)],
 }
 
 IMPORTS = [
@@ -221,6 +237,9 @@ def main():
         if not entry.endswith(".coil"):
             continue
         name = entry[:-5]
+        # Tests of x86-64 internals name backend modules on purpose.
+        if name.startswith("x64-"):
+            continue
         path = os.path.join(TESTS, entry)
         with open(path) as handle:
             text = handle.read()
@@ -232,7 +251,7 @@ def main():
             if listing:
                 print(f"a64-internal {name}: imports {' '.join(internal)}")
             continue
-        if name in EXCLUDED or MACHINE_CODE.search(text):
+        if name in EXCLUDED or machine_code_only_a64(text):
             if listing:
                 print(f"a64-internal {name}: {EXCLUDED.get(name, MACHINE_CODE_REASON)}")
             continue
