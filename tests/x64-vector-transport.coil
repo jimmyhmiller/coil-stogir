@@ -1,0 +1,478 @@
+(module stogir.tests.x64-vector-transport)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.target" :as target)
+(import "stogir.types" :as types)
+(import "stogir.x64.testing" :as t)
+(import "stogir.x64.vector-testing" :as vt)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.cc" :as cc)
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; How vector values travel on x86-64, every lane type at 8 and 16 bytes:
+;;;
+;;;   pressure   twenty vectors loaded before any is used, so several live
+;;;              in spill slots (8-byte slots for 8-byte vectors, 16-byte
+;;;              aligned ones otherwise) and are reloaded as operands
+;;;   loop       a vector PHI carried round a counted loop; it starts as a
+;;;              loaded value, a constant, all zeros or all ones (the
+;;;              constants are written on the entry edge)
+;;;   diamond    a vector PHI at a merge whose inputs are loaded values and
+;;;              constants, with and without sixteen other vectors live
+;;;              across the branch (which puts PHI constants into spill
+;;;              slots)
+;;;   locals     VSTORE/VLOAD of a vector variable, plain and volatile, and
+;;;              an 8-byte view of the start of a 16-byte variable
+;;;   constants  all zeros (pxor), all ones (pcmpeqd) and a pattern (image
+;;;              data) stored and used as operands
+;;;   by value   two 16-byte vector parameters in xmm0 and xmm1 and the
+;;;              result in xmm0, called through a probe written in x86-64
+;;;              machine code (the Linux Coil compiler cannot pass a 16-byte
+;;;              vector across a C function pointer)
+
+(const SENTINEL 0xA5)
+
+;;; call16(f, in, out): xmm0 = in[0..16), xmm1 = in[16..32); f(); out[0..16) =
+;;; xmm0. Bytes from tools/x86/asm-bytes.sh:
+;;;   push rbx; mov rbx, rdx; movups xmm0, [rsi]; movups xmm1, [rsi+16];
+;;;   call rdi; movups [rbx], xmm0; pop rbx
+(target/arch-pick
+  (defn call16 :cc (cc/C) [(f u64) (in u64) (out u64)] (-> void)
+    (primitive/machine-code (Aarch64) 0xc0 0x03 0x5f 0xd6))
+  (defn call16 :cc (cc/C) [(f u64) (in u64) (out u64)] (-> void)
+    (primitive/machine-code (X86_64)
+                            0x53 0x48 0x89 0xd3 0x0f 0x10 0x06 0x0f 0x10 0x4e 0x10 0xff
+                            0xd7 0x0f 0x11 0x03 0x5b)))
+
+(defn lane-value [(base i32) (lane i64) (seed i64)] (-> u64)
+  (vt/special base (% (+ (* lane 5) seed 2) vt/SPECIALS)))
+
+;;; An operation every lane type has: ADD, or XOR for BOOL lanes.
+(defn combine-op [(base i32)] (-> i32)
+  (if (= base 1) 48 26))
+
+(defn fill! [(buffer (mut (ArrayList u8))) (offset i64) (base i32) (seed i64)] (-> void)
+  (let [size (vt/lane-bytes base)]
+    (for [i 0 (/ 16 (cast i64 size))]
+      (vt/put! (mut buffer) (+ offset (* i (cast i64 size))) size (lane-value base i seed)))))
+
+(defn constant-of! [(graph (mut g/Graph)) (ty i32) (seed i64) (a (dyn Allocator))] (-> i32)
+  (let [(mut lanes) (ArrayList::new [u64] a)]
+    (for [i 0 (cast i64 (types/lanes ty))]
+      (push! (mut lanes) (lane-value (types/base-type ty) i seed)))
+    (let [reference (vt/constant! (mut graph) ty (slice lanes) a)]
+      (free! (mut lanes))
+      reference)))
+
+;;; A constant whose every byte is `byte`.
+(defn bytes-of! [(graph (mut g/Graph)) (ty i32) (byte u64) (a (dyn Allocator))] (-> i32)
+  (let [(mut lanes) (ArrayList::new [u64] a)]
+    (for [i 0 (cast i64 (types/lanes ty))]
+      (push! (mut lanes) (* byte 0x0101010101010101)))
+    (let [reference (vt/constant! (mut graph) ty (slice lanes) a)]
+      (free! (mut lanes))
+      reference)))
+
+(const LIVE 20)
+
+;;; f(out, in): v[k] = in[16k] for every k first; then
+;;; out[16k] = v[LIVE-1-k] OP v[k].
+(defn pressure! [(tally (mut t/Tally)) (ty i32) (a (dyn Allocator))] (-> void)
+  (let [base (types/base-type ty)
+        size (vt/lane-bytes base)
+        lanes (cast i64 (types/lanes ty))
+        width (cast i64 (types/size ty 8))
+        opcode (combine-op base)
+        (mut graph) (g/create a)
+        start (t/start! (mut graph))
+        out (t/param! (mut graph) start 6 0)
+        in (t/param! (mut graph) start 6 1)
+        (mut values) (ArrayList::new [i32] a)
+        (mut control) start]
+    (for [k 0 LIVE]
+      (set! control (vt/load! (mut graph) ty control (vt/offset! (mut graph) in (* k 16))))
+      (push! (mut values) control))
+    (for [k 0 LIVE]
+      (set! control
+            (vt/save! (mut graph) control (vt/offset! (mut graph) out (* k 16))
+                      (t/require (b/vector-binary! (mut graph) opcode ty
+                                                   (get values (- (- LIVE 1) k))
+                                                   (get values k) 0)))))
+    (let [ret (t/return! (mut graph) control 0 0)]
+      (match (vt/compiled (mut tally) "x64 vector pressure" graph start [ret] a)
+        (None [] (println "  (type {})" ty))
+        (Some [code]
+              (let [(mut code) code
+                    (mut input) (vt/buffer (* LIVE 16) 0 a)
+                    (mut output) (vt/buffer (* LIVE 16) SENTINEL a)]
+                (for [seed 0 4]
+                  (for [k 0 LIVE] (fill! (mut input) (* k 16) base (+ seed (* k 3))))
+                  (for [i 0 (* LIVE 16)] (set! (mut output) i SENTINEL))
+                  (vt/invoke code [(vt/address output 0) (vt/address input 0)])
+                  (for [k 0 LIVE]
+                    (for [i 0 lanes]
+                      (let [p (lane-value base i (+ seed (* (- (- LIVE 1) k) 3)))
+                            q (lane-value base i (+ seed (* k 3)))]
+                        (unless (vt/lane-ambiguous? opcode base p q)
+                          (vt/expect! (mut tally) "pressure" ty opcode k i
+                                      (vt/word (slice output) (+ (* k 16) (* i (cast i64 size)))
+                                               size)
+                                      (vt/lane-binary opcode base p q)))))
+                    (for [i width 16]
+                      (vt/expect! (mut tally) "pressure gap" ty opcode k i
+                                  (cast u64 (get output (+ (* k 16) i))) SENTINEL))))
+                (free! (mut input))
+                (free! (mut output))
+                (vt/release! (mut code))))))
+    (free! (mut values))
+    (g/release! (mut graph))))
+
+;;; f(out, pa, pb, n): acc = initial; n times acc = acc OP step; out = acc.
+;;; `initial`: 0 loaded from pa, 1 a pattern constant, 2 zeros, 3 ones.
+(defn loop! [(tally (mut t/Tally)) (ty i32) (initial i64) (a (dyn Allocator))] (-> void)
+  (let [base (types/base-type ty)
+        size (vt/lane-bytes base)
+        lanes (cast i64 (types/lanes ty))
+        opcode (combine-op base)
+        (mut graph) (g/create a)
+        start (t/start! (mut graph))
+        out (t/param! (mut graph) start 6 0)
+        pa (t/param! (mut graph) start 6 1)
+        pb (t/param! (mut graph) start 6 2)
+        n (t/param! (mut graph) start 11 3)
+        x (vt/load! (mut graph) ty start pa)
+        step (vt/load! (mut graph) ty x pb)
+        first (case initial
+                0 x
+                1 (constant-of! (mut graph) ty 7 a)
+                2 (bytes-of! (mut graph) ty 0 a)
+                (bytes-of! (mut graph) ty 0xFF a))
+        loop (t/loop-begin! (mut graph) (t/end! (mut graph) step))
+        i (t/loop-phi! (mut graph) loop (t/constant! (mut graph) 11 0))
+        acc (t/loop-phi! (mut graph) loop first)
+        branch (t/if! (mut graph) loop (t/compare! (mut graph) 16 i n))
+        body (t/if-true! (mut graph) branch)
+        exit (t/if-false! (mut graph) branch)
+        next-i (t/binary! (mut graph) 26 11 i (t/constant! (mut graph) 11 1))
+        next (t/require (b/vector-binary! (mut graph) opcode ty acc step 0))
+        back (t/loop-end! (mut graph) body)]
+    (t/patch! (mut graph) loop 2 back)
+    (t/patch! (mut graph) i 3 next-i)
+    (t/patch! (mut graph) acc 3 next)
+    (let [stored (vt/save! (mut graph) exit out acc)
+          ret (t/return! (mut graph) stored 0 0)]
+      (match (vt/compiled (mut tally) "x64 vector loop" graph start [ret] a)
+        (None [] (println "  (type {} initial {})" ty initial))
+        (Some [code]
+              (let [(mut code) code
+                    (mut first-input) (vt/buffer 16 0 a)
+                    (mut second-input) (vt/buffer 16 0 a)
+                    (mut output) (vt/buffer 16 SENTINEL a)]
+                (for [seed 0 4]
+                  (for trips [(: 0 i64) 1 2 5]
+                    (fill! (mut first-input) 0 base seed)
+                    (fill! (mut second-input) 0 base (+ seed 9))
+                    (for [i 0 16] (set! (mut output) i SENTINEL))
+                    (vt/invoke code [(vt/address output 0) (vt/address first-input 0)
+                                     (vt/address second-input 0) (cast u64 trips)])
+                    (for [lane 0 lanes]
+                      (let [(mut value) (case initial
+                                          0 (lane-value base lane seed)
+                                          1 (lane-value base lane 7)
+                                          2 (: 0 u64)
+                                          (vt/lane-mask base))
+                            q (lane-value base lane (+ seed 9))
+                            (mut known) true]
+                        (for [k 0 trips]
+                          (when (vt/lane-ambiguous? opcode base value q) (set! known false))
+                          (set! value (vt/lane-binary opcode base value q)))
+                        (when known
+                          (vt/expect! (mut tally) "loop" ty opcode initial lane
+                                      (vt/word (slice output) (* lane (cast i64 size)) size)
+                                      value))))))
+                (free! (mut first-input))
+                (free! (mut second-input))
+                (free! (mut output))
+                (vt/release! (mut code))))))
+    (g/release! (mut graph))))
+
+;;; f(out, pa, pb, c, pe): v = c != 0 ? yes : no at a MERGE; out = v. `shape`
+;;; picks the PHI inputs: 0 (x, y) both loaded, 1 (constant, y),
+;;; 2 (x, constant), 3 (constant, constant), 4 (x OP y computed in the true
+;;; block, zeros), 5 (ones, x). `extra` other vectors are loaded from pe
+;;; before the branch and stored after the merge.
+(defn diamond! [(tally (mut t/Tally)) (ty i32) (shape i64) (extra i64) (a (dyn Allocator))]
+  (-> void)
+  (let [base (types/base-type ty)
+        size (vt/lane-bytes base)
+        lanes (cast i64 (types/lanes ty))
+        opcode (combine-op base)
+        (mut graph) (g/create a)
+        start (t/start! (mut graph))
+        out (t/param! (mut graph) start 6 0)
+        pa (t/param! (mut graph) start 6 1)
+        pb (t/param! (mut graph) start 6 2)
+        c (t/param! (mut graph) start 11 3)
+        pe (t/param! (mut graph) start 6 4)
+        x (vt/load! (mut graph) ty start pa)
+        y (vt/load! (mut graph) ty x pb)
+        (mut others) (ArrayList::new [i32] a)
+        (mut control) y]
+    (for [k 0 extra]
+      (set! control (vt/load! (mut graph) ty control (vt/offset! (mut graph) pe (* k 16))))
+      (push! (mut others) control))
+    (let [branch (t/if! (mut graph) control c)
+          on (t/if-true! (mut graph) branch)
+          off (t/if-false! (mut graph) branch)
+          yes (case shape
+                0 x
+                1 (constant-of! (mut graph) ty 3 a)
+                2 x
+                3 (constant-of! (mut graph) ty 3 a)
+                4 (t/require (b/vector-binary! (mut graph) opcode ty x y 0))
+                (bytes-of! (mut graph) ty 0xFF a))
+          no (case shape
+               0 y
+               1 y
+               2 (constant-of! (mut graph) ty 11 a)
+               3 (constant-of! (mut graph) ty 11 a)
+               4 (bytes-of! (mut graph) ty 0 a)
+               x)
+          merge (t/merge! (mut graph) (t/end! (mut graph) on) (t/end! (mut graph) off))
+          v (t/phi! (mut graph) ty merge yes no)]
+      (set! control (vt/save! (mut graph) merge out v))
+      (for [k 0 extra]
+        (set! control
+              (vt/save! (mut graph) control (vt/offset! (mut graph) out (+ 16 (* k 16)))
+                        (get others k))))
+      (let [ret (t/return! (mut graph) control 0 0)]
+        (match (vt/compiled (mut tally) "x64 vector diamond" graph start [ret] a)
+          (None [] (println "  (type {} shape {} extra {})" ty shape extra))
+          (Some [code]
+                (let [(mut code) code
+                      (mut first) (vt/buffer 16 0 a)
+                      (mut second) (vt/buffer 16 0 a)
+                      (mut rest) (vt/buffer (+ 16 (* extra 16)) 0 a)
+                      (mut output) (vt/buffer (+ 16 (* extra 16)) SENTINEL a)]
+                  (for [seed 0 3]
+                    (for chosen [(: 0 u64) 1 0x100000000]
+                      (fill! (mut first) 0 base seed)
+                      (fill! (mut second) 0 base (+ seed 5))
+                      (for [k 0 extra] (fill! (mut rest) (* k 16) base (+ seed k 1)))
+                      (for [i 0 (len output)] (set! (mut output) i SENTINEL))
+                      (vt/invoke code [(vt/address output 0) (vt/address first 0)
+                                       (vt/address second 0) chosen (vt/address rest 0)])
+                      (for [lane 0 lanes]
+                        (let [p (lane-value base lane seed)
+                              q (lane-value base lane (+ seed 5))
+                              yes-lane (case shape
+                                         0 p
+                                         1 (lane-value base lane 3)
+                                         2 p
+                                         3 (lane-value base lane 3)
+                                         4 (vt/lane-binary opcode base p q)
+                                         (vt/lane-mask base))
+                              no-lane (case shape
+                                        0 q
+                                        1 q
+                                        2 (lane-value base lane 11)
+                                        3 (lane-value base lane 11)
+                                        4 (: 0 u64)
+                                        p)]
+                          (unless (and (= shape 4) (!= chosen 0)
+                                       (vt/lane-ambiguous? opcode base p q))
+                            (vt/expect! (mut tally) "diamond" ty (cast i32 shape) extra lane
+                                        (vt/word (slice output) (* lane (cast i64 size)) size)
+                                        (if (!= chosen 0) yes-lane no-lane)))
+                          (for [k 0 extra]
+                            (vt/expect! (mut tally) "diamond other" ty (cast i32 shape) k lane
+                                        (vt/word (slice output)
+                                                 (+ 16 (* k 16) (* lane (cast i64 size))) size)
+                                        (lane-value base lane (+ seed k 1))))))))
+                  (free! (mut first))
+                  (free! (mut second))
+                  (free! (mut rest))
+                  (free! (mut output))
+                  (vt/release! (mut code)))))))
+    (free! (mut others))
+    (g/release! (mut graph))))
+
+;;; f(out, pa): u = x; t = u; u = t OP t; out[0] = u; out[16] = the 8-byte
+;;; view of u when `view` is an 8-byte vector type (0: none). `volatile`
+;;; uses VLOAD_v/VSTORE_v.
+(defn locals! [(tally (mut t/Tally)) (ty i32) (view i32) (volatile bool) (alignment i32)
+               (a (dyn Allocator))] (-> void)
+  (let [base (types/base-type ty)
+        size (vt/lane-bytes base)
+        lanes (cast i64 (types/lanes ty))
+        opcode (combine-op base)
+        load-op (if volatile (: 86 i32) 85)
+        store-op (if volatile (: 88 i32) 87)
+        (mut graph) (g/create a)
+        start (t/start! (mut graph))
+        out (t/param! (mut graph) start 6 0)
+        pa (t/param! (mut graph) start 6 1)
+        u (t/require (b/variable! (mut graph) ty start "u" alignment))
+        x (vt/load! (mut graph) ty start pa)
+        s1 (t/require (b/emit! (mut graph) store-op 0 [x u x]))
+        l1 (t/require (b/emit! (mut graph) load-op ty [s1 u]))
+        doubled (t/require (b/vector-binary! (mut graph) opcode ty l1 l1 0))
+        s2 (t/require (b/emit! (mut graph) store-op 0 [l1 u doubled]))
+        l2 (t/require (b/emit! (mut graph) load-op ty [s2 u]))
+        c1 (vt/save! (mut graph) l2 out l2)
+        (mut control) c1]
+    (when (!= view 0)
+      (let [narrow (t/require (b/emit! (mut graph) load-op view [control u]))]
+        (set! control (vt/save! (mut graph) narrow (vt/offset! (mut graph) out 16) narrow))))
+    (let [ret (t/return! (mut graph) control 0 0)]
+      (match (vt/compiled (mut tally) "x64 vector locals" graph start [ret] a)
+        (None [] (println "  (type {} view {} alignment {})" ty view alignment))
+        (Some [code]
+              (let [(mut code) code
+                    (mut input) (vt/buffer 16 0 a)
+                    (mut output) (vt/buffer 32 SENTINEL a)]
+                (for [seed 0 vt/SPECIALS]
+                  (fill! (mut input) 0 base seed)
+                  (for [i 0 32] (set! (mut output) i SENTINEL))
+                  (vt/invoke code [(vt/address output 0) (vt/address input 0)])
+                  (for [lane 0 lanes]
+                    (let [p (lane-value base lane seed)]
+                      (unless (vt/lane-ambiguous? opcode base p p)
+                        (vt/expect! (mut tally) "locals" ty opcode (cast i64 alignment) lane
+                                    (vt/word (slice output) (* lane (cast i64 size)) size)
+                                    (vt/lane-binary opcode base p p)))))
+                  (when (!= view 0)
+                    ; The view is the first eight bytes of the variable.
+                    (vt/expect! (mut tally) "locals view" ty opcode (cast i64 view) 0
+                                (vt/word (slice output) 16 8) (vt/word (slice output) 0 8))
+                    (vt/expect! (mut tally) "locals view end" ty opcode (cast i64 view) 1
+                                (vt/word (slice output) 24 8) 0xA5A5A5A5A5A5A5A5)))
+                (free! (mut input))
+                (free! (mut output))
+                (vt/release! (mut code))))))
+    (g/release! (mut graph))))
+
+;;; f(out, pa): out[0] = zeros; out[16] = ones; out[32] = a pattern;
+;;; out[48] = bits(x) ^ ones; out[64] = bits(x) | zeros; out[80] = zeros & bits(x).
+(defn constants! [(tally (mut t/Tally)) (ty i32) (a (dyn Allocator))] (-> void)
+  (let [base (types/base-type ty)
+        size (vt/lane-bytes base)
+        lanes (cast i64 (types/lanes ty))
+        width (cast i64 (types/size ty 8))
+        raw (types/vector-type (vt/integer-of base false) (types/lanes ty))
+        (mut graph) (g/create a)
+        start (t/start! (mut graph))
+        out (t/param! (mut graph) start 6 0)
+        pa (t/param! (mut graph) start 6 1)
+        x (vt/load! (mut graph) ty start pa)
+        bits (t/unary! (mut graph) 36 raw x)
+        zeros (bytes-of! (mut graph) raw 0 a)
+        ones (bytes-of! (mut graph) raw 0xFF a)
+        c1 (vt/save! (mut graph) x out (bytes-of! (mut graph) ty 0 a))
+        c2 (vt/save! (mut graph) c1 (vt/offset! (mut graph) out 16) (bytes-of! (mut graph) ty 0xFF a))
+        c3 (vt/save! (mut graph) c2 (vt/offset! (mut graph) out 32) (constant-of! (mut graph) ty 1 a))
+        c4 (vt/save! (mut graph) c3 (vt/offset! (mut graph) out 48)
+                     (t/require (b/vector-binary! (mut graph) 48 raw bits ones 0)))
+        c5 (vt/save! (mut graph) c4 (vt/offset! (mut graph) out 64)
+                     (t/require (b/vector-binary! (mut graph) 46 raw bits zeros 0)))
+        c6 (vt/save! (mut graph) c5 (vt/offset! (mut graph) out 80)
+                     (t/require (b/vector-binary! (mut graph) 47 raw zeros bits 0)))
+        ret (t/return! (mut graph) c6 0 0)]
+    (match (vt/compiled (mut tally) "x64 vector constants" graph start [ret] a)
+      (None [] (println "  (type {})" ty))
+      (Some [code]
+            (let [(mut code) code
+                  (mut input) (vt/buffer 16 0 a)
+                  (mut output) (vt/buffer 96 SENTINEL a)]
+              (for [seed 0 4]
+                (fill! (mut input) 0 base seed)
+                (for [i 0 96] (set! (mut output) i SENTINEL))
+                (vt/invoke code [(vt/address output 0) (vt/address input 0)])
+                (for [lane 0 lanes]
+                  (let [p (lane-value base lane seed)
+                        at (* lane (cast i64 size))]
+                    (vt/expect! (mut tally) "zeros" ty 0 0 lane (vt/word (slice output) at size) 0)
+                    (vt/expect! (mut tally) "ones" ty 0 1 lane
+                                (vt/word (slice output) (+ 16 at) size) (vt/lane-mask base))
+                    (vt/expect! (mut tally) "pattern" ty 0 2 lane
+                                (vt/word (slice output) (+ 32 at) size) (lane-value base lane 1))
+                    (vt/expect! (mut tally) "xor ones" ty 0 3 lane
+                                (vt/word (slice output) (+ 48 at) size)
+                                (^ p (vt/lane-mask base)))
+                    (vt/expect! (mut tally) "or zeros" ty 0 4 lane
+                                (vt/word (slice output) (+ 64 at) size) p)
+                    (vt/expect! (mut tally) "and zeros" ty 0 5 lane
+                                (vt/word (slice output) (+ 80 at) size) 0)))
+                (for [block 0 6]
+                  (for [i width 16]
+                    (vt/expect! (mut tally) "constant gap" ty 0 block i
+                                (cast u64 (get output (+ (* block 16) i))) SENTINEL))))
+              (free! (mut input))
+              (free! (mut output))
+              (vt/release! (mut code)))))
+    (g/release! (mut graph))))
+
+;;; f(p, q) = bits(p) ^ bits(q) for two 16-byte vector parameters, returned
+;;; as a vector; `swap` returns q's copy when the bits are equal.
+(defn by-value! [(tally (mut t/Tally)) (ty i32) (a (dyn Allocator))] (-> void)
+  (let [base (types/base-type ty)
+        size (vt/lane-bytes base)
+        lanes (cast i64 (types/lanes ty))
+        raw (types/vector-type (vt/integer-of base false) (types/lanes ty))
+        (mut graph) (g/create a)
+        start (t/start! (mut graph))
+        p (t/param! (mut graph) start ty 0)
+        q (t/param! (mut graph) start ty 1)
+        mixed (t/require (b/vector-binary! (mut graph) 48 raw
+                                           (t/unary! (mut graph) 36 raw p)
+                                           (t/unary! (mut graph) 36 raw q) 0))
+        ret (t/return! (mut graph) start ty (t/unary! (mut graph) 36 ty mixed))]
+    (match (vt/compiled (mut tally) "x64 vector by value" graph start [ret] a)
+      (None [] (println "  (type {})" ty))
+      (Some [code]
+            (let [(mut code) code
+                  (mut input) (vt/buffer 32 0 a)
+                  (mut output) (vt/buffer 32 SENTINEL a)]
+              (for [seed 0 vt/SPECIALS]
+                (fill! (mut input) 0 base seed)
+                (fill! (mut input) 16 base (+ seed 6))
+                (for [i 0 32] (set! (mut output) i SENTINEL))
+                (call16 (primitive/cast u64 (.base (.memory (.loaded code))))
+                        (vt/address input 0) (vt/address output 0))
+                (for [lane 0 lanes]
+                  (vt/expect! (mut tally) "by value" ty 120 0 lane
+                              (vt/word (slice output) (* lane (cast i64 size)) size)
+                              (^ (lane-value base lane seed) (lane-value base lane (+ seed 6)))))
+                (vt/expect! (mut tally) "by value end" ty 120 0 16
+                            (vt/word (slice output) 16 8) 0xA5A5A5A5A5A5A5A5))
+              (free! (mut input))
+              (free! (mut output))
+              (vt/release! (mut code)))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 vector transport: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (for [index 0 vt/TYPES]
+          (let [ty (vt/vector-type index)
+                whole (= (types/size ty 8) 16)]
+            (pressure! (mut tally) ty a)
+            (for [initial 0 4] (loop! (mut tally) ty initial a))
+            (for [shape 0 6]
+              (diamond! (mut tally) ty shape 0 a)
+              (diamond! (mut tally) ty shape 16 a))
+            (locals! (mut tally) ty 0 false 0 a)
+            (locals! (mut tally) ty 0 true 16 a)
+            (locals! (mut tally) ty 0 false 64 a)
+            (when whole
+              ; The 8-byte vector of the same lane type views the variable.
+              (locals! (mut tally) ty (vt/vector-type (- index 1)) false 0 a)
+              (by-value! (mut tally) ty a))
+            (constants! (mut tally) ty a)))
+        (println "x64 vector transport: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))

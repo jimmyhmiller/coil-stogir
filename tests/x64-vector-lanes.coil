@@ -1,0 +1,356 @@
+(module stogir.tests.x64-vector-lanes)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.types" :as types)
+(import "stogir.x64.testing" :as t)
+(import "stogir.x64.vector-testing" :as vt)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; EXTRACT, REPLACE, SPLAT and vector BITCAST of the x86-64 vector family,
+;;; every lane type at 8 and 16 bytes.
+;;;
+;;;   extract  f(pa, index) = lane of x. A literal index (one function per
+;;;            lane) or a run-time index typed U8, I32 or U64 with garbage
+;;;            above it; an index at or past the lane count, negative ones
+;;;            included, yields zero. Integer lanes are also extracted as the
+;;;            other signedness. The vector is loaded or a constant.
+;;;   replace  f(out, pa, index, scalar): out = x with one lane replaced. The
+;;;            scalar is a parameter with garbage above its width or a
+;;;            constant; an out-of-range run-time index changes nothing.
+;;;   splat    f(out, scalar): every lane the scalar (parameter or constant).
+;;;   bitcast  between vector types of one size, and between an 8-byte
+;;;            vector and U64, I64 and DOUBLE in both directions.
+;;;   by value an 8-byte vector as a parameter in xmm0 and as the result.
+;;; Floating scalars travel as integer bits and are converted by BITCAST in
+;;; the function, so the harness needs no floating arguments.
+
+(const SENTINEL 0xA5)
+
+(defn lane-value [(base i32) (lane i64) (seed i64)] (-> u64)
+  (vt/special base (% (+ (* lane 3) seed 1) vt/SPECIALS)))
+
+;;; A scalar of lane type `base` to put into a vector: a BOOL scalar is 0 or
+;;; 1 (lanes read from memory may hold any byte).
+(defn scalar-value [(base i32) (index i64)] (-> u64)
+  (if (= base 1) (& (vt/special base index) 1) (vt/special base index)))
+
+;;; Run-time indexes: every lane, the first invalid ones and wild values.
+(defn index-value [(lanes i64) (round i64)] (-> u64)
+  (if (< round (+ lanes 2))
+      (cast u64 round)
+      (case (- round (+ lanes 2))
+        0 (: 0xFFFFFFFFFFFFFFFF u64)
+        1 0x80
+        2 0xFF
+        3 0x100
+        4 0x80000000
+        5 0x100000000
+        0x8000000000000000)))
+
+;;; The scalar type of an index mode: 1 U8, 2 I32, 3 U64 (0: literal).
+(defn index-type [(mode i64)] (-> i32)
+  (case mode 1 (: 2 i32) 2 10 5))
+
+;;; What the function sees of index `raw` in its type.
+(defn index-seen [(mode i64) (raw u64)] (-> u64)
+  (case mode 1 (& raw 0xFF) 2 (& raw 0xFFFFFFFF) raw))
+
+;;; The scalar of lane type `base` whose bits are the integer value `raw`.
+(defn scalar! [(graph (mut g/Graph)) (base i32) (raw i32)] (-> i32)
+  (if (types/floating? base) (t/float-value! (mut graph) base raw) raw))
+
+;;; The vector operand: loaded from `pointer`, or the constant `fixed`.
+(defn operand! [(graph (mut g/Graph)) (ty i32) (control i32) (pointer i32) (constant bool)
+                (fixed (slice u64)) (a (dyn Allocator))] (-> i32)
+  (if constant (vt/constant! (mut graph) ty fixed a) (vt/load! (mut graph) ty control pointer)))
+
+(defn fill! [(buffer (mut (ArrayList u8))) (base i32) (seed i64)] (-> void)
+  (let [size (vt/lane-bytes base)]
+    (for [i 0 (/ 16 (cast i64 size))]
+      (vt/put! (mut buffer) (* i (cast i64 size)) size (lane-value base i seed)))))
+
+;;; `index-mode` 0: the literal lane `literal`; else a run-time index.
+;;; `other`: extract an integer lane as the other signedness.
+(defn extract! [(tally (mut t/Tally)) (ty i32) (index-mode i64) (literal i64) (constant bool)
+                (other bool) (a (dyn Allocator))] (-> void)
+  (let [base (types/base-type ty)
+        size (vt/lane-bytes base)
+        lanes (cast i64 (types/lanes ty))
+        scalar (if other (vt/integer-of base (not (types/signed? base))) base)
+        (mut graph) (g/create a)
+        start (t/start! (mut graph))
+        pa (t/param! (mut graph) start 6 0)
+        dynamic (t/param! (mut graph) start (index-type index-mode) 1)
+        index (if (= index-mode 0) (t/constant! (mut graph) 10 (cast u64 literal)) dynamic)
+        (mut fixed) (ArrayList::new [u64] a)]
+    (for [i 0 lanes] (push! (mut fixed) (lane-value base i 4)))
+    (let [x (operand! (mut graph) ty start pa constant (slice fixed) a)
+          lane (t/require (b/vector-extract! (mut graph) scalar 8 x index))
+          returned-type (if (types/floating? scalar) (: 5 i32) scalar)
+          value (if (types/floating? scalar) (t/float-bits! (mut graph) scalar lane) lane)
+          ret (t/return! (mut graph) (if constant start x) returned-type value)]
+      (match (vt/compiled (mut tally) "x64 vector extract" graph start [ret] a)
+        (None [] (println "  (type {} index mode {} literal {})" ty index-mode literal))
+        (Some [code]
+              (let [(mut code) code
+                    (mut input) (vt/buffer 16 0 a)]
+                (for [seed 0 4]
+                  (fill! (mut input) base seed)
+                  (for [round 0 (if (= index-mode 0) 1 (+ lanes 9))]
+                    (let [raw (index-value lanes round)
+                          seen (if (= index-mode 0) (cast u64 literal) (index-seen index-mode raw))
+                          passed (if (= index-mode 0) 0 (t/dirty (index-type index-mode) raw))
+                          wanted (cond (>= seen (cast u64 lanes)) 0
+                                       constant (get fixed (cast i64 seen))
+                                       :else (lane-value base (cast i64 seen) seed))
+                          actual (vt/invoke code [(vt/address input 0) passed])]
+                      (vt/expect! (mut tally) "extracted" ty 61 index-mode (cast i64 seen)
+                                  (& actual (t/returned-mask returned-type))
+                                  (t/returned returned-type wanted)))))
+                (free! (mut input))
+                (vt/release! (mut code))))))
+    (free! (mut fixed))
+    (g/release! (mut graph))))
+
+;;; `scalar-mode` 0: the scalar is a parameter; 1: a constant.
+(defn replace! [(tally (mut t/Tally)) (ty i32) (index-mode i64) (literal i64) (constant bool)
+                (scalar-mode i64) (a (dyn Allocator))] (-> void)
+  (let [base (types/base-type ty)
+        size (vt/lane-bytes base)
+        lanes (cast i64 (types/lanes ty))
+        width (cast i64 (types/size ty 8))
+        carrier (if (types/floating? base) (if (= base 12) (: 5 i32) 4) base)
+        fixed-scalar (scalar-value base 9)
+        (mut graph) (g/create a)
+        start (t/start! (mut graph))
+        out (t/param! (mut graph) start 6 0)
+        pa (t/param! (mut graph) start 6 1)
+        dynamic (t/param! (mut graph) start (index-type index-mode) 2)
+        index (if (= index-mode 0) (t/constant! (mut graph) 10 (cast u64 literal)) dynamic)
+        passed-scalar (t/param! (mut graph) start carrier 3)
+        raw (if (= scalar-mode 0) passed-scalar (t/constant! (mut graph) carrier fixed-scalar))
+        value (if (types/floating? base) (t/unary! (mut graph) 36 base raw) raw)
+        (mut fixed) (ArrayList::new [u64] a)]
+    (for [i 0 lanes] (push! (mut fixed) (lane-value base i 6)))
+    (let [x (operand! (mut graph) ty start pa constant (slice fixed) a)
+          r (t/require (b/vector-replace! (mut graph) ty 8 x index value))
+          c1 (vt/save! (mut graph) (if constant start x) out r)
+          c2 (vt/save! (mut graph) c1 (vt/offset! (mut graph) out 32) x)
+          ret (t/return! (mut graph) c2 0 0)]
+      (match (vt/compiled (mut tally) "x64 vector replace" graph start [ret] a)
+        (None [] (println "  (type {} index mode {} literal {})" ty index-mode literal))
+        (Some [code]
+              (let [(mut code) code
+                    (mut input) (vt/buffer 16 0 a)
+                    (mut output) (vt/buffer 64 SENTINEL a)]
+                (for [seed 0 4]
+                  (fill! (mut input) base seed)
+                  (for [round 0 (if (= index-mode 0) 1 (+ lanes 9))]
+                    (for [i 0 64] (set! (mut output) i SENTINEL))
+                    (let [raw-index (index-value lanes round)
+                          seen (if (= index-mode 0)
+                                   (cast u64 literal)
+                                   (index-seen index-mode raw-index))
+                          passed (if (= index-mode 0)
+                                     0
+                                     (t/dirty (index-type index-mode) raw-index))
+                          given (scalar-value base (% (+ seed round 2) vt/SPECIALS))
+                          put (if (= scalar-mode 0) given fixed-scalar)]
+                      (vt/invoke code [(vt/address output 0) (vt/address input 0) passed
+                                       (t/dirty carrier given)])
+                      (for [i 0 lanes]
+                        (let [before (if constant (get fixed i) (lane-value base i seed))]
+                          (vt/expect! (mut tally) "replaced" ty 62 index-mode i
+                                      (vt/word (slice output) (* i (cast i64 size)) size)
+                                      (if (= (cast u64 i) seen) put before))
+                          (vt/expect! (mut tally) "source kept" ty 62 index-mode i
+                                      (vt/word (slice output) (+ 32 (* i (cast i64 size))) size)
+                                      before)))
+                      (for [i width 32]
+                        (vt/expect! (mut tally) "after replaced" ty 62 index-mode i
+                                    (cast u64 (get output i)) SENTINEL)))))
+                (free! (mut input))
+                (free! (mut output))
+                (vt/release! (mut code))))))
+    (free! (mut fixed))
+    (g/release! (mut graph))))
+
+(defn splat! [(tally (mut t/Tally)) (ty i32) (scalar-mode i64) (a (dyn Allocator))] (-> void)
+  (let [base (types/base-type ty)
+        size (vt/lane-bytes base)
+        lanes (cast i64 (types/lanes ty))
+        width (cast i64 (types/size ty 8))
+        carrier (if (types/floating? base) (if (= base 12) (: 5 i32) 4) base)
+        fixed-scalar (scalar-value base 8)
+        (mut graph) (g/create a)
+        start (t/start! (mut graph))
+        out (t/param! (mut graph) start 6 0)
+        passed-scalar (t/param! (mut graph) start carrier 1)
+        raw (if (= scalar-mode 0) passed-scalar (t/constant! (mut graph) carrier fixed-scalar))
+        value (if (types/floating? base) (t/unary! (mut graph) 36 base raw) raw)
+        r (t/require (b/vector-splat! (mut graph) ty 8 value))
+        c1 (vt/save! (mut graph) start out r)
+        ret (t/return! (mut graph) c1 0 0)]
+    (match (vt/compiled (mut tally) "x64 vector splat" graph start [ret] a)
+      (None [] (println "  (type {} scalar mode {})" ty scalar-mode))
+      (Some [code]
+            (let [(mut code) code
+                  (mut output) (vt/buffer 32 SENTINEL a)]
+              (for [seed 0 vt/SPECIALS]
+                (for [i 0 32] (set! (mut output) i SENTINEL))
+                (let [given (scalar-value base seed)]
+                  (vt/invoke code [(vt/address output 0) (t/dirty carrier given)])
+                  (for [i 0 lanes]
+                    (vt/expect! (mut tally) "splat" ty 63 scalar-mode i
+                                (vt/word (slice output) (* i (cast i64 size)) size)
+                                (if (= scalar-mode 0) given fixed-scalar)))
+                  (for [i width 32]
+                    (vt/expect! (mut tally) "after splat" ty 63 scalar-mode i
+                                (cast u64 (get output i)) SENTINEL))))
+              (free! (mut output))
+              (vt/release! (mut code)))))
+    (g/release! (mut graph))))
+
+;;; out = BITCAST(x) between two vector types of one size: the bytes are kept.
+(defn recast! [(tally (mut t/Tally)) (from i32) (to i32) (constant bool) (a (dyn Allocator))]
+  (-> void)
+  (let [base (types/base-type from)
+        lanes (cast i64 (types/lanes from))
+        width (cast i64 (types/size from 8))
+        (mut graph) (g/create a)
+        start (t/start! (mut graph))
+        out (t/param! (mut graph) start 6 0)
+        pa (t/param! (mut graph) start 6 1)
+        (mut fixed) (ArrayList::new [u64] a)]
+    (for [i 0 lanes] (push! (mut fixed) (lane-value base i 2)))
+    (let [x (operand! (mut graph) from start pa constant (slice fixed) a)
+          r (t/unary! (mut graph) 36 to x)
+          c1 (vt/save! (mut graph) (if constant start x) out r)
+          ret (t/return! (mut graph) c1 0 0)]
+      (match (vt/compiled (mut tally) "x64 vector bitcast" graph start [ret] a)
+        (None [] (println "  (from {} to {})" from to))
+        (Some [code]
+              (let [(mut code) code
+                    (mut input) (vt/buffer 16 0 a)
+                    (mut output) (vt/buffer 32 SENTINEL a)
+                    size (vt/lane-bytes base)]
+                (for [seed 0 4]
+                  (fill! (mut input) base seed)
+                  (for [i 0 32] (set! (mut output) i SENTINEL))
+                  (vt/invoke code [(vt/address output 0) (vt/address input 0)])
+                  (for [i 0 lanes]
+                    (vt/expect! (mut tally) "bitcast" from 36 (cast i64 to) i
+                                (vt/word (slice output) (* i (cast i64 size)) size)
+                                (if constant (get fixed i) (lane-value base i seed))))
+                  (for [i width 32]
+                    (vt/expect! (mut tally) "after bitcast" from 36 (cast i64 to) i
+                                (cast u64 (get output i)) SENTINEL)))
+                (free! (mut input))
+                (free! (mut output))
+                (vt/release! (mut code))))))
+    (free! (mut fixed))
+    (g/release! (mut graph))))
+
+;;; An 8-byte vector to and from the 8-byte scalar type `scalar` (U64, I64 or
+;;; DOUBLE): f(out, pa, bits) stores BITCAST(scalar of bits) as a vector and
+;;; returns the bits of BITCAST(x) as that scalar.
+(defn scalar-cast! [(tally (mut t/Tally)) (ty i32) (scalar i32) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        out (t/param! (mut graph) start 6 0)
+        pa (t/param! (mut graph) start 6 1)
+        raw (t/param! (mut graph) start (if (= scalar 12) 5 scalar) 2)
+        given (if (= scalar 12) (t/unary! (mut graph) 36 12 raw) raw)
+        x (vt/load! (mut graph) ty start pa)
+        packed (t/unary! (mut graph) 36 ty given)
+        c1 (vt/save! (mut graph) x out packed)
+        unpacked (t/unary! (mut graph) 36 scalar x)
+        bits (if (= scalar 12) (t/unary! (mut graph) 36 5 unpacked) unpacked)
+        ret (t/return! (mut graph) c1 (if (= scalar 12) 5 scalar) bits)]
+    (match (vt/compiled (mut tally) "x64 vector scalar bitcast" graph start [ret] a)
+      (None [] (println "  (type {} scalar {})" ty scalar))
+      (Some [code]
+            (let [(mut code) code
+                  (mut input) (vt/buffer 16 0 a)
+                  (mut output) (vt/buffer 16 SENTINEL a)]
+              (for [seed 0 vt/SPECIALS]
+                (for [i 0 16] (set! (mut output) i SENTINEL))
+                (let [stored (vt/special 5 seed)
+                      given (vt/special 12 (% (+ seed 3) vt/SPECIALS))]
+                  (vt/put! (mut input) 0 8 stored)
+                  (vt/put! (mut input) 8 8 0x1122334455667788)
+                  (vt/expect! (mut tally) "vector to scalar" ty 36 (cast i64 scalar) 0
+                              (vt/invoke code [(vt/address output 0) (vt/address input 0) given])
+                              stored)
+                  (vt/expect! (mut tally) "scalar to vector" ty 36 (cast i64 scalar) 0
+                              (vt/word (slice output) 0 8) given)
+                  (vt/expect! (mut tally) "after scalar to vector" ty 36 (cast i64 scalar) 1
+                              (vt/word (slice output) 8 8) 0xA5A5A5A5A5A5A5A5)))
+              (free! (mut input))
+              (free! (mut output))
+              (vt/release! (mut code)))))
+    (g/release! (mut graph))))
+
+;;; f(v) = NOT v for an 8-byte vector parameter in xmm0, returned in xmm0;
+;;; `copied` routes the result through a COPY.
+(defn by-value! [(tally (mut t/Tally)) (ty i32) (copied bool) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        v (t/param! (mut graph) start ty 0)
+        mask (types/vector-type (vt/integer-of (types/base-type ty) false) (types/lanes ty))
+        flipped (t/unary! (mut graph) 36 ty
+                          (t/require (b/vector-unary! (mut graph) 45 mask
+                                                      (t/unary! (mut graph) 36 mask v))))
+        r (if copied (t/copy! (mut graph) ty flipped) flipped)
+        ret (t/return! (mut graph) start ty r)]
+    (match (vt/compiled (mut tally) "x64 vector by value" graph start [ret] a)
+      (None [] (println "  (type {})" ty))
+      (Some [code]
+            (let [(mut code) code]
+              (for [seed 0 vt/SPECIALS]
+                (let [given (vt/special 5 seed)]
+                  (vt/expect! (mut tally) "by value" ty 120 0 0
+                              (vt/invoke-floating code given [])
+                              (^ given 0xFFFFFFFFFFFFFFFF))))
+              (vt/release! (mut code)))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 vector lanes: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (for [index 0 vt/TYPES]
+          (let [ty (vt/vector-type index)
+                base (types/base-type ty)
+                lanes (cast i64 (types/lanes ty))]
+            (for [lane 0 lanes]
+              (extract! (mut tally) ty 0 lane false false a)
+              (extract! (mut tally) ty 0 lane true false a)
+              (when (types/integer? base) (extract! (mut tally) ty 0 lane false true a))
+              (replace! (mut tally) ty 0 lane false 0 a)
+              (replace! (mut tally) ty 0 lane true 1 a)
+              (replace! (mut tally) ty 0 lane false 1 a))
+            (for [mode 1 4]
+              (extract! (mut tally) ty mode 0 false false a)
+              (replace! (mut tally) ty mode 0 false 0 a))
+            (extract! (mut tally) ty 3 0 true false a)
+            (replace! (mut tally) ty 2 0 true 1 a)
+            (splat! (mut tally) ty 0 a)
+            (splat! (mut tally) ty 1 a)
+            ; Every other vector type of the same size.
+            (for [other 0 vt/TYPES]
+              (let [to (vt/vector-type other)]
+                (when (= (types/size to 8) (types/size ty 8))
+                  (recast! (mut tally) ty to false a)
+                  (when (= (% (+ index other) 5) 0) (recast! (mut tally) ty to true a)))))
+            (when (= (types/size ty 8) 8)
+              (for scalar [(: 5 i32) 11 12]
+                (scalar-cast! (mut tally) ty scalar a))
+              (by-value! (mut tally) ty false a)
+              (by-value! (mut tally) ty true a))))
+        (println "x64 vector lanes: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))
