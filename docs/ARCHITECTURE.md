@@ -65,8 +65,16 @@ must pass compiler delivery gates before being described as installed.
     embedder's single-threaded setup).
   `stogir.graph-seal` fingerprints everything a graph owns;
   `tests/compile-reads-graph.coil` and `tests/x64-verify-borrowed-graph.coil`
-  hold the entry points to this with graphs that live in an arena, and the
+  hold every entry point to this with graphs that live in an arena, and the
   x86-64 test support checks the seal around every compile it makes.
+  The inliner's read-only entry (`call-inline/optimize-frozen-specialized-policy`
+  on a closed registry, with registered and borrowed-snapshot templates) is
+  under the same contract. `tests/compile-module-concurrent.coil` runs the
+  embedder's whole worker job (expand template calls, then the
+  `image-for-private-module*` forms at levels two and three, with a sealed
+  private-leaf context and, on x86-64, MEMORY-class arguments) for a module
+  whose graphs share one arena: serially, then from eight threads, checking
+  arena total, fingerprints and byte-identical images.
 - JIT and AOT consume the same relocatable image. There is no alternate optimizer
   or LLVM/TPDE fallback behind either path.
 - Keep all optimization, matching, allocation and image generation inside the

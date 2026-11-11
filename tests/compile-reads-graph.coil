@@ -7,7 +7,7 @@
 (import "stogir.options" :as options)
 (import "stogir.image" :as image)
 (import "stogir.native.compile" :as compile)
-(import "stogir.native.private-types" :as private)
+(import "stogir.native.private-leaf" :as private)
 (import "coil.scratch" :as scratch)
 (import "coil.primitive" :as p)
 (import "coil.alloc" :use [malloc-allocator Allocator allocator])
@@ -89,8 +89,13 @@
     (Ok [compiled] (let [(mut compiled) compiled] (image/release! (mut compiled)) 0))))
 
 ;;; Compile `graph` through every entry point and report what changed.
+;;; `context` is a sealed private-leaf context without leaves and
+;;; `publication` its publication for `scope`, for the private-module forms;
+;;; tests/compile-module-concurrent.coil does those with a published leaf,
+;;; inline templates and several threads.
 (defn check [(label (slice u8)) (graph g/Graph) (start i32) (roots (slice i32))
-             (arena (ptr scratch/ScratchArena))] (-> i64)
+             (arena (ptr scratch/ScratchArena)) (context private/Context)
+             (publication private/Publication) (scope usize)] (-> i64)
   (let [a (malloc-allocator)
         total (.total arena)
         sealed (seal/seal graph)
@@ -98,6 +103,11 @@
     (match (compile/validate graph)
       (Err [message] (println "{}: validate: {}" label message) (set! failures (+ failures 1)))
       (Ok [_] 0))
+    ; Bare text carries no relocation: the call graph is refused, after the
+    ; whole pipeline has run over it.
+    (match (compile/text graph start roots a)
+      (Err [_] 0)
+      (Ok [bytes] (let [(mut bytes) bytes] (free! (mut bytes)) 0)))
     (set! failures (+ failures (settle label "image" (compile/image graph start roots "entry" a))))
     (set! failures (+ failures (settle label "vector-image"
                                        (compile/vector-image graph start roots "entry" a))))
@@ -118,7 +128,28 @@
       (set! failures (+ failures (settle label "image-with-options-proven"
                                          (compile/image-with-options-proven
                                            graph start roots "entry"
-                                           (options/Options :level level) a 0)))))
+                                           (options/Options :level level) a 0))))
+      (set! failures (+ failures (settle label "image-for-private-module"
+                                         (compile/image-for-private-module
+                                           graph start roots "entry"
+                                           (options/Options :level level) a
+                                           context publication scope))))
+      (set! failures (+ failures (settle label "image-for-private-module-optimized"
+                                         (compile/image-for-private-module-optimized
+                                           graph start roots "entry"
+                                           (options/Options :level level) a
+                                           context publication scope))))
+      (set! failures (+ failures (settle label "image-for-private-module-proven"
+                                         (compile/image-for-private-module-proven
+                                           graph start roots "entry"
+                                           (options/Options :level level) a
+                                           context publication scope 0))))
+      (match (compile/object-with-options graph start roots "entry"
+                                          (options/Options :level level) a)
+        (Err [message]
+             (println "{}: object-with-options: {}" label message)
+             (set! failures (+ failures 1)))
+        (Ok [bytes] (let [(mut bytes) bytes] (free! (mut bytes)) 0))))
     (match (compile/object graph start roots "entry" a)
       (Err [message] (println "{}: object: {}" label message) (set! failures (+ failures 1)))
       (Ok [bytes] (let [(mut bytes) bytes] (free! (mut bytes)) 0)))
@@ -132,7 +163,12 @@
     failures))
 
 (defn main [] (-> i64)
-  (let [(mut failures) 0]
+  (let [(mut failures) 0
+        (mut context) (private/context-create (malloc-allocator))
+        scope (: 4096 usize)
+        publication (match (private/seal-module! (mut context) scope)
+                      (None [] (panic "an empty private context did not seal"))
+                      (Some [publication] publication))]
     (for kind [(: 0 i32) 1 2]
       (let [arena (p/alloc-stack scratch/ScratchArena)
             _ (scratch/ScratchArena::init-with-capacity arena (malloc-allocator) 65536)
@@ -146,7 +182,8 @@
         (set! failures
               (+ failures
                  (if (= (get roots 1) 0)
-                     (check label graph start [(get roots 0)] arena)
-                     (check label graph start [(get roots 0) (get roots 1)] arena))))))
+                     (check label graph start [(get roots 0)] arena context publication scope)
+                     (check label graph start [(get roots 0) (get roots 1)] arena context
+                            publication scope))))))
     (println "compile reads its graph: {} failures" failures)
     (if (= failures 0) 0 1)))

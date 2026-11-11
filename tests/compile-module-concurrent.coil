@@ -1,0 +1,453 @@
+(module stogir.tests.compile-module-concurrent)
+(import "stogir.graph" :as g)
+(import "stogir.graph-seal" :as seal)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.call-results" :as results)
+(import "stogir.call-inline" :as inlining)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.symbols" :as symbols)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.native.compile" :as compile)
+(import "stogir.native.private-leaf" :as private)
+(import "coil.scratch" :as scratch)
+(import "coil.thread" :use [Thread ThreadConfig])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [malloc-allocator Allocator allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; What an embedder's emission workers do, serially and then from several
+;;; threads at once (docs/ARCHITECTURE.md, "A compile call only reads its
+;;; graph"). One private module:
+;;;
+;;;   * every graph of the module (two inline templates, a private leaf and
+;;;     eight functions) lives in ONE scratch arena, as the Coil compiler's
+;;;     module arena does;
+;;;   * the templates are in a closed inline registry: one registered (so the
+;;;     registry holds specialization contexts for literal arguments), one
+;;;     reached through a borrowed snapshot that reads the arena graph itself;
+;;;   * the leaf is published in a frozen, sealed private-leaf context;
+;;;   * each function calls both templates and the leaf, runs a loop, and on
+;;;     x86-64 half of them pass a MEMORY-class argument (an ARGVAL). Six
+;;;     have their template calls expanded (the compile then reads a private
+;;;     copy); two are compiled as they are, straight from the arena.
+;;;
+;;; A worker's job for one function is the adapter's: expand its template
+;;; calls against the closed registry (optimize-frozen-specialized-policy),
+;;; then compile the result with image-for-private-module at level three,
+;;; image-for-private-module-proven at level three and
+;;; image-for-private-module-optimized at level two.
+;;;
+;;; Checked: the serial pass leaves the arena's allocation total and the
+;;; fingerprint of every graph unchanged; THREADS workers then repeat
+;;; different functions concurrently for ROUNDS rounds, every image must
+;;; equal the serial one byte for byte (text, data, symbols, relocations, by
+;;; a digest over all of them), and the arena total and the fingerprints are
+;;; still unchanged afterwards.
+
+(const FUNCTIONS 8)
+(const THREADS 8)
+(const ROUNDS 60)
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn mix [(h u64) (w u64)] (-> u64)
+  (let [x (p/imul (^ h w) (: 0x9E3779B97F4A7C15 u64))]
+    (^ x (>> x 29))))
+
+;;; A digest of everything an image carries.
+(defn image-digest [(h u64) (compiled image/Image)] (-> u64)
+  (let [(mut d) (mix h (cast u64 (len (.text compiled))))]
+    (for byte (.text compiled) (set! d (mix d (cast u64 byte))))
+    (set! d (mix d (cast u64 (len (.data compiled)))))
+    (for byte (.data compiled) (set! d (mix d (cast u64 byte))))
+    (for byte (.names compiled) (set! d (mix d (cast u64 byte))))
+    (for symbol (.symbols compiled)
+      (set! d (mix (mix (mix d (cast u64 (.section symbol))) (cast u64 (.offset symbol)))
+                   (if (.global? symbol) 1 2))))
+    (for record (.relocations compiled)
+      (set! d (mix (mix (mix (mix (mix d (cast u64 (.section record)))
+                                  (cast u64 (.offset record)))
+                             (cast u64 (.kind record)))
+                        (cast u64 (.symbol record)))
+                   (cast u64 (.addend record)))))
+    (mix d (.leaf-effects compiled))))
+
+;;; One function of the module and the template calls in it.
+(defstruct Job
+  [(graph g/Graph) (start i32) (ret i32) (sites (ArrayList inlining/FrozenSite))])
+
+;;; What every worker shares. All of it is only read after setup.
+(defstruct Shared
+  [(jobs (ArrayList Job))
+   (expected (ArrayList u64))
+   (registry inlining/Registry)
+   (context private/Context)
+   (publication private/Publication)
+   (scope usize)])
+
+(defstruct Work [(shared (ptr Shared)) (index i64) (failures i64) (expansions i64)])
+
+(defn settle [(d u64) (label (slice u8)) (result (Result image/Image (slice u8)))] (-> u64)
+  (match result
+    (Err [message] (panic "module function does not compile ({}): {}" label message))
+    (Ok [compiled]
+        (let [(mut compiled) compiled
+              digest (image-digest d compiled)]
+          (image/release! (mut compiled))
+          digest))))
+
+;;; The adapter's job for function `index`, with allocator `a` only. Returns
+;;; the digest of the three images; `expanded` counts inlined sites.
+(defn run-job [(shared (ptr Shared)) (index i64) (expanded (mut i64)) (a (dyn Allocator))]
+  (-> u64)
+  (let [job (get (.jobs shared) index)
+        outcome (if (= (len (.sites job)) 0)
+                    (None [rewrite/Rewritten])
+                    (match (inlining/optimize-frozen-specialized-policy
+                             (.registry shared) (.graph job) (.start job) [(.ret job)]
+                             (slice (.sites job)) (inlining/default-policy 96) 0 a)
+                      (Err [message] (panic "inline expansion: {}" message))
+                      (Ok [outcome] outcome)))
+        three (options/Options :level 3)
+        two (options/Options :level 2)]
+    (match outcome
+      (None []
+            (settle (settle (settle 7 "module"
+                                    (compile/image-for-private-module
+                                      (.graph job) (.start job) [(.ret job)] "module_function"
+                                      three a (.context shared) (.publication shared)
+                                      (.scope shared)))
+                            "proven"
+                            (compile/image-for-private-module-proven
+                              (.graph job) (.start job) [(.ret job)] "module_function"
+                              three a (.context shared) (.publication shared)
+                              (.scope shared) 0))
+                    "level two"
+                    (compile/image-for-private-module
+                      (.graph job) (.start job) [(.ret job)] "module_function"
+                      two a (.context shared) (.publication shared) (.scope shared))))
+      (Some [rewritten]
+            (let [(mut rewritten) rewritten
+                  _ (set! expanded (+ expanded (cast i64 (.changes rewritten))))
+                  digest
+                    (settle (settle (settle 7 "module"
+                                            (compile/image-for-private-module
+                                              (.graph rewritten) (.start job)
+                                              (slice (.roots rewritten)) "module_function"
+                                              three a (.context shared) (.publication shared)
+                                              (.scope shared)))
+                                    "proven"
+                                    (compile/image-for-private-module-proven
+                                      (.graph rewritten) (.start job)
+                                      (slice (.roots rewritten)) "module_function"
+                                      three a (.context shared) (.publication shared)
+                                      (.scope shared) (.proof rewritten)))
+                            "optimized"
+                            (compile/image-for-private-module-optimized
+                              (.graph rewritten) (.start job)
+                              (slice (.roots rewritten)) "module_function"
+                              two a (.context shared) (.publication shared)
+                              (.scope shared)))]
+              (rewrite/release! (mut rewritten))
+              digest)))))
+
+;;; Thread body: ROUNDS jobs, starting at this worker's own function and
+;;; moving on by one each round, so at every moment the workers compile
+;;; different functions that share templates, leaf and arena.
+(defn worker :cc (cc/C) [(argument (ptr i8))] (-> (ptr i8))
+  (let [work (p/cast (ptr Work) argument)
+        shared (.shared work)
+        a (malloc-allocator)
+        (mut expanded) (: 0 i64)]
+    (for [round 0 ROUNDS]
+      (let [index (% (+ (.index work) round) FUNCTIONS)
+            digest (run-job shared index (mut expanded) a)]
+        (when (!= digest (get (.expected shared) index))
+          (set! (.failures work) (+ (.failures work) 1)))))
+    (set! (.expansions work) expanded)
+    (p/cast (ptr i8) 0)))
+
+;;; scale(x, k) = x * k + 1
+(defn scale-template [(graph (mut g/Graph)) (a (dyn Allocator))] (-> i32)
+  (let [start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        k (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        one (require (b/scalar-constant! (mut graph) 5 1 8))
+        product (require (b/emit! (mut graph) 28 5 [x k]))
+        value (require (b/emit! (mut graph) 26 5 [product one]))
+        own (match (calls/create 0 5 [(: 5 u8) 5] a)
+              (Err [message] (panic "{}" message)) (Ok [owned] owned))]
+    (require (calls/function! (mut graph) own a))
+    (require (b/emit! (mut graph) 120 5 [start value (: 0 i32)]))))
+
+;;; pick(x) = x * 3 ^ (x >> 2)
+(defn pick-template [(graph (mut g/Graph)) (a (dyn Allocator))] (-> i32)
+  (let [start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        three (require (b/scalar-constant! (mut graph) 5 3 8))
+        two (require (b/scalar-constant! (mut graph) 5 2 8))
+        tripled (require (b/emit! (mut graph) 28 5 [x three]))
+        shifted (require (b/emit! (mut graph) 50 5 [x two]))
+        value (require (b/emit! (mut graph) 48 5 [tripled shifted]))
+        own (match (calls/create 0 5 [(: 5 u8)] a)
+              (Err [message] (panic "{}" message)) (Ok [owned] owned))]
+    (require (calls/function! (mut graph) own a))
+    (require (b/emit! (mut graph) 120 5 [start value (: 0 i32)]))))
+
+;;; Function `index` of the module:
+;;;   v = x + y * (index + 2)
+;;;   c1 = module_scale(v, index + 3)      registered template, literal argument
+;;;   c2 = module_pick(c1)                 template through a borrowed snapshot
+;;;   c3 = module_leaf(c2)                 private leaf
+;;;   [x86-64, odd index: a 16-byte MEMORY argument to an external function]
+;;;   for (j = 0; j < (x & 7); j++) acc += c3 ^ j
+;;;   return acc + c1
+(defn function! [(graph (mut g/Graph)) (index i64) (scale-handle i64)
+                 (pick-snapshot inlining/Snapshot) (job (mut Job)) (a (dyn Allocator))] (-> void)
+  (let [start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        y (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 1]))
+        factor (require (b/scalar-constant! (mut graph) 5 (cast u64 (+ index 2)) 8))
+        literal (require (b/scalar-constant! (mut graph) 5 (cast u64 (+ index 3)) 8))
+        v (require (b/emit! (mut graph) 26 5
+                            [x (require (b/emit! (mut graph) 28 5 [y factor]))]))
+        two-words (match (calls/create 0 5 [(: 5 u8) 5] a)
+                    (Err [message] (panic "{}" message)) (Ok [owned] owned))
+        one-word (match (calls/create 0 5 [(: 5 u8)] a)
+                   (Err [message] (panic "{}" message)) (Ok [owned] owned))
+        scale (require (symbols/function! (mut graph) "module_scale" 0))
+        pick (require (symbols/function! (mut graph) "module_pick" 0))
+        leaf (require (symbols/function! (mut graph) "module_leaf" 0))
+        c1 (require (calls/emit! (mut graph) two-words start scale [v literal] a))
+        c2 (require (calls/emit! (mut graph) one-word c1 pick [c1] a))
+        c3 (require (calls/emit! (mut graph) one-word c2 leaf [c2] a))
+        (mut control) c3]
+    (when (and (results/system-v?) (= (% index 2) 1))
+      (let [size (require (b/scalar-constant! (mut graph) 5 16 8))
+            frame (require (b/frame-object! (mut graph) start size 8))
+            stored (require (b/emit! (mut graph) 93 0 [control frame c3]))
+            copy (require (b/argument-value! (mut graph) frame 16 8))
+            external (require (symbols/function! (mut graph) "module_external" 0))
+            (mut memory) (match (calls/create 8 5 [(: 6 u8)] a)
+                           (Err [message] (panic "{}" message)) (Ok [owned] owned))]
+        (require (calls/memory-parameter! (mut memory) 0 16 8))
+        (set! control (require (calls/emit! (mut graph) memory stored external [copy] a)))))
+    (let [zero (require (b/scalar-constant! (mut graph) 5 0 8))
+          one (require (b/scalar-constant! (mut graph) 5 1 8))
+          seven (require (b/scalar-constant! (mut graph) 5 7 8))
+          limit (require (b/emit! (mut graph) 47 5 [x seven]))
+          entry (require (b/emit! (mut graph) 114 0 [control]))
+          loop (require (b/loop-begin! (mut graph) entry))
+          j (require (b/loop-phi! (mut graph) loop zero))
+          acc (require (b/loop-phi! (mut graph) loop zero))
+          condition (require (b/emit! (mut graph) 20 1 [j limit]))
+          split (require (b/emit! (mut graph) 116 0 [loop condition]))
+          body (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+          exit (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+          next-j (require (b/emit! (mut graph) 26 5 [j one]))
+          mixed (require (b/emit! (mut graph) 48 5 [c3 j]))
+          next-acc (require (b/emit! (mut graph) 26 5 [acc mixed]))
+          back (require (b/emit! (mut graph) 115 0 [body]))
+          total (require (b/emit! (mut graph) 26 5 [acc c1]))
+          own (match (calls/create (if (results/system-v?) 8 0) 5 [(: 5 u8) 5] a)
+                (Err [message] (panic "{}" message)) (Ok [owned] owned))]
+      (require (b/patch! (mut graph) loop 2 back))
+      (require (b/patch! (mut graph) j 3 next-j))
+      (require (b/patch! (mut graph) acc 3 next-acc))
+      (require (calls/function! (mut graph) own a))
+      (let [ret (require (b/emit! (mut graph) 120 5 [exit total (: 0 i32)]))
+            none (inlining/Snapshot :state (p/cast (ptr u8) 0))]
+        (set! (.start job) start)
+        (set! (.ret job) ret)
+        ; Functions 2 and 3 expand nothing: their own arena graphs are what
+        ; gets compiled (function 3 with its ARGVAL on x86-64), as for any
+        ; function the adapter finds no inline site in.
+        (unless (or (= index 2) (= index 3))
+          (push! (mut (.sites job))
+                 (inlining/FrozenSite :reference c1 :callee scale-handle :snapshot none))
+          (push! (mut (.sites job))
+                 (inlining/FrozenSite :reference c2 :callee 0 :snapshot pick-snapshot)))))))
+
+;;; Close the registry: its specialization cache admits 128 creation
+;;; attempts, spent here on a throwaway caller of module_scale with 130
+;;; different literal arguments (as the adapter's serial phase spends them).
+(defn close-registry! [(registry (mut inlining/Registry)) (handle i64) (a (dyn Allocator))]
+  (-> void)
+  (let [(mut graph) (g/create a)
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 5 [start (: 0 i32) 0]))
+        zero (require (b/scalar-constant! (mut graph) 5 0 8))
+        scale (require (symbols/function! (mut graph) "module_scale" 0))
+        proto (match (calls/create 0 5 [(: 5 u8) 5] a)
+                (Err [message] (panic "{}" message)) (Ok [owned] owned))
+        called (require (calls/emit! (mut graph) proto start scale [x zero] a))
+        ret (require (b/emit! (mut graph) 120 5 [called called (: 0 i32)]))]
+    (for [bits 1000 1140]
+      (let [literal (require (b/scalar-constant! (mut graph) 5 (cast u64 bits) 8))]
+        (unless (g/set-operand! (mut graph) called 4 literal) (panic "literal rewrite failed"))
+        (match (inlining/optimize-registered-specialized-if-changed
+                 registry graph start [ret]
+                 [(inlining/RegisteredSite :reference called :callee handle)] 128 a)
+          (Err [message] (panic "registry warm-up: {}" message))
+          (Ok [outcome]
+              (match outcome
+                (None [] 0)
+                (Some [owned] (let [(mut owned) owned] (rewrite/release! (mut owned)) 0)))))))
+    (g/release! (mut graph))
+    (unless (inlining/registry-closed? registry)
+      (panic "the inline registry did not close ({} contexts)"
+             (inlining/specialization-count registry)))
+    (match (inlining/registry-settle! (mut registry) a)
+      (Err [message] (panic "registry settle: {}" message))
+      (Ok [_] 0))))
+
+;;; How many of the shared things changed: the arena's allocation total and
+;;; the fingerprint of every graph, against what they were after setup.
+(defn unchanged [(label (slice u8)) (arena (ptr scratch/ScratchArena)) (total i64)
+     (seals (ArrayList u64)) (scale g/Graph) (pick g/Graph) (leaf g/Graph)
+     (jobs (ArrayList Job))] (-> i64)
+  (let [(mut bad) 0]
+    (when (!= (.total arena) total)
+      (println "{}: {} bytes were allocated from the module arena"
+               label (- (.total arena) total))
+      (set! bad (+ bad 1)))
+    (when (!= (seal/seal scale) (get seals 0))
+      (println "{}: the registered template was written to" label)
+      (set! bad (+ bad 1)))
+    (when (!= (seal/seal pick) (get seals 1))
+      (println "{}: the borrowed template was written to" label)
+      (set! bad (+ bad 1)))
+    (when (!= (seal/seal leaf) (get seals 2))
+      (println "{}: the leaf graph was written to" label)
+      (set! bad (+ bad 1)))
+    (for [i 0 (len jobs)]
+      (when (!= (seal/seal (.graph (get jobs i))) (get seals (+ i 3)))
+        (println "{}: function {} was written to" label i)
+        (set! bad (+ bad 1))))
+    bad))
+
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        arena (p/alloc-stack scratch/ScratchArena)
+        _ (scratch/ScratchArena::init-with-capacity arena a 1048576)
+        module (allocator arena)
+        (mut failures) 0
+        ; The module's graphs, all in the one arena.
+        (mut scale-graph) (g/create module)
+        scale-ret (scale-template (mut scale-graph) module)
+        (mut pick-graph) (g/create module)
+        pick-ret (pick-template (mut pick-graph) module)
+        (mut leaf-graph) (g/create module)
+        leaf-start (require (b/emit! (mut leaf-graph) 104 0 [(: 0 i32)]))
+        leaf-x (require (b/emit! (mut leaf-graph) 71 5 [leaf-start (: 0 i32) 0]))
+        leaf-mask (require (b/scalar-constant! (mut leaf-graph) 5 0x55 8))
+        leaf-value (require (b/emit! (mut leaf-graph) 48 5 [leaf-x leaf-mask]))
+        leaf-own (match (calls/create 0 5 [(: 5 u8)] module)
+                   (Err [message] (panic "{}" message)) (Ok [owned] owned))
+        _ (require (calls/function! (mut leaf-graph) leaf-own module))
+        leaf-ret (require (b/emit! (mut leaf-graph) 120 5 [leaf-start leaf-value (: 0 i32)]))
+        ; Setup, single-threaded: registry, snapshot, leaf publication.
+        (mut registry) (inlining/registry-create 8 a)
+        scale-callee (inlining/Callee :name "module_scale" :graph scale-graph :entry 1
+                                      :roots [scale-ret] :observed [scale-ret]
+                                      :never false :always false :sparse false)
+        pick-callee (inlining/Callee :name "module_pick" :graph pick-graph :entry 1
+                                     :roots [pick-ret] :observed [pick-ret]
+                                     :never false :always false :sparse false)
+        scale-handle (match (inlining/register! (mut registry) scale-callee)
+                       (Err [message] (panic "register: {}" message)) (Ok [handle] handle))
+        pick-snapshot (match (inlining/snapshot-borrow pick-callee 0 8 a a)
+                        (Err [message] (panic "snapshot: {}" message)) (Ok [owned] owned))
+        (mut context) (private/context-create a)
+        (mut leaf-image) (match (compile/image leaf-graph leaf-start [leaf-ret] "leaf_entry" a)
+                           (Err [message] (panic "leaf: {}" message)) (Ok [compiled] compiled))
+        leaf-local (require (image/local-symbol! (mut leaf-image) "module_leaf_body" 1 0))
+        (mut signature) (calls/encode leaf-own a)
+        scope (p/cast usize (p/cast (ptr u8) arena))
+        certified (match (private/register-as! (mut context) "module_leaf" leaf-image leaf-local
+                                               (len (.text leaf-image)) (slice signature))
+                    (Err [message] (panic "leaf registration: {}" message))
+                    (Ok [accepted] accepted))]
+    (unless certified (panic "the private leaf was not certified"))
+    (match (private/confirm-publication! (mut context) scope "module_leaf" 9 0
+                                         (slice (.text leaf-image)))
+      (Err [message] (panic "leaf publication: {}" message))
+      (Ok [confirmed] (unless confirmed (panic "leaf publication was not confirmed"))))
+    (close-registry! (mut registry) scale-handle a)
+    (let [publication (match (private/seal-module! (mut context) scope)
+                        (None [] (panic "the module did not seal"))
+                        (Some [publication] publication))
+          (mut shared) (Shared :jobs (ArrayList::new [Job] a)
+                               :expected (ArrayList::new [u64] a)
+                               :registry registry
+                               :context context
+                               :publication publication
+                               :scope scope)
+          (mut seals) (ArrayList::new [u64] a)
+          (mut expanded) (: 0 i64)]
+      (for [index 0 FUNCTIONS]
+        (let [(mut job) (Job :graph (g/create module) :start 0 :ret 0
+                             :sites (ArrayList::new [inlining/FrozenSite] a))]
+          (function! (mut (.graph job)) index scale-handle pick-snapshot (mut job) module)
+          (push! (mut (.jobs shared)) job)))
+      ; Everything shared is built. From here on it is only read.
+      (push! (mut seals) (seal/seal scale-graph))
+      (push! (mut seals) (seal/seal pick-graph))
+      (push! (mut seals) (seal/seal leaf-graph))
+      (for job (.jobs shared) (push! (mut seals) (seal/seal (.graph job))))
+      (let [total (.total arena)]
+        ; Serial pass: the reference images.
+        (for [index 0 FUNCTIONS]
+          (push! (mut (.expected shared))
+                 (run-job (p/cast (ptr Shared) (mut shared)) index (mut expanded) a)))
+        (when (= expanded 0)
+          (println "no template call was expanded: the test would not read the templates")
+          (set! failures (+ failures 1)))
+        (set! failures
+              (+ failures (unchanged "serial" arena total seals scale-graph pick-graph leaf-graph
+                                     (.jobs shared))))
+        ; A second serial pass gives the same bytes.
+        (for [index 0 FUNCTIONS]
+          (let [(mut again) (: 0 i64)]
+            (when (!= (run-job (p/cast (ptr Shared) (mut shared)) index (mut again) a)
+                      (get (.expected shared) index))
+              (println "function {}: a second serial compile differs" index)
+              (set! failures (+ failures 1)))))
+        ; Concurrent passes.
+        (let [(mut works) (ArrayList::new [Work] a)
+              (mut threads) (ArrayList::new [Thread] a)
+              (mut concurrent) (: 0 i64)]
+          (for [t 0 THREADS]
+            (push! (mut works) (Work :shared (p/cast (ptr Shared) (mut shared)) :index t
+                                     :failures 0 :expansions 0))
+            (push! (mut threads) (Thread :handle (p/cast (ptr i8) 0))))
+          (for [t 0 THREADS]
+            (when (!= (Thread::spawn-configured
+                        (elem (mut threads) t) (fnptr-of worker)
+                        (p/cast (ptr i8) (elem (mut works) t))
+                        (ThreadConfig::new 33554432 -1))
+                      0)
+              (panic "thread {} did not start" t)))
+          (for [t 0 THREADS]
+            (when (!= (Thread::join (elem (mut threads) t)) 0) (panic "thread {} did not join" t)))
+          (for work works
+            (set! concurrent (+ concurrent (.expansions work)))
+            (when (> (.failures work) 0)
+              (println "worker starting at function {}: {} of {} concurrent results differ from the serial compile"
+                       (.index work) (.failures work) ROUNDS)
+              (set! failures (+ failures 1))))
+          (when (!= concurrent (* (/ (* THREADS ROUNDS) FUNCTIONS) expanded))
+            (println "concurrent workers expanded {} sites, expected {}" concurrent
+                     (* (/ (* THREADS ROUNDS) FUNCTIONS) expanded))
+            (set! failures (+ failures 1)))
+          (set! failures
+                (+ failures (unchanged "concurrent" arena total seals scale-graph pick-graph
+                                       leaf-graph (.jobs shared))))
+          (println "module of {} functions: {} sites expanded per pass, {} threads x {} rounds x 3 images, {} failures"
+                   FUNCTIONS expanded THREADS ROUNDS failures)))
+      (if (= failures 0) 0 1))))
