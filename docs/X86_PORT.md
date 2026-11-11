@@ -35,6 +35,17 @@ decision changes.
   the parallel-move skeleton, the node walk) is moved to `src/stogir/` and
   shared when an x64 file would otherwise be a copy. Moving is preferred over
   copying; a copy needs a reason written at the top of the file.
+  Moved so far: `stogir.phi-coalesce` (was `stogir.a64.phi-coalesce`).
+  The x64 driver, transfers and fixups are written again rather than shared,
+  each with its reason at the top of the file (4-byte words, AArch64
+  scratches, shrink-wrapping interleaved with the node walk).
+- `src/stogir/x64/families.coil` classifies every node into the core or one
+  operation family and is the only dispatch to the family modules;
+  `docs/X86_FAMILIES.md` describes the extension points.
+- `src/stogir/x64/testing.coil` is test support (graph shorthands, a
+  reference evaluator, calling generated code); only tests import it.
+- Until `stogir.native.private-types` exists on this branch, `x64/compile`
+  takes the private context types from `stogir.a64.private-leaf`.
 
 ## Registers
 
@@ -57,33 +68,74 @@ Two scratch registers per bank mirror a64's x16/x17 and v30/v31 so emitters
 keep the same shape. Freeing rbp and one scratch for allocation is a later
 tuning step, not part of the first correct version.
 
+Scratch roles: r10 carries an emitter's first operand when it is a constant
+or a reload, and is the data scratch of memory-to-memory transfers; r11
+carries the second operand and is the cycle holder (xmm14 and xmm15
+likewise). Nothing lives in a scratch between two nodes.
+
+## Integer values in registers
+
+A value of type T is defined in the low `8 * size(T)` bits of its register;
+every higher bit is unspecified, also for 32-bit values, for parameters and
+after a spill and reload. BOOL is a byte holding 0 or 1. Low-bit arithmetic
+(ADD SUB MUL AND OR XOR NOT NEG SHL, moves, cmovcc) runs at 32 bits for every
+type of at most four bytes and at 64 bits otherwise; operations that read the
+high bits (compares, SHR, SAR, rotates, the truth test) use the 8- and 16-bit
+instruction forms at the type's own width; DIV and MOD extend narrow operands
+to 32 bits. A returned value is extended to 32 bits by its signedness. The
+rule is written out at the top of `x64/value.coil`.
+
 ## What x86 needs that a64 did not
 
 1. **Two-address instructions.** `op rd, rm` overwrites rd. The emitter
    produces `mov rd, rn; op rd, rm`; when rd = rm it commutes the operation if
    it can, and otherwise goes through r11. The definition gets a `Part.hint`
    to its first operand so the move usually disappears.
-2. **Fixed registers.** Expressed with the existing vocabulary: a kind-2 fixed
-   use for the operand, a kind-2 fixed definition, and `allocation/reserve!`
-   for clobbers.
-   - Variable shifts and rotates: count fixed in rcx at the use position; rcx
-     reserved over the definition position so the result cannot land in it.
-   - `div`/`idiv`, one-operand `mul`/`imul` (64-bit high halves, unsigned
-     checked multiply, reciprocal division of 64-bit values): rax and rdx fixed
-     or reserved as upstream's `ir_get_target_constraints` does.
-   - `cmpxchg`: rax.
+2. **Fixed registers.** Expressed with `allocation/reserve!` clobbers and
+   advisory preferences, not with fixed uses. A kind-2 fixed *use* (at the
+   even operand position) cannot always be allocated: when the operand lives
+   on past the instruction and its fixed register is already promised from
+   the definition position (the result's coalesced PHI group holds it across
+   a lifetime hole), the operand would have to change register at an odd
+   position, which only calls lower, and the allocator reports "eviction did
+   not make a register available". The differential stress test hit this
+   about once in 30 000 functions with a fixed rcx count. Kind-2 fixed
+   *definitions* remain fine (register parameters, later call results).
+   - Variable shifts and rotates: rcx is clobbered over the operand position
+     `[2i, 2i+1)`, so no operand and no live value is in it; the emitter copies
+     the count into ecx (masking it for 8- and 16-bit values, whose hardware
+     count is taken modulo 32). The result may be rcx; the emitter then
+     shifts in a scratch register.
+   - `div`/`idiv`: rax and rdx are clobbered over `[2i, 2i+1)`; the register
+     that does not hold the result stays clobbered over `[2i+1, 2i+2)`; the
+     result prefers rax (DIV) or rdx (MOD) and is moved when it landed
+     elsewhere. The dividend is copied into rax, a constant divisor into r11.
+     Division by zero and the overflowing signed quotient trap (#DE); the IR
+     leaves both undefined and nothing is checked. Division by a constant is
+     a plain `div` until `x64/reciprocal.coil` selects better rules.
+   - One-operand `mul`/`imul` and `cmpxchg` (families not written yet) follow
+     the same pattern: clobber, copy in, prefer.
 3. **Flags.** Almost every ALU instruction writes flags. Rules:
    - Moves emitted between any two nodes (spills, reloads, phi moves, constant
      and address materialization) never write flags: `mov`, `lea`, `movaps`,
      `mov r, imm`. `xor r, r` zeroing is used only by emitters that know no
      flag value is live across it.
    - A compare is emitted directly before its consumer (`jcc`, `setcc`,
-     `cmovcc`), as a64 already repeats compares per user.
+     `cmovcc`), as a64 already repeats compares per user. Every operand load
+     and constant comes before the compare; after it only `mov` (COND arms,
+     edge moves, `movzx` after `setcc`) is emitted.
+   - No flag value is live between two nodes, so a node's own code may use
+     any instruction once its last flag consumer is emitted (DIV zeroes edx
+     with `xor`).
    - Floating compares use `ucomiss/ucomisd` and handle the parity flag for
      unordered operands exactly as upstream's `ir_emit_cmp_fp` does.
 4. **Variable-length code.** Offsets are bytes. A branch is emitted as rel32
    with a fixup record; shrinking to rel8 and loop alignment are a separate
    pass over records, not word arithmetic. There are no veneers in text.
+   A record (`x64/fixups.coil`) holds the instruction's first byte, its
+   displacement field, its label and its condition; labels are a table of
+   byte offsets. Neither the relaxation pass nor alignment padding exists
+   yet: the block layout's alignment requests are ignored.
 5. **Memory operands and LEA.** Loads fold into ALU and compare operands, and
    `lea` covers add-with-shift and three-operand adds, following upstream's
    fusion rules. This is selection work on top of a correct register-only
@@ -102,8 +154,14 @@ callee-saved area). Differences:
   `push rbp; mov rbp, rsp` first when the frame is anchored (dynamic stack or
   over-alignment); rbp is then the base for locals and parameters.
 - rsp is 16-byte aligned at every call: entry rsp + 8 + N is a multiple of 16.
-- Frameless leaves may use the 128-byte red zone for spills.
+  N is the frame contents rounded up to 8 modulo 16; a function without
+  frame contents (no spill, no preserved register, no frame object) has
+  N = 0 and no prologue.
+- Frameless leaves may use the 128-byte red zone for spills. Not done yet:
+  a function with any spill gets a frame.
 - Traps are `ud2`.
+- Not in the first version: anchored (rbp) frames, shrink-wrapping,
+  spill-home planning. The allocator runs with the pinned plain tuning.
 
 ## Calls (System V)
 
@@ -145,12 +203,24 @@ follows, in which case the addend accounts for it).
 - Every new behavior has a test; every stub is a hard error with a clear
   message.
 
+## Optimization levels
+
+As on AArch64: level 0 is rejected, level 1 generates the graph as given,
+levels 2 and 3 run SCCP first. The level-3 stages of the a64 path
+(global-load forwarding, fact folding, select diamonds, loop-load hoisting,
+rotation, loop strength reduction, the vectorizer) are not run on x86-64
+yet (`LEVEL-THREE-CHAIN` in `x64/compile.coil`): the strength stage uses an
+AArch64 cost module and the vectorizer produces vector operations no family
+emits. Level 3 generates what level 2 does. `a64.constant-hoist` and
+`a64.return-values` are not run either.
+
 ## Phases
 
 0. Encoder; neutral image/link/relocate/JIT/ELF layers; Linux measurement tools.
 1. Core: a function of integer values, parameters, constants, compares,
    branches, loops and PHIs compiles and runs through the facade; the driver
-   has one hook module per operation family.
+   has one hook module per operation family. (Done on branch `x86/core`,
+   tested directly against `stogir.x64.compile`; see `docs/X86_FAMILIES.md`.)
 2. Families in parallel: integer completeness; memory and stack; calls and ABI;
    floating point; vectors; switches, branch relaxation and peepholes.
 3. Coil adapter for x86-64, compiler builds itself with Stogir on Linux, FAST

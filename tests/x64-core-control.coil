@@ -305,6 +305,98 @@
               (t/unmap! (mut mapped)))))
     (g/release! (mut graph))))
 
+;;; Three nested loops over the same bound n. The innermost body swaps two
+;;; carried values while adding to them, the middle loop rotates three:
+;;;   for i < n: for j < n: { for k < n: (x, y) = (y + k, x + j);
+;;;                           (x, y, z) = (y, z + i, x) }
+;;; Every carried value is a PHI of all three loop headers. Returns
+;;; x * 3 + y * 5 + z * 7.
+(defn deep! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        n (t/param! (mut graph) start 11 0)
+        sx (t/param! (mut graph) start 11 1)
+        sy (t/param! (mut graph) start 11 2)
+        sz (t/param! (mut graph) start 11 3)
+        zero (t/constant! (mut graph) 11 0)
+        one (t/constant! (mut graph) 11 1)
+        ; outer
+        l1 (t/loop-begin! (mut graph) (t/end! (mut graph) start))
+        i (t/loop-phi! (mut graph) l1 zero)
+        x1 (t/loop-phi! (mut graph) l1 sx)
+        y1 (t/loop-phi! (mut graph) l1 sy)
+        z1 (t/loop-phi! (mut graph) l1 sz)
+        if1 (t/if! (mut graph) l1 (t/compare! (mut graph) 16 i n))
+        body1 (t/if-true! (mut graph) if1)
+        exit1 (t/if-false! (mut graph) if1)
+        ; middle
+        l2 (t/loop-begin! (mut graph) (t/end! (mut graph) body1))
+        j (t/loop-phi! (mut graph) l2 zero)
+        x2 (t/loop-phi! (mut graph) l2 x1)
+        y2 (t/loop-phi! (mut graph) l2 y1)
+        z2 (t/loop-phi! (mut graph) l2 z1)
+        if2 (t/if! (mut graph) l2 (t/compare! (mut graph) 16 j n))
+        body2 (t/if-true! (mut graph) if2)
+        exit2 (t/if-false! (mut graph) if2)
+        ; inner
+        l3 (t/loop-begin! (mut graph) (t/end! (mut graph) body2))
+        k (t/loop-phi! (mut graph) l3 zero)
+        x3 (t/loop-phi! (mut graph) l3 x2)
+        y3 (t/loop-phi! (mut graph) l3 y2)
+        if3 (t/if! (mut graph) l3 (t/compare! (mut graph) 16 k n))
+        body3 (t/if-true! (mut graph) if3)
+        exit3 (t/if-false! (mut graph) if3)
+        next-x3 (t/binary! (mut graph) 26 11 y3 k)
+        next-y3 (t/binary! (mut graph) 26 11 x3 j)
+        next-k (t/binary! (mut graph) 26 11 k one)
+        back3 (t/loop-end! (mut graph) body3)
+        ; after the inner loop, in the middle body
+        rotated-y (t/binary! (mut graph) 26 11 z2 i)
+        next-j (t/binary! (mut graph) 26 11 j one)
+        back2 (t/loop-end! (mut graph) exit3)
+        next-i (t/binary! (mut graph) 26 11 i one)
+        back1 (t/loop-end! (mut graph) exit2)
+        total (t/binary! (mut graph) 26 11
+                (t/binary! (mut graph) 26 11
+                  (t/binary! (mut graph) 28 11 x1 (t/constant! (mut graph) 11 3))
+                  (t/binary! (mut graph) 28 11 y1 (t/constant! (mut graph) 11 5)))
+                (t/binary! (mut graph) 28 11 z1 (t/constant! (mut graph) 11 7)))
+        ret (t/return! (mut graph) exit1 11 total)]
+    (t/patch! (mut graph) l3 2 back3)
+    (t/patch! (mut graph) k 3 next-k)
+    (t/patch! (mut graph) x3 3 next-x3)
+    (t/patch! (mut graph) y3 3 next-y3)
+    (t/patch! (mut graph) l2 2 back2)
+    (t/patch! (mut graph) j 3 next-j)
+    (t/patch! (mut graph) x2 3 y3)
+    (t/patch! (mut graph) y2 3 rotated-y)
+    (t/patch! (mut graph) z2 3 x3)
+    (t/patch! (mut graph) l1 2 back1)
+    (t/patch! (mut graph) i 3 next-i)
+    (t/patch! (mut graph) x1 3 x2)
+    (t/patch! (mut graph) y1 3 y2)
+    (t/patch! (mut graph) z1 3 z2)
+    (match (t/compiled (mut tally) "deep loops" graph start [ret] a)
+      (None [] 0)
+      (Some [mapped]
+            (let [(mut mapped) mapped]
+              (for [bound 0 7]
+                (let [(mut x) (: 11 u64) (mut y) (: 222 u64) (mut z) (: 3333 u64)]
+                  (for [vi 0 bound]
+                    (for [vj 0 bound]
+                      (for [vk 0 bound]
+                        (let [ox x oy y]
+                          (set! x (+ oy (cast u64 vk)))
+                          (set! y (+ ox (cast u64 vj)))))
+                      (let [ox x oy y oz z]
+                        (set! x oy)
+                        (set! y (+ oz (cast u64 vi)))
+                        (set! z ox))))
+                  (t/expect! (mut tally) "deep loops" mapped 11 [(cast u64 bound) 11 222 3333]
+                             (+ (+ (* x 3) (* y 5)) (* z 7)))))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
 ;;; A u8 counter that wraps: i = start; do nothing while (i != 0) i++, counting
 ;;; iterations in a 64-bit sum of i.
 (defn narrow-counter! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
@@ -387,6 +479,7 @@
         (for kind [(: 0 i32) 1 2]
           (for ty [(: 11 i32) 10 9 2]
             (permutation! (mut tally) kind ty a)))
+        (deep! (mut tally) a)
         (narrow-counter! (mut tally) a)
         (terminal! (mut tally) false a)
         (terminal! (mut tally) true a)
