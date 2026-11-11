@@ -256,7 +256,7 @@
 (defn owned-image [(result (Result image/Image (slice u8)))] (-> image/Image)
   (match result
     (Ok [source] source)
-    (Err [message] (println "{}" message) (image/create (malloc-allocator)))))
+    (Err [message] (println "{}" message) (target/arch-pick (image/create (malloc-allocator)) (image/create-x64 (malloc-allocator))))))
 
 (defn pair-image [(first? bool)] (-> image/Image)
   (let [allocator (malloc-allocator)
@@ -384,7 +384,7 @@
 
 (defn data-image [] (-> image/Image)
   (let [allocator (malloc-allocator)
-        (mut source) (image/create allocator)]
+        (mut source) (target/arch-pick (image/create allocator) (image/create-x64 allocator))]
     (while (< (len (.data source)) 8) (push! (mut (.data source)) 0xA5))
     (bytes/append32! (mut (.data source)) 10)
     (bytes/append32! (mut (.data source)) 0)
@@ -1138,7 +1138,7 @@
                                                             (target/os-pick "_inline_caller" "inline_caller")
                                                             a))
                               (mut target-code) (inline-target-image)
-                              (mut global) (image/create a)
+                              (mut global) (target/arch-pick (image/create a) (image/create-x64 a))
                               (mut leaf)
                                 (owned-image (compile/image callee
                                                             start
@@ -1744,6 +1744,27 @@
     (g/release! (mut caller))
     (g/release! (mut callee))))
 
+;;; Whether undefined divisions trap on the machine the test runs on.
+(defn division-traps? [] (-> bool)
+  (target/arch-pick false true))
+
+;;; Whether calling f(a, b) raises SIGFPE, observed in a child process.
+(defn division-trap? [(f (fnptr (cc/C) [u64 u64] u64)) (a u64) (b u64)] (-> bool)
+  (let [child (fork)]
+    (if (< child 0)
+        false
+        (if (= child 0)
+            (do
+              (signal 8 (primitive/cast (ptr i8)
+                                        (primitive/cast (ptr u8) (fnptr-of inline-trap-handler))))
+              (call-ptr f a b)
+              (exit-child 99)
+              false)
+            (let [(mut status) (: 0 i32)]
+              (and (= (waitpid child (mut status) 0) child)
+                   (= (& status 127) 0)
+                   (= (& (>> status 8) 255) 77)))))))
+
 ;;; Cloning must preserve the native unchecked division contract at zero and
 ;;; signed min/-1, all widths, as well as ordinary positive/negative divisors.
 (defn unguarded-division-inline [(opcode i32) (ty u8)] (-> void)
@@ -1803,7 +1824,22 @@
                                                   sy (if (and (types/signed? (cast i32 ty)) (>= yy sign)) (- (cast i128 yy) modulus) (cast i128 yy))
                                                   quotient (if (= sy 0) (: 0 i128) (/ sx sy))
                                                   wanted (& (cast u64 (if (= opcode 29) quotient (- sx (* quotient sy)))) mask)]
-                                              (assert (= (& (function left right) mask) wanted)))))
+                                              ; A zero divisor and the overflowing signed
+                                              ; quotient are undefined in the IR: AArch64
+                                              ; hardware gives the results computed above,
+                                              ; x86-64 traps (#DE), also after inlining.
+                                              ; Narrow operands are divided at 32 bits
+                                              ; there, so their overflowing quotient does
+                                              ; not trap and wraps to the same result.
+                                              (if (and (division-traps?)
+                                                       (or (= sy 0)
+                                                           (and (types/signed? (cast i32 ty))
+                                                                (>= width 32)
+                                                                (= xx sign) (= sy -1))))
+                                                  (unless (division-trap? function left right)
+                                                    (panic "no division trap: opcode {} type {} after {} left {} right {}"
+                                                           opcode ty after left right))
+                                                  (assert (= (& (function left right) mask) wanted))))))
                                         (jit/release-image! (mut loaded)))))
                                 (link/release! (mut module)))))
                         (image/release! (mut code))))
@@ -2518,11 +2554,16 @@
     (for budget [(: 0 i32) 512] (repeated-validation (cast i32 mode) budget)))
   (for ty [(: 2 u8) 3 4 5 6 8 9 10 11]
     (for opcode [(: 29 i32) 30] (unguarded-division-inline opcode ty)))
-  (for spec [[(: 5 u8) 2]
-             [(: 11 u8) 2]
-             [(: 12 u8) 2]
-             [(: 13 u8) 4]
-             [(: 37 u8) 1]]
+  ; Four float pieces and a vector piece are AArch64 register results;
+  ; System V returns at most two integer or floating eightbytes that way.
+  (for spec (target/arch-pick [[(: 5 u8) 2]
+                               [(: 11 u8) 2]
+                               [(: 12 u8) 2]
+                               [(: 13 u8) 4]
+                               [(: 37 u8) 1]]
+                              [[(: 5 u8) 2]
+                               [(: 11 u8) 2]
+                               [(: 12 u8) 2]])
     (for mode [(: 0 i32) 1 2 3 4 5 6 7 8 9 10]
       (register-inline-case mode
                             false
@@ -2586,7 +2627,7 @@
         (mut b) (pair-image false)
         (mut via) (pointer-image)
         (mut table) (table-image)
-        (mut prefix) (image/create allocator)
+        (mut prefix) (target/arch-pick (image/create allocator) (image/create-x64 allocator))
         (mut sources-live?) true
         (mut failures) 0]
     (bytes/append32! (mut (.text prefix)) (target/arch-pick 0xD65F03C0 0x909090C3))
@@ -2613,10 +2654,12 @@
                    (link/release! (mut inner)))
               (Ok [composed]
                   (let [(mut outer) composed]
-                    (when (or (!= (.text (get (.parts outer) 1)) 5004)
+                    ; The inner module follows the 5004-byte prefix at its text
+                    ; alignment: 4 on AArch64, 16 on x86-64.
+                    (when (or (!= (.text (get (.parts outer) 1)) (target/arch-pick 5004 5008))
                               (!= (.data (get (.parts outer) 1)) 8208)
                               (!= (.offset (get (.text-data (.image outer)) 0))
-                                  (+ 5004
+                                  (+ (target/arch-pick 5004 5008)
                                      (.offset (get (.text-data (.image inner))
                                                    0)))))
                       (set! failures (+ failures 1)))
