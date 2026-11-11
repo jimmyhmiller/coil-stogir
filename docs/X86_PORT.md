@@ -145,10 +145,26 @@ rule is written out at the top of `x64/value.coil`.
    displacement field, its label and its condition; labels are a table of
    byte offsets. Neither the relaxation pass nor alignment padding exists
    yet: the block layout's alignment requests are ignored.
-5. **Memory operands and LEA.** Loads fold into ALU and compare operands, and
-   `lea` covers add-with-shift and three-operand adds, following upstream's
-   fusion rules. This is selection work on top of a correct register-only
-   version, not a prerequisite for it.
+5. **Memory operands and LEA.** Done by the memory family
+   (`x64/memory.coil`, `fuse!`), after the core's own tiles and comparison
+   fusion:
+   - The address of every LOAD and STORE is matched as
+     base + index * 2^shift + disp32 and kept in the plan's address tables;
+     `x64/address.coil` (`operand!`) turns an access into its `encode/Mem`
+     for every family. As in upstream's `ir_match_fuse_addr`, an address
+     expression is absorbed only when every use of it is an access address.
+   - A LOAD with one use becomes the memory operand of an ADD SUB AND OR XOR
+     MUL or integer comparison when the consumer is emitted once, in the
+     load's block, and nothing that may write memory or release stack is
+     scheduled in between (upstream's `ir_match_has_mem_deps`). The
+     instruction runs at the load's own width. Volatile loads are never
+     fused.
+   - STORE(a, OP(LOAD(a), x)) with the store directly after the load becomes
+     `op [a], x` (ADD SUB AND OR XOR with a register or immediate; NOT, NEG).
+   - The scratch contract: a memory operand names allocated registers, rsp,
+     rbp and at most r10, so r11 is free for the instruction's other operand.
+   `lea` for add-with-shift and three-operand adds of values (not addresses)
+   is still to do.
 
 ## Frame
 
@@ -160,8 +176,22 @@ callee-saved area). Differences:
   start at entry rsp + 8 and there is no link register or link slot.
 - Prologue: `sub rsp, N` and callee-saved registers stored with `mov` into the
   callee-saved area (so shrink-wrapping and the offset model carry over).
-  `push rbp; mov rbp, rsp` first when the frame is anchored (dynamic stack or
-  over-alignment); rbp is then the base for locals and parameters.
+  `push rbp; mov rbp, rsp` first when the frame is anchored (dynamic stack,
+  FRAME_ADDR, or an alignment above 16); rbp is then the base for locals,
+  spills, the callee-saved area and stack parameters, and every RETURN
+  restores rsp from the anchor. Logical offset L is at `[rbp - N + L]`.
+- An over-aligned frame (alignment A > 16, from an ALLOCA, a frame object or
+  a VAR) is anchored too: `and rsp, -A` after the `sub`, the anchor saved in
+  an 8-byte entry slot of the frame, and rbp re-pointed at the aligned frame
+  top (`lea rbp, [rsp + N]`, N a multiple of A). Stack parameters are then
+  read through the saved anchor (`frame-address/parameter!`).
+- Dynamic stack (ALLOCA, AFREE, BLOCK_BEGIN/END): rsp moves below the frame;
+  the outgoing call area stays the bottom of the stack (`[rsp + k]`,
+  `frame-address/outgoing`, never the frame base), and an ALLOCA's result is
+  rsp plus the outgoing size. Sizes are rounded to the frame alignment; a
+  negative or overflowing runtime size traps (`ud2`) before rsp changes.
+- A static frame object is a frame slot whose address is rebuilt at each use
+  (`lea`, or folded into a memory operand); it has no register.
 - rsp is 16-byte aligned at every call: entry rsp + 8 + N is a multiple of 16.
   N is the frame contents rounded up to 8 modulo 16; a function without
   frame contents (no spill, no preserved register, no frame object) has
@@ -169,8 +199,8 @@ callee-saved area). Differences:
 - Frameless leaves may use the 128-byte red zone for spills. Not done yet:
   a function with any spill gets a frame.
 - Traps are `ud2`.
-- Not in the first version: anchored (rbp) frames, shrink-wrapping,
-  spill-home planning. The allocator runs with the pinned plain tuning.
+- Not in the first version: shrink-wrapping, spill-home planning. The
+  allocator runs with the pinned plain tuning.
 
 ## Calls (System V)
 
@@ -191,6 +221,15 @@ callee-saved area). Differences:
 - Named functions are called with `call rel32` (PLT32); named data and function
   addresses are loaded from a private 8-byte slot with `mov r, [rip+slot]`
   (PC32); strings and constants are addressed with `lea r, [rip+x]` (PC32).
+  The emitters are in `x64/code.coil` (`reference-address!`, `long-address!`,
+  `direct-call!`, `direct-jump!`, `rip-reference!`). A named constant is an
+  ordinary operand of every core node: `value/constant!` rebuilds it, without
+  writing flags.
+- Builtin move and compare calls of constant size are replaced by the
+  straight-line emitters `x64/block-move.coil` (1..256 bytes, `movdqu` and
+  general-register chunks) and `x64/block-compare.coil` (0..16 bytes,
+  `bswap` and `cmp`); their headers give the entry points and what they
+  write.
 - Private leaf calls: the written-register set of a leaf is recorded while it
   is emitted (no decoder).
 
@@ -200,6 +239,13 @@ callee-saved area). Differences:
 1 ABS64 (both), 2..4 AArch64 only, 5 PC32 and 6 PLT32 (x86-64 only, explicit
 addends; the field is the last 4 bytes of the instruction unless an immediate
 follows, in which case the addend accounts for it).
+
+`x64/image.coil` (`finish!`) resolves a function's pending references: PC32
+to a FUNC or SYM goes to that symbol's address slot (one 8-byte slot per
+symbol and image, ABS64 against the symbol), PC32 to a STR or LONG_CONST to
+its private data, PLT32 to the function symbol itself. An ABS64 word is only
+ever created for an address slot, which is the form the Coil adapter turns
+into a GOT load (`docs/X86_ADAPTER_REQUESTS.md`, item 7).
 
 ## Testing
 
