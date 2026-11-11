@@ -15,9 +15,12 @@
 ;;; or a reload, xmm15 the second; both and r10/r11 are free inside a node.
 ;;;
 ;;; Results and NaNs
-;;;   * ADD SUB MUL DIV are `op rd, right` with rd = left, never commuted:
-;;;     with two NaN operands the hardware returns the left one (quieted), and
-;;;     an invalid operation produces the x86 default NaN (sign bit set).
+;;;   * ADD SUB MUL DIV are `op rd, right` with rd = left. A NaN operand is
+;;;     returned quieted and an invalid operation produces the x86 default
+;;;     NaN (sign bit set). With two NaN operands the hardware returns the
+;;;     first; ADD and MUL may be commuted when rd is the right operand's
+;;;     register, so which of two different NaNs survives is unspecified,
+;;;     as it is for constant folding.
 ;;;   * NEG and ABS flip or clear the sign bit of any value, NaNs included.
 ;;;   * MIN is `left <= right ? left : right` and MAX `left >= right ? left :
 ;;;     right` on the raw operands, as stogir.floating/evaluate and the
@@ -178,8 +181,13 @@
                         (require! (mut error) (uses/use! (mut set) (.right tile) position)))
                       (do
                         (require! (mut error) (uses/use! (mut set) (.op1 node) position))
+                        ; ADD SUB MUL DIV read their right operand from its
+                        ; spill slot when it has no register.
                         (unless (floating/unary? opcode)
-                          (require! (mut error) (uses/use! (mut set) (.op2 node) position)))
+                          (require! (mut error)
+                                    (if (and (>= opcode 26) (<= opcode 29))
+                                        (uses/use-anywhere! (mut set) (.op2 node) position)
+                                        (uses/use! (mut set) (.op2 node) position))))
                         ; Two-address forms compute in rd = left.
                         (when (or (and (>= opcode 26) (<= opcode 32)) (= opcode 58)
                                   (= opcode 59))
@@ -243,16 +251,19 @@
     131 (if wide encode/SQRTSD encode/SQRTSS)
     -1))
 
-;;; rd = left OP right for ADD SUB MUL DIV. The operation is never commuted
-;;; (see the module comment): when rd is the right operand's register the
-;;; result is computed in xmm14.
+;;; rd = left OP right for ADD SUB MUL DIV. The right operand is read where
+;;; it is: its register, its spill slot or the constant pool. When rd is the
+;;; right operand's register, ADD and MUL are commuted and SUB and DIV are
+;;; computed in xmm14.
 (defn binary! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
                (node n/Node) (position i64) (wide bool) (rd i32)] (-> void)
-  (let [op (arithmetic-op (cast i32 (n/opcode node)) wide)
+  (let [opcode (cast i32 (n/opcode node))
+        op (arithmetic-op opcode wide)
         xa (operand! (mut out) (mut error) cx (.op1 node) position X14)
-        xb (operand! (mut out) (mut error) cx (.op2 node) position X15)]
-    (cond (= rd xa) (sse! (mut out) (mut error) op rd xb)
-          (= rd xb)
+        xb (value/float-register-of (.graph cx) (.parts cx) (.op2 node) position)]
+    (cond (and (= rd xb) (!= rd xa) (or (= opcode 26) (= opcode 28)))
+            (sse! (mut out) (mut error) op rd xa)
+          (and (= rd xb) (!= rd xa))
             (do
               (move! (mut out) (mut error) X14 xa)
               (sse! (mut out) (mut error) op X14 xb)
@@ -260,7 +271,9 @@
           :else
             (do
               (move! (mut out) (mut error) rd xa)
-              (sse! (mut out) (mut error) op rd xb)))))
+              (check! (mut error)
+                      (value/float-apply! (mut out) (.graph cx) (.parts cx) (.base cx) op rd
+                                          (.op2 node) position X15))))))
 
 ;;; NEG and ABS: the sign bit flipped or cleared with a mask built in xmm15.
 (defn sign! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
