@@ -34,8 +34,9 @@
 ;;;   7. A variadic call sets al to the number of xmm registers used; an
 ;;;      indirect callee first moves from rax to r11.
 ;;;   8. `call rel32` with a PLT32 reference to the named function, or
-;;;      `call rax` / `call r11`. Builtin memmove and memcmp call their runtime
-;;;      routine; `inline-builtin!` is where an inline expansion plugs in.
+;;;      `call rax` / `call r11`. A builtin memmove of a literal size up to
+;;;      256 bytes and a builtin memcmp of a known count up to 16 are expanded
+;;;      inline instead (`inline-builtin!`).
 ;;;   9. Register result pieces are stored through the saved place pointer
 ;;;      (r11); a narrow integer result is extended to 32 bits.
 ;;; A native tail call (mode 1) stops after step 7: the driver moves the stack
@@ -54,6 +55,12 @@
 (import "stogir.locations" :as loc)
 (import "stogir.argument-value" :as argval)
 (import "stogir.call-results" :as results)
+(import "stogir.call-groups" :as groups)
+(import "stogir.calls" :as calls)
+(import "stogir.copy-forward" :as copy-forward)
+(import "stogir.known-count" :as known)
+(import "stogir.x64.block-compare" :as block-compare)
+(import "stogir.x64.block-move" :as block-move)
 (import "stogir.x64.abi-arguments" :as arguments)
 (import "stogir.x64.call-abi" :as abi)
 (import "stogir.x64.code" :as code)
@@ -316,15 +323,55 @@
   (let [size (types/size ty 8)]
     (if (< size 4) 4 size)))
 
-;;; Hook for inline expansions of builtin calls (BUILTIN-MOVE with a constant
-;;; size, BUILTIN-COMPARE with a known count): called when the arguments are
-;;; in rdi, rsi and rdx, in place of the call instruction. Returns whether it
-;;; emitted the expansion; when false the runtime routine is called. The
-;;; memory family's block-move and block-compare emitters plug in here; until
-;;; then every builtin calls its routine.
+;;; Inline expansion of a builtin call, in place of the call instruction,
+;;; once the arguments are in rdi, rsi and rdx: BUILTIN-MOVE with a literal
+;;; size (stogir.x64.block-move) and BUILTIN-COMPARE with a count known where
+;;; the call runs (stogir.known-count, stogir.x64.block-compare). Returns
+;;; whether it emitted the expansion; when false the runtime routine is
+;;; called. The expansions write only caller-saved registers, all of which
+;;; the call's constraints clobber except the XMM bank of a function without
+;;; floating values, where nothing lives; every register they may write is
+;;; recorded for the function's write set.
 (defn inline-builtin! [(out (mut code/Buffer)) (cx context/Context) (reference i32)
                        (planned abi/Layout)] (-> (Result bool (slice u8)))
-  (Ok false))
+  (let [graph (.graph cx)
+        node (get (.instructions graph) (cast i64 reference))
+        builtin (calls/builtin-of graph reference)]
+    (if (or (= builtin 0)
+            (!= (n/opcode node) 79)
+            (!= (len (.arguments planned)) 3)
+            (!= (.register (get (.arguments planned) 0)) registers/RDI)
+            (!= (.register (get (.arguments planned) 1)) registers/RSI))
+        (Ok false)
+        (let [size (cond
+                     (= builtin groups/BUILTIN-MOVE)
+                       (match (copy-forward/move graph reference)
+                         (None [] (: -1 i64))
+                         (Some [move]
+                               (if (block-move/inline? (.size move)) (.size move) (: -1 i64))))
+                     (= builtin groups/BUILTIN-COMPARE)
+                       (match (known/known-count graph (.value (get (.arguments planned) 2))
+                                                 (.op1 node))
+                         (None [] (: -1 i64))
+                         (Some [count]
+                               (if (<= count (cast u64 (block-compare/maximum)))
+                                   (cast i64 count)
+                                   (: -1 i64))))
+                     :else (: -1 i64))]
+          (if (< size 0)
+              (Ok false)
+              (match (if (= builtin groups/BUILTIN-MOVE)
+                         (block-move/emit! (mut (.text out)) size)
+                         (block-compare/emit! (mut (.text out)) size))
+                (Err [message] (Err message))
+                (Ok [_]
+                    (for register [(: registers/RAX i32) registers/RCX registers/RDX
+                                   registers/R8]
+                      (code/wrote! (mut out) register))
+                    (when (= builtin groups/BUILTIN-MOVE)
+                      (for [register 32 48] (code/wrote! (mut out) (cast i32 register))))
+                    (code/clear-flags! (mut out))
+                    (Ok true))))))))
 
 ;;; Constraints of a node lowered as a call to a runtime routine that takes
 ;;; its `operands` in xmm0, xmm1, ... and returns in xmm0 (FMA through libm's
@@ -539,10 +586,14 @@
                   (Err [message] (set! error message))
                   (Ok [inlined]
                       (unless inlined
-                        (code/accept-count! (mut error) (code/direct-call! (mut out) graph callee)))))
-                (code/accept! (mut error)
-                              (encode/call-r (mut (.text out)) (target-register planned))))
-            (code/called! (mut out)))
+                        (code/accept-count! (mut error) (code/direct-call! (mut out) graph callee))
+                        (code/called! (mut out)))))
+                (do
+                  (code/accept! (mut error)
+                                (encode/call-r (mut (.text out)) (target-register planned)))
+                  (code/called! (mut out))))
+            ; Whatever the callee left in the flags describes no register here.
+            (code/clear-flags! (mut out)))
           ; 9. Results.
           (when (and (= error "") (= mode 0))
             (when (>= (.result-save planned) 0)
