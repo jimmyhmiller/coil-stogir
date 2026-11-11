@@ -22,6 +22,7 @@
 (import "stogir.locations" :as locations)
 (import "stogir.x64.code" :as code)
 (import "stogir.x64.encode" :as encode)
+(import "stogir.x64.frame-address" :as frame)
 (import "stogir.x64.registers" :as registers)
 (import "stogir.x64.value" :as value)
 (import "stogir.x64.abi-arguments" :as arguments)
@@ -195,14 +196,17 @@
 ;;; Make parameter `parameter` available in its allocated register at its PARAM
 ;;; definition (`position + 1`). `frame-size` is the rsp adjustment of the
 ;;; prologue, so the first stack argument is at rsp + frame-size + 8;
-;;; `result-slot` is the logical frame offset of the register-piece result
-;;; buffer (kind 3 only). Register parameters are already in place.
+;;; `base` is the frame base and `result-slot` the logical frame offset of
+;;; the register-piece result buffer (kind 3 only). Register parameters are
+;;; already in place. Stack arguments are addressed from rsp, which holds for
+;;; the fixed frame; a frame with another base is rejected.
 (defn emit-entry-with-locations! [(out (mut code/Buffer))
                                   (graph g/Graph)
                                   (parts locations/View)
                                   (parameter Parameter)
                                   (position i64)
                                   (frame-size i64)
+                                  (base frame/Base)
                                   (result-slot i64)] (-> (Result i32 (slice u8)))
   (let [begin (len (.text out))
         ty (value/type-of graph (.reference parameter))
@@ -210,6 +214,8 @@
     (cond (or (= kind 0) (= kind 2)) (Ok 0)
           (or (< kind 0) (> kind 4)) (Err "invalid x86-64 parameter kind")
           (and (= kind 3) (< result-slot 0)) (Err "x86-64 result buffer has no frame slot")
+          (and (!= kind 3) (!= (.reg base) registers/RSP))
+            (Err "x86-64 backend: stack parameters of a frame that is not rsp-based are not implemented (stack family)")
           :else
             (match (locations/resolve parts (.reference parameter) (+ position 1))
               (Err [message] (Err message))
@@ -221,8 +227,9 @@
                                 (not (registers/allocatable? ty destination)))
                               (Err [i64 (slice u8)] "stack parameter definition requires a register of its class")
                             (= kind 3)
-                              (encode/lea (mut (.text out)) 64 destination
-                                          (encode/mem registers/RSP result-slot))
+                              (match (frame/slot base result-slot)
+                                (Err [message] (Err [i64 (slice u8)] message))
+                                (Ok [buffer] (encode/lea (mut (.text out)) 64 destination buffer)))
                             (= kind 4) (encode/lea (mut (.text out)) 64 destination incoming)
                             (types/integer? ty)
                               (encode/mov-rm (mut (.text out)) (value/operation-bits ty)

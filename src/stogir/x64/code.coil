@@ -9,12 +9,17 @@
 ;;; which records the first failure; the caller discards the bytes on error.
 (module stogir.x64.code)
 (import "stogir.alignment" :as alignment)
+(import "stogir.graph" :as g)
+(import "stogir.image" :as image)
+(import "stogir.node" :as n)
+(import "stogir.symbols" :as symbols)
+(import "stogir.x64.encode" :as encode)
 (import "stogir.bytes" :as bytes)
 (import "stogir.text-data" :as text-data)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [Allocator])
 (import "coil.primitive" :as primitive)
-(import "coil.result" :use [Result Ok Err])
+(import "coil.result" :use [Result Ok Err Some None])
 
 ;;; A pending image relocation of 4 bytes at `offset`: `kind` is an image
 ;;; relocation kind (5 PC32, 6 PLT32), `target` a negative graph constant
@@ -123,3 +128,35 @@
                      :target (.target reference)
                      :addend (.addend reference))))
           true))))
+
+(defn direct-branch! [(output (mut Buffer)) (graph g/Graph) (reference i32) (link bool)]
+  (-> (Result i32 (slice u8)))
+  (match (g/lookup graph reference)
+    (None [] (Err "call target missing"))
+    (Some [node]
+          (if (or (>= reference 0)
+                  (!= (n/opcode node) 74)
+                  (not (symbols/validate graph node)))
+              (Err "direct call requires named FUNC constant")
+              (match (if link
+                         (encode/call-rel32 (mut (.text output)) 0)
+                         (encode/jmp-rel32 (mut (.text output)) 0))
+                (Err [message] (Err message))
+                (Ok [field]
+                    (push! (mut (.references output))
+                           (Reference
+                             :offset field
+                             :kind image/X64-PLT32
+                             :target reference
+                             :addend (- 0 (encode/field-to-end (.text output) field))))
+                    (Ok 5)))))))
+
+;;; call rel32 to named function `reference` (PLT32).
+(defn direct-call! [(output (mut Buffer)) (graph g/Graph) (reference i32)]
+  (-> (Result i32 (slice u8)))
+  (direct-branch! (mut output) graph reference true))
+
+;;; jmp rel32 to named function `reference` (PLT32).
+(defn direct-jump! [(output (mut Buffer)) (graph g/Graph) (reference i32)]
+  (-> (Result i32 (slice u8)))
+  (direct-branch! (mut output) graph reference false))

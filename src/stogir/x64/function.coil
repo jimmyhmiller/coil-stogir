@@ -50,6 +50,7 @@
 (import "stogir.x64.call-abi" :as abi)
 (import "stogir.call-results" :as results)
 (import "stogir.x64.callee-saved" :as callee)
+(import "stogir.x64.frame-address" :as address)
 (import "stogir.x64.code" :as code)
 (import "stogir.x64.conditional" :as conditional)
 (import "stogir.x64.context" :as context)
@@ -112,10 +113,11 @@
     (when (= (.kind (.spec role)) 2)
       (if (or (< (.slot role) 0) (<= frame-size 0))
           (set! error "indirect result pointer has no frame slot")
-          (code/accept! (mut error)
-                        (encode/mov-mr (mut (.text out)) 64
-                                       (encode/mem registers/RSP (.slot role))
-                                       registers/RDI))))
+          (match (address/slot (.base assigned) (.slot role))
+            (Err [message] (set! error message))
+            (Ok [slot]
+                (code/accept! (mut error)
+                              (encode/mov-mr (mut (.text out)) 64 slot registers/RDI))))))
     (if (= error "") (Ok 0) (Err error))))
 
 ;;; The preserved-register reloads and add rsp, N: rsp is back at the return
@@ -162,22 +164,27 @@
           (code/accept-count! (mut error) (abi/normalize! (mut out) ty registers/RAX)))
       (< (.slot role) 0) (set! error "aggregate result has no frame slot")
       (= (.kind spec) 2)
-        (code/accept! (mut error)
-                      (encode/mov-rm (mut (.text out)) 64 registers/RAX
-                                     (encode/mem registers/RSP (.slot role))))
+        (match (address/slot (.base cx) (.slot role))
+          (Err [message] (set! error message))
+          (Ok [slot]
+              (code/accept! (mut error)
+                            (encode/mov-rm (mut (.text out)) 64 registers/RAX slot))))
       :else
         (for [i 0 (cast i64 (.count spec))]
           (let [piece (cast i32 i)
-                register (arguments/result-register spec piece)
-                slot (encode/mem registers/RSP (+ (.slot role) (results/piece-offset spec piece)))]
-            (code/accept! (mut error)
-                          (cond (registers/gpr? register)
-                                  (encode/mov-rm (mut (.text out)) 64 register slot)
-                                (= (results/piece-type spec piece) 13)
-                                  (encode/sse-mov-rm (mut (.text out)) encode/MOVSS register slot)
-                                :else
-                                  (encode/sse-mov-rm (mut (.text out)) encode/MOVSD register
-                                                     slot))))))
+                register (arguments/result-register spec piece)]
+            (match (address/slot (.base cx) (+ (.slot role) (results/piece-offset spec piece)))
+              (Err [message] (when (= error "") (set! error message)))
+              (Ok [slot]
+                  (code/accept! (mut error)
+                                (cond (registers/gpr? register)
+                                        (encode/mov-rm (mut (.text out)) 64 register slot)
+                                      (= (results/piece-type spec piece) 13)
+                                        (encode/sse-mov-rm (mut (.text out)) encode/MOVSS register
+                                                           slot)
+                                      :else
+                                        (encode/sse-mov-rm (mut (.text out)) encode/MOVSD register
+                                                           slot))))))))
     (code/accept-count! (mut error) (epilogue! (mut out) assigned (.frame-size cx)))
     (if (= error "") (Ok 0) (Err error))))
 
@@ -203,6 +210,10 @@
     (cond
       (and (= (n/opcode node) 80) (= mode 0)) (Err "TAILCALL has no selected lowering")
       (= mode 0) (call/emit-call! (mut out) cx reference position preserve 0 allocator)
+      ; The move below addresses the incoming arguments from rsp; the
+      ; selection never jumps out of a function with a dynamic stack.
+      (and (= mode 1) (!= (.reg (.base cx)) registers/RSP))
+        (Err "x86-64 tail jump selected in a function whose frame is not rsp-based")
       :else
         (do
           (code/accept-count! (mut error)
@@ -229,7 +240,7 @@
                                           (release-frame! (mut out) assigned frame-size))
                       (if (abi/direct-callee? graph (.op2 node))
                           (code/accept-count! (mut error)
-                                              (call/direct-jump! (mut out) (.op2 node)))
+                                              (code/direct-jump! (mut out) graph (.op2 node)))
                           (code/accept! (mut error)
                                         (encode/jmp-r (mut (.text out))
                                                       (call/target-register planned))))
@@ -484,7 +495,7 @@
                       (incoming/emit-entry-with-locations!
                         (mut output) graph (.parts cx)
                         (.parameter (at (.values set) (cast i64 reference)))
-                        position frame-size (.slot role))
+                        position frame-size (.base assigned) (.slot role))
                     (or (= opcode 96) (= opcode 121))
                       (match (encode/ud2 (mut (.text output)))
                         (Err [message] (Err [i32 (slice u8)] message))
