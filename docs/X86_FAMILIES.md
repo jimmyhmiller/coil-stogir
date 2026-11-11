@@ -19,7 +19,7 @@ whose entry points currently return a clear `Err`.
 | `LOCALS` | `x64/locals.coil` | VAR, VADDR, VLOAD, VSTORE |
 | `STACK` | `x64/stack.coil` | ALLOCA, AFREE, BLOCK_BEGIN, BLOCK_END, FRAME_ADDR |
 | `CALL` | `x64/call.coil`, `x64/call-abi.coil` | CALL, TAILCALL, ARGVAL, PROTO, EXITCALL, VA_* |
-| `FLOATING` | `x64/floating.coil` | every node of FLOAT/DOUBLE type or reading one |
+| `FLOATING` | `x64/floating.coil`, `x64/fcompare.coil`, `x64/float-memory.coil`, `x64/pool.coil` | every node of FLOAT/DOUBLE type or reading one (implemented, except FMA) |
 | `VECTOR` | `x64/vector.coil` | every node of a vector type or reading one |
 | `ATOMIC` | `x64/atomic.coil` | ATOMIC_LOAD/STORE/RMW/CMPXCHG/FENCE |
 | `CHECKED` | `x64/checked.coil` | ADD_OV, SUB_OV, MUL_OV, OVERFLOW |
@@ -28,7 +28,10 @@ whose entry points currently return a clear `Err`.
 | (rule hook) | `x64/reciprocal.coil` | DIV/MOD by a constant without `div` |
 
 Each placeholder module's header lists its operations, the interface it must
-implement and the notes specific to it.
+implement and the notes specific to it. The floating family is implemented
+and is the worked example of a family: selection of a tile another stage
+fuses (`fcompare/tile`), constraints, emitters with operand folding, and the
+places it meets the core (listed under "Families with a different shape").
 
 ## Where the dispatch is
 
@@ -172,11 +175,32 @@ the location view, the frame base, the plan, the frame and the frame size.
 - **Stack** needs anchored frames: `allocate.coil` rejects
   `(.anchored set)` and alignments above 16, and `function.coil`'s
   `prologue!`/`epilogue!` only know the rsp base.
-- **Floating/vector** registers already allocate (the bridge switches to the
+- **Floating** (`x64/floating.coil`) meets the core in these places, each a
+  few delimited lines:
+  - `families/of` sends floating LOAD/STORE and floating locals to it
+    (`float-memory/claims?`) ahead of the memory and locals families;
+  - the matcher lets its comparison tile (`select/RULE-FCOMPARE`) fuse into
+    IF, integer COND and floating COND like an integer comparison;
+  - `emit/flags!` and `truth/flags!` return an *extended condition* for a
+    floating comparison or value (`x64/fcompare.coil`: a condition code,
+    possibly combined with the parity flag). Every flag consumer must accept
+    one: `edges/branch-edge-parity!` for branches, `fcompare/boolean!` for a
+    BOOL, `conditional/parity!` for `cmovcc`, `fcompare/jump-if!` for a short
+    jump inside a node;
+  - the driver emits floating PARAM (`incoming.coil`), RETURN (xmm0) and IF
+    itself, because they need its state; the family only constrains them;
+  - edges build floating PHI constants (`edges.coil`), and
+    `typed-transfers.coil` holds an XMM cycle in xmm15;
+  - `function.coil` ends with `pool/finish!`, which appends the function's
+    floating constant pool and patches its loads.
+  Floating operands: `value/float-register!`, `float-into!`,
+  `float-destination`, `float-constant!`, and `float-apply!` (an SSE
+  instruction with its second operand in a register, a spill slot or the
+  constant pool). Short jumps inside one node: `x64/local.coil`.
+- **Vector** registers already allocate (the bridge switches to the
   48-register domain when a value of those types is live) and move
-  (`x64/transfers.coil`); constants, parameters (`incoming.coil` places them,
-  kind 2), returns and PHI constants of those types report a clear error at
-  the place to extend.
+  (`x64/transfers.coil`); constants, parameters, returns and PHI constants
+  of vector types report a clear error at the place to extend.
 
 ## Tests
 
@@ -185,7 +209,12 @@ Tests are `tests/x64-NAME.coil`, run on the Linux host with
 is the shared support: graph shorthands, an independent reference evaluator
 for integer operations, `compiled` / `expect!` / `invoke` (every function is
 called through one twelve-argument signature), `dirty` (garbage above a
-narrow argument) and a tally.
+narrow argument) and a tally. For floating values it has a bit-exact
+reference evaluator with the x86-64 NaN rules (`float-binary`, `float-unary`,
+`float-compare`, the conversions), `float-specials`, and `invoke-mixed` /
+`invoke-floating` (twelve floating arguments, then twelve integers; the
+result in rax or xmm0). The floating family's tests (`tests/x64-float-*.coil`)
+follow the pattern below.
 
 For a new family, follow the core's pattern:
 

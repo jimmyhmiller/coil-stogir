@@ -28,8 +28,7 @@
 ;;;   4. One parallel group moves the located register arguments, the indirect
 ;;;      callee (into rax, which no argument uses) and the allocator's
 ;;;      preservation transfers. Cycles use r11 / xmm15.
-;;;   5. Constant arguments and a constant callee are materialized (r10 for
-;;;      floating bits).
+;;;   5. Constant arguments and a constant callee are materialized.
 ;;;   6. Narrow integer register arguments are extended to 32 bits; unnamed
 ;;;      FLOAT register arguments are converted to DOUBLE.
 ;;;   7. A variadic call sets al to the number of xmm registers used; an
@@ -177,35 +176,13 @@
           (and (>= opcode 97) (<= opcode 100)) (Err VARIADIC-PENDING)
           :else (Err "x86-64 backend: EXITCALL is not implemented"))))
 
-;;; The bits of floating constant `reference` in XMM `register`, through r10.
-(defn floating-constant! [(out (mut code/Buffer)) (error (mut (slice u8))) (graph g/Graph)
-                          (reference i32) (register i32)] (-> void)
-  (match (g/lookup graph reference)
-    (None [] (when (= error "") (set! error "floating constant missing")))
-    (Some [node]
-          (let [ty (cast i32 (n/type-id node))
-                wide (= ty 12)]
-            (if (or (>= reference 0) (not (types/floating? ty)) (!= (cast i32 (n/opcode node)) ty))
-                (when (= error "") (set! error "invalid floating constant"))
-                (do
-                  (code/accept! (mut error)
-                                (encode/mov-ri (mut (.text out)) 64 registers/SCRATCH-GPR
-                                               (cast i64 (if wide
-                                                             (n/constant-bits node)
-                                                             (& (n/constant-bits node)
-                                                                0xFFFFFFFF)))))
-                  (code/accept! (mut error)
-                                (encode/movd-xr (mut (.text out)) (if wide 64 32) register
-                                                registers/SCRATCH-GPR))))))))
-
 ;;; Copy scalar value `reference` (register, spill slot or constant) into
 ;;; `register`: a general register for an integer, an XMM register for a
-;;; FLOAT or DOUBLE. Only moves are emitted. A floating constant goes through
-;;; r10.
+;;; FLOAT or DOUBLE (stogir.x64.value/float-into!; a nonzero floating constant
+;;; is loaded from the constant pool). Only moves are emitted.
 (defn load! [(out (mut code/Buffer)) (cx context/Context) (reference i32)
              (position i64) (register i32)] (-> (Result i32 (slice u8)))
-  (let [ty (value/type-of (.graph cx) reference)
-        (mut error) ""]
+  (let [ty (value/type-of (.graph cx) reference)]
     (cond
       (types/integer? ty)
         (if (registers/gpr? register)
@@ -213,34 +190,9 @@
             (Err "integer value requires a general register"))
       (or (not (types/floating? ty)) (not (registers/simd? register)))
         (Err "x86-64 backend: only integer, FLOAT and DOUBLE values cross a call boundary (vector family)")
-      (< reference 0)
-        (do
-          (floating-constant! (mut out) (mut error) (.graph cx) reference register)
-          (if (= error "") (Ok 0) (Err error)))
       :else
-        (match (loc/resolve (.parts cx) reference position)
-          (Err [message] (Err message))
-          (Ok [location]
-              (cond (loc/constant? location)
-                      (floating-constant! (mut out) (mut error) (.graph cx)
-                                          (cast i32 (.value location)) register)
-                    (= (.kind location) 1)
-                      (match (value/spill location (.base cx))
-                        (Err [message] (set! error message))
-                        (Ok [m]
-                            (code/accept! (mut error)
-                                          (encode/sse-mov-rm (mut (.text out))
-                                                             (if (= ty 12)
-                                                                 (: encode/MOVSD i32)
-                                                                 encode/MOVSS)
-                                                             register m))))
-                    (and (= (.kind location) 0) (registers/simd? (cast i32 (.value location))))
-                      (when (!= (cast i32 (.value location)) register)
-                        (code/accept! (mut error)
-                                      (encode/sse-mov-rr (mut (.text out)) encode/MOVAPS register
-                                                         (cast i32 (.value location)))))
-                    :else (set! error "floating value requires an XMM register or a spill slot"))
-              (if (= error "") (Ok 0) (Err error)))))))
+        (value/float-into! (mut out) (.graph cx) (.parts cx) (.base cx) reference position
+                           register))))
 
 ;;; PROTO and ARGVAL: the result is the first operand's value.
 (defn emit! [(out (mut code/Buffer)) (cx context/Context) (reference i32) (position i64)]
