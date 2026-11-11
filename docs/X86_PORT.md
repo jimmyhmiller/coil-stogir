@@ -148,12 +148,33 @@ rule is written out at the top of `x64/value.coil`.
      zeroing, `movaps`/`movss`/`movsd`, `andps`, `pcmpeqd` and the like may
      sit between a flag producer and its consumer, unlike `xor r, r`.
 4. **Variable-length code.** Offsets are bytes. A branch is emitted as rel32
-   with a fixup record; shrinking to rel8 and loop alignment are a separate
-   pass over records, not word arithmetic. There are no veneers in text.
-   A record (`x64/fixups.coil`) holds the instruction's first byte, its
-   displacement field, its label and its condition; labels are a table of
-   byte offsets. Neither the relaxation pass nor alignment padding exists
-   yet: the block layout's alignment requests are ignored.
+   with a fixup record (`x64/fixups.coil`: the instruction's first byte, its
+   displacement field, its label, its condition, and whether it is short);
+   labels are a table of byte offsets. There are no veneers in text. Once a
+   function's code, edge stubs and jump tables are emitted, `fixups/relax!`
+   shrinks every `jmp`/`jcc` whose displacement fits rel8, iterating to a
+   fixed point (branches only shrink), inserts alignment padding, and moves
+   every recorded offset: labels, branch records, jump-table words and
+   bases, the buffer's references and text-data ranges. A branch that crosses
+   an alignment point is charged that point's full padding limit, so no
+   later padding can push a shrunk branch out of reach. Then the
+   displacements are written and `fixups/verify` decodes every branch again
+   and checks its target (in every compile; it is a few instructions per
+   branch). The floating constant pool is appended after all of this.
+   - Loop tops are aligned to 16 bytes with multi-byte NOPs when a jump
+     really goes back to them and the padding is at most 10 bytes
+     (`fixups/loop-alignment` is the policy; `function/loop-top-candidate?`
+     names the labels that ask). Functions are aligned to 16 bytes.
+   - Jump tables are 32-bit `target - table` words behind the function's
+     code, 4-byte aligned, reached with `lea r11, [rip + table]` (an ADDRESS
+     fixup record).
+   - What the last instruction left in the flags is recorded with the buffer
+     (`x64/code.coil`, `Flags`): a compare with zero directly behind the
+     instruction that produced the value emits nothing, and its consumer
+     reads a condition those flags answer (`emit/zero-flags!`). An emitter
+     that ends in a flag-setting instruction for its result calls
+     `code/note-flags!`; nothing else is needed to stay correct, since any
+     byte emitted afterwards and every block start invalidate the record.
 5. **Memory operands and LEA.** Loads fold into ALU and compare operands, and
    `lea` covers add-with-shift and three-operand adds, following upstream's
    fusion rules. This is selection work on top of a correct register-only
@@ -285,13 +306,13 @@ follows, in which case the addend accounts for it).
 ## Optimization levels
 
 As on AArch64: level 0 is rejected, level 1 generates the graph as given,
-levels 2 and 3 run SCCP first. The level-3 stages of the a64 path
-(global-load forwarding, fact folding, select diamonds, loop-load hoisting,
-rotation, loop strength reduction, the vectorizer) are not run on x86-64
-yet (`LEVEL-THREE-CHAIN` in `x64/compile.coil`): the strength stage uses an
-AArch64 cost module and the vectorizer produces vector operations no family
-emits. Level 3 generates what level 2 does. `a64.constant-hoist` and
-`a64.return-values` are not run either.
+levels 2 and 3 run SCCP first. Level 3 then runs the graph stages of the a64
+path under the same context switches (global-load forwarding, the fact fold
+or branch facts, select diamonds or if-conversion, loop-load hoisting,
+rotation, loop strength reduction with `x64/strength-cost.coil`). Its last
+stage, the loop vectorizer, creates vector operations and stays off behind
+`LEVEL-THREE-VECTORIZE` in `x64/compile.coil` until the vector family emits
+them. `a64.constant-hoist` and `a64.return-values` are not run.
 
 ## Phases
 
