@@ -1,0 +1,96 @@
+(module stogir.tests.x64-vector-unary)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.types" :as types)
+(import "stogir.vector-arithmetic" :as va)
+(import "stogir.x64.testing" :as t)
+(import "stogir.x64.vector-testing" :as vt)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; Unary lane operations of the x86-64 vector family, every lane type the
+;;; IR allows at 8 and 16 bytes: NEG, ABS, NOT, BSWAP and the three bit
+;;; counts (55 leading zeros, 56 trailing zeros, 57 set bits), and NEG/ABS of
+;;; floating lanes.
+;;;
+;;;   f(out, pa): out[0] = OP x; out[32] = x
+;;;
+;;; with x loaded (`mode` 0) or a constant (1), or the operation applied
+;;; twice (2: OP (OP x), the first result feeding the second in place).
+;;; Besides the rotating edge values, every single-bit lane and every lane
+;;; with one bit clear is run through the counts.
+
+(const SENTINEL 0xA5)
+
+;;; `seed` below SPECIALS rotates the edge values; above it, lane i has only
+;;; bit (seed + i) set, or all but that bit for odd lanes.
+(defn lane-value [(base i32) (lane i64) (seed i64)] (-> u64)
+  (if (< seed vt/SPECIALS)
+      (vt/special base (% (+ lane seed) vt/SPECIALS))
+      (let [bit (<< (: 1 u64) (cast u64 (% (+ lane (- seed vt/SPECIALS))
+                                           (cast i64 (vt/lane-bits base)))))]
+        (if (= (% lane 2) 0) bit (& (^ bit 0xFFFFFFFFFFFFFFFF) (vt/lane-mask base))))))
+
+(defn case! [(tally (mut t/Tally)) (opcode i32) (ty i32) (mode i64) (a (dyn Allocator))]
+  (-> void)
+  (let [base (types/base-type ty)
+        size (vt/lane-bytes base)
+        lanes (cast i64 (types/lanes ty))
+        width (cast i64 (types/size ty 8))
+        (mut graph) (g/create a)
+        start (t/start! (mut graph))
+        out (t/param! (mut graph) start 6 0)
+        pa (t/param! (mut graph) start 6 1)
+        x (vt/load! (mut graph) ty start pa)
+        (mut fixed) (ArrayList::new [u64] a)]
+    (for [i 0 lanes] (push! (mut fixed) (lane-value base i 3)))
+    (let [value (if (= mode 1) (vt/constant! (mut graph) ty (slice fixed) a) x)
+          once (t/require (b/vector-unary! (mut graph) opcode ty value))
+          r (if (= mode 2) (t/require (b/vector-unary! (mut graph) opcode ty once)) once)
+          c1 (vt/save! (mut graph) x out r)
+          c2 (vt/save! (mut graph) c1 (vt/offset! (mut graph) out 32) value)
+          ret (t/return! (mut graph) c2 0 0)]
+      (match (vt/compiled (mut tally) "x64 vector unary" graph start [ret] a)
+        (None [] (println "  (opcode {} type {} mode {})" opcode ty mode))
+        (Some [code]
+              (let [(mut code) code
+                    (mut output) (vt/buffer 64 SENTINEL a)
+                    (mut input) (vt/buffer 16 0 a)]
+                (for [seed 0 (+ vt/SPECIALS (cast i64 (vt/lane-bits base)))]
+                  (for [i 0 64] (set! (mut output) i SENTINEL))
+                  (for [i 0 (/ 16 (cast i64 size))]
+                    (vt/put! (mut input) (* i (cast i64 size)) size (lane-value base i seed)))
+                  (vt/invoke code [(vt/address output 0) (vt/address input 0)])
+                  (for [i 0 lanes]
+                    (let [p (if (= mode 1) (get fixed i) (lane-value base i seed))
+                          first (vt/lane-unary opcode base p)
+                          at (* i (cast i64 size))]
+                      (vt/expect! (mut tally) "result" ty opcode mode i
+                                  (vt/word (slice output) at size)
+                                  (if (= mode 2) (vt/lane-unary opcode base first) first))
+                      (vt/expect! (mut tally) "operand kept" ty opcode mode i
+                                  (vt/word (slice output) (+ 32 at) size) p)))
+                  (for [i width 32]
+                    (vt/expect! (mut tally) "after result" ty opcode mode i
+                                (cast u64 (get output i)) SENTINEL)))
+                (free! (mut output))
+                (free! (mut input))
+                (vt/release! (mut code))))))
+    (free! (mut fixed))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 vector unary: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (for [index 0 vt/TYPES]
+          (let [ty (vt/vector-type index)]
+            (for opcode [(: 31 i32) 32 45 54 55 56 57]
+              (when (va/valid-type? opcode ty)
+                (for [mode 0 3]
+                  (case! (mut tally) opcode ty mode a))))))
+        (println "x64 vector unary: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))

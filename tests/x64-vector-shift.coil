@@ -1,0 +1,155 @@
+(module stogir.tests.x64-vector-shift)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.types" :as types)
+(import "stogir.vector-arithmetic" :as va)
+(import "stogir.x64.testing" :as t)
+(import "stogir.x64.vector-testing" :as vt)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; SHL SHR SAR ROL ROR of the x86-64 vector family, every integer lane type
+;;; the IR allows at 8 and 16 bytes. Counts are taken modulo the lane width,
+;;; lane by lane.
+;;;
+;;;   f(out, pa, pb, count): out[0] = x OP c; out[32] = x
+;;;
+;;; `mode` picks the count c:
+;;;   0  the scalar parameter, typed U8, with garbage above its byte
+;;;   1  the scalar parameter, typed I32, with garbage above
+;;;   2  the scalar parameter, typed U64
+;;;   3  a scalar constant (one function per count: 0, 1, width - 1, width,
+;;;      width + 1 and an all-ones count)
+;;;   4  a vector of counts loaded from pb
+;;;   5  a constant vector of counts
+;;;   6  x itself (the value shifted by its own lanes)
+;;;   7  as 2 with x a constant vector
+;;; The scalar counts run over every count 0..2*width+1 and extreme values.
+
+(const SENTINEL 0xA5)
+
+(defn value-lane [(base i32) (lane i64) (seed i64)] (-> u64)
+  (vt/special base (% (+ lane seed) vt/SPECIALS)))
+
+;;; A count lane: small counts, counts around the width and wild bits.
+(defn count-lane [(base i32) (lane i64) (seed i64)] (-> u64)
+  (let [bits (cast u64 (vt/lane-bits base))
+        k (% (+ (* lane 3) seed) 12)]
+    (& (cond (= k 0) 0
+             (= k 1) 1
+             (= k 2) (- bits 1)
+             (= k 3) bits
+             (= k 4) (+ bits 1)
+             (= k 5) 0xFFFFFFFFFFFFFFFF
+             (= k 6) (/ bits 2)
+             (= k 7) 0x8000000000000003
+             (= k 8) 7
+             (= k 9) (+ (* bits 5) 2)
+             (= k 10) 0x0101010101010105
+             :else (- (* bits 2) 1))
+       (vt/lane-mask base))))
+
+(defn fixed-count [(base i32) (index i64)] (-> u64)
+  (let [bits (cast u64 (vt/lane-bits base))]
+    (case index
+      0 0
+      1 1
+      2 (- bits 1)
+      3 bits
+      4 (+ bits 1)
+      0xFFFFFFFFFFFFFFFF)))
+
+(defn case! [(tally (mut t/Tally)) (opcode i32) (ty i32) (mode i64) (fixed i64)
+             (a (dyn Allocator))] (-> void)
+  (let [base (types/base-type ty)
+        size (vt/lane-bytes base)
+        lanes (cast i64 (types/lanes ty))
+        width (cast i64 (types/size ty 8))
+        count-type (case mode 0 (: 2 i32) 1 10 5)
+        (mut graph) (g/create a)
+        start (t/start! (mut graph))
+        out (t/param! (mut graph) start 6 0)
+        pa (t/param! (mut graph) start 6 1)
+        pb (t/param! (mut graph) start 6 2)
+        scalar (t/param! (mut graph) start count-type 3)
+        x (vt/load! (mut graph) ty start pa)
+        y (vt/load! (mut graph) ty x pb)
+        (mut fixed-values) (ArrayList::new [u64] a)
+        (mut fixed-counts) (ArrayList::new [u64] a)]
+    (for [i 0 lanes]
+      (push! (mut fixed-values) (value-lane base i 5))
+      (push! (mut fixed-counts) (count-lane base i 7)))
+    (let [value (if (= mode 7) (vt/constant! (mut graph) ty (slice fixed-values) a) x)
+          count (cond (= mode 3) (t/constant! (mut graph) 5 (fixed-count base fixed))
+                      (= mode 4) y
+                      (= mode 5) (vt/constant! (mut graph) ty (slice fixed-counts) a)
+                      (= mode 6) x
+                      :else scalar)
+          r (t/require (b/vector-binary! (mut graph) opcode ty value count 0))
+          c1 (vt/save! (mut graph) y out r)
+          c2 (vt/save! (mut graph) c1 (vt/offset! (mut graph) out 32) value)
+          ret (t/return! (mut graph) c2 0 0)]
+      (match (vt/compiled (mut tally) "x64 vector shift" graph start [ret] a)
+        (None [] (println "  (opcode {} type {} mode {})" opcode ty mode))
+        (Some [code]
+              (let [(mut code) code
+                    (mut output) (vt/buffer 64 SENTINEL a)
+                    (mut first) (vt/buffer 16 0 a)
+                    (mut second) (vt/buffer 16 0 a)
+                    bits (cast i64 (vt/lane-bits base))
+                    scalar-mode (or (<= mode 2) (= mode 7))
+                    rounds (if scalar-mode (+ (* bits 2) 8) (: 12 i64))]
+                (for [seed 0 rounds]
+                  (for [i 0 64] (set! (mut output) i SENTINEL))
+                  (for [i 0 (/ 16 (cast i64 size))]
+                    (vt/put! (mut first) (* i (cast i64 size)) size (value-lane base i seed))
+                    (vt/put! (mut second) (* i (cast i64 size)) size (count-lane base i seed)))
+                  (let [plain (if (< seed (+ (* bits 2) 2))
+                                  (cast u64 seed)
+                                  (count-lane 5 (- seed (* bits 2)) 1))
+                        passed (cond (= mode 0) (t/dirty 2 plain)
+                                     (= mode 1) (t/dirty 10 plain)
+                                     :else plain)]
+                    (vt/invoke code [(vt/address output 0) (vt/address first 0)
+                                     (vt/address second 0) passed])
+                    (for [i 0 lanes]
+                      (let [p (if (= mode 7) (get fixed-values i) (value-lane base i seed))
+                            c (cond (= mode 3) (fixed-count base fixed)
+                                    (= mode 4) (count-lane base i seed)
+                                    (= mode 5) (get fixed-counts i)
+                                    (= mode 6) p
+                                    :else plain)
+                            at (* i (cast i64 size))]
+                        (vt/expect! (mut tally) "result" ty opcode mode i
+                                    (vt/word (slice output) at size)
+                                    (vt/lane-binary opcode base p c))
+                        (vt/expect! (mut tally) "operand kept" ty opcode mode i
+                                    (vt/word (slice output) (+ 32 at) size) p)))
+                    (for [i width 32]
+                      (vt/expect! (mut tally) "after result" ty opcode mode i
+                                  (cast u64 (get output i)) SENTINEL))))
+                (free! (mut output))
+                (free! (mut first))
+                (free! (mut second))
+                (vt/release! (mut code))))))
+    (free! (mut fixed-values))
+    (free! (mut fixed-counts))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 vector shift: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (for [index 0 vt/TYPES]
+          (let [ty (vt/vector-type index)]
+            (for opcode [(: 49 i32) 50 51 52 53]
+              (when (va/valid-type? opcode ty)
+                (for [mode 0 8]
+                  (if (= mode 3)
+                      (for [fixed 0 6] (case! (mut tally) opcode ty mode fixed a))
+                      (case! (mut tally) opcode ty mode 0 a)))))))
+        (println "x64 vector shift: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))
