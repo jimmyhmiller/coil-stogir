@@ -363,16 +363,24 @@ callee-saved area). Differences:
   `call/emit-call!` instead of emitting them itself.
 - Tail calls (`x64/tail-plan.coil`): `jmp rel32` / `jmp rax` when no frame
   address can reach the target, no ARGVAL is passed, the call is not
-  variadic, its stack arguments fit in the ones the function received, the
-  function has no dynamic stack and the result role matches. Stack arguments
-  are built in the outgoing area and moved over the incoming ones, highest
-  slot first, before the frame is released. Otherwise a TAILCALL is a call
+  variadic, its stack arguments fit in the ones the function received and
+  the result role matches. Stack arguments are built in the outgoing area
+  and moved over the incoming ones, highest slot first, before the frame is
+  released; an anchored (rbp) frame finds the incoming slots through its
+  base and restores rsp from it, so functions with ALLOCA jump too. Otherwise a TAILCALL is a call
   followed by the epilogue, and an ordinary CALL + RETURN stays as it is.
-- Builtin memmove and memcmp call their runtime routine; `call/inline-builtin!`
-  is the hook where the memory family's inline expansions plug in.
-- Not done: the direct register return of integer-pair results
-  (`a64/return-values`, `a64/result-projections`); pairs always go through the
-  frame buffer and the result place. VA_START/VA_ARG have no lowering.
+- A builtin memmove of a literal size up to 256 bytes and a builtin memcmp
+  of a known count up to 16 are expanded inline (`call/inline-builtin!`,
+  `x64/block-move`, `x64/block-compare`); other builtin calls reach their
+  runtime routine. A builtin call in tail position is a jump to the routine.
+- Integer-pair results avoid memory in both directions. A function whose
+  result buffer can be promoted away returns the piece values straight in
+  rax/rdx and has no buffer (`x64/return-values.coil`, on the neutral
+  lowering of `a64/return-values`); a CALL whose pieces are only loaded back
+  from a private frame object defines those loads itself in rax/rdx
+  (`a64/result-projections`, which is target-neutral, run by `x64/match`).
+  Mixed and floating pairs use the frame buffer and the result place.
+- VA_START/VA_ARG have no lowering.
 
 ## Image and relocations
 

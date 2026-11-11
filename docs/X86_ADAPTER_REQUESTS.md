@@ -55,5 +55,7 @@ rejected as before.
 
 Not available: reading variadic arguments in a callee (VA_START, VA_ARG; no
 lowering on either target), vector-typed arguments and results (vector
-family), and the direct register return of integer pairs without the frame
-buffer (`a64/return-values`; the buffer path is always correct).
+family). Integer pair results (`results/pieces` of U64/I64) use rax/rdx
+without memory when the callee's result place is promotable and when the
+caller only loads the pieces back from a private frame object
+(`builder/frame-object!`), exactly the shapes the AArch64 backend recognizes.
