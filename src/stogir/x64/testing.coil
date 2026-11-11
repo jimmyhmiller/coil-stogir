@@ -140,7 +140,8 @@
 
 ;;; Reference result of integer binary operation `opcode` on type `ty`,
 ;;; masked to the type. Comparisons (14..23) yield 0 or 1. Shift and rotate
-;;; counts are reduced modulo the width. DIV/MOD require `divisible?`.
+;;; counts are reduced modulo the width. DIV/MOD require `divisible?`. MIN
+;;; (58) and MAX (59) compare by the type's signedness.
 (defn binary [(opcode i32) (ty i32) (a u64) (b u64)] (-> u64)
   (let [width (bits ty)
         modulus (<< (: 1 u128) (cast u128 width))
@@ -194,15 +195,71 @@
                                (<< wide (- (cast u128 width) shift)))
                             modulus))
                m)
+          (= opcode 58) (if (types/signed? ty) (if (< sx sy) x y) (if (< x y) x y))
+          (= opcode 59) (if (types/signed? ty) (if (> sx sy) x y) (if (> x y) x y))
+          ; The value of ADD_OV, SUB_OV and MUL_OV is the wrapped result.
+          (and (>= opcode 41) (<= opcode 43)) (binary (- opcode 15) ty a b)
           :else (panic "x64 test reference: unknown binary opcode {}" opcode))))
 
-;;; Reference result of NEG (31) and NOT (45). NOT of a BOOL flips bit 0.
+;;; Reference OVERFLOW of ADD_OV (41), SUB_OV (42) or MUL_OV (43) on `ty`:
+;;; 1 when the exact result does not fit the type, else 0.
+(defn overflow [(opcode i32) (ty i32) (a u64) (b u64)] (-> u64)
+  (let [width (bits ty)
+        x (cast u128 (& a (mask ty)))
+        y (cast u128 (& b (mask ty)))
+        sx (signed ty a)
+        sy (signed ty b)
+        modulus (<< (: 1 u128) (cast u128 width))
+        limit (cast i128 (/ modulus 2))]
+    (if (types/signed? ty)
+        (let [exact (cond (= opcode 41) (+ sx sy)
+                          (= opcode 42) (- sx sy)
+                          (= opcode 43) (* sx sy)
+                          :else (panic "x64 test reference: unknown checked opcode {}" opcode))]
+          (if (or (< exact (- 0 limit)) (>= exact limit)) 1 0))
+        (cond (= opcode 41) (if (>= (+ x y) modulus) 1 0)
+              (= opcode 42) (if (< x y) 1 0)
+              (= opcode 43) (if (>= (* x y) modulus) 1 0)
+              :else (panic "x64 test reference: unknown checked opcode {}" opcode)))))
+
+;;; Reference result of NEG (31), NOT (45), ABS (32), BSWAP (54), CTPOP (55),
+;;; CTLZ (56) and CTTZ (57). NOT of a BOOL flips bit 0.
 (defn unary [(opcode i32) (ty i32) (a u64)] (-> u64)
   (let [m (mask ty)
         x (& a m)]
     (cond (= opcode 31) (& (+ (^ x m) 1) m)
           (and (= opcode 45) (= ty 1)) (^ x 1)
           (= opcode 45) (^ x m)
+          ; ABS of the minimum is the minimum.
+          (= opcode 32) (if (< (signed ty a) 0) (& (+ (^ x m) 1) m) x)
+          (= opcode 54)
+            (let [(mut rest) x
+                  (mut result) (: 0 u64)]
+              (for [i 0 (/ (cast i64 (bits ty)) 8)]
+                (set! result (| (<< result 8) (& rest 255)))
+                (set! rest (>> rest 8)))
+              result)
+          (= opcode 55)
+            (let [(mut count) (: 0 u64)]
+              (for [i 0 (cast i64 (bits ty))]
+                (set! count (+ count (& (>> x (cast u64 i)) 1))))
+              count)
+          ; The IR leaves the count of a zero undefined. The backends agree
+          ; on the type's width for CTLZ, and for CTTZ on the width the
+          ; operation runs at: 32 for every type narrower than 32 bits.
+          (= opcode 56)
+            (let [(mut count) (: 0 u64)
+                  (mut i) (- (cast i64 (bits ty)) 1)]
+              (while (and (>= i 0) (= (& (>> x (cast u64 i)) 1) 0))
+                (set! count (+ count 1))
+                (set! i (- i 1)))
+              count)
+          (= opcode 57)
+            (if (= x 0)
+                (if (< (bits ty) 32) 32 (cast u64 (bits ty)))
+                (let [(mut count) (: 0 u64)]
+                  (while (= (& (>> x count) 1) 0) (set! count (+ count 1)))
+                  count))
           :else (panic "x64 test reference: unknown unary opcode {}" opcode))))
 
 ;;; Reference result of SEXT (33), ZEXT (34), TRUNC (35) and BITCAST (36)
