@@ -1,0 +1,239 @@
+(module stogir.tests.x64-memory-emit)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.fill" :as fill)
+(import "stogir.allocation" :as allocation)
+(import "stogir.interval" :as interval)
+(import "stogir.locations" :as locations)
+(import "stogir.frame" :as frame)
+(import "stogir.matched-uses" :as machine)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.context" :as context)
+(import "stogir.x64.emit" :as emit)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.frame-address" :as address)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.select" :as select)
+(import "stogir.x64.testing" :as t)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err])
+
+;;; The emitters of tiles with a memory operand under hand-made register
+;;; assignments: the result register aliasing the address base, the index
+;;; or the register operand; a constant base (built in r10) with a spilled
+;;; index (reloaded into r11, which forces the address to be collapsed) and
+;;; a constant register operand (which then needs r11 itself); every
+;;; operation, every width, and the three comparison forms. The allocator
+;;; reaches these combinations only by chance; here each is constructed.
+;;;
+;;; A function under test: f(x, p, i) copies its arguments into the chosen
+;;; registers (or the spill slot), runs the emitter, and returns the result.
+
+(const RAX 0)
+(const RCX 1)
+(const RDX 2)
+(const RSP 4)
+(const RSI 6)
+(const RDI 7)
+(const R8 8)
+(const R9 9)
+
+(defn hold! [(parts (mut (ArrayList allocation/Part))) (reference i32) (register i32)
+             (slot i64) (a (dyn Allocator))] (-> void)
+  (let [(mut part) (allocation/create reference a)]
+    (interval/add! (mut (.ranges part)) 0 100)
+    (set! (.register part) register)
+    (set! (.spill-slot part) slot)
+    (push! (mut parts) part)))
+
+(defn release-parts! [(parts (mut (ArrayList allocation/Part)))] (-> void)
+  (for [i 0 (len parts)] (allocation/release! (elem (mut parts) i)))
+  (free! (mut parts)))
+
+(defn blank-plan [(cells i64) (a (dyn Allocator))] (-> plan/Plan)
+  (let [(mut result)
+          (plan/Plan
+            :operands (machine/Plan
+                        :ranges (ArrayList::new [machine/Range] a)
+                        :inputs (ArrayList::new [i32] a)
+                        :definitions (ArrayList::new [bool] a)
+                        :omitted (ArrayList::new [bool] a)
+                        :rematerialized (ArrayList::new [bool] a)
+                        :output-ranges (ArrayList::new [machine/Range] a)
+                        :outputs (ArrayList::new [i32] a)
+                        :definers (ArrayList::new [i32] a))
+            :tiles (ArrayList::new [select/Tile] a)
+            :families (ArrayList::new [i32] a)
+            :comparisons (ArrayList::new [i32] a)
+            :addresses (ArrayList::new [i32] a)
+            :offsets (ArrayList::new [i64] a)
+            :indices (ArrayList::new [i32] a)
+            :index-shifts (ArrayList::new [i32] a))]
+    (extend-zeroed! (mut (.omitted (.operands result))) cells)
+    (fill/append! (mut (.tiles result)) cells (select/none))
+    (extend-zeroed! (mut (.comparisons result)) cells)
+    (extend-zeroed! (mut (.addresses result)) cells)
+    (extend-zeroed! (mut (.offsets result)) cells)
+    (extend-zeroed! (mut (.indices result)) cells)
+    (extend-zeroed! (mut (.index-shifts result)) cells)
+    result))
+
+(defn accept! [(tally (mut t/Tally)) (result (Result i64 (slice u8)))] (-> void)
+  (match result
+    (Err [message] (println "encode failed: {}" message) (t/fail! (mut tally)))
+    (Ok [_] 0)))
+
+;;; One tile. `rule` is a memory-operand rule and `operation` its ALU
+;;; operation or comparison opcode (14..23). The register operand x is held
+;;; in `rx` (a constant instead when `constant-operand`), the base in `rb`
+;;; (a constant address when `constant-base`), the index in `ri` (in a spill
+;;; slot when `spilled-index`; no index when `indexed` is false) and the
+;;; result is defined in `rd`.
+(defn case! [(tally (mut t/Tally)) (ty i32) (rule i32) (operation i32) (indexed bool)
+             (constant-base bool) (spilled-index bool) (constant-operand bool)
+             (rx i32) (rb i32) (ri i32) (rd i32) (a (dyn Allocator))] (-> void)
+  (let [(mut memory) (primitive/zeroed (array u64 8))
+        base-address (primitive/cast u64 (primitive/cast (ptr u64) (mut memory)))
+        comparison (select/comparison-rule? rule)
+        fixed (: 0x7A3B5C6D9E8F1023 u64)
+        (mut graph) (g/create a)
+        start (t/start! (mut graph))
+        x (t/param! (mut graph) start ty 0)
+        p (t/param! (mut graph) start 6 1)
+        i (t/param! (mut graph) start 11 2)
+        ; The constant base is 16 bytes before the cells; the displacement
+        ; is 16 more than the register base's.
+        absolute (t/constant! (mut graph) 6 (- base-address 16))
+        operand (if constant-operand (t/constant! (mut graph) ty fixed) x)
+        load (t/require (b/emit! (mut graph) 91 ty [start p]))
+        node (if comparison
+                 (if (= rule select/RULE-COMPARE-RM)
+                     (t/compare! (mut graph) operation operand load)
+                     (t/compare! (mut graph) operation load operand))
+                 (t/binary! (mut graph) operation ty operand load))
+        (mut parts) (ArrayList::new [allocation/Part] a)
+        (mut matched) (blank-plan (len (.instructions graph)) a)
+        (mut layout) (frame/create a)
+        (mut out) (code/create a)
+        bits (t/bits ty)
+        immediate (: 100 i64)
+        tile (select/Tile
+               :rule rule
+               :operation (cond comparison (select/condition-code operation)
+                                (= rule select/RULE-MUL-RM) (: 0 i32)
+                                :else (select/alu-operation operation))
+               :bits bits
+               :left (if (or (= rule select/RULE-COMPARE-MR) (= rule select/RULE-COMPARE-MI))
+                         load
+                         operand)
+               :right (cond (= rule select/RULE-COMPARE-MR) operand
+                            (= rule select/RULE-COMPARE-MI) (: 0 i32)
+                            :else load)
+               :immediate (if (= rule select/RULE-COMPARE-MI) immediate 0))]
+    (set! (mut (.addresses matched)) (cast i64 load) (if constant-base absolute p))
+    (set! (mut (.offsets matched)) (cast i64 load) (if constant-base 24 8))
+    (set! (mut (.indices matched)) (cast i64 load) (if indexed i 0))
+    (set! (mut (.index-shifts matched)) (cast i64 load) (if indexed 3 0))
+    (hold! (mut parts) x rx -1 a)
+    (hold! (mut parts) p rb -1 a)
+    (if spilled-index
+        (hold! (mut parts) i -1 8 a)
+        (hold! (mut parts) i ri -1 a))
+    (hold! (mut parts) node rd -1 a)
+    ; sub rsp, 24: a frame with one spill slot at [rsp + 8].
+    (accept! (mut tally) (encode/alu-ri (mut (.text out)) encode/SUB 64 RSP 24))
+    (accept! (mut tally) (encode/mov-mr (mut (.text out)) 64 (encode/mem RSP 8) RDX))
+    (accept! (mut tally) (encode/mov-rr (mut (.text out)) 64 rx RDI))
+    (accept! (mut tally) (encode/mov-rr (mut (.text out)) 64 rb RSI))
+    (accept! (mut tally) (encode/mov-rr (mut (.text out)) 64 ri RDX))
+    (let [cx (context/Context
+               :graph graph
+               :parts (locations/linear-view parts)
+               :base (address/stack-base)
+               :matched matched
+               :frame layout
+               :frame-size 24
+               :outgoing-size 0
+               :alignment 16)]
+      (match (if comparison
+                 (match (emit/flags! (mut out) cx 10 tile)
+                   (Err [message] (Err [i32 (slice u8)] message))
+                   (Ok [cc] (emit/set-condition! (mut out) cc rd)))
+                 (emit/tile! (mut out) cx node 10 tile))
+        (Err [message]
+             (println "emit failed: rule {} type {} rd {}: {}" rule ty rd message)
+             (t/fail! (mut tally)))
+        (Ok [_]
+            (accept! (mut tally) (encode/mov-rr (mut (.text out)) 64 RAX rd))
+            (accept! (mut tally) (encode/alu-ri (mut (.text out)) encode/ADD 64 RSP 24))
+            (accept! (mut tally) (encode/ret (mut (.text out))))
+            (set! (.functions tally) (+ (.functions tally) 1))
+            (match (t/map (slice (.text out)))
+              (Err [message] (println "map failed: {}" message) (t/fail! (mut tally)))
+              (Ok [mapped]
+                  (let [(mut mapped) mapped
+                        result-type (if comparison (: 1 i32) ty)
+                        index-value (if indexed (: 2 u64) 0)]
+                    (for stored [(: 0 u64) 100 0x7F 0x80 0xFFFFFFFFFFFFFFFF 0x8000000000000000
+                                 0x0123456789ABCDEF]
+                      (for given [(: 0 u64) 1 100 0xFFFFFFFFFFFFFF80 0x7FFFFFFFFFFFFFFF]
+                        (for [k 0 8] (set! (mut memory) k 0x5555555555555555))
+                        ; [p + 8 + i*8]: cell 1 without an index, cell 3 with.
+                        (set! (mut memory) (if indexed 3 1) stored)
+                        (let [value (if constant-operand fixed given)
+                              expected (cond (= rule select/RULE-COMPARE-RM)
+                                               (t/binary operation ty value stored)
+                                             (= rule select/RULE-COMPARE-MR)
+                                               (t/binary operation ty stored value)
+                                             (= rule select/RULE-COMPARE-MI)
+                                               (t/binary operation ty stored 100)
+                                             :else (t/binary operation ty value stored))
+                              actual (& (t/invoke mapped [(t/dirty ty given) base-address
+                                                          index-value])
+                                        (t/mask result-type))]
+                          (set! (.checks tally) (+ (.checks tally) 1))
+                          (when (!= actual (& expected (t/mask result-type)))
+                            (when (< (.failures tally) 20)
+                              (println "rule {} operation {} type {} indexed {} constant base {} spilled index {} constant operand {} rx {} rb {} ri {} rd {}: got {:x} expected {:x}"
+                                       rule operation ty indexed constant-base spilled-index
+                                       constant-operand rx rb ri rd actual expected))
+                            (t/fail! (mut tally))))))
+                    (t/unmap! (mut mapped))))))))
+    (code/release! (mut out))
+    (frame/release! (mut layout))
+    (plan/release! (mut matched))
+    (release-parts! (mut parts))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 memory emit: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (for ty [(: 11 i32) 5 10 4 9 3 8 2]
+          ; The result in the operand's register, the base's, the index's
+          ; and a register of its own.
+          (for rd [(: RCX i32) R8 R9 RAX]
+            (for shape [(: 0 i32) 1 2 3 4 5]
+              (let [indexed (>= shape 1)
+                    constant-base (or (= shape 2) (= shape 4) (= shape 5))
+                    spilled-index (>= shape 3)
+                    constant-operand (= shape 5)]
+                (for operation [(: 26 i32) 27 46 47 48]
+                  (case! (mut tally) ty select/RULE-ALU-RM operation indexed constant-base
+                         spilled-index constant-operand RCX R8 R9 rd a))
+                (when (>= (t/bits ty) 16)
+                  (case! (mut tally) ty select/RULE-MUL-RM 28 indexed constant-base
+                         spilled-index constant-operand RCX R8 R9 rd a))
+                (for operation [(: 14 i32) 15 16 17 18 19 20 21 22 23]
+                  (case! (mut tally) ty select/RULE-COMPARE-RM operation indexed constant-base
+                         spilled-index constant-operand RCX R8 R9 rd a)
+                  (case! (mut tally) ty select/RULE-COMPARE-MR operation indexed constant-base
+                         spilled-index constant-operand RCX R8 R9 rd a)
+                  (case! (mut tally) ty select/RULE-COMPARE-MI operation indexed constant-base
+                         spilled-index false RCX R8 R9 rd a))))))
+        (println "x64 memory emit: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))
