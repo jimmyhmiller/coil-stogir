@@ -41,7 +41,12 @@ decision changes.
   the parallel-move skeleton, the node walk) is moved to `src/stogir/` and
   shared when an x64 file would otherwise be a copy. Moving is preferred over
   copying; a copy needs a reason written at the top of the file.
-  Moved so far: `stogir.phi-coalesce` (was `stogir.a64.phi-coalesce`).
+  Moved so far: `stogir.phi-coalesce` (was `stogir.a64.phi-coalesce`),
+  `stogir.tail-eligibility` (the target-neutral proofs of
+  `stogir.a64.tail-plan`). `x64/private-leaf` uses the context, registry and
+  publication functions of `stogir.a64.private-leaf` as they are (its neutral
+  state types are exported for that); only leaf creation, the clobber mask,
+  reference validation and binding are x86-64's own.
   The x64 driver, transfers and fixups are written again rather than shared,
   each with its reason at the top of the file (4-byte words, AArch64
   scratches, shrink-wrapping interleaved with the node walk).
@@ -65,7 +70,7 @@ registers are 32..47.
 | Integer arguments | rdi rsi rdx rcx r8 r9 |
 | Float arguments | xmm0..xmm7 |
 | Results | rax, rdx; xmm0, xmm1 |
-| Indirect call target, tail-call target | r11 |
+| Indirect call target, tail-call target | rax (r11 for a variadic call, where al is the vector count) |
 | Parallel-move cycle holder | r11, xmm15 |
 
 Two scratch registers per bank mirror a64's x16/x17 and v30/v31 so emitters
@@ -164,8 +169,15 @@ callee-saved area). Differences:
   over-alignment); rbp is then the base for locals and parameters.
 - rsp is 16-byte aligned at every call: entry rsp + 8 + N is a multiple of 16.
   N is the frame contents rounded up to 8 modulo 16; a function without
-  frame contents (no spill, no preserved register, no frame object) has
-  N = 0 and no prologue.
+  frame contents (no spill, no preserved register, no frame object) that
+  executes no call instruction has N = 0 and no prologue. A function that
+  calls always has a frame (N = 8 at least); one whose only calls are tail
+  jumps does not need one.
+- Two frame objects belong to the function's result role and are owned by its
+  entry node: the 16-byte buffer of register result pieces (PARAM 0 is its
+  address; RETURN loads the pieces from it) and the 8-byte slot in which the
+  prologue saves the hidden pointer of an indirect result (RETURN reloads it
+  into rax).
 - Frameless leaves may use the 128-byte red zone for spills. Not done yet:
   a function with any spill gets a frame.
 - Traps are `ud2`.
@@ -192,7 +204,35 @@ callee-saved area). Differences:
   addresses are loaded from a private 8-byte slot with `mov r, [rip+slot]`
   (PC32); strings and constants are addressed with `lea r, [rip+x]` (PC32).
 - Private leaf calls: the written-register set of a leaf is recorded while it
-  is emitted (no decoder).
+  is emitted (no decoder). `code/Buffer.written` collects every register an
+  allocated value occupies, every declared clobber, the scratches and the
+  result registers; `code/Buffer.calls` is set by any call or tail jump. An
+  emitter may therefore write only its destination, the scratches and
+  registers it declared with `uses/clobber!`; anything else it must record
+  with `code/wrote!`. A function without calls or relocations carries the
+  record in `Image.leaf-effects`, and `x64/private-leaf` narrows the clobbers
+  of a direct call to a registered leaf to (leaf writes + the call's own
+  argument registers) within the caller-saved allocatable set.
+- An indirect callee is moved into rax by the same parallel group that places
+  the arguments (no argument uses rax and every value living there is being
+  moved out anyway), so the reserved scratches stay free for that group's
+  cycles. A variadic call moves it on to r11 before al is set.
+- The call's own parallel group also carries the allocator's transfers at the
+  call's definition position (values leaving caller-saved registers): the
+  call family announces the position and the driver hands the transfers to
+  `call/emit-call!` instead of emitting them itself.
+- Tail calls (`x64/tail-plan.coil`): `jmp rel32` / `jmp rax` when no frame
+  address can reach the target, no ARGVAL is passed, the call is not
+  variadic, its stack arguments fit in the ones the function received, the
+  function has no dynamic stack and the result role matches. Stack arguments
+  are built in the outgoing area and moved over the incoming ones, highest
+  slot first, before the frame is released. Otherwise a TAILCALL is a call
+  followed by the epilogue, and an ordinary CALL + RETURN stays as it is.
+- Builtin memmove and memcmp call their runtime routine; `call/inline-builtin!`
+  is the hook where the memory family's inline expansions plug in.
+- Not done: the direct register return of integer-pair results
+  (`a64/return-values`, `a64/result-projections`); pairs always go through the
+  frame buffer and the result place. VA_START/VA_ARG have no lowering.
 
 ## Image and relocations
 

@@ -1024,3 +1024,75 @@ consumers with debug checks, exact source/pass-set equality, regenerated objects
 and no linked warnings. All 358 implementation/test source files remain Coil.
 Formatting and diff checks pass. Correctness and bounded instruction counts do
 not establish runtime/compile-time benchmark results or full backend completion.
+
+## System V x86-64 call shapes
+
+The x86-64 backend (`docs/X86_PORT.md`) places arguments by the System V
+rules, which need three prototype shapes AArch64 has no use for. All three are
+valid only when the library is compiled for x86-64
+(`stogir.call-results/system-v?`): on AArch64 every validator rejects them
+exactly as before, serialized prototypes that do not use them are byte for
+byte unchanged, and `a64/abi-arguments` rejects them independently.
+
+**Mixed argument pairs.** A `call-groups/Group` of count 2 may have members of
+different types, each from {U64 5, I64 11, DOUBLE 12, FLOAT 13}
+(`call-groups/pair-members?`, alignment 8 or 16). Each member is one
+eightbyte: it takes a register of its own class, or both members go to the
+stack. Homogeneous groups keep their rules; on x86-64 a group has at most two
+members. `call-groups/member-types?` is the one predicate construction,
+`calls/validate-call` and prototype validation share.
+
+**Result pairs.** `(call-results/pair first second)` is a `Spec` of kind 1
+with `count` 2 and the new field `second` set: two one-eightbyte pieces of
+types `first` and `second` (same type set), stored at offsets 0 and 8 of the
+result place. Integer pieces are returned in rax then rdx and floating pieces
+in xmm0 then xmm1, in order per class, so `(pair 12 11)` is xmm0 + rax.
+`second` = 0 is every existing shape (`pieces`, `indirect`, `ordinary`).
+`call-results/piece-type`, `piece-offset` and `size` describe both shapes.
+Serialized, the second type is the high four bits of the piece-count byte,
+which were always zero. Because a pair is still kind 1, the optimizer's
+private-result reasoning (`call-effects`, `call-inline`, `private-object`)
+applies unchanged; those passes use `call-results/size` for the extent.
+
+**MEMORY parameters.** `(calls/memory-parameter! prototype ordinal size
+alignment)` declares fixed ADDR parameter `ordinal` a by-value aggregate of
+memory class (`call-groups/Memory {ordinal size alignment}`). In the callee
+that PARAM is the address of the caller's copy in the incoming stack
+arguments; it takes no register and occupies `size` rounded up to 8 bytes,
+starting at a multiple of 16 when `alignment` is 16. A caller passes it as an
+ARGVAL of exactly `size` bytes (checked at construction and by
+`calls/validate-call`). Records are added in ascending ordinal order and may
+not name a group member. Serialized, a record shares the group array, sorted
+by ordinal: `{u16 ordinal, u8 1, u8 alignment, u8 1, u24 size}` (a group
+record has zero in its last four bytes). `call-groups/memory? bytes index` and
+`call-groups/memory-at bytes index` read it; `call-groups/at` still returns the
+record's ordinal, count 1 and alignment.
+
+**ARGVAL** on x86-64 is upstream's `pass_struct_by_val`: the bytes are copied
+into the outgoing stack arguments (8-byte alignment, 16 when the node asks for
+more than 8), with or without a prototype record. It is not a private copy
+passed by pointer, which remains the AArch64 rule.
+
+**Placement** (`x64/abi-arguments.coil`): six integer registers (rdi rsi rdx
+rcx r8 r9) and eight vector registers (xmm0..xmm7), independent; a group that
+does not fit goes to the stack whole and leaves its registers to later
+arguments; stack slots are 8 bytes; group alignment 16 affects stack placement
+only. An indirect result's hidden pointer is the first integer argument and
+is returned in rax. Unnamed arguments of a variadic call are placed like named
+ones, an unnamed FLOAT is promoted to DOUBLE, and al carries the number of
+vector registers used. The caller extends narrow integers to 32 bits; a callee
+never relies on it. Convention numbers 0 and 8 are accepted. Vector-typed
+arguments and results are rejected with a clear error (vector family).
+
+Evidence, all on the Linux host against C compiled by the system compiler
+(`tools/x86/call-tests.sh`): `tests/x64-call-abi.coil` (both directions:
+scalars beyond the banks, narrow integers, pairs of every class mix, groups on
+the stack, register-pair and indirect results, MEMORY aggregates of 8- and
+16-byte alignment and a 200-byte one, variadic calls checked through
+`snprintf` and a `va_arg` callee, al), `tests/x64-call-flow.coil` (a `qsort`
+callback, recursion, register pressure, indirect and tail calls, private
+leaves and module publication), `tests/x64-call-stress.coil` (3000 random
+signatures, argument images compared location by location) and
+`tests/x64-abi-arguments.coil` (placement tables and serialized forms).
+Reading variadic arguments (VA_START, VA_ARG) has no lowering on either
+target.

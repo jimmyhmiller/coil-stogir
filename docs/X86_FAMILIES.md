@@ -104,6 +104,8 @@ rematerialized. `position` is `2 * schedule index`: operands are read at
 | value would like one register | `uses/prefer!` |
 | a frame object | push a `uses/Local` on `(.locals set)` |
 | outgoing call area | raise `(.outgoing-size set)` (multiple of 16) |
+| a fixed register that is the instruction's own result | `uses/define-fixed!` plus `uses/clobber-unless-live!` (the clobber applies only when the result is dead) |
+| the function executes a call instruction | set `(.calls set)` (forces a frame so rsp is aligned) |
 | allocator transfers at a definition position that the emitter lowers itself | push `position + 1` on `(.definition-moves set)` |
 
 Do **not** use `uses/use-fixed!` for an operand that may live on after the
@@ -152,11 +154,21 @@ the location view, the frame base, the plan, the frame and the frame size.
   rule hook. `reciprocal/select` may replace the `RULE-DIVIDE` tile of a DIV
   or MOD; its rules are then constrained and emitted by
   `reciprocal/constrain!` and `reciprocal/emit!`.
-- **Calls** additionally own `x64/call-abi.coil` (placement) and will need
-  the driver to hand over the allocator's definition-position transfers
-  (`function.coil` reports "definition-position transfers are not lowered
-  yet" where that hook goes), plus private-leaf contexts in
-  `x64/compile.coil`.
+- **Calls** (`x64/call.coil`, implemented): placement is
+  `x64/abi-arguments.coil` (shared with `x64/incoming.coil`) and
+  `x64/call-abi.coil` (one call's layout). The matcher asks
+  `call/select-tails!` once per function for the tail-call plan
+  (`plan/tail-mode`). `call/constrain!` announces `position + 1` in
+  `(.definition-moves set)`; the driver then does not emit the allocator's
+  transfers at that position but hands them to `call/emit-call!`
+  (`function.coil`, `call-node!`), which also covers TAILCALL. PROTO and
+  ARGVAL go through the ordinary `emit!`. Private-leaf contexts reach the
+  family through `(.private set)`.
+- **Registers an emitter may write**: its allocated destination, the
+  scratches, and registers it declared with `uses/clobber!`. The driver
+  records exactly those as the function's write set for private-leaf callers;
+  an emitter that writes anything else must call `code/wrote!`, and one that
+  emits a call or jump out of the function `code/called!`.
 - **Stack** needs anchored frames: `allocate.coil` rejects
   `(.anchored set)` and alignments above 16, and `function.coil`'s
   `prologue!`/`epilogue!` only know the rsp base.

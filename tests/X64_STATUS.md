@@ -282,9 +282,9 @@ shape on AArch64. An x86-64 shape check can take the place of `(do)`.
 | jit-floating-varargs | ported-to-facade | floating |  |
 | jit-frame-address | a64-internal |  | imports encode |
 | jit-grouped-arguments | ported-to-facade | calls+ABI |  |
-| jit-hva-abi | ported-to-facade | calls+ABI | AArch64 HVA convention; x86-64 expectations to be decided |
-| jit-hva-incoming | ported-to-facade | calls+ABI | AArch64 HVA convention; Linux Coil compiler aborts (SysV SSEUP unimplemented) |
-| jit-hva-outgoing | ported-to-facade | calls+ABI | AArch64 HVA convention; Linux Coil compiler aborts (SysV SSEUP unimplemented) |
+| jit-hva-abi | ported-to-facade | calls+ABI | AArch64 HVA convention. On System V an aggregate of two 16-byte vectors is MEMORY class (by value on the stack, returned through a hidden pointer), which tests/x64-call-abi.coil covers against C; this test itself needs vector values (vector family) and a Coil host callback the Linux compiler cannot build (SysV SSEUP unimplemented) |
+| jit-hva-incoming | ported-to-facade | calls+ABI | AArch64 HVA convention; Linux Coil compiler aborts (SysV SSEUP unimplemented); System V equivalents in tests/x64-call-abi.coil |
+| jit-hva-outgoing | ported-to-facade | calls+ABI | AArch64 HVA convention; Linux Coil compiler aborts (SysV SSEUP unimplemented); System V equivalents in tests/x64-call-abi.coil |
 | jit-hva-varargs | a64-internal |  | hand-encoded AArch64 probe function |
 | jit-image | a64-internal |  | hand-encoded AArch64 words |
 | jit-incoming | ported-to-facade | calls+ABI |  |

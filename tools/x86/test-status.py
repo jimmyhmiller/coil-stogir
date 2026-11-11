@@ -62,9 +62,9 @@ FAMILY = {
 
 # Facade tests that need more than the backend to run on x86-64 Linux.
 NOTES = {
-    "jit-hva-abi": "AArch64 HVA convention; x86-64 expectations to be decided",
-    "jit-hva-incoming": "AArch64 HVA convention; Linux Coil compiler aborts (SysV SSEUP unimplemented)",
-    "jit-hva-outgoing": "AArch64 HVA convention; Linux Coil compiler aborts (SysV SSEUP unimplemented)",
+    "jit-hva-abi": "AArch64 HVA convention. On System V an aggregate of two 16-byte vectors is MEMORY class (by value on the stack, returned through a hidden pointer), which tests/x64-call-abi.coil covers against C; this test itself needs vector values (vector family) and a Coil host callback the Linux compiler cannot build (SysV SSEUP unimplemented)",
+    "jit-hva-incoming": "AArch64 HVA convention; Linux Coil compiler aborts (SysV SSEUP unimplemented); System V equivalents in tests/x64-call-abi.coil",
+    "jit-hva-outgoing": "AArch64 HVA convention; Linux Coil compiler aborts (SysV SSEUP unimplemented); System V equivalents in tests/x64-call-abi.coil",
     "jit-vector-lane-returns": "Linux Coil compiler aborts (SysV SSEUP unimplemented)",
     "jit-vector-select-returns": "Linux Coil compiler aborts (SysV SSEUP unimplemented)",
     "vector-locals": "expects the compile to be refused; passes against the placeholder",
