@@ -38,7 +38,10 @@
 ;;;      256 bytes and a builtin memcmp of a known count up to 16 are expanded
 ;;;      inline instead (`inline-builtin!`).
 ;;;   9. Register result pieces are stored through the saved place pointer
-;;;      (r11); a narrow integer result is extended to 32 bits.
+;;;      (r11); a narrow integer result is extended to 32 bits. When the
+;;;      matcher projected the pieces (integer pieces only loaded back from a
+;;;      private frame object), they stay in rax/rdx as the definitions of
+;;;      those loads and steps 2 and 9 store nothing.
 ;;; A native tail call (mode 1) stops after step 7: the driver moves the stack
 ;;; arguments over the incoming ones, releases the frame and jumps.
 ;;;
@@ -53,6 +56,7 @@
 (import "stogir.types" :as types)
 (import "stogir.schedule" :as schedule)
 (import "stogir.locations" :as loc)
+(import "stogir.matched-uses" :as machine)
 (import "stogir.argument-value" :as argval)
 (import "stogir.call-results" :as results)
 (import "stogir.call-groups" :as groups)
@@ -137,6 +141,7 @@
                     mask (private/call-clobbers (.private set) graph reference mode
                                                 (slice (.arguments planned)))
                     outgoing (arguments/round-up (.stack planned) 16)
+                    projected (machine/output-range (.operands matched) reference)
                     (mut error) ""]
                 (for argument (.arguments planned)
                   (when (and (> (.value argument) 0)
@@ -148,11 +153,26 @@
                 (for [register 0 48]
                   (when (and (!= (& mask (<< (: 1 u64) (cast u64 register))) 0)
                              (or (< register 32) (.floating set)))
-                    (if (= (cast i32 register) defined)
-                        (uses/clobber-unless-live! (mut set) (cast i32 register)
-                                                   (+ position 1) (+ position 2) reference)
-                        (uses/clobber! (mut set) (cast i32 register)
-                                       (+ position 1) (+ position 2)))))
+                    (let [owner (cond (= (cast i32 register) defined) reference
+                                      (and (= register 0) (> (.count projected) 0))
+                                        (get (.outputs (.operands matched)) (.offset projected))
+                                      (and (= register 2) (> (.count projected) 1))
+                                        (get (.outputs (.operands matched))
+                                             (+ (.offset projected) 1))
+                                      :else 0)]
+                      (if (> owner 0)
+                          (uses/clobber-unless-live! (mut set) (cast i32 register)
+                                                     (+ position 1) (+ position 2) owner)
+                          (uses/clobber! (mut set) (cast i32 register)
+                                         (+ position 1) (+ position 2))))))
+                ; Projected result pieces are defined by the call itself.
+                (for [k 0 (.count projected)]
+                  (unless (uses/define-fixed! (mut set)
+                                              (get (.outputs (.operands matched))
+                                                   (+ (.offset projected) k))
+                                              position
+                                              (if (= k 0) (: registers/RAX i32) registers/RDX))
+                    (set! error CONFLICT)))
                 (when (and (>= defined 0)
                            (not (uses/define-fixed! (mut set) reference position defined)))
                   (set! error CONFLICT))
@@ -452,6 +472,42 @@
     (free! (mut copies))
     (if (= error "") (Ok 0) (Err error))))
 
+;;; Move the integer result pieces `low` and `high` (0 for a single piece)
+;;; into rax and rdx as one simultaneous group; a constant piece is built
+;;; afterwards.
+(defn return-pieces! [(out (mut code/Buffer)) (cx context/Context) (position i64)
+                      (low i32) (high i32) (allocator (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (let [(mut copies) (ArrayList::new [typed/Copy] allocator)
+        values [low high]
+        targets [(: registers/RAX i32) registers/RDX]
+        (mut error) ""]
+    (for [i 0 2]
+      (when (and (= error "") (located? cx (get values i) position))
+        (match (loc/resolve (.parts cx) (get values i) position)
+          (Err [message] (set! error message))
+          (Ok [source]
+              (push! (mut copies)
+                     (typed/Copy
+                       :transfer (loc/Transfer
+                                   :position position
+                                   :parent (get values i)
+                                   :source source
+                                   :destination (loc/Location
+                                                  :kind 0
+                                                  :value (cast i64 (get targets i))))
+                       :size 8))))))
+    (when (and (= error "") (> (len copies) 0))
+      (code/accept-count! (mut error)
+                          (typed/parallel-frame! (mut (.text out)) (slice copies) allocator
+                                                 (.base cx))))
+    (for [i 0 2]
+      (when (and (= error "") (!= (get values i) 0) (not (located? cx (get values i) position)))
+        (code/accept-count! (mut error)
+                            (load! (mut out) cx (get values i) position (get targets i)))))
+    (free! (mut copies))
+    (if (= error "") (Ok 0) (Err error))))
+
 ;;; The register an indirect callee is in once `emit-call!` has installed the
 ;;; arguments: r11 for a variadic call (al carries the vector count), rax
 ;;; otherwise.
@@ -474,6 +530,9 @@
               node (get (.instructions graph) (cast i64 reference))
               callee (.op2 node)
               direct? (abi/direct-callee? graph callee)
+              ; The matcher made the loads of the result pieces definitions
+              ; of this call (rax, rdx): nothing is stored to the place.
+              projected (> (.count (machine/output-range (.operands (.matched cx)) reference)) 0)
               (mut copies) (ArrayList::new [typed/Copy] allocator)
               (mut error) ""]
           (when (or (< mode 0) (> mode 2)
@@ -485,7 +544,7 @@
               (code/accept-count! (mut error)
                                   (argument-copy! (mut out) cx argument position))))
           ; 2. The result place pointer.
-          (when (and (= error "") (= mode 0) (>= (.result-save planned) 0))
+          (when (and (= error "") (= mode 0) (not projected) (>= (.result-save planned) 0))
             (code/accept-count! (mut error)
                                 (emit/into! (mut out) cx
                                             (.value (get (.arguments planned) 0))
@@ -596,7 +655,7 @@
             (code/clear-flags! (mut out)))
           ; 9. Results.
           (when (and (= error "") (= mode 0))
-            (when (>= (.result-save planned) 0)
+            (when (and (not projected) (>= (.result-save planned) 0))
               (code/accept! (mut error)
                             (encode/mov-rm (mut (.text out)) 64 registers/SCRATCH-GPR-2
                                            (encode/mem registers/RSP (.result-save planned))))

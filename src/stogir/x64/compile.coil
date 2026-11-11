@@ -54,6 +54,8 @@
 (import "stogir.split-position" :as split-position)
 (import "stogir.native.private-types" :as private)
 (import "stogir.x64.private-leaf" :as leaves)
+(import "stogir.x64.return-values" :as return-values)
+(import "stogir.a64.return-values" :as shared-returns)
 (import "stogir.x64.allocate" :as allocate)
 (import "stogir.x64.code" :as buffer)
 (import "stogir.x64.constraints" :as constraints)
@@ -129,6 +131,77 @@
 (defn generate-reusing [(graph g/Graph) (entry i32) (roots (slice i32))
                         (options function/Options) (reuse (Option pipeline/Prepared))
                         (validated bool) (allocator (dyn Allocator))]
+  (-> (Result buffer/Buffer (slice u8)))
+  ; Integer result pieces are returned straight from registers when the
+  ; private result buffer can be promoted away (stogir.x64.return-values).
+  (match (return-values/prepare graph entry roots validated allocator)
+    (Err [message]
+         (match reuse
+           (Some [prepared] (let [(mut unused) prepared] (pipeline/release! (mut unused)) 0))
+           (None [] 0))
+         (Err message))
+    (Ok [lowered]
+        (match lowered
+          (None [] (generate-buffered graph entry roots options reuse validated allocator))
+          (Some [owned]
+                (let [(mut owned) owned
+                      _ (match reuse
+                          (Some [prepared]
+                                (let [(mut unused) prepared] (pipeline/release! (mut unused)) 0))
+                          (None [] 0))
+                      direct (generate-direct (.graph owned) entry (slice (.roots owned))
+                                              (slice (.returns owned)) (.count (.spec owned))
+                                              options allocator)
+                      answer
+                        (match direct
+                          (Err [message] (Err [buffer/Buffer (slice u8)] message))
+                          (Ok [text]
+                              (let [(mut text) text]
+                                (if (return-values/shared-references? graph (.graph owned) text)
+                                    (Ok text)
+                                    (do
+                                      (buffer/release! (mut text))
+                                      (generate-buffered graph entry roots options
+                                                         (None [pipeline/Prepared]) false
+                                                         allocator))))))]
+                  (shared-returns/release! (mut owned))
+                  answer))))))
+
+;;; Generation of a lowered copy whose RETURNs carry their pieces as machine
+;;; uses. The copy's validation is its own: `validated` does not extend to it.
+(defn generate-direct [(graph g/Graph) (entry i32) (roots (slice i32))
+                       (returns (slice shared-returns/Return)) (count i32)
+                       (options function/Options) (allocator (dyn Allocator))]
+  (-> (Result buffer/Buffer (slice u8)))
+  (let [(mut anchors) (return-values/anchors returns allocator)
+        prepared (pipeline/prepare-native-anchored graph entry roots (slice anchors) allocator)]
+    (free! (mut anchors))
+    (match prepared
+      (Err [message] (Err message))
+      (Ok [prepared]
+          (let [(mut owned) prepared
+                result
+                  (match (matching/build graph (.schedule owned) roots allocator)
+                    (Err [message] (Err [buffer/Buffer (slice u8)] message))
+                    (Ok [selected]
+                        (let [(mut matched) selected
+                              emitted
+                                (match (return-values/install-uses! graph returns
+                                                                    (mut (.operands matched))
+                                                                    count)
+                                  (Err [message] (Err [buffer/Buffer (slice u8)] message))
+                                  (Ok [_] (generate-matched graph owned matched options
+                                                            allocator)))]
+                          (matching/release! (mut matched))
+                          emitted)))]
+            (pipeline/release! (mut owned))
+            result)))))
+
+;;; Generation of `graph` as it is: aggregate results go through the frame
+;;; buffer.
+(defn generate-buffered [(graph g/Graph) (entry i32) (roots (slice i32))
+                         (options function/Options) (reuse (Option pipeline/Prepared))
+                         (validated bool) (allocator (dyn Allocator))]
   (-> (Result buffer/Buffer (slice u8)))
   (match (match reuse
            (None []

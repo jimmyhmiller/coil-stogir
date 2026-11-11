@@ -52,6 +52,7 @@
 (import "stogir.x64.switch" :as switch)
 (import "stogir.x64.uses" :as uses)
 (import "stogir.call-results" :as results)
+(import "stogir.x64.return-values" :as return-values)
 (import "stogir.native.private-types" :as private)
 (import "coil.alloc" :use [Allocator])
 (import "coil.arraylist" :use [ArrayList])
@@ -112,6 +113,20 @@
               (unless (or (select/comparison-rule? rule) (= rule select/RULE-DIVIDE))
                 (uses/hint! (mut set) reference (.left tile)))))))
 
+;;; Whether every RETURN the function executes carries its result pieces as
+;;; values (stogir.x64.return-values): the frame buffer is then not needed.
+(defn direct-returns? [(graph g/Graph) (scheduled schedule/Schedule) (matched plan/Plan)]
+  (-> bool)
+  (let [(mut direct) false
+        (mut buffered) false]
+    (for reference (.nodes scheduled)
+      (when (and (= (n/opcode (get (.instructions graph) (cast i64 reference))) 120)
+                 (not (plan/omitted? matched reference)))
+        (if (> (return-values/pieces graph (.operands matched) reference) 0)
+            (set! direct true)
+            (set! buffered true))))
+    (and direct (not buffered))))
+
 (defn build-matched [(graph g/Graph)
                      (scheduled schedule/Schedule)
                      (matched plan/Plan)
@@ -145,7 +160,8 @@
       (match (incoming/result-role graph)
         (Err [message] (set! error message))
         (Ok [role]
-            (cond (= (.kind role) 1)
+            (cond (and (= (.kind role) 1) (direct-returns? graph scheduled matched)) 0
+                  (= (.kind role) 1)
                     (push! (mut (.locals set))
                            (uses/Local :owner (get (.nodes scheduled) 0)
                                        :size (results/size role) :alignment 8))
@@ -196,6 +212,13 @@
                               (= (.kind parameter) 4))
                             (require! (mut error) (uses/define! (mut set) reference position))
                           :else (set! error "x86-64 PARAM has no declared parameter")))
+                (and (= opcode 120) (> (return-values/pieces graph (.operands matched) reference) 0))
+                  ; A direct return: the pieces go to rax and rdx.
+                  (for [k 0 (return-values/pieces graph (.operands matched) reference)]
+                    (let [value (return-values/piece (.operands matched) reference k)]
+                      (require! (mut error) (uses/use-anywhere! (mut set) value position))
+                      (uses/prefer! (mut set) value
+                                    (if (= k 0) (: registers/RAX i32) registers/RDX))))
                 (= opcode 120)
                   (when (!= ty 0)
                     (require! (mut error) (uses/use-anywhere! (mut set) (.op2 node) position))
