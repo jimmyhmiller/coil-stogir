@@ -1,0 +1,535 @@
+(module stogir.tests.x64-switch-dispatch)
+(import "stogir.graph" :as g)
+(import "stogir.types" :as types)
+(import "stogir.x64.testing" :as t)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; SWITCH dispatch of the x86-64 backend (stogir.x64.switch), executed.
+;;;
+;;; Every dispatch strategy on every integer type: no case at all, one to
+;;; three cases (linear tests, including zero and the type's limits), dense
+;;; cases from zero, from a positive and from a negative base, with holes
+;;; (jump tables, up to 300 entries), sparse cases (compare trees), 64-bit
+;;; case values outside the signed 32-bit range, ranges, cases that share
+;;; code addresses in a 64-value window (bit tests, at zero, at an offset and
+;;; below zero) and windows covered whole. The function around the dispatch
+;;; is varied too: each case returning, every case ending in one MERGE with
+;;; a PHI (edges with moves, so edge stubs), cases grouped onto shared
+;;; blocks. The selector is a parameter with garbage above its width, or
+;;; the SEXT/ZEXT of a 32-bit parameter (dispatch on the source word).
+;;; Inputs are every case boundary and its neighbours, the type's limits
+;;; and random values, checked against a direct search of the cases. The
+;;; emission summary confirms a table where one is due and none otherwise.
+
+;;; One case: the raw bits of its bounds in the selector type, and the
+;;; destination group it belongs to.
+(defstruct Case [(low u64) (high u64) (group i64)])
+
+;;; Each case has its own RETURN of 1000 + its index.
+(const RETURNS 0)
+;;; Every case ends in one MERGE; a PHI of 1000 + index is returned.
+(const PHIS 1)
+;;; The cases of a group end in that group's MERGE, which returns
+;;; 2000 + group; the case blocks themselves are empty.
+(const GROUPS 2)
+
+;;; The selector is the parameter itself, or its sign or zero extension.
+(const DIRECT 0)
+(const SIGN-EXTENDED 33)
+(const ZERO-EXTENDED 34)
+
+(defn inside? [(ty i32) (item Case) (x u64)] (-> bool)
+  (if (types/signed? ty)
+      (and (>= (t/signed ty x) (t/signed ty (.low item)))
+           (<= (t/signed ty x) (t/signed ty (.high item))))
+      (and (>= (& x (t/mask ty)) (& (.low item) (t/mask ty)))
+           (<= (& x (t/mask ty)) (& (.high item) (t/mask ty))))))
+
+(defn expected [(mode i32) (ty i32) (cases (ArrayList Case)) (x u64)] (-> u64)
+  (let [(mut result) (: 7 u64)]
+    (for [i 0 (len cases)]
+      (when (inside? ty (get cases i) x)
+        (set! result (if (= mode GROUPS)
+                         (+ 2000 (cast u64 (.group (get cases i))))
+                         (+ 1000 (cast u64 i))))))
+    result))
+
+;;; Build, compile and run one dispatch. `tables` is the number of jump
+;;; tables the code must contain, or -1 when either is right.
+(defn dispatch! [(tally (mut t/Tally)) (label (slice u8)) (mode i32) (ty i32)
+                 (extension i32) (cases (ArrayList Case)) (tables i64)
+                 (a (dyn Allocator))] (-> void)
+  (dispatch-within! (mut tally) label mode ty extension cases tables -1 a))
+
+;;; As dispatch!; `jumps`, unless negative, is the most conditional jumps
+;;; the whole function may contain.
+(defn dispatch-within! [(tally (mut t/Tally)) (label (slice u8)) (mode i32) (ty i32)
+                        (extension i32) (cases (ArrayList Case)) (tables i64) (jumps i64)
+                        (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        source-ty (cond (= extension DIRECT) ty
+                        (= extension SIGN-EXTENDED) (: 10 i32)
+                        :else 4)
+        parameter (t/param! (mut graph) start source-ty 0)
+        selector (if (= extension DIRECT)
+                     parameter
+                     (t/unary! (mut graph) extension ty parameter))
+        switch (t/switch! (mut graph) start selector)
+        (mut roots) (ArrayList::new [i32] a)
+        (mut ends) (ArrayList::new [i32] a)
+        (mut values) (ArrayList::new [i32] a)
+        (mut groups) (: 0 i64)]
+    (for item cases
+      (when (>= (.group item) groups) (set! groups (+ (.group item) 1))))
+    (for [i 0 (len cases)]
+      (let [item (get cases i)
+            low (t/constant! (mut graph) ty (.low item))
+            projection (if (= (.low item) (.high item))
+                           (t/case-value! (mut graph) switch low)
+                           (t/case-range! (mut graph) switch low
+                                          (t/constant! (mut graph) ty (.high item))))]
+        (if (= mode RETURNS)
+            (push! (mut roots)
+                   (t/return! (mut graph) projection 11
+                              (t/constant! (mut graph) 11 (+ 1000 (cast u64 i)))))
+            (do
+              (push! (mut ends) (t/end! (mut graph) projection))
+              (push! (mut values) (t/constant! (mut graph) 11 (+ 1000 (cast u64 i))))))))
+    (let [default (t/case-default! (mut graph) switch)]
+      (cond (= mode PHIS)
+              (do
+                (push! (mut ends) (t/end! (mut graph) default))
+                (push! (mut values) (t/constant! (mut graph) 11 7))
+                (if (= (len ends) 1)
+                    (push! (mut roots)
+                           (t/return! (mut graph) (t/begin! (mut graph) (get ends 0)) 11
+                                      (get values 0)))
+                    (let [merge (t/merge-all! (mut graph) (slice ends))
+                          phi (t/phi-all! (mut graph) 11 merge (slice values) a)]
+                      (push! (mut roots) (t/return! (mut graph) merge 11 phi)))))
+            (= mode GROUPS)
+              (do
+                (push! (mut roots)
+                       (t/return! (mut graph) default 11 (t/constant! (mut graph) 11 7)))
+                (for [group 0 groups]
+                  (let [(mut members) (ArrayList::new [i32] a)]
+                    (for [i 0 (len cases)]
+                      (when (= (.group (get cases i)) group)
+                        (push! (mut members) (get ends i))))
+                    (let [region (if (= (len members) 1)
+                                     (t/begin! (mut graph) (get members 0))
+                                     (t/merge-all! (mut graph) (slice members)))]
+                      (push! (mut roots)
+                             (t/return! (mut graph) region 11
+                                        (t/constant! (mut graph) 11
+                                                     (+ 2000 (cast u64 group))))))
+                    (free! (mut members)))))
+            :else
+              (push! (mut roots)
+                     (t/return! (mut graph) default 11 (t/constant! (mut graph) 11 7)))))
+    (match (t/generated (mut tally) label graph start (slice roots) a)
+      (None [] 0)
+      (Some [made]
+            (let [(mut mapped) (.mapped made)
+                  (mut inputs) (ArrayList::new [u64] a)
+                  (mut state) (: 0xD15EA5E u64)
+                  top (<< (: 1 u64) (cast u64 (- (t/bits ty) 1)))]
+              (when (>= tables 0)
+                (t/check! (mut tally) (= (.tables (.summary made)) tables) label
+                          (.tables (.summary made)) tables))
+              (when (>= jumps 0)
+                (t/check! (mut tally) (<= (.conditional (.summary made)) jumps) label
+                          (.conditional (.summary made)) jumps))
+              (for item cases
+                (push! (mut inputs) (primitive/isub (.low item) 1))
+                (push! (mut inputs) (.low item))
+                (push! (mut inputs) (primitive/iadd (.low item) 1))
+                (push! (mut inputs) (primitive/isub (.high item) 1))
+                (push! (mut inputs) (.high item))
+                (push! (mut inputs) (primitive/iadd (.high item) 1))
+                ; The same low bits under a different upper half.
+                (push! (mut inputs) (^ (.low item) 0x100000000))
+                (push! (mut inputs) (^ (.low item) (<< top 1))))
+              (for edge [(: 0 u64) 1 2 63 64 65 127 128 255 256 0xFFFF 0x10000
+                         0x7FFFFFFF 0x80000000 0xFFFFFFFF 0x100000000
+                         0x7FFFFFFFFFFFFFFF 0x8000000000000000 0xFFFFFFFFFFFFFFFF]
+                (push! (mut inputs) edge)
+                (push! (mut inputs) (primitive/isub top edge))
+                (push! (mut inputs) (primitive/iadd top edge)))
+              (for [k 0 60] (push! (mut inputs) (t/random! (mut state))))
+              (for [k 0 60] (push! (mut inputs) (& (t/random! (mut state)) 0x1FF)))
+              (for raw inputs
+                (let [; What the selector is for this argument.
+                      x (cond (= extension DIRECT) raw
+                              (= extension SIGN-EXTENDED)
+                                (cast u64 (cast i64 (t/signed 10 raw)))
+                              :else (& raw 0xFFFFFFFF))]
+                  (t/expect! (mut tally) label mapped 11 [(t/dirty source-ty raw)]
+                             (expected mode ty cases x))))
+              (free! (mut inputs))
+              (t/unmap! (mut mapped)))))
+    (free! (mut roots))
+    (free! (mut ends))
+    (free! (mut values))
+    (g/release! (mut graph))))
+
+(defn one [(low u64) (high u64) (group i64)] (-> Case)
+  (Case :low low :high high :group group))
+
+;;; Singleton cases `first, first + step, ...` (wrapping in the type), each
+;;; in group `index % groups`.
+(defn run-of [(ty i32) (first u64) (step u64) (count i64) (groups i64) (a (dyn Allocator))]
+  (-> (ArrayList Case))
+  (let [(mut cases) (ArrayList::new [Case] a)]
+    (for [i 0 count]
+      (let [value (& (primitive/iadd first (primitive/imul step (cast u64 i))) (t/mask ty))]
+        (push! (mut cases) (one value value (% i groups)))))
+    cases))
+
+;;; The value `n` (negative for a signed type's low end) as bits of `ty`.
+(defn bits-of [(ty i32) (n i64)] (-> u64)
+  (& (cast u64 n) (t/mask ty)))
+
+(defn shapes! [(tally (mut t/Tally)) (ty i32) (a (dyn Allocator))] (-> void)
+  (let [signed (types/signed? ty)
+        width (t/bits ty)
+        low-end (if signed (<< (: 1 u64) (cast u64 (- width 1))) 0)
+        high-end (if signed (- (<< (: 1 u64) (cast u64 (- width 1))) 1) (t/mask ty))]
+    (for mode [(: RETURNS i32) PHIS GROUPS]
+      ; No case at all.
+      (let [(mut cases) (ArrayList::new [Case] a)]
+        (dispatch! (mut tally) "default only" mode ty DIRECT cases 0 a)
+        (free! (mut cases)))
+      ; One, two and three cases: linear tests.
+      (let [(mut cases) (ArrayList::new [Case] a)]
+        (push! (mut cases) (one 0 0 0))
+        (dispatch! (mut tally) "one case zero" mode ty DIRECT cases 0 a)
+        (push! (mut cases) (one high-end high-end 1))
+        (dispatch! (mut tally) "zero and maximum" mode ty DIRECT cases 0 a)
+        (push! (mut cases) (one (if signed low-end 1) (if signed low-end 1) 2))
+        (dispatch! (mut tally) "zero and both limits" mode ty DIRECT cases 0 a)
+        (free! (mut cases)))
+      (let [(mut cases) (ArrayList::new [Case] a)]
+        (push! (mut cases) (one 100 100 0))
+        (push! (mut cases) (one 17 17 1))
+        (dispatch! (mut tally) "two unordered cases" mode ty DIRECT cases 0 a)
+        (free! (mut cases)))
+      ; Dense from zero, from a positive base, from a negative one (signed)
+      ; or just below the top (unsigned): tables. With every case its own
+      ; address no bit test applies.
+      (for count [(: 4 i64) 16 65 129 200]
+        (let [(mut cases) (run-of ty 0 1 count count a)]
+          (dispatch! (mut tally) "dense from zero" mode ty DIRECT cases
+                     (if (= mode GROUPS) -1 1) a)
+          (free! (mut cases)))
+        (when (or (> width 8) (<= count 65))
+          (let [(mut cases) (run-of ty 40 1 count count a)]
+            (dispatch! (mut tally) "dense from forty" mode ty DIRECT cases
+                       (if (= mode GROUPS) -1 1) a)
+            (free! (mut cases)))
+          (let [(mut cases) (run-of ty (bits-of ty (- 0 (/ count 2))) 1 count count a)]
+            ; For an unsigned type these wrap around the top: two runs.
+            (dispatch! (mut tally) "dense around zero" mode ty DIRECT cases
+                       (if (or (= mode GROUPS) (not signed)) -1 1) a)
+            (free! (mut cases)))
+          (let [(mut cases) (run-of ty (- high-end (cast u64 count)) 1 count count a)]
+            (dispatch! (mut tally) "dense below the maximum" mode ty DIRECT cases
+                       (if (= mode GROUPS) -1 1) a)
+            (free! (mut cases)))
+          (let [(mut cases) (run-of ty low-end 1 count count a)]
+            (dispatch! (mut tally) "dense from the minimum" mode ty DIRECT cases
+                       (if (= mode GROUPS) -1 1) a)
+            (free! (mut cases)))))
+      ; Holes: every third and every seventh value, still dense enough.
+      (let [(mut cases) (run-of ty 3 3 30 30 a)]
+        (dispatch! (mut tally) "every third value" mode ty DIRECT cases
+                   (if (= mode GROUPS) -1 1) a)
+        (free! (mut cases)))
+      (let [(mut cases) (run-of ty 5 7 17 17 a)]
+        (dispatch! (mut tally) "every seventh value" mode ty DIRECT cases
+                   (if (= mode GROUPS) -1 1) a)
+        (free! (mut cases)))
+      ; Sparse: a compare tree.
+      (when (> width 8)
+        (let [(mut cases) (run-of ty 11 97 40 40 a)]
+          (dispatch! (mut tally) "sparse" mode ty DIRECT cases 0 a)
+          (free! (mut cases)))
+        (let [(mut cases) (run-of ty (bits-of ty -2000) 131 30 30 a)]
+          (dispatch! (mut tally) "sparse around zero" mode ty DIRECT cases 0 a)
+          (free! (mut cases))))
+      (let [(mut cases) (run-of ty 2 9 12 12 a)]
+        (dispatch! (mut tally) "sparse small" mode ty DIRECT cases 0 a)
+        (free! (mut cases)))
+      ; Ranges, alone and between singletons.
+      (let [(mut cases) (ArrayList::new [Case] a)]
+        (push! (mut cases) (one 10 20 0))
+        (dispatch! (mut tally) "one range" mode ty DIRECT cases 0 a)
+        (push! (mut cases) (one 30 30 1))
+        (push! (mut cases) (one 40 90 2))
+        (push! (mut cases) (one 0 3 3))
+        (push! (mut cases) (one 100 100 4))
+        (push! (mut cases) (one (if signed low-end 5) (if signed low-end 5) 5))
+        (push! (mut cases) (one (- high-end 5) high-end 6))
+        (dispatch! (mut tally) "ranges and singletons" mode ty DIRECT cases 0 a)
+        (free! (mut cases)))
+      (let [(mut cases) (ArrayList::new [Case] a)]
+        (push! (mut cases) (one low-end high-end 0))
+        (dispatch! (mut tally) "the whole type as one range" mode ty DIRECT cases 0 a)
+        (free! (mut cases))))
+    ; Cases sharing addresses inside one 64-value window: bit tests. Three
+    ; cases on one address, five on two, six on three, more; at zero, at an
+    ; offset, below zero or at the top; and a window covered whole.
+    (for base [(: 0 u64) 1 37 (bits-of ty -20) (- high-end 63) low-end]
+      (for groups [(: 1 i64) 2 3]
+        (for count [(: 3 i64) 5 6 11 21]
+          ; Enough cases per address (LLVM's thresholds): one range check
+          ; and one `bt` per address, however many cases there are. An
+          ; unsigned window below zero is two runs and no window at all.
+          (let [fits (and (or (= groups 1) (>= count (if (= groups 2) 5 6)))
+                          (or signed (!= base (bits-of ty -20))))
+                (mut cases) (run-of ty base 3 count groups a)]
+            (dispatch-within! (mut tally) "shared addresses, step three" GROUPS ty DIRECT
+                              cases (if fits 0 -1) (if fits (+ groups 1) -1) a)
+            (free! (mut cases)))
+          (let [fits (and (or (= groups 1) (>= count (if (= groups 2) 5 6)))
+                          (or signed (!= base (bits-of ty -20))))
+                (mut cases) (run-of ty base 1 count groups a)]
+            (dispatch-within! (mut tally) "shared addresses, contiguous" GROUPS ty DIRECT
+                              cases (if fits 0 -1) (if fits (+ groups 1) -1) a)
+            (free! (mut cases)))))
+      (let [(mut cases) (run-of ty base 1 64 1 a)
+            fits (or signed (!= base (bits-of ty -20)))]
+        ; A window covered whole by one address: the range check alone.
+        (dispatch-within! (mut tally) "one address, whole window" GROUPS ty DIRECT cases
+                          (if fits 0 -1) (if fits 1 -1) a)
+        (free! (mut cases)))
+      (let [(mut cases) (run-of ty base 1 64 3 a)
+            fits (or signed (!= base (bits-of ty -20)))]
+        (dispatch-within! (mut tally) "three addresses, whole window" GROUPS ty DIRECT cases
+                          (if fits 0 -1) (if fits 4 -1) a)
+        (free! (mut cases)))
+      ; Four addresses: too many for bit tests.
+      (let [(mut cases) (run-of ty base 1 24 4 a)]
+        (dispatch! (mut tally) "four addresses" GROUPS ty DIRECT cases
+                   (if (= base (bits-of ty -20)) -1 1) a)
+        (free! (mut cases))))))
+
+;;; 64-bit case values that no immediate holds, mixed with small ones.
+(defn wide-values! [(tally (mut t/Tally)) (ty i32) (a (dyn Allocator))] (-> void)
+  (for mode [(: RETURNS i32) PHIS GROUPS]
+    (let [(mut cases) (ArrayList::new [Case] a)]
+      (push! (mut cases) (one 0x123456789 0x123456789 0))
+      (dispatch! (mut tally) "one wide value" mode ty DIRECT cases 0 a)
+      (push! (mut cases) (one 0xFFFFFFFF00000000 0xFFFFFFFF00000000 1))
+      (push! (mut cases) (one 0x80000000 0x80000000 2))
+      (dispatch! (mut tally) "three wide values" mode ty DIRECT cases 0 a)
+      (push! (mut cases) (one 0x7FFFFFFF 0x7FFFFFFF 0))
+      (push! (mut cases) (one 0xFFFFFFFF7FFFFFFF 0xFFFFFFFF7FFFFFFF 1))
+      (push! (mut cases) (one 0xFFFFFFFF80000000 0xFFFFFFFF80000000 2))
+      (push! (mut cases) (one 0x7FFFFFFFFFFFFFFF 0x7FFFFFFFFFFFFFFF 0))
+      (push! (mut cases) (one 0x8000000000000000 0x8000000000000000 1))
+      (push! (mut cases) (one 5 5 2))
+      (push! (mut cases) (one 0xDEADBEEFCAFE 0xDEADBEEFCAFF 0))
+      (dispatch! (mut tally) "wide values, tree" mode ty DIRECT cases 0 a)
+      (free! (mut cases)))
+    ; Tables and bit-test windows whose base is a wide value.
+    (for base [(: 0x100000000 u64) 0xFFFFFFFF 0x7FFFFFF0 0x8000000000000000
+               0xFFFFFFFFFFFFFF00 0x7FFFFFFFFFFFFF00 0x123456789ABCDEF0]
+      (let [(mut cases) (run-of ty base 1 40 40 a)]
+        (dispatch! (mut tally) "dense at a wide base" mode ty DIRECT cases
+                   (if (= mode GROUPS) -1 1) a)
+        (free! (mut cases)))
+      (let [(mut cases) (run-of ty base 2 20 2 a)]
+        (dispatch! (mut tally) "window at a wide base" GROUPS ty DIRECT cases 0 a)
+        (free! (mut cases))))))
+
+;;; A SWITCH on the extension of a 32-bit parameter dispatches on the
+;;; parameter's own word when every case value is the extension of its low
+;;; word; one case outside that range keeps the 64-bit dispatch. Both must
+;;; agree with the search.
+(defn extensions! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (for ty [(: 5 i32) 11]
+    (for extension [(: SIGN-EXTENDED i32) ZERO-EXTENDED]
+      (for mode [(: RETURNS i32) PHIS GROUPS]
+        (let [negative (= extension SIGN-EXTENDED)
+              ; Values every source word can reach under this extension.
+              around (if negative (: 0xFFFFFFFFFFFFFFF0 u64) 0xFFFFFFF0)]
+          (let [(mut cases) (run-of ty 0 1 20 20 a)]
+            (dispatch! (mut tally) "extension, dense" mode ty extension cases
+                       (if (= mode GROUPS) -1 1) a)
+            (free! (mut cases)))
+          (let [(mut cases) (run-of ty around 1 12 3 a)]
+            (dispatch! (mut tally) "extension, top of the word" mode ty extension cases -1 a)
+            (free! (mut cases)))
+          (let [(mut cases) (ArrayList::new [Case] a)]
+            (push! (mut cases) (one 0 0 0))
+            (push! (mut cases) (one 0x7FFFFFFF 0x7FFFFFFF 1))
+            (push! (mut cases) (one around around 2))
+            (push! (mut cases) (one 1000 2000 0))
+            (push! (mut cases) (one 77 77 1))
+            (dispatch! (mut tally) "extension, tree" mode ty extension cases 0 a)
+            ; A value no extended word equals: dispatch stays 64 bits wide.
+            (push! (mut cases) (one 0x100000005 0x100000005 2))
+            (dispatch! (mut tally) "extension, one wide case" mode ty extension cases 0 a)
+            (push! (mut cases) (one 0x8000000000000000 0x8000000000000000 0))
+            (dispatch! (mut tally) "extension, two wide cases" mode ty extension cases 0 a)
+            (free! (mut cases))))))))
+
+(defn add [(x u64) (y u64)] (-> u64) (primitive/iadd x y))
+
+(defn sub [(x u64) (y u64)] (-> u64) (primitive/isub x y))
+
+(defn mul [(x u64) (y u64)] (-> u64) (primitive/imul x y))
+
+;;; A switch inside a loop, with nine parameters live across it:
+;;;   acc = 0
+;;;   for i in 0 .. n: selector = ((i * 5 + p1) & 31) - 16, in the type
+;;;     case k: acc = update_k(acc)      default: acc = acc ^ i
+;;;   return acc + p2 + ... + p9
+;;; where update_k is acc + p, acc * 3 - p or acc ^ (p + k) for a parameter
+;;; p chosen by k. Every case ends in the loop's one MERGE, so each edge
+;;; carries the PHI of its own result.
+(defn loop! [(tally (mut t/Tally)) (label (slice u8)) (ty i32) (cases (ArrayList Case))
+             (tables i64) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        (mut params) (ArrayList::new [i32] a)
+        zero (t/constant! (mut graph) 11 0)]
+    (for [k 0 10] (push! (mut params) (t/param! (mut graph) start 11 (cast i32 k))))
+    (let [entry (t/end! (mut graph) start)
+          header (t/loop-begin! (mut graph) entry)
+          i (t/loop-phi! (mut graph) header zero)
+          acc (t/loop-phi! (mut graph) header zero)
+          branch (t/if! (mut graph) header (t/compare! (mut graph) 16 i (get params 0)))
+          body (t/if-true! (mut graph) branch)
+          exit (t/if-false! (mut graph) branch)
+          mixed (t/binary! (mut graph) 26 11
+                           (t/binary! (mut graph) 28 11 i (t/constant! (mut graph) 11 5))
+                           (get params 1))
+          wide (t/binary! (mut graph) 27 11
+                          (t/binary! (mut graph) 47 11 mixed (t/constant! (mut graph) 11 31))
+                          (t/constant! (mut graph) 11 16))
+          selector (cond (= ty 11) wide
+                         (= (t/bits ty) 64) (t/unary! (mut graph) 36 ty wide)
+                         :else (t/unary! (mut graph) 35 ty wide))
+          switch (t/switch! (mut graph) body selector)
+          (mut ends) (ArrayList::new [i32] a)
+          (mut values) (ArrayList::new [i32] a)]
+      (for [k 0 (len cases)]
+        (let [item (get cases k)
+              low (t/constant! (mut graph) ty (.low item))
+              projection (if (= (.low item) (.high item))
+                             (t/case-value! (mut graph) switch low)
+                             (t/case-range! (mut graph) switch low
+                                            (t/constant! (mut graph) ty (.high item))))
+              p (get params (+ 2 (% k 8)))]
+          (push! (mut ends) (t/end! (mut graph) projection))
+          (push! (mut values)
+                 (cond (= (% k 3) 0) (t/binary! (mut graph) 26 11 acc p)
+                       (= (% k 3) 1)
+                         (t/binary! (mut graph) 27 11
+                                    (t/binary! (mut graph) 28 11 acc
+                                               (t/constant! (mut graph) 11 3))
+                                    p)
+                       :else
+                         (t/binary! (mut graph) 48 11 acc
+                                    (t/binary! (mut graph) 26 11 p
+                                               (t/constant! (mut graph) 11 (cast u64 k))))))))
+      (push! (mut ends) (t/end! (mut graph) (t/case-default! (mut graph) switch)))
+      (push! (mut values) (t/binary! (mut graph) 48 11 acc i))
+      (let [merge (if (= (len ends) 1)
+                      (t/begin! (mut graph) (get ends 0))
+                      (t/merge-all! (mut graph) (slice ends)))
+            next-acc (if (= (len ends) 1)
+                         (get values 0)
+                         (t/phi-all! (mut graph) 11 merge (slice values) a))
+            next-i (t/binary! (mut graph) 26 11 i (t/constant! (mut graph) 11 1))
+            back (t/loop-end! (mut graph) merge)
+            (mut total) acc]
+        (t/patch! (mut graph) header 2 back)
+        (t/patch! (mut graph) i 3 next-i)
+        (t/patch! (mut graph) acc 3 next-acc)
+        (for [k 2 10] (set! total (t/binary! (mut graph) 26 11 total (get params k))))
+        (let [ret (t/return! (mut graph) exit 11 total)]
+          (match (t/generated (mut tally) label graph start [ret] a)
+            (None [] 0)
+            (Some [made]
+                  (let [(mut mapped) (.mapped made)
+                        (mut state) (: 0xFEED u64)]
+                    (when (>= tables 0)
+                      (t/check! (mut tally) (= (.tables (.summary made)) tables) label
+                                (.tables (.summary made)) tables))
+                    (for [run 0 24]
+                      (let [(mut arguments) (ArrayList::new [u64] a)
+                            n (cast u64 (* run 5))
+                            (mut model) (: 0 u64)]
+                        (push! (mut arguments) n)
+                        (for [k 1 10] (push! (mut arguments) (t/random! (mut state))))
+                        (for [step 0 (cast i64 n)]
+                          (let [raw (sub (& (add (mul (cast u64 step) 5) (get arguments 1)) 31) 16)
+                                (mut hit) (: -1 i64)]
+                            (for [k 0 (len cases)]
+                              (when (inside? ty (get cases k) raw) (set! hit k)))
+                            (set! model
+                                  (if (< hit 0)
+                                      (^ model (cast u64 step))
+                                      (let [p (get arguments (+ 2 (% hit 8)))]
+                                        (cond (= (% hit 3) 0) (add model p)
+                                              (= (% hit 3) 1) (sub (mul model 3) p)
+                                              :else (^ model (add p (cast u64 hit)))))))))
+                        (for [k 2 10] (set! model (add model (get arguments k))))
+                        (t/expect! (mut tally) label mapped 11 (slice arguments) model)
+                        (free! (mut arguments))))
+                    (t/unmap! (mut mapped)))))))
+      (free! (mut ends))
+      (free! (mut values)))
+    (free! (mut params))
+    (g/release! (mut graph))))
+
+(defn loops! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (for ty [(: 11 i32) 5 10 4 9 3 8 2]
+    ; The selector takes the values -16 .. 15.
+    (let [(mut cases) (run-of ty (bits-of ty -8) 1 16 16 a)]
+      (loop! (mut tally) "loop, dense" ty cases (if (types/signed? ty) 1 -1) a)
+      (free! (mut cases)))
+    (let [(mut cases) (run-of ty 0 1 12 12 a)]
+      (loop! (mut tally) "loop, dense from zero" ty cases 1 a)
+      (free! (mut cases)))
+    (let [(mut cases) (ArrayList::new [Case] a)]
+      (push! (mut cases) (one (bits-of ty -16) (bits-of ty -16) 0))
+      (push! (mut cases) (one (bits-of ty -3) (bits-of ty -3) 0))
+      (push! (mut cases) (one 0 0 0))
+      (push! (mut cases) (one 9 9 0))
+      (push! (mut cases) (one 15 15 0))
+      ; Five cases within 32 values: dense enough for a table when the
+      ; type's order keeps them together.
+      (loop! (mut tally) "loop, sparse" ty cases (if (types/signed? ty) 1 0) a)
+      (free! (mut cases)))
+    (let [(mut cases) (ArrayList::new [Case] a)]
+      (push! (mut cases) (one 2 6 0))
+      (push! (mut cases) (one 8 8 0))
+      (push! (mut cases) (one 10 15 0))
+      (loop! (mut tally) "loop, ranges" ty cases 0 a)
+      (free! (mut cases)))
+    (let [(mut cases) (ArrayList::new [Case] a)]
+      (loop! (mut tally) "loop, default only" ty cases 0 a)
+      (free! (mut cases)))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 switch dispatch: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (for ty [(: 2 i32) 3 4 5 6 7 8 9 10 11]
+          (shapes! (mut tally) ty a))
+        (for ty [(: 5 i32) 11 6]
+          (wide-values! (mut tally) ty a))
+        (extensions! (mut tally) a)
+        (loops! (mut tally) a)
+        (println "x64 switch dispatch: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))

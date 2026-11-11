@@ -54,18 +54,92 @@
 ;;; instruction; see stogir.x64.encode's header).
 (defstruct Reference [(offset i64) (kind i32) (target i32) (addend i64)])
 
+;;; What the last instruction in the text left in the flags, when an emitter
+;;; knows it exactly. The record holds while `at` is the text length: any
+;;; byte appended afterwards makes it stale, and the driver clears it wherever
+;;; control can arrive from elsewhere (a block start) and wherever bytes are
+;;; taken back out of the text.
+;;;
+;;; `register` was written at `bits` wide by that instruction and ZF and SF
+;;; describe its new value at that width. `kind` says what else holds:
+;;;   FLAGS-LOGIC   CF = OF = 0: exactly the flags of `test r, r`
+;;;                 (AND, OR, XOR)
+;;;   FLAGS-RESULT  only ZF and SF may be read (ADD, SUB, NEG, INC, DEC, a
+;;;                 shift by a nonzero constant): CF and OF are the
+;;;                 operation's own, or unchanged
+;;;   FLAGS-EXACT   as FLAGS-RESULT with OF = 0 guaranteed: an ADD or SUB
+;;;                 proven not to overflow as a signed operation
+;;; Instructions whose ZF or SF do not describe the result (MOV, LEA, IMUL,
+;;; rotates, a shift whose count may be zero) never leave a record.
+(defstruct Flags [(at i64) (register i32) (bits i32) (kind i32)])
+
+(const FLAGS-NONE 0)
+
+(const FLAGS-LOGIC 1)
+
+(const FLAGS-RESULT 2)
+
+(const FLAGS-EXACT 3)
+
+;;; Counts of what the driver emitted for one function, for tests and
+;;; measurements.
+;;;   conditional, unconditional  `jcc` and `jmp` instructions
+;;;   short          how many of those are rel8 after relaxation
+;;;   padding        bytes of alignment padding
+;;;   loops          loop tops that a jump goes back to and the layout asked
+;;;                  to align
+;;;   aligned-loops  how many of those ended on their boundary
+;;;   tables         jump tables
+;;;   stubs          edge stubs behind the function body
+;;;   entries        edges whose moves run at the entry of their block
+;;;   fused-tests    compares with zero that a flags record made unnecessary
+(defstruct Summary
+  [(conditional i64) (unconditional i64) (short i64) (padding i64) (loops i64)
+   (aligned-loops i64) (tables i64) (stubs i64) (entries i64) (fused-tests i64)])
+
 (defstruct Buffer
   [(alignment i64)
    (text (ArrayList u8))
    (references (ArrayList Reference))
-   (text-data (ArrayList text-data/Range))])
+   (text-data (ArrayList text-data/Range))
+   (flags Flags)
+   (summary Summary)])
 
 (defn create [(allocator (dyn Allocator))] (-> Buffer)
   (Buffer
     :alignment 1
     :text (ArrayList::new [u8] allocator)
     :references (ArrayList::new [Reference] allocator)
-    :text-data (ArrayList::new [text-data/Range] allocator)))
+    :text-data (ArrayList::new [text-data/Range] allocator)
+    :flags (Flags :at -1 :register -1 :bits 0 :kind FLAGS-NONE)
+    :summary (Summary :conditional 0 :unconditional 0 :short 0 :padding 0 :loops 0
+                      :aligned-loops 0 :tables 0 :stubs 0 :entries 0 :fused-tests 0)))
+
+;;; Record that the instruction just appended wrote `register` at `bits`
+;;; and left flags of `kind` for its value.
+(defn note-flags! [(buffer (mut Buffer)) (register i32) (bits i32) (kind i32)] (-> void)
+  (set! (.flags buffer)
+        (Flags :at (len (.text buffer)) :register register :bits bits :kind kind)))
+
+(defn clear-flags! [(buffer (mut Buffer))] (-> void)
+  (set! (.flags buffer) (Flags :at -1 :register -1 :bits 0 :kind FLAGS-NONE)))
+
+;;; The ADD or SUB just recorded is known not to overflow as a signed
+;;; operation: its flags are FLAGS-EXACT.
+(defn exact-flags! [(buffer (mut Buffer))] (-> void)
+  (when (and (= (.at (.flags buffer)) (len (.text buffer)))
+             (= (.kind (.flags buffer)) FLAGS-RESULT))
+    (set! (.kind (.flags buffer)) FLAGS-EXACT)))
+
+;;; The kind of flags the text's last instruction left for `register` at
+;;; `bits`, or FLAGS-NONE.
+(defn flags-for [(buffer Buffer) (register i32) (bits i32)] (-> i32)
+  (let [flags (.flags buffer)]
+    (if (and (= (.at flags) (len (.text buffer)))
+             (= (.register flags) register)
+             (= (.bits flags) bits))
+        (.kind flags)
+        FLAGS-NONE)))
 
 (defn release! [(buffer (mut Buffer))] (-> void)
   (free! (mut (.text buffer)))

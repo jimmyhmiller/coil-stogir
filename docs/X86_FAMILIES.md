@@ -26,7 +26,7 @@ address-form arithmetic (`x64/lea.coil`) and view coalescing
 | `VECTOR` | `x64/vector.coil` | every node of a vector type or reading one |
 | `ATOMIC` | `x64/atomic.coil` | ATOMIC_LOAD/STORE/RMW/CMPXCHG/FENCE |
 | `CHECKED` | `x64/checked.coil` | ADD_OV, SUB_OV, MUL_OV, OVERFLOW |
-| `SWITCH` | `x64/switch.coil` | SWITCH (the CASE_* projections are block starts) |
+| `SWITCH` | `x64/switch.coil` | SWITCH (the CASE_* projections are block starts); implemented |
 | `BITS` | `x64/bits.coil` | integer ABS, BSWAP, CTPOP, CTLZ, CTTZ, MIN, MAX |
 | (rule hook) | `x64/reciprocal.coil` | DIV/MOD by a constant without `div` |
 | (rule hook) | `x64/lea.coil` | sums and small multiplications as `lea` (RULE-LEA), with fusion of single-use producers |
@@ -151,7 +151,11 @@ the location view, the frame base, the plan, the frame and the frame size.
   nothing between nodes.
 - Encoders: `x64/encode.coil`; feed each result through `code/accept!`.
 - Flags: nothing is live on entry or exit. Inside the node only `mov`, `lea`
-  and SSE moves may sit between a flag producer and its consumer.
+  and SSE moves may sit between a flag producer and its consumer. When the
+  node's last instruction sets ZF and SF by the result it wrote (an ALU
+  instruction, not `mov`, `lea` or `imul`), call `code/note-flags!` with the
+  register, width and kind: a compare of that register with zero directly
+  behind it is then dropped. Never call it for anything else.
   `emit/flags!` (integer compare tile) and `truth/flags!` (value is nonzero)
   load every operand first and return the condition code.
 - Narrow integers: bits above the type's width are unspecified
@@ -196,11 +200,13 @@ the location view, the frame base, the plan, the frame and the frame size.
 
 ### Families with a different shape
 
-- **SWITCH** (`x64/switch.coil`): `emit!` also receives the control-flow
-  state, because it branches: `edges/Flow`, `(mut edges/Control)`, the
-  fall-through successor `next`. Branch with `edges/branch-edge!` (it emits
-  the edge's moves in a stub when there are any) and `fixups/jump!`; jump
-  tables are `fixups/Relative` words.
+- **SWITCH** (`x64/switch.coil`, implemented): `emit!` also receives the
+  control-flow state, because it branches: `edges/Flow`,
+  `(mut edges/Control)`, the fall-through successor `next`. It is the model
+  for anything else that branches: `edges/stub-or-target!` gives the label
+  of an edge (the block, or a new edge stub when the edge has moves),
+  `fixups/jump!` records a jump, `fixups/address!` a `lea` of a label, and a
+  table is pushed on `(.tables control)` for the driver to place.
 - **Reciprocal division** (`x64/reciprocal.coil`): not a node family but a
   rule hook. `reciprocal/select` may replace the `RULE-DIVIDE` tile of a DIV
   or MOD, by one of its own rules (100..119, constrained and emitted by

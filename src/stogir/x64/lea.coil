@@ -38,8 +38,9 @@
 ;;; `emit!` uses the shorter two-address form when the allocator gave the
 ;;; result the register of an operand (`add rd, c`, `add rd, r`), and `lea`
 ;;; otherwise: no move is needed and the operands stay intact. `lea` writes
-;;; no flags; the two-address forms do, which is fine because no flag value
-;;; is live across a node.
+;;; no flags and leaves no flags record; the two-address forms record their
+;;; result's flags as the core's ADD does, so a compare with zero behind an
+;;; in-place decrement still reads them (stogir.x64.code/Flags).
 (module stogir.x64.lea)
 (import "stogir.graph" :as g)
 (import "stogir.x64.code" :as code)
@@ -101,8 +102,14 @@
           (and (= rule select/RULE-ALU-RR) (= (.operation selected) encode/ADD)
                (> (.right selected) 0))
             (tile bits left (.right selected) 0 0)
+          ; SUB of the minimum stays a `sub`: its negation wraps, and
+          ; `add rd, minimum` would not leave the overflow flag of the
+          ; subtraction, which a flags record may promise (FLAGS-EXACT).
           (and (= rule select/RULE-ALU-RI)
-               (or (= (.operation selected) encode/ADD) (= (.operation selected) encode/SUB)))
+               (or (= (.operation selected) encode/ADD)
+                   (and (= (.operation selected) encode/SUB)
+                        (!= (encode/sign-extend bits (.immediate selected))
+                            (encode/sign-extend bits (- 0 (.immediate selected)))))))
             (match (displacement bits (if (= (.operation selected) encode/ADD)
                                           (.immediate selected)
                                           (- 0 (.immediate selected))))
@@ -209,6 +216,13 @@
                                   registers/SCRATCH-GPR-2)
               (Err [message] (set! error message))
               (Ok [register] (set! index register))))
+          ; Flags (stogir.x64.code/Flags). `lea` and `mov` leave no record,
+          ; so a compare with zero behind them tests the value. The `add`
+          ; forms record their result like the core's ADD. A sum that emits
+          ; nothing (rd = rd + 0) drops whatever record the instruction
+          ; before it left: the driver may otherwise promote that record
+          ; for this node (code/exact-flags!).
+          (code/clear-flags! (mut out))
           (cond (!= error "") 0
                 (or (< shift 0) (> shift 3) (not (encode/fits32? offset))
                     (and (< base 0) (< index 0)))
@@ -217,14 +231,19 @@
                 (and (= rd base) (< index 0))
                   (when (!= offset 0)
                     (code/accept! (mut error)
-                                  (encode/alu-ri (mut (.text out)) encode/ADD bits rd offset)))
+                                  (encode/alu-ri (mut (.text out)) encode/ADD bits rd offset))
+                    (code/note-flags! (mut out) rd bits code/FLAGS-RESULT))
                 ; rd = rd + r
                 (and (= rd base) (= shift 0) (= offset 0))
-                  (code/accept! (mut error)
-                                (encode/alu-rr (mut (.text out)) encode/ADD bits rd index))
+                  (do
+                    (code/accept! (mut error)
+                                  (encode/alu-rr (mut (.text out)) encode/ADD bits rd index))
+                    (code/note-flags! (mut out) rd bits code/FLAGS-RESULT))
                 (and (= rd index) (= shift 0) (= offset 0) (>= base 0))
-                  (code/accept! (mut error)
-                                (encode/alu-rr (mut (.text out)) encode/ADD bits rd base))
+                  (do
+                    (code/accept! (mut error)
+                                  (encode/alu-rr (mut (.text out)) encode/ADD bits rd base))
+                    (code/note-flags! (mut out) rd bits code/FLAGS-RESULT))
                 ; rd = r
                 (and (< index 0) (= offset 0)) (emit/move! (mut out) (mut error) bits rd base)
                 :else

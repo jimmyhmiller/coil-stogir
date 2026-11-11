@@ -77,14 +77,31 @@
       (Err [message] (do (println "{}" message) (set! failures (+ failures 1))))
       (Ok [compiled]
           (let [(mut owned) compiled]
-            (when (!= (.text-alignment owned) 8) (set! failures (+ failures 1)))
+            ; The loop header's alignment (8 bytes on AArch64) or the
+            ; function's own (16 bytes on x86-64, which also aligns loops).
+            (when (!= (.text-alignment owned) (target/arch-pick 8 16))
+              (set! failures (+ failures 1)))
             (image/release! (mut owned)))))
     (match (compile/object graph start [ret] (target/os-pick "_stogir_loop_test" "stogir_loop_test") allocator)
       (Err [msg] (do (println "{}" msg) (set! failures (+ failures 1))))
       (Ok [object]
           (let [(mut owned-object) object]
-            (when (!= (read/read32 owned-object 156) 3)
-              (set! failures (+ failures 1)))
+            ; The text section carries that alignment: the Mach-O section's
+            ; log2 field, or sh_addralign of the ELF section with
+            ; SHF_EXECINSTR.
+            (target/os-pick
+              (when (!= (read/read32 owned-object 156) (target/arch-pick 3 4))
+                (set! failures (+ failures 1)))
+              (let [sections (cast i64 (read/read32 owned-object 40))
+                    count (cast i64 (& (read/read32 owned-object 60) 0xFFFF))
+                    (mut aligned) false]
+                (for [k 0 count]
+                  (let [header (+ sections (* k 64))]
+                    (when (and (!= (& (read/read32 owned-object (+ header 8)) 4) 0)
+                               (= (read/read32 owned-object (+ header 48))
+                                  (target/arch-pick 8 16)))
+                      (set! aligned true))))
+                (unless aligned (set! failures (+ failures 1)))))
             (match (fs/write-file allocator
                                   "/tmp/coil-stogir-loop.o"
                                   (slice owned-object))
