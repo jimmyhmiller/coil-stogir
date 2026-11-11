@@ -8,6 +8,7 @@
 (module stogir.tests.x64-call-flow)
 (import "stogir.graph" :as g)
 (import "stogir.calls" :as calls)
+(import "stogir.call-results" :as results)
 (import "stogir.image" :as image)
 (import "stogir.options" :as options)
 (import "stogir.jit.native" :as jit)
@@ -24,15 +25,20 @@
 (extern c_load64 :cc (cc/C) [] (-> void))
 (extern c_ints10 :cc (cc/C) [i64 i64 i64 i64 i64 i64 i64 i64 i64 i64] (-> i64))
 (extern qsort :cc (cc/C) [(ptr i64) u64 u64 (ptr u8)] (-> void))
+(extern c_ret_ii :cc (cc/C) [] (-> void))
+(extern c_ret_big :cc (cc/C) [] (-> void))
+(extern c_drive_ret_ii :cc (cc/C) [(ptr u8) i64 i64] (-> i64))
+(extern c_drive_ret_big_rax :cc (cc/C) [(ptr u8) i64 i64] (-> i64))
 
 (defn address-of [(f Code)] (-> Code)
   `(primitive/cast u64 (primitive/cast (ptr u8) (fnptr-of ~f))))
 
-(def NAMES ["c_load64" "c_ints10"])
+(def NAMES ["c_load64" "c_ints10" "c_ret_ii" "c_ret_big"])
 
 (defn finish [(label (slice u8)) (graph g/Graph) (start i32) (roots (slice i32))
               (a (dyn Allocator))] (-> jit/Loaded)
-  (let [table [(address-of c_load64) (address-of c_ints10)]]
+  (let [table [(address-of c_load64) (address-of c_ints10) (address-of c_ret_ii)
+               (address-of c_ret_big)]]
     (ct/build label graph start roots NAMES table a)))
 
 (defn check! [(tally (mut t/Tally)) (label (slice u8)) (good bool)] (-> void)
@@ -311,6 +317,42 @@
     (calls/release! (mut ten))
     (g/release! (mut graph))))
 
+;;; Tail calls keep the function's result role. Register pieces: the callee's
+;;; rax/rdx are the function's own, so its private buffer is never read.
+;;; Indirect: the hidden pointer is forwarded in rdi and the callee returns it
+;;; in rax. Both as an explicit TAILCALL and as CALL + RETURN.
+(defn tail-roles! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (for indirect [false true]
+    (for explicit [false true]
+      (let [(mut graph) (g/create a)
+            start (t/start! (mut graph))
+            (mut own) (ct/result-prototype [(: 6 u8) 11 11] []
+                                           (if indirect (results/indirect) (results/pieces 11 2))
+                                           a)]
+        (ct/declare! (mut graph) own a)
+        (let [place (t/param! (mut graph) start 6 0)
+              x (t/param! (mut graph) start 11 1)
+              y (t/param! (mut graph) start 11 2)
+              target (ct/named! (mut graph) (if indirect "c_ret_big" "c_ret_ii"))
+              root (if explicit
+                       (ct/tail! (mut graph) own start target [place y x] a)
+                       (let [call (ct/call! (mut graph) own start target [place y x] a)]
+                         (t/return! (mut graph) call 0 0)))
+              (mut loaded) (finish "tail roles" graph start [root] a)]
+          (for s [(: -11 i64) 0 3 77777]
+            (if indirect
+                ; c_ret_big(y, x) = {y, x, y * x}, read through the returned rax.
+                (check! (mut tally) "tail indirect result"
+                        (= (c_drive_ret_big_rax (ct/entry loaded) s (+ s 5))
+                           (+ (+ s 5) (* 2 s) (* 3 (* s (+ s 5))))))
+                ; c_ret_ii(y, x) = {y + x, y - x}
+                (check! (mut tally) "tail register pieces"
+                        (= (c_drive_ret_ii (ct/entry loaded) s (+ s 5))
+                           (+ (* (+ s s 5) 7) (* 5 13))))))
+          (jit/release-image! (mut loaded)))
+        (calls/release! (mut own))
+        (g/release! (mut graph))))))
+
 ;;; leaf(x, y) = x * 3 + y, compiled on its own and registered as a private
 ;;; leaf. A caller keeps eight values live across four direct calls to it.
 ;;; With the frozen context those calls clobber only what the leaf writes, so
@@ -506,6 +548,7 @@
         (tail-recursion! (mut tally) true a)
         (tail-recursion! (mut tally) false a)
         (tail-to-c! (mut tally) a)
+        (tail-roles! (mut tally) a)
         (private-leaf! (mut tally) a)
         (private-module! (mut tally) a)
         (println "x64 call flow: {} checks, {} failures" (.checks tally) (.failures tally))

@@ -349,6 +349,16 @@
                         (encode/mov-mr (mut (.text out)) 64 slot registers/SCRATCH-GPR))))
     (if (= error "") (Ok 0) (Err error))))
 
+;;; Whether value `reference` is in a register or a spill slot at `position`,
+;;; so that a parallel move can carry it. A constant, and a value the
+;;; allocator rematerializes (a constant recipe or a frame address), is built
+;;; in place afterwards instead (`load!`).
+(defn located? [(cx context/Context) (reference i32) (position i64)] (-> bool)
+  (and (> reference 0)
+       (match (loc/resolve (.parts cx) reference position)
+         (Err [_] false)
+         (Ok [location] (or (= (.kind location) 0) (= (.kind location) 1))))))
+
 ;;; The transfer extent of a value of type `ty`: 4, 8 or 16 bytes.
 (defn extent [(ty i32)] (-> i32)
   (let [size (types/size ty 8)]
@@ -416,8 +426,7 @@
           (for argument (.arguments planned)
             (when (and (= error "")
                        (>= (.register argument) 0)
-                       (> (.value argument) 0)
-                       (= (loc/constant-reference (.parts cx) (.value argument)) 0))
+                       (located? cx (.value argument) position))
               (match (loc/resolve (.parts cx) (.value argument) position)
                 (Err [message] (set! error message))
                 (Ok [source]
@@ -431,8 +440,7 @@
                                                         :kind 0
                                                         :value (cast i64 (.register argument))))
                              :size (extent (cast i32 (.ty argument)))))))))
-          (when (and (= error "") (> callee 0)
-                     (= (loc/constant-reference (.parts cx) callee) 0))
+          (when (and (= error "") (located? cx callee position))
             (match (loc/resolve (.parts cx) callee position)
               (Err [message] (set! error message))
               (Ok [source]
@@ -463,17 +471,15 @@
             (code/accept-count! (mut error)
                                 (typed/parallel-frame! (mut (.text out)) (slice copies)
                                                        allocator (.base cx))))
-          ; 5. Constants.
+          ; 5. Constants and rematerialized values.
           (for argument (.arguments planned)
             (when (and (= error "")
                        (>= (.register argument) 0)
-                       (or (< (.value argument) 0)
-                           (!= (loc/constant-reference (.parts cx) (.value argument)) 0)))
+                       (not (located? cx (.value argument) position)))
               (code/accept-count! (mut error)
                                   (load! (mut out) cx (.value argument) position
                                          (.register argument)))))
-          (when (and (= error "") (not direct?)
-                     (or (< callee 0) (!= (loc/constant-reference (.parts cx) callee) 0)))
+          (when (and (= error "") (not direct?) (not (located? cx callee position)))
             (code/accept-count! (mut error)
                                 (emit/into! (mut out) cx callee position registers/RAX)))
           ; 6. Caller-side extension and promotion of register arguments.
