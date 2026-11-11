@@ -25,11 +25,11 @@
 ;;;     left one for equal operands (signed zeros). minsd/maxsd return their
 ;;;     second operand in both cases, so a compare and a select are emitted.
 ;;;   * FMIN/FMAX (IEEE 754-2019 minimum/maximum) and FMINNM/FMAXNM (minNum/
-;;;     maxNum) order -0 below +0. A NaN result follows the x86 rule above
-;;;     (`left + right`), which is the AArch64 result except when the left
-;;;     operand is a quiet and the right a signalling NaN (AArch64 returns the
-;;;     right one). FMINNM/FMAXNM return the other operand when exactly one
-;;;     is a quiet NaN.
+;;;     maxNum) order -0 below +0 and give the AArch64 instructions' results
+;;;     bit for bit, NaNs included: a signalling NaN operand is returned
+;;;     quieted (the left one first), else a quiet NaN operand (the left one
+;;;     first); FMINNM/FMAXNM return the other operand when exactly one is a
+;;;     quiet NaN.
 ;;;   * ROUND_* are exact for every input: values of magnitude 2^52 (2^23 for
 ;;;     f32) and above are already integral and returned as they are, NaNs
 ;;;     quieted; smaller ones go through cvttsd2si (always in range) or the
@@ -308,8 +308,9 @@
 ;;;   ordered: min = minsd(b, a) | minsd(a, b), max = maxsd(b, a) & maxsd(a, b):
 ;;;            the two orders differ only for equal operands, where one gives
 ;;;            a and the other b, and OR (AND) of the two zeros is -0 (+0).
-;;;   a NaN:   left + right, except that FMINNM/FMAXNM return the other
-;;;            operand when exactly one is a quiet NaN.
+;;;   a NaN:   FMINNM/FMAXNM return the other operand when exactly one is a
+;;;            quiet NaN; otherwise the sum of the operands, in the order
+;;;            that makes the hardware's NaN propagation pick AArch64's NaN.
 (defn ieee-extremum! [(out (mut code/Buffer)) (error (mut (slice u8))) (cx context/Context)
                       (node n/Node) (position i64) (wide bool) (rd i32)] (-> void)
   (let [opcode (cast i32 (n/opcode node))
@@ -360,6 +361,23 @@
         (move! (mut out) (mut error) rd X14)
         (local/jump! (mut out) (mut error) (mut jumps) -1 done)
         (local/bind! (mut out) (mut jumps) sum)))
+    ; The NaN result is left + right, which the hardware resolves to the
+    ; left NaN (quieted) or else the right one. AArch64 lets a signalling
+    ; NaN win over a quiet one: when the left operand's quiet bit is set and
+    ; the right one's is clear, right + left gives that result (the left
+    ; operand is then a quiet NaN or a number, the right one a signalling NaN
+    ; or a number, and not both are numbers).
+    (let [forward (local/label! (mut jumps))]
+      (code/accept! (mut error) (encode/movd-rx (mut (.text out)) bits R11 X14))
+      (code/accept! (mut error) (encode/bt-ri (mut (.text out)) encode/BT bits R11 quiet-bit))
+      (local/jump! (mut out) (mut error) (mut jumps) encode/CC-AE forward)
+      (code/accept! (mut error) (encode/movd-rx (mut (.text out)) bits R11 X15))
+      (code/accept! (mut error) (encode/bt-ri (mut (.text out)) encode/BT bits R11 quiet-bit))
+      (local/jump! (mut out) (mut error) (mut jumps) encode/CC-B forward)
+      (move! (mut out) (mut error) rd X15)
+      (sse! (mut out) (mut error) add rd X14)
+      (local/jump! (mut out) (mut error) (mut jumps) -1 done)
+      (local/bind! (mut out) (mut jumps) forward))
     (move! (mut out) (mut error) rd X14)
     (sse! (mut out) (mut error) add rd X15)
     (local/bind! (mut out) (mut jumps) done)
