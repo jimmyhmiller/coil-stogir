@@ -1,0 +1,136 @@
+(module stogir.tests.x64-vector-arithmetic)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.types" :as types)
+(import "stogir.vector-arithmetic" :as va)
+(import "stogir.x64.testing" :as t)
+(import "stogir.x64.vector-testing" :as vt)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; Binary lane operations of the x86-64 vector family, every lane type at 8
+;;; and 16 bytes: ADD SUB MUL DIV MOD, AND OR XOR, MIN MAX. Each function is
+;;;
+;;;   f(out, pa, pb): r = left OP right; out[0] = r; out[32] = left; out[64] = right
+;;;
+;;; with the operands taken from memory or from constants (`mode`): 0 both
+;;; loaded, 1 the left one a constant, 2 the right one, 3 both, 4 one loaded
+;;; value used twice. The result is compared lane by lane with the reference
+;;; evaluator over rotating edge values; the bytes after an 8-byte result
+;;; must be untouched (an 8-byte store writes eight bytes), and the operands
+;;; must come back unchanged (an operation never writes its operand
+;;; registers). Integer divisors are made defined (no zero, no MIN / -1 on
+;;; wide lanes), since those trap on x86-64 as scalar division does.
+
+(const SENTINEL 0xA5)
+
+(defn left-lane [(base i32) (lane i64) (seed i64)] (-> u64)
+  (vt/special base (% (+ lane seed) vt/SPECIALS)))
+
+(defn right-lane [(opcode i32) (base i32) (lane i64) (seed i64) (left u64)] (-> u64)
+  (let [(mut k) (% (+ (* lane 3) seed 5) vt/SPECIALS)]
+    (while (not (vt/lane-defined? opcode base left (vt/special base k)))
+      (set! k (% (+ k 1) vt/SPECIALS)))
+    (vt/special base k)))
+
+(defn case! [(tally (mut t/Tally)) (opcode i32) (ty i32) (mode i64) (a (dyn Allocator))]
+  (-> void)
+  (let [base (types/base-type ty)
+        size (vt/lane-bytes base)
+        lanes (cast i64 (types/lanes ty))
+        width (cast i64 (types/size ty 8))
+        (mut graph) (g/create a)
+        start (t/start! (mut graph))
+        out (t/param! (mut graph) start 6 0)
+        pa (t/param! (mut graph) start 6 1)
+        pb (t/param! (mut graph) start 6 2)
+        x (vt/load! (mut graph) ty start pa)
+        y (vt/load! (mut graph) ty x pb)
+        (mut fixed-left) (ArrayList::new [u64] a)
+        (mut fixed-right) (ArrayList::new [u64] a)]
+    (for [i 0 lanes]
+      (push! (mut fixed-left) (left-lane base i 2))
+      (push! (mut fixed-right) (right-lane opcode base i 9 (left-lane base i 2))))
+    (let [left (if (or (= mode 1) (= mode 3))
+                   (vt/constant! (mut graph) ty (slice fixed-left) a)
+                   x)
+          right (cond (= mode 4) left
+                      (or (= mode 2) (= mode 3)) (vt/constant! (mut graph) ty (slice fixed-right) a)
+                      :else y)
+          r (t/require (b/vector-binary! (mut graph) opcode ty left right
+                                         (if (or (= opcode 29) (= opcode 30)) start (: 0 i32))))
+          c1 (vt/save! (mut graph) y out r)
+          c2 (vt/save! (mut graph) c1 (vt/offset! (mut graph) out 32) left)
+          c3 (vt/save! (mut graph) c2 (vt/offset! (mut graph) out 64) right)
+          ret (t/return! (mut graph) c3 0 0)]
+      (match (vt/compiled (mut tally) "x64 vector binary" graph start [ret] a)
+        (None [] (println "  (opcode {} type {} mode {})" opcode ty mode))
+        (Some [code]
+              (let [(mut code) code
+                    (mut output) (vt/buffer 96 SENTINEL a)
+                    (mut first) (vt/buffer 16 0 a)
+                    (mut second) (vt/buffer 16 0 a)]
+                (for [seed 0 vt/SPECIALS]
+                  (for [i 0 96] (set! (mut output) i SENTINEL))
+                  (for [i 0 (/ 16 (cast i64 size))]
+                    (let [p (left-lane base i seed)
+                          ; In mode 4 the divisor is the dividend itself.
+                          usable (if (and (= mode 4) (not (vt/lane-defined? opcode base p p)))
+                                     (: 1 u64)
+                                     p)]
+                      (vt/put! (mut first) (* i (cast i64 size)) size usable)
+                      (vt/put! (mut second) (* i (cast i64 size)) size
+                               (right-lane opcode base i seed
+                                           (if (or (= mode 1) (= mode 3))
+                                               (get fixed-left (% i lanes))
+                                               usable)))))
+                  (vt/invoke code [(vt/address output 0) (vt/address first 0)
+                                   (vt/address second 0)])
+                  (for [i 0 lanes]
+                    (let [p (if (or (= mode 1) (= mode 3))
+                                (get fixed-left i)
+                                (vt/word (slice first) (* i (cast i64 size)) size))
+                          q (cond (= mode 4) p
+                                  (or (= mode 2) (= mode 3)) (get fixed-right i)
+                                  :else (vt/word (slice second) (* i (cast i64 size)) size))
+                          at (* i (cast i64 size))]
+                      (when (vt/lane-defined? opcode base p q)
+                        (unless (vt/lane-ambiguous? opcode base p q)
+                          (vt/expect! (mut tally) "result" ty opcode mode i
+                                      (vt/word (slice output) at size)
+                                      (vt/lane-binary opcode base p q))))
+                      (vt/expect! (mut tally) "left kept" ty opcode mode i
+                                  (vt/word (slice output) (+ 32 at) size) p)
+                      (vt/expect! (mut tally) "right kept" ty opcode mode i
+                                  (vt/word (slice output) (+ 64 at) size) q)))
+                  ; Bytes no store may touch.
+                  (for [i width 32]
+                    (vt/expect! (mut tally) "after result" ty opcode mode i
+                                (cast u64 (get output i)) SENTINEL)
+                    (vt/expect! (mut tally) "after left" ty opcode mode i
+                                (cast u64 (get output (+ 32 i))) SENTINEL)
+                    (vt/expect! (mut tally) "after right" ty opcode mode i
+                                (cast u64 (get output (+ 64 i))) SENTINEL)))
+                (free! (mut output))
+                (free! (mut first))
+                (free! (mut second))
+                (vt/release! (mut code))))))
+    (free! (mut fixed-left))
+    (free! (mut fixed-right))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 vector arithmetic: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (for [index 0 vt/TYPES]
+          (let [ty (vt/vector-type index)]
+            (for opcode [(: 26 i32) 27 28 29 30 46 47 48 58 59]
+              (when (va/valid-type? opcode ty)
+                (for [mode 0 5]
+                  (case! (mut tally) opcode ty mode a))))))
+        (println "x64 vector arithmetic: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))
