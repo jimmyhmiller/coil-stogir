@@ -1,0 +1,190 @@
+;;; System V x86-64 placement rules (stogir.x64.abi-arguments) and the
+;;; prototype shapes that exist only for them: mixed argument pairs, result
+;;; pairs and MEMORY parameter records, including their serialized form.
+(module stogir.tests.x64-abi-arguments)
+(import "stogir.calls" :as calls)
+(import "stogir.call-groups" :as groups)
+(import "stogir.call-results" :as results)
+(import "stogir.x64.abi-arguments" :as arguments)
+(import "stogir.x64.incoming" :as incoming)
+(import "stogir.x64.testing" :as t)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err])
+
+(defn check! [(tally (mut t/Tally)) (label (slice u8)) (good bool)] (-> void)
+  (set! (.checks tally) (+ (.checks tally) 1))
+  (unless good
+    (println "{}: wrong placement" label)
+    (t/fail! (mut tally))))
+
+;;; Place `tys` and compare every part with `expected`: one {register,
+;;; offset} pair per parameter (offset -1 for a register), then the stack size
+;;; and the vector register count.
+(defn placed! [(tally (mut t/Tally)) (label (slice u8)) (tys (slice u8)) (fixed i64)
+               (variadic bool) (descriptors (slice groups/Group))
+               (memory (slice groups/Memory)) (spec results/Spec)
+               (expected (slice i64)) (stack i64) (vectors i32) (a (dyn Allocator))] (-> void)
+  (match (arguments/plan-result tys fixed variadic descriptors memory spec a)
+    (Err [message]
+         (println "{}: {}" label message)
+         (check! (mut tally) label false))
+    (Ok [layout]
+        (let [(mut layout) layout
+              (mut good) (and (= (* 2 (len (.parts layout))) (len expected))
+                              (= (.stack layout) stack)
+                              (= (.vectors layout) vectors))]
+          (when good
+            (for [i 0 (len (.parts layout))]
+              (let [part (get (.parts layout) i)]
+                (when (or (!= (cast i64 (.register part)) (get expected (* 2 i)))
+                          (!= (.offset part) (get expected (+ (* 2 i) 1))))
+                  (set! good false)))))
+          (check! (mut tally) label good)
+          (arguments/release! (mut layout))))))
+
+(defn rejected! [(tally (mut t/Tally)) (label (slice u8)) (tys (slice u8))
+                 (descriptors (slice groups/Group)) (memory (slice groups/Memory))
+                 (spec results/Spec) (a (dyn Allocator))] (-> void)
+  (match (arguments/plan-result tys (len tys) false descriptors memory spec a)
+    (Err [_] (check! (mut tally) label true))
+    (Ok [layout]
+        (let [(mut layout) layout]
+          (arguments/release! (mut layout))
+          (check! (mut tally) label false)))))
+
+(defn group [(first i32) (count i32) (alignment i32)] (-> groups/Group)
+  (groups/Group :first first :count count :alignment alignment))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 abi arguments: skipped (not an x86-64 host)") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)
+            none (results/ordinary)]
+        ; rdi rsi rdx rcx r8 r9 are 7 6 2 1 8 9; xmm0.. are 32..
+        (placed! (mut tally) "seven integers" [(: 11 u8) 5 6 10 2 8 11] 7 false [] [] none
+                 [(: 7 i64) -1 6 -1 2 -1 1 -1 8 -1 9 -1 -1 0] 8 0 a)
+        (placed! (mut tally) "nine doubles and an integer"
+                 [(: 12 u8) 12 12 12 12 12 12 12 13 11] 10 false [] [] none
+                 [(: 32 i64) -1 33 -1 34 -1 35 -1 36 -1 37 -1 38 -1 39 -1 -1 0 7 -1] 8 8 a)
+        ; A pair that does not fit goes to the stack whole; r9 stays free.
+        (placed! (mut tally) "group does not exhaust its bank"
+                 [(: 11 u8) 11 11 11 11 11 11 11] 8 false [(group 5 2 8)] [] none
+                 [(: 7 i64) -1 6 -1 2 -1 1 -1 8 -1 -1 0 -1 8 9 -1] 16 0 a)
+        ; A mixed pair takes one register of each bank.
+        (placed! (mut tally) "mixed pairs"
+                 [(: 11 u8) 12 13 5 12 12] 6 false [(group 0 2 8) (group 2 2 8) (group 4 2 8)]
+                 [] none
+                 [(: 7 i64) -1 32 -1 33 -1 6 -1 34 -1 35 -1] 0 4 a)
+        ; Seven doubles leave xmm7: {double, double} goes to the stack and
+        ; leaves it free for {integer, double}; the last double has none.
+        (placed! (mut tally) "banks are independent"
+                 [(: 12 u8) 12 12 12 12 12 12 12 12 11 12 12] 12 false
+                 [(group 7 2 8) (group 9 2 8)] [] none
+                 [(: 32 i64) -1 33 -1 34 -1 35 -1 36 -1 37 -1 38 -1 -1 0 -1 8 7 -1 39 -1 -1 16]
+                 24 8 a)
+        ; Alignment 16 matters on the stack only: no register is skipped.
+        (placed! (mut tally) "alignment 16 in registers"
+                 [(: 11 u8) 11 11] 3 false [(group 1 2 16)] [] none
+                 [(: 7 i64) -1 6 -1 2 -1] 0 0 a)
+        (placed! (mut tally) "alignment 16 on the stack"
+                 [(: 11 u8) 11 11 11 11 11 11 11 11] 9 false [(group 7 2 16)] [] none
+                 [(: 7 i64) -1 6 -1 2 -1 1 -1 8 -1 9 -1 -1 0 -1 16 -1 24] 32 0 a)
+        ; MEMORY aggregates take stack only, rounded to 8, aligned to 8 or 16.
+        (placed! (mut tally) "memory aggregates"
+                 [(: 11 u8) 6 11 6 6] 5 false []
+                 [(groups/Memory :ordinal 1 :size 20 :alignment 4)
+                  (groups/Memory :ordinal 3 :size 32 :alignment 16)
+                  (groups/Memory :ordinal 4 :size 1 :alignment 1)]
+                 none
+                 [(: 7 i64) -1 -1 0 6 -1 -1 32 -1 64] 72 0 a)
+        ; The hidden result pointer is the first integer argument.
+        (placed! (mut tally) "indirect result" [(: 6 u8) 11 11] 3 false [] [] (results/indirect)
+                 [(: 7 i64) -1 6 -1 2 -1] 0 0 a)
+        ; The place of register pieces is not passed.
+        (placed! (mut tally) "register pieces" [(: 6 u8) 11 12] 3 false [] []
+                 (results/pair 12 11)
+                 [(: -2 i64) -1 7 -1 32 -1] 0 1 a)
+        ; Unnamed arguments use registers like named ones.
+        (placed! (mut tally) "variadic" [(: 6 u8) 11 12 13 11 11 11 11 11] 1 true [] [] none
+                 [(: 7 i64) -1 6 -1 32 -1 33 -1 2 -1 1 -1 8 -1 9 -1 -1 0] 8 2 a)
+        (match (arguments/plan-result [(: 6 u8) 13 13] 2 true [] [] none a)
+          (Err [_] (check! (mut tally) "promotion" false))
+          (Ok [layout]
+              (let [(mut layout) layout]
+                (check! (mut tally) "unnamed FLOAT is promoted, a named one is not"
+                        (and (not (.promote? (get (.parts layout) 1)))
+                             (.promote? (get (.parts layout) 2))))
+                (arguments/release! (mut layout)))))
+        (rejected! (mut tally) "group of three" [(: 12 u8) 12 12] [(group 0 3 8)] [] none a)
+        (rejected! (mut tally) "vector argument" [(: 37 u8)] [] [] none a)
+        (rejected! (mut tally) "three result pieces" [(: 6 u8)] [] [] (results/pieces 12 3) a)
+        (rejected! (mut tally) "memory record on an integer" [(: 11 u8)] []
+                   [(groups/Memory :ordinal 0 :size 24 :alignment 8)] none a)
+        ; Result registers: per class, in order.
+        (check! (mut tally) "rax rdx"
+                (and (= (arguments/result-register (results/pieces 11 2) 0) 0)
+                     (= (arguments/result-register (results/pieces 11 2) 1) 2)))
+        (check! (mut tally) "xmm0 xmm1"
+                (and (= (arguments/result-register (results/pair 12 13) 0) 32)
+                     (= (arguments/result-register (results/pair 12 13) 1) 33)))
+        (check! (mut tally) "rax xmm0"
+                (and (= (arguments/result-register (results/pair 5 12) 0) 0)
+                     (= (arguments/result-register (results/pair 5 12) 1) 32)))
+        (check! (mut tally) "xmm0 rax"
+                (and (= (arguments/result-register (results/pair 12 11) 0) 32)
+                     (= (arguments/result-register (results/pair 12 11) 1) 0)))
+        (check! (mut tally) "pair layout"
+                (and (= (results/size (results/pair 13 11)) 16)
+                     (= (results/piece-offset (results/pair 13 11) 1) 8)
+                     (= (results/piece-offset (results/pieces 13 2) 1) 4)
+                     (= (results/piece-type (results/pair 13 11) 1) 11)))
+        (check! (mut tally) "conventions"
+                (and (incoming/convention? 0) (incoming/convention? 8) (incoming/convention? 24)
+                     (not (incoming/convention? 9)) (not (incoming/convention? 1))))
+        ; Serialized prototypes: the new shapes survive a round trip, and a
+        ; prototype without them is byte for byte what it was before.
+        (match (calls/create-result 8 [(: 6 u8) 11 13 6 12] [(group 1 2 8)] (results/pair 12 11) a)
+          (Err [message] (println "{}" message) (check! (mut tally) "prototype" false))
+          (Ok [prototype]
+              (let [(mut prototype) prototype]
+                (match (calls/memory-parameter! (mut prototype) 3 40 16)
+                  (Err [message] (println "{}" message) (check! (mut tally) "record" false))
+                  (Ok [_] 0))
+                (check! (mut tally) "memory record in a group is rejected"
+                        (match (calls/memory-parameter! (mut prototype) 4 8 8)
+                          (Err [_] true)
+                          (Ok [_] false)))
+                (let [(mut bytes) (calls/encode prototype a)
+                      spec (results/decode (slice bytes))]
+                  (check! (mut tally) "round trip validates" (calls/valid-bytes? (slice bytes)))
+                  (check! (mut tally) "round trip result pair"
+                          (and (= (.kind spec) 1) (= (.ty spec) 12) (= (.count spec) 2)
+                               (= (.second spec) 11)))
+                  (check! (mut tally) "round trip records"
+                          (and (= (groups/count (slice bytes)) 2)
+                               (not (groups/memory? (slice bytes) 0))
+                               (= (.first (groups/at (slice bytes) 0)) 1)
+                               (groups/memory? (slice bytes) 1)
+                               (= (.ordinal (groups/memory-at (slice bytes) 1)) 3)
+                               (= (.size (groups/memory-at (slice bytes) 1)) 40)
+                               (= (.alignment (groups/memory-at (slice bytes) 1)) 16)))
+                  (free! (mut bytes)))
+                (calls/release! (mut prototype)))))
+        (match (calls/create-result 8 [(: 6 u8) 11 11] [(group 1 2 8)] (results/pieces 5 2) a)
+          (Err [message] (println "{}" message) (check! (mut tally) "old prototype" false))
+          (Ok [prototype]
+              (let [(mut prototype) prototype
+                    (mut bytes) (calls/encode prototype a)
+                    expected [(: 8 u8) 0 3 6 11 11 83 71 65 71 2 1 1 0 5 2 0 0 0 0 0 0 1 0 2 8 0 0
+                              0 0]
+                    (mut same) (= (len bytes) (len expected))]
+                (when same
+                  (for [i 0 (len expected)]
+                    (when (!= (get bytes i) (get expected i)) (set! same false))))
+                (check! (mut tally) "homogeneous prototypes keep their bytes" same)
+                (free! (mut bytes))
+                (calls/release! (mut prototype)))))
+        (println "x64 abi arguments: {} checks, {} failures" (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))

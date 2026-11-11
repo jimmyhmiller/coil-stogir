@@ -11,7 +11,10 @@ constants, COPY, ADD SUB MUL DIV MOD, AND OR XOR NOT NEG, shifts and rotates,
 integer comparisons, IF, COND, SEXT ZEXT TRUNC and integer BITCAST, PHI, loops,
 MERGE, RETURN, TRAP and UNREACHABLE, with spilling, preserved registers and a
 fixed frame. Everything else belongs to a family, and each family is a module
-whose entry points currently return a clear `Err`.
+whose entry points return a clear `Err` until it is implemented. Implemented
+so far: `CHECKED`, `BITS`, the reciprocal rule hook, and on the core's side
+address-form arithmetic (`x64/lea.coil`) and view coalescing
+(`x64/coalesce.coil`).
 
 | Family constant | Module(s) | Operations |
 |---|---|---|
@@ -23,9 +26,10 @@ whose entry points currently return a clear `Err`.
 | `VECTOR` | `x64/vector.coil` | every node of a vector type or reading one |
 | `ATOMIC` | `x64/atomic.coil` | ATOMIC_LOAD/STORE/RMW/CMPXCHG/FENCE |
 | `CHECKED` | `x64/checked.coil` | ADD_OV, SUB_OV, MUL_OV, OVERFLOW |
-| `SWITCH` | `x64/switch.coil` | SWITCH (the CASE_* projections are block starts) |
+| `SWITCH` | `x64/switch.coil` | SWITCH (the CASE_* projections are block starts); implemented |
 | `BITS` | `x64/bits.coil` | integer ABS, BSWAP, CTPOP, CTLZ, CTTZ, MIN, MAX |
 | (rule hook) | `x64/reciprocal.coil` | DIV/MOD by a constant without `div` |
+| (rule hook) | `x64/lea.coil` | sums and small multiplications as `lea` (RULE-LEA), with fusion of single-use producers |
 
 Each placeholder module's header lists its operations, the interface it must
 implement and the notes specific to it. The floating family is implemented
@@ -122,6 +126,8 @@ rematerialized. `position` is `2 * schedule index`: operands are read at
 | value would like one register | `uses/prefer!` |
 | a frame object | push a `uses/Local` on `(.locals set)` |
 | outgoing call area | raise `(.outgoing-size set)` (multiple of 16) |
+| a fixed register that is the instruction's own result | `uses/define-fixed!` plus `uses/clobber-unless-live!` (the clobber applies only when the result is dead) |
+| the function executes a call instruction | set `(.calls set)` (forces a frame so rsp is aligned) |
 | allocator transfers at a definition position that the emitter lowers itself | push `position + 1` on `(.definition-moves set)` |
 
 Do **not** use `uses/use-fixed!` for an operand that may live on after the
@@ -147,7 +153,11 @@ the location view, the frame base, the plan, the frame and the frame size.
   nothing between nodes.
 - Encoders: `x64/encode.coil`; feed each result through `code/accept!`.
 - Flags: nothing is live on entry or exit. Inside the node only `mov`, `lea`
-  and SSE moves may sit between a flag producer and its consumer.
+  and SSE moves may sit between a flag producer and its consumer. When the
+  node's last instruction sets ZF and SF by the result it wrote (an ALU
+  instruction, not `mov`, `lea` or `imul`), call `code/note-flags!` with the
+  register, width and kind: a compare of that register with zero directly
+  behind it is then dropped. Never call it for anything else.
   `emit/flags!` (integer compare tile) and `truth/flags!` (value is nonzero)
   load every operand first and return the condition code.
 - Narrow integers: bits above the type's width are unspecified
@@ -192,20 +202,43 @@ the location view, the frame base, the plan, the frame and the frame size.
 
 ### Families with a different shape
 
-- **SWITCH** (`x64/switch.coil`): `emit!` also receives the control-flow
-  state, because it branches: `edges/Flow`, `(mut edges/Control)`, the
-  fall-through successor `next`. Branch with `edges/branch-edge!` (it emits
-  the edge's moves in a stub when there are any) and `fixups/jump!`; jump
-  tables are `fixups/Relative` words.
+- **SWITCH** (`x64/switch.coil`, implemented): `emit!` also receives the
+  control-flow state, because it branches: `edges/Flow`,
+  `(mut edges/Control)`, the fall-through successor `next`. It is the model
+  for anything else that branches: `edges/stub-or-target!` gives the label
+  of an edge (the block, or a new edge stub when the edge has moves),
+  `fixups/jump!` records a jump, `fixups/address!` a `lea` of a label, and a
+  table is pushed on `(.tables control)` for the driver to place.
 - **Reciprocal division** (`x64/reciprocal.coil`): not a node family but a
   rule hook. `reciprocal/select` may replace the `RULE-DIVIDE` tile of a DIV
-  or MOD; its rules are then constrained and emitted by
-  `reciprocal/constrain!` and `reciprocal/emit!`.
-- **Calls** additionally own `x64/call-abi.coil` (placement) and will need
-  the driver to hand over the allocator's definition-position transfers
-  (`function.coil` reports "definition-position transfers are not lowered
-  yet" where that hook goes), plus private-leaf contexts in
-  `x64/compile.coil`.
+  or MOD, by one of its own rules (100..119, constrained and emitted by
+  `reciprocal/constrain!` and `reciprocal/emit!`) or by a core rule (an
+  unsigned division by a power of two is `RULE-SHIFT-RI`).
+- **Address forms** (`x64/lea.coil`): the same kind of hook for the other
+  arithmetic tiles. `lea/strength` rewrites a tile when it is selected,
+  `lea/fuse!` runs in the matcher's fusion pass and marks absorbed producers
+  `omitted`, the matcher rebuilds a RULE-LEA node's machine inputs from its
+  tile, and the driver calls `lea/emit!`. The core's constraints already fit
+  the tile (`left` and `right` are its register operands, 0 when absent).
+- **Checked arithmetic** (`x64/checked.coil`) is the one place where a flag
+  value crosses a node boundary: from a producer to the OVERFLOW scheduled
+  directly behind it. Do not emit flag-writing code for a node of another
+  family between the two; allocator transfers are moves.
+- **Calls** (`x64/call.coil`, implemented): placement is
+  `x64/abi-arguments.coil` (shared with `x64/incoming.coil`) and
+  `x64/call-abi.coil` (one call's layout). The matcher asks
+  `call/select-tails!` once per function for the tail-call plan
+  (`plan/tail-mode`). `call/constrain!` announces `position + 1` in
+  `(.definition-moves set)`; the driver then does not emit the allocator's
+  transfers at that position but hands them to `call/emit-call!`
+  (`function.coil`, `call-node!`), which also covers TAILCALL. PROTO and
+  ARGVAL go through the ordinary `emit!`. Private-leaf contexts reach the
+  family through `(.private set)`.
+- **Registers an emitter may write**: its allocated destination, the
+  scratches, and registers it declared with `uses/clobber!`. The driver
+  records exactly those as the function's write set for private-leaf callers;
+  an emitter that writes anything else must call `code/wrote!`, and one that
+  emits a call or jump out of the function `code/called!`.
 - **Stack** sets `(.anchored set)` and raises `(.alignment set)`;
   `allocate.coil` then builds the rbp base and `function.coil`'s
   `prologue!`/`epilogue!` establish and release it. A frame object or VAR

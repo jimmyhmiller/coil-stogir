@@ -51,21 +51,141 @@
 ;;; A pending image relocation of 4 bytes at `offset`: `kind` is an image
 ;;; relocation kind (5 PC32, 6 PLT32), `target` a negative graph constant
 ;;; reference, and `addend` the explicit addend (-4 when the field ends the
-;;; instruction; see stogir.x64.encode's header).
+;;; instruction; see stogir.x64.encode's header). A PLT32 reference may
+;;; instead name a runtime routine the backend itself calls: `target` is then
+;;; one of the positive RUNTIME-* ids below and the image names its symbol.
 (defstruct Reference [(offset i64) (kind i32) (target i32) (addend i64)])
+
+;;; `written` is the set of registers the code may write, one bit per library
+;;; register (general 0..15, XMM 32..47), and `calls` whether it executes a
+;;; call or a tail jump. The driver records every allocated register, every
+;;; declared clobber, the scratches and the result registers; an emitter that
+;;; writes any other register must record it with `wrote!`. A function that
+;;; makes no call is a leaf whose write set stogir.x64.private-leaf uses to
+;;; narrow the clobbers of direct calls to it.
+;;; What the last instruction in the text left in the flags, when an emitter
+;;; knows it exactly. The record holds while `at` is the text length: any
+;;; byte appended afterwards makes it stale, and the driver clears it wherever
+;;; control can arrive from elsewhere (a block start) and wherever bytes are
+;;; taken back out of the text.
+;;;
+;;; `register` was written at `bits` wide by that instruction and ZF and SF
+;;; describe its new value at that width. `kind` says what else holds:
+;;;   FLAGS-LOGIC   CF = OF = 0: exactly the flags of `test r, r`
+;;;                 (AND, OR, XOR)
+;;;   FLAGS-RESULT  only ZF and SF may be read (ADD, SUB, NEG, INC, DEC, a
+;;;                 shift by a nonzero constant): CF and OF are the
+;;;                 operation's own, or unchanged
+;;;   FLAGS-EXACT   as FLAGS-RESULT with OF = 0 guaranteed: an ADD or SUB
+;;;                 proven not to overflow as a signed operation
+;;; Instructions whose ZF or SF do not describe the result (MOV, LEA, IMUL,
+;;; rotates, a shift whose count may be zero) never leave a record.
+(defstruct Flags [(at i64) (register i32) (bits i32) (kind i32)])
+
+(const FLAGS-NONE 0)
+
+(const FLAGS-LOGIC 1)
+
+(const FLAGS-RESULT 2)
+
+(const FLAGS-EXACT 3)
+
+;;; Counts of what the driver emitted for one function, for tests and
+;;; measurements.
+;;;   conditional, unconditional  `jcc` and `jmp` instructions
+;;;   short          how many of those are rel8 after relaxation
+;;;   padding        bytes of alignment padding
+;;;   loops          loop tops that a jump goes back to and the layout asked
+;;;                  to align
+;;;   aligned-loops  how many of those ended on their boundary
+;;;   tables         jump tables
+;;;   stubs          edge stubs behind the function body
+;;;   entries        edges whose moves run at the entry of their block
+;;;   fused-tests    compares with zero that a flags record made unnecessary
+(defstruct Summary
+  [(conditional i64) (unconditional i64) (short i64) (padding i64) (loops i64)
+   (aligned-loops i64) (tables i64) (stubs i64) (entries i64) (fused-tests i64)])
 
 (defstruct Buffer
   [(alignment i64)
    (text (ArrayList u8))
    (references (ArrayList Reference))
-   (text-data (ArrayList text-data/Range))])
+   (text-data (ArrayList text-data/Range))
+   (flags Flags)
+   (summary Summary)
+   (written u64)
+   (calls bool)])
+
+;;; libm's `double fma(double, double, double)`.
+(const RUNTIME-FMA 1)
+
+;;; libm's `float fmaf(float, float, float)`.
+(const RUNTIME-FMAF 2)
+
+(defn runtime? [(reference Reference)] (-> bool)
+  (and (= (.kind reference) image/X64-PLT32)
+       (or (= (.target reference) RUNTIME-FMA) (= (.target reference) RUNTIME-FMAF))))
+
+;;; `call rel32` to runtime routine `routine` (a RUNTIME-* id), PLT32.
+(defn runtime-call! [(output (mut Buffer)) (routine i32)] (-> (Result i32 (slice u8)))
+  (match (encode/call-rel32 (mut (.text output)) 0)
+    (Err [message] (Err message))
+    (Ok [field]
+        (let [pending (Reference
+                        :offset field
+                        :kind image/X64-PLT32
+                        :target routine
+                        :addend (- 0 (encode/field-to-end (.text output) field)))]
+          (if (runtime? pending)
+              (do (push! (mut (.references output)) pending) (Ok 5))
+              (Err "unknown x86-64 runtime routine"))))))
 
 (defn create [(allocator (dyn Allocator))] (-> Buffer)
   (Buffer
     :alignment 1
     :text (ArrayList::new [u8] allocator)
     :references (ArrayList::new [Reference] allocator)
-    :text-data (ArrayList::new [text-data/Range] allocator)))
+    :text-data (ArrayList::new [text-data/Range] allocator)
+    :flags (Flags :at -1 :register -1 :bits 0 :kind FLAGS-NONE)
+    :summary (Summary :conditional 0 :unconditional 0 :short 0 :padding 0 :loops 0
+                      :aligned-loops 0 :tables 0 :stubs 0 :entries 0 :fused-tests 0)
+    :written 0
+    :calls false))
+
+;;; Record that the code may write `register`.
+(defn wrote! [(buffer (mut Buffer)) (register i32)] (-> void)
+  (when (and (>= register 0) (< register 48))
+    (set! (.written buffer) (| (.written buffer) (<< (: 1 u64) (cast u64 register))))))
+
+;;; Record that the code executes a call or a tail jump.
+(defn called! [(buffer (mut Buffer))] (-> void)
+  (set! (.calls buffer) true))
+
+;;; Record that the instruction just appended wrote `register` at `bits`
+;;; and left flags of `kind` for its value.
+(defn note-flags! [(buffer (mut Buffer)) (register i32) (bits i32) (kind i32)] (-> void)
+  (set! (.flags buffer)
+        (Flags :at (len (.text buffer)) :register register :bits bits :kind kind)))
+
+(defn clear-flags! [(buffer (mut Buffer))] (-> void)
+  (set! (.flags buffer) (Flags :at -1 :register -1 :bits 0 :kind FLAGS-NONE)))
+
+;;; The ADD or SUB just recorded is known not to overflow as a signed
+;;; operation: its flags are FLAGS-EXACT.
+(defn exact-flags! [(buffer (mut Buffer))] (-> void)
+  (when (and (= (.at (.flags buffer)) (len (.text buffer)))
+             (= (.kind (.flags buffer)) FLAGS-RESULT))
+    (set! (.kind (.flags buffer)) FLAGS-EXACT)))
+
+;;; The kind of flags the text's last instruction left for `register` at
+;;; `bits`, or FLAGS-NONE.
+(defn flags-for [(buffer Buffer) (register i32) (bits i32)] (-> i32)
+  (let [flags (.flags buffer)]
+    (if (and (= (.at flags) (len (.text buffer)))
+             (= (.register flags) register)
+             (= (.bits flags) bits))
+        (.kind flags)
+        FLAGS-NONE)))
 
 (defn release! [(buffer (mut Buffer))] (-> void)
   (free! (mut (.text buffer)))
@@ -109,7 +229,7 @@
     (for reference (.references source)
       (when (or (< (.offset reference) 0)
                 (> (.offset reference) (- (len (.text source)) 4))
-                (>= (.target reference) 0)
+                (and (>= (.target reference) 0) (not (runtime? reference)))
                 (< (.kind reference) 5)
                 (> (.kind reference) 6))
         (set! valid? false)))
@@ -119,6 +239,8 @@
         (do
           (set! (.alignment output)
                 (alignment/maximum (.alignment output) (.alignment source)))
+          (set! (.written output) (| (.written output) (.written source)))
+          (when (.calls source) (set! (.calls output) true))
           (for range (.text-data source)
             (push! (mut (.text-data output))
                    (text-data/Range

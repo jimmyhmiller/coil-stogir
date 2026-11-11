@@ -4,6 +4,7 @@
 (import "stogir.calls" :as calls)
 (import "stogir.types" :as types)
 (import "stogir.native.compile" :as compile)
+(import "stogir.target" :as target)
 (import "stogir.jit.native" :as jit)
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.primitive" :as primitive)
@@ -42,6 +43,49 @@
                       result (if (= opcode 29) quotient (- sx (* quotient sy)))]
                   (& (cast u64 result) mask))
                 (if (= opcode 29) (/ x y) (- x (* (/ x y) y))))))))
+
+;;; DIV and MOD of these operands are undefined in the IR: a zero divisor, or
+;;; the signed minimum divided by -1. AArch64 hardware returns the results
+;;; `expected` lists; x86-64 hardware raises #DE and the backend emits no
+;;; guard (docs/X86_PORT.md), so there the call must die with SIGFPE.
+(defn undefined? [(opcode i32) (ty i32) (a u64) (b u64)] (-> bool)
+  (let [width (* 8 (types/scalar-size ty 8))
+        mask (cast u64 (- (<< (: 1 u128) (cast u128 width)) 1))
+        x (& a mask)
+        y (& b mask)]
+    (and (or (= opcode 29) (= opcode 30))
+         (or (= y 0)
+             (and (types/signed? ty)
+                  (= y mask)
+                  (= x (<< (: 1 u64) (cast u64 (- width 1)))))))))
+
+;;; Whether undefined divisions trap on the machine the test runs on.
+(defn division-traps? [] (-> bool)
+  (target/arch-pick false true))
+
+(extern fork :cc (cc/C) [] (-> i32))
+(extern waitpid :cc (cc/C) [i32 (ptr i32) i32] (-> i32))
+(extern exit-child :as "_exit" :cc (cc/C) [i32] (-> void))
+(extern signal :cc (cc/C) [i32 u64] (-> u64))
+
+(defn arithmetic-handler :cc (cc/C) [(number i32)] (-> void)
+  (exit-child 77))
+
+;;; Whether calling f(a, b) raises SIGFPE, observed in a child process.
+(defn traps? [(f (fnptr (cc/C) [u64 u64] u64)) (a u64) (b u64)] (-> bool)
+  (let [child (fork)]
+    (if (< child 0)
+        false
+        (if (= child 0)
+            (do
+              (signal 8 (primitive/cast u64 (primitive/cast (ptr u8) (fnptr-of arithmetic-handler))))
+              (call-ptr f a b)
+              (exit-child 99)
+              false)
+            (let [(mut status) (: 0 i32)]
+              (and (= (waitpid child (mut status) 0) child)
+                   (= (& status 127) 0)
+                   (= (& (>> status 8) 255) 77)))))))
 
 ;;; Exercise allocated operand/result overlap and all combinations of constant
 ;;; materialization, including both reserved scratch registers being occupied.
@@ -134,19 +178,27 @@
                                 (if (>= mode 2)
                                     (if (= mode 4) (: 0 u64) (: 3 u64))
                                     b)
-                              wanted (expected opcode (cast i32 ty) x y)
-                              actual (call-ptr f a b)]
-                          (when (!= actual wanted)
-                            (when (= failures 0)
-                              (println "op={} ty={} mode={} a={} b={} expected={} actual={}"
-                                       opcode
-                                       ty
-                                       mode
-                                       x
-                                       y
-                                       wanted
-                                       actual))
-                            (set! failures (+ failures 1))))))
+                              trapping (and (division-traps?)
+                                            (undefined? opcode (cast i32 ty) x y))]
+                          (if trapping
+                              (unless (traps? f a b)
+                                (when (= failures 0)
+                                  (println "op={} ty={} mode={} a={} b={}: expected a division trap"
+                                           opcode ty mode x y))
+                                (set! failures (+ failures 1)))
+                              (let [wanted (expected opcode (cast i32 ty) x y)
+                                    actual (call-ptr f a b)]
+                                (when (!= actual wanted)
+                                  (when (= failures 0)
+                                    (println "op={} ty={} mode={} a={} b={} expected={} actual={}"
+                                             opcode
+                                             ty
+                                             mode
+                                             x
+                                             y
+                                             wanted
+                                             actual))
+                                  (set! failures (+ failures 1))))))))
                     (jit/release! (mut owned)))))
             (free! (mut code)))))
     (g/release! (mut graph))

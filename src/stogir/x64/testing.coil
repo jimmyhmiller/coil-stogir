@@ -24,6 +24,8 @@
 (import "stogir.numeric-conversion" :as numeric)
 (import "coil.math" :as math)
 (import "stogir.x64.compile" :as compile)
+(import "stogir.x64.code" :as buffer)
+(import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [Allocator])
 (import "coil.primitive" :as primitive)
 (import "coil.cc" :as cc)
@@ -146,7 +148,8 @@
 
 ;;; Reference result of integer binary operation `opcode` on type `ty`,
 ;;; masked to the type. Comparisons (14..23) yield 0 or 1. Shift and rotate
-;;; counts are reduced modulo the width. DIV/MOD require `divisible?`.
+;;; counts are reduced modulo the width. DIV/MOD require `divisible?`. MIN
+;;; (58) and MAX (59) compare by the type's signedness.
 (defn binary [(opcode i32) (ty i32) (a u64) (b u64)] (-> u64)
   (let [width (bits ty)
         modulus (<< (: 1 u128) (cast u128 width))
@@ -200,15 +203,71 @@
                                (<< wide (- (cast u128 width) shift)))
                             modulus))
                m)
+          (= opcode 58) (if (types/signed? ty) (if (< sx sy) x y) (if (< x y) x y))
+          (= opcode 59) (if (types/signed? ty) (if (> sx sy) x y) (if (> x y) x y))
+          ; The value of ADD_OV, SUB_OV and MUL_OV is the wrapped result.
+          (and (>= opcode 41) (<= opcode 43)) (binary (- opcode 15) ty a b)
           :else (panic "x64 test reference: unknown binary opcode {}" opcode))))
 
-;;; Reference result of NEG (31) and NOT (45). NOT of a BOOL flips bit 0.
+;;; Reference OVERFLOW of ADD_OV (41), SUB_OV (42) or MUL_OV (43) on `ty`:
+;;; 1 when the exact result does not fit the type, else 0.
+(defn overflow [(opcode i32) (ty i32) (a u64) (b u64)] (-> u64)
+  (let [width (bits ty)
+        x (cast u128 (& a (mask ty)))
+        y (cast u128 (& b (mask ty)))
+        sx (signed ty a)
+        sy (signed ty b)
+        modulus (<< (: 1 u128) (cast u128 width))
+        limit (cast i128 (/ modulus 2))]
+    (if (types/signed? ty)
+        (let [exact (cond (= opcode 41) (+ sx sy)
+                          (= opcode 42) (- sx sy)
+                          (= opcode 43) (* sx sy)
+                          :else (panic "x64 test reference: unknown checked opcode {}" opcode))]
+          (if (or (< exact (- 0 limit)) (>= exact limit)) 1 0))
+        (cond (= opcode 41) (if (>= (+ x y) modulus) 1 0)
+              (= opcode 42) (if (< x y) 1 0)
+              (= opcode 43) (if (>= (* x y) modulus) 1 0)
+              :else (panic "x64 test reference: unknown checked opcode {}" opcode)))))
+
+;;; Reference result of NEG (31), NOT (45), ABS (32), BSWAP (54), CTPOP (55),
+;;; CTLZ (56) and CTTZ (57). NOT of a BOOL flips bit 0.
 (defn unary [(opcode i32) (ty i32) (a u64)] (-> u64)
   (let [m (mask ty)
         x (& a m)]
     (cond (= opcode 31) (& (+ (^ x m) 1) m)
           (and (= opcode 45) (= ty 1)) (^ x 1)
           (= opcode 45) (^ x m)
+          ; ABS of the minimum is the minimum.
+          (= opcode 32) (if (< (signed ty a) 0) (& (+ (^ x m) 1) m) x)
+          (= opcode 54)
+            (let [(mut rest) x
+                  (mut result) (: 0 u64)]
+              (for [i 0 (/ (cast i64 (bits ty)) 8)]
+                (set! result (| (<< result 8) (& rest 255)))
+                (set! rest (>> rest 8)))
+              result)
+          (= opcode 55)
+            (let [(mut count) (: 0 u64)]
+              (for [i 0 (cast i64 (bits ty))]
+                (set! count (+ count (& (>> x (cast u64 i)) 1))))
+              count)
+          ; The IR leaves the count of a zero undefined. The backends agree
+          ; on the type's width for CTLZ, and for CTTZ on the width the
+          ; operation runs at: 32 for every type narrower than 32 bits.
+          (= opcode 56)
+            (let [(mut count) (: 0 u64)
+                  (mut i) (- (cast i64 (bits ty)) 1)]
+              (while (and (>= i 0) (= (& (>> x (cast u64 i)) 1) 0))
+                (set! count (+ count 1))
+                (set! i (- i 1)))
+              count)
+          (= opcode 57)
+            (if (= x 0)
+                (if (< (bits ty) 32) 32 (cast u64 (bits ty)))
+                (let [(mut count) (: 0 u64)]
+                  (while (= (& (>> x count) 1) 0) (set! count (+ count 1)))
+                  count))
           :else (panic "x64 test reference: unknown unary opcode {}" opcode))))
 
 ;;; Reference result of SEXT (33), ZEXT (34), TRUNC (35) and BITCAST (36)
@@ -314,6 +373,75 @@
 (defn dirty [(ty i32) (value u64)] (-> u64)
   (| (& value (mask ty))
      (& (: 0xA5C3F00DDEADBE00 u64) (^ (mask ty) 0xFFFFFFFFFFFFFFFF))))
+
+;;; Mapped code with what the driver reported about it: the emission summary
+;;; (jumps by form, padding, tables, reused flags) and the text size.
+(defstruct Generated [(mapped Mapped) (summary buffer/Summary) (size i64)])
+
+;;; As `compiled`, through stogir.x64.compile/generate, keeping the summary.
+(defn generated [(counts (mut Tally)) (label (slice u8)) (graph g/Graph) (start i32)
+                 (roots (slice i32)) (allocator (dyn Allocator))] (-> (Option Generated))
+  (set! (.functions counts) (+ (.functions counts) 1))
+  (match (compile/generate graph start roots allocator)
+    (Err [message]
+         (println "{}: compile failed: {}" label message)
+         (fail! (mut counts))
+         (None))
+    (Ok [emitted]
+        (let [(mut emitted) emitted
+              result (if (> (len (.references emitted)) 0)
+                         (do (println "{}: unexpected references" label)
+                             (fail! (mut counts))
+                             (None [Generated]))
+                         (match (map (slice (.text emitted)))
+                           (Err [message]
+                                (println "{}: map failed: {}" label message)
+                                (fail! (mut counts))
+                                (None [Generated]))
+                           (Ok [mapped]
+                               (Some (Generated :mapped mapped :summary (.summary emitted)
+                                                :size (len (.text emitted)))))))]
+          (buffer/release! (mut emitted))
+          result))))
+
+;;; Count one check of a property of generated code; print `label` and the
+;;; two numbers when it does not hold.
+(defn check! [(counts (mut Tally)) (holds bool) (label (slice u8)) (got i64) (wanted i64)]
+  (-> void)
+  (set! (.checks counts) (+ (.checks counts) 1))
+  (unless holds
+    (when (< (.failures counts) 25) (println "{}: got {}, expected {}" label got wanted))
+    (fail! (mut counts))))
+
+;;; BEGIN of the block entered from one block end.
+(defn begin! [(graph (mut g/Graph)) (end i32)] (-> i32)
+  (require (b/emit! (mut graph) 106 0 [end (: 0 i32)])))
+
+;;; MERGE of any number of block ends, and a PHI over it (one value per end,
+;;; in the same order).
+(defn merge-all! [(graph (mut g/Graph)) (ends (slice i32))] (-> i32)
+  (require (b/emit! (mut graph) 112 0 ends)))
+
+(defn phi-all! [(graph (mut g/Graph)) (ty i32) (region i32) (values (slice i32))
+                (allocator (dyn Allocator))] (-> i32)
+  (let [(mut inputs) (ArrayList::new [i32] allocator)]
+    (push! (mut inputs) region)
+    (for value values (push! (mut inputs) value))
+    (let [phi (require (b/emit! (mut graph) 67 ty (slice inputs)))]
+      (free! (mut inputs))
+      phi)))
+
+(defn switch! [(graph (mut g/Graph)) (control i32) (selector i32)] (-> i32)
+  (require (b/switch! (mut graph) control selector)))
+
+(defn case-value! [(graph (mut g/Graph)) (source i32) (value i32)] (-> i32)
+  (require (b/case-value! (mut graph) source value)))
+
+(defn case-range! [(graph (mut g/Graph)) (source i32) (low i32) (high i32)] (-> i32)
+  (require (b/case-range! (mut graph) source low high)))
+
+(defn case-default! [(graph (mut g/Graph)) (source i32)] (-> i32)
+  (require (b/case-default! (mut graph) source)))
 
 ;;; ---- Floating support -------------------------------------------------------
 ;;;

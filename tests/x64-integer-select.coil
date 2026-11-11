@@ -1,0 +1,279 @@
+(module stogir.tests.x64-integer-select)
+(import "stogir.graph" :as g)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.x64.compile" :as compile)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.match" :as matching)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.reciprocal" :as reciprocal)
+(import "stogir.x64.select" :as select)
+(import "stogir.x64.testing" :as t)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; What the x86-64 integer family selects, as opposed to what its code
+;;; computes (the other tests/x64-integer-*.coil): the address-form tiles and
+;;; their fusion (stogir.x64.lea), the rule chosen for a division by a
+;;; constant (stogir.x64.reciprocal), and that register views cost no move
+;;; (stogir.x64.coalesce). Selection is host-independent, so those checks run
+;;; everywhere; the generated code is also executed on an x86-64 host.
+
+(defn fail! [(tally (mut t/Tally)) (label (slice u8)) (what (slice u8))] (-> void)
+  (println "{}: {}" label what)
+  (t/fail! (mut tally)))
+
+(defn check! [(tally (mut t/Tally)) (label (slice u8)) (what (slice u8)) (holds bool)] (-> void)
+  (set! (.checks tally) (+ (.checks tally) 1))
+  (unless holds (fail! (mut tally) label what)))
+
+;;; Whether `tile` is the address form base + (index << shift) + offset.
+(defn address? [(tile select/Tile) (base i32) (index i32) (shift i32) (offset i64)] (-> bool)
+  (and (= (.rule tile) select/RULE-LEA)
+       (= (.left tile) base)
+       (= (.right tile) index)
+       (= (.operation tile) shift)
+       (= (.immediate tile) offset)))
+
+;;; `shape` of f(x, y) on type `ty`, its expected selection, and its value.
+;;;   0  (x + (y << 2)) + 100        one lea; the shift and the inner sum vanish
+;;;   1  ((y << 3) + x) - 8          the same with the operands the other way
+;;;   2  x * 5 + 7                   lea [x + x*4 + 7]
+;;;   3  (x + y) + 100               lea [x + y + 100]
+;;;   4  s = y << 2; (x + s) ^ s     the shift has two readers and stays
+;;;   5  x * 8                       a shift
+;;;   6  x * 7                       imul
+;;;   7  (x + 100) + (y << 1)        lea [x + y*2 + 100]
+(defn address-case! [(tally (mut t/Tally)) (shape i32) (ty i32) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        bits (if (>= (t/bits ty) 64) (: 64 i32) 32)
+        start (t/start! (mut graph))
+        x (t/param! (mut graph) start ty 0)
+        y (t/param! (mut graph) start ty 1)
+        inner (cond (= shape 0) (t/binary! (mut graph) 49 ty y (t/constant! (mut graph) ty 2))
+                    (= shape 1) (t/binary! (mut graph) 49 ty y (t/constant! (mut graph) ty 3))
+                    (= shape 2) (t/binary! (mut graph) 28 ty x (t/constant! (mut graph) ty 5))
+                    (= shape 3) (t/binary! (mut graph) 26 ty x y)
+                    (= shape 4) (t/binary! (mut graph) 49 ty y (t/constant! (mut graph) ty 2))
+                    (= shape 5) (t/binary! (mut graph) 28 ty x (t/constant! (mut graph) ty 8))
+                    (= shape 6) (t/binary! (mut graph) 28 ty x (t/constant! (mut graph) ty 7))
+                    :else (t/binary! (mut graph) 49 ty y (t/constant! (mut graph) ty 1)))
+        middle (cond (= shape 0) (t/binary! (mut graph) 26 ty x inner)
+                     (= shape 1) (t/binary! (mut graph) 26 ty inner x)
+                     (= shape 4) (t/binary! (mut graph) 26 ty x inner)
+                     (= shape 7) (t/binary! (mut graph) 26 ty x (t/constant! (mut graph) ty 100))
+                     :else inner)
+        outer (cond (= shape 0) (t/binary! (mut graph) 26 ty middle (t/constant! (mut graph) ty 100))
+                    (= shape 1) (t/binary! (mut graph) 27 ty middle (t/constant! (mut graph) ty 8))
+                    (= shape 2) (t/binary! (mut graph) 26 ty middle (t/constant! (mut graph) ty 7))
+                    (= shape 3) (t/binary! (mut graph) 26 ty middle (t/constant! (mut graph) ty 100))
+                    (= shape 4) (t/binary! (mut graph) 48 ty middle inner)
+                    (= shape 7) (t/binary! (mut graph) 26 ty middle inner)
+                    :else middle)
+        ret (t/return! (mut graph) start ty outer)
+        label (cond (= shape 0) "x + (y << 2) + 100"
+                    (= shape 1) "(y << 3) + x - 8"
+                    (= shape 2) "x * 5 + 7"
+                    (= shape 3) "x + y + 100"
+                    (= shape 4) "shared shift"
+                    (= shape 5) "x * 8"
+                    (= shape 6) "x * 7"
+                    :else "(x + 100) + (y << 1)")]
+    (match (pipeline/prepare-native graph start [ret] a)
+      (Err [message] (fail! (mut tally) label message))
+      (Ok [prepared]
+          (let [(mut owned) prepared]
+            (match (matching/build graph (.schedule owned) [ret] a)
+              (Err [message] (fail! (mut tally) label message))
+              (Ok [selected]
+                  (let [(mut matched) selected
+                        tile (get (.tiles matched) (cast i64 outer))]
+                    (cond (= shape 0)
+                            (do
+                              (check! (mut tally) label "outer tile"
+                                      (address? tile x y 2 100))
+                              (check! (mut tally) label "producers absorbed"
+                                      (and (plan/omitted? matched inner) (plan/omitted? matched middle))))
+                          (= shape 1)
+                            (do
+                              (check! (mut tally) label "outer tile" (address? tile x y 3 -8))
+                              (check! (mut tally) label "producers absorbed"
+                                      (and (plan/omitted? matched inner) (plan/omitted? matched middle))))
+                          (= shape 2)
+                            (do
+                              (check! (mut tally) label "outer tile" (address? tile x x 2 7))
+                              (check! (mut tally) label "product absorbed" (plan/omitted? matched inner)))
+                          (= shape 3)
+                            (do
+                              (check! (mut tally) label "outer tile" (address? tile x y 0 100))
+                              (check! (mut tally) label "sum absorbed" (plan/omitted? matched inner)))
+                          (= shape 4)
+                            (do
+                              (check! (mut tally) label "shift kept" (not (plan/omitted? matched inner)))
+                              (check! (mut tally) label "sum tile"
+                                      (address? (get (.tiles matched) (cast i64 middle))
+                                                x inner 0 0)))
+                          (= shape 5)
+                            (check! (mut tally) label "shift tile"
+                                    (and (= (.rule tile) select/RULE-SHIFT-RI)
+                                         (= (.operation tile) encode/SHL)
+                                         (= (.immediate tile) 3)))
+                          (= shape 6)
+                            (check! (mut tally) label "imul tile"
+                                    (= (.rule tile) select/RULE-MUL-RI))
+                          :else
+                            (do
+                              (check! (mut tally) label "outer tile" (address? tile x y 1 100))
+                              (check! (mut tally) label "producers absorbed"
+                                      (and (plan/omitted? matched inner) (plan/omitted? matched middle)))))
+                    (check! (mut tally) label "tile width" (or (= shape 6) (= (.bits tile) bits)))
+                    (matching/release! (mut matched)))))
+            (pipeline/release! (mut owned)))))
+    (when (t/host?)
+      (match (t/compiled (mut tally) label graph start [ret] a)
+        (None [] 0)
+        (Some [mapped]
+              (let [(mut code) mapped
+                    m (t/mask ty)]
+                (for vx [(: 0 u64) 1 3 0x7FFFFFFF 0xFFFFFFFF 0x123456789ABCDEF 0xFFFFFFFFFFFFFFFF]
+                  (for vy [(: 0 u64) 1 5 0x40000000 0x8000000000000000 0xFEDCBA9876543210]
+                    (let [wx (& vx m)
+                          wy (& vy m)
+                          expected
+                            (& (cond (= shape 0) (+ wx (<< wy 2) 100)
+                                     (= shape 1) (- (+ (<< wy 3) wx) 8)
+                                     (= shape 2) (+ (* wx 5) 7)
+                                     (= shape 3) (+ wx wy 100)
+                                     (= shape 4) (^ (+ wx (<< wy 2)) (& (<< wy 2) m))
+                                     (= shape 5) (* wx 8)
+                                     (= shape 6) (* wx 7)
+                                     :else (+ wx 100 (<< wy 1)))
+                               m)]
+                      (t/expect! (mut tally) label code ty [(t/dirty ty vx) (t/dirty ty vy)]
+                                 expected))))
+                (t/unmap! (mut code))))))
+    (g/release! (mut graph))))
+
+;;; The rule selected for `x OP d` on `ty`.
+(defn division-rule [(opcode i32) (ty i32) (d u64) (constant-dividend bool) (a (dyn Allocator))]
+  (-> i32)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        x (if constant-dividend
+              (t/constant! (mut graph) ty 1000)
+              (t/param! (mut graph) start ty 0))
+        node (t/binary! (mut graph) opcode ty x (t/constant! (mut graph) ty d))
+        rule (match (select/arithmetic graph node)
+               (Err [_] -1)
+               (Ok [tile] (.rule (reciprocal/select graph node tile))))]
+    (g/release! (mut graph))
+    rule))
+
+(defn division-rules! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (for ty [(: 2 i32) 3 4 5 6 7 8 9 10 11]
+    (let [signed (and (>= ty 7) (<= ty 11))
+          m (t/mask ty)
+          minimum (<< (: 1 u64) (cast u64 (- (t/bits ty) 1)))]
+      ; Zero, one and minus one keep the hardware division, as does a
+      ; constant dividend.
+      (for d [(: 0 u64) 1]
+        (for opcode [(: 29 i32) 30]
+          (check! (mut tally) "division rule" "0 and 1 keep the hardware division"
+                  (= (division-rule opcode ty d false a) select/RULE-DIVIDE))))
+      (when signed
+        (check! (mut tally) "division rule" "-1 keeps the hardware division"
+                (= (division-rule 29 ty m false a) select/RULE-DIVIDE)))
+      (check! (mut tally) "division rule" "a constant dividend keeps the hardware division"
+              (= (division-rule 29 ty 10 true a) select/RULE-DIVIDE))
+      ; Powers of two.
+      (check! (mut tally) "division rule" "x / 8"
+              (= (division-rule 29 ty 8 false a)
+                 (if signed (: reciprocal/RULE-POWER-SIGNED i32) select/RULE-SHIFT-RI)))
+      (check! (mut tally) "division rule" "x % 8"
+              (= (division-rule 30 ty 8 false a)
+                 (if signed (: reciprocal/RULE-POWER-SIGNED i32) reciprocal/RULE-POWER-MASK)))
+      (check! (mut tally) "division rule" "x / minimum"
+              (= (division-rule 29 ty minimum false a)
+                 (if signed (: reciprocal/RULE-POWER-SIGNED i32) select/RULE-SHIFT-RI)))
+      (when signed
+        (check! (mut tally) "division rule" "x / -4"
+                (= (division-rule 29 ty (& (- 0 (: 4 u64)) m) false a)
+                   reciprocal/RULE-POWER-SIGNED)))
+      ; Everything else is a multiplication.
+      (for d [(: 3 u64) 7 10 100 (- m 2) (+ minimum 1) (- minimum 1)]
+        (for opcode [(: 29 i32) 30]
+          (check! (mut tally) "division rule" "multiply-high"
+                  (= (division-rule opcode ty (& d m) false a) reciprocal/RULE-MAGIC)))))))
+
+;;; Register-to-register moves in `text`: 89 /r and 8B /r with a register
+;;; operand. Only for the small functions below, whose code holds no
+;;; immediate or displacement byte that could look like one.
+(defn register-moves [(text (slice u8))] (-> i64)
+  (let [(mut count) 0]
+    (for [i 0 (- (len text) 1)]
+      (when (and (or (= (get text i) 0x89) (= (get text i) 0x8B))
+                 (>= (get text (+ i 1)) 0xC0))
+        (set! count (+ count 1))))
+    count))
+
+;;; Views that share their source's register need no move, also when the
+;;; source lives on past them.
+;;;   0  s = x + y; c = COPY s; return c + s
+;;;   1  s = x + y (I64); t = TRUNC I32 s; h = s + x; return TRUNC I32 h + t
+;;;   2  s = x + y (I64); u = BITCAST U64 s; return BITCAST I64 u + s
+(defn view-case! [(tally (mut t/Tally)) (shape i32) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        x (t/param! (mut graph) start 11 0)
+        y (t/param! (mut graph) start 11 1)
+        s (t/binary! (mut graph) 26 11 x y)
+        result-type (if (= shape 1) (: 10 i32) 11)
+        result
+          (cond (= shape 0)
+                  (t/binary! (mut graph) 26 11 (t/copy! (mut graph) 11 s) s)
+                (= shape 1)
+                  (let [low (t/unary! (mut graph) 35 10 s)
+                        h (t/binary! (mut graph) 26 11 s x)]
+                    (t/binary! (mut graph) 26 10 (t/unary! (mut graph) 35 10 h) low))
+                :else
+                  (let [u (t/unary! (mut graph) 36 5 s)]
+                    (t/binary! (mut graph) 26 11 (t/unary! (mut graph) 36 11 u) s)))
+        ret (t/return! (mut graph) start result-type result)
+        label (cond (= shape 0) "COPY view" (= shape 1) "TRUNC view" :else "BITCAST view")]
+    (match (compile/text graph start [ret] a)
+      (Err [message] (fail! (mut tally) label message))
+      (Ok [text]
+          (let [(mut bytes) text]
+            (check! (mut tally) label "no register move" (= (register-moves (slice bytes)) 0))
+            (when (!= (register-moves (slice bytes)) 0)
+              (print "  code:")
+              (for byte bytes (print " {:x}" byte))
+              (println ""))
+            (when (t/host?)
+              (match (t/map (slice bytes))
+                (Err [message] (fail! (mut tally) label message))
+                (Ok [mapped]
+                    (let [(mut code) mapped]
+                      (for vx [(: 0 u64) 1 0x123456789ABCDEF0 0xFFFFFFFFFFFFFFFF]
+                        (for vy [(: 0 u64) 7 0x8000000000000000 0xFEDCBA9876543210]
+                          (let [sum (+ vx vy)
+                                expected (cond (= shape 0) (+ sum sum)
+                                               (= shape 1) (& (+ (+ sum vx) sum) 0xFFFFFFFF)
+                                               :else (+ sum sum))]
+                            (t/expect! (mut tally) label code result-type [vx vy] expected))))
+                      (t/unmap! (mut code))))))
+            (free! (mut bytes)))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut tally) (t/tally)]
+    (for ty [(: 11 i32) 5 6 10 4 9 3 8 2]
+      (for [shape 0 8]
+        ; ADDR takes only an offset of a 64-bit integer type as its second
+        ; operand; the shapes above add values of one type.
+        (address-case! (mut tally) (cast i32 shape) ty a)))
+    (division-rules! (mut tally) a)
+    (for [shape 0 3] (view-case! (mut tally) (cast i32 shape) a))
+    (println "x64 integer select: {} functions, {} checks, {} failures"
+             (.functions tally) (.checks tally) (.failures tally))
+    (if (= (.failures tally) 0) 0 1)))

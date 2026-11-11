@@ -40,8 +40,8 @@
 ;;;     and negative values rounding to zero give -0.0. ROUND_EVEN relies on
 ;;;     MXCSR being in its default round-to-nearest mode, like every other
 ;;;     arithmetic instruction here.
-;;;   * FMA needs FMA3 (not baseline) or libm's fma; it is rejected until the
-;;;     call family can call a named runtime function from inside a node.
+;;;   * FMA needs FMA3 (not baseline), so it calls libm's fma / fmaf through
+;;;     the call family's runtime-call sequence (`fma!`); that needs an image.
 ;;;   * FP2INT is cvttss2si/cvttsd2si. The IR leaves NaN and out-of-range
 ;;;     inputs undefined (stogir.numeric-conversion/fp-to-int folds none of
 ;;;     them); AArch64 saturates there, x86-64 returns what the instruction
@@ -57,8 +57,11 @@
 (import "stogir.graph" :as g)
 (import "stogir.node" :as n)
 (import "stogir.types" :as types)
+(import "stogir.x64.call" :as call)
 (import "stogir.x64.address" :as address)
 (import "stogir.x64.code" :as code)
+(import "stogir.locations" :as loc)
+(import "coil.alloc" :use [Allocator])
 (import "stogir.x64.conditional" :as conditional)
 (import "stogir.x64.context" :as context)
 (import "stogir.x64.emit" :as emit)
@@ -75,7 +78,21 @@
 
 (const CONFLICT "conflicting x86-64 register constraints")
 
-(const FMA-PENDING "x86-64 backend: FMA is not implemented yet: the SSE2 baseline has no fused multiply-add and calling libm's fma/fmaf from inside a node needs the call family; see docs/X86_FAMILIES.md")
+;;; FMA: op1 * op2 + op3 rounded once, by libm's fma (DOUBLE) or fmaf
+;;; (FLOAT). The driver calls this in place of `emit!` with the allocator's
+;;; transfers at the node's definition position, which the call sequence
+;;; lowers itself. The reference to the routine needs an image: bare text
+;;; (compile/text) reports a clear error.
+(defn fma! [(out (mut code/Buffer)) (cx context/Context) (reference i32) (position i64)
+            (preserve (slice loc/Transfer)) (allocator (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (let [node (get (.instructions (.graph cx)) (cast i64 reference))
+        ty (cast i32 (n/type-id node))]
+    (if (not (types/floating? ty))
+        (Err "x86-64 backend: FMA of a vector type is not implemented (vector family)")
+        (call/emit-runtime! (mut out) cx position [(.op1 node) (.op2 node) (.op3 node)]
+                            (if (= ty 12) (: code/RUNTIME-FMA i32) code/RUNTIME-FMAF)
+                            preserve allocator))))
 
 (const X14 registers/SCRATCH-SIMD)
 
@@ -168,14 +185,21 @@
               (Err [message] (fail! (mut error) message))
               (Ok [_]
                   (if (or (types/vector? ty) (types/vector? (value/type-of graph (.op1 node))))
-                      (fail! (mut error) "x86-64 backend: vector conversions are not implemented yet (vector family)")
+                      (fail! (mut error) "x86-64 backend: a conversion to or from a vector belongs to the vector family (stogir.x64.vector)")
                       (do
                         (require! (mut error) (uses/use! (mut set) (.op1 node) position))
                         (require! (mut error) (uses/define! (mut set) reference position))
                         (when (= (types/floating? ty)
                                  (types/floating? (value/type-of graph (.op1 node))))
                           (uses/hint! (mut set) reference (.op1 node)))))))
-          (floating/ternary? opcode) (fail! (mut error) FMA-PENDING)
+          ; FMA is a call to libm (stogir.x64.call/runtime-constraints!).
+          (floating/ternary? opcode)
+            (match (floating/validate graph reference)
+              (Err [message] (fail! (mut error) message))
+              (Ok [_]
+                  (check! (mut error)
+                          (call/runtime-constraints! (mut set) reference position
+                                                     [(.op1 node) (.op2 node) (.op3 node)]))))
           (floating/operation? opcode)
             (match (floating/validate graph reference)
               (Err [message] (fail! (mut error) message))
@@ -597,7 +621,7 @@
         target (cast i32 (n/type-id node))
         origin (value/type-of (.graph cx) (.op1 node))]
     (cond (or (types/vector? target) (types/vector? origin))
-            (fail! (mut error) "x86-64 backend: vector conversions are not implemented yet (vector family)")
+            (fail! (mut error) "x86-64 backend: a conversion to or from a vector belongs to the vector family (stogir.x64.vector)")
           (types/floating? target)
             (match (value/float-destination (.graph cx) (.parts cx) reference position)
               (Err [message] (fail! (mut error) message))
@@ -691,7 +715,8 @@
                         (check! (mut error) (fcompare/boolean! (mut out) condition rd))))))
           (not (types/floating? ty))
             (fail! (mut error) "x86-64 backend: this operation on a floating value is not implemented")
-          (floating/ternary? opcode) (fail! (mut error) FMA-PENDING)
+          (floating/ternary? opcode)
+            (fail! (mut error) "x86-64 backend: FMA is emitted by the driver (stogir.x64.floating/fma!)")
           :else
             (match (value/float-destination (.graph cx) (.parts cx) reference position)
               (Err [message] (fail! (mut error) message))

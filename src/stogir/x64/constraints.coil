@@ -51,6 +51,9 @@
 (import "stogir.x64.select" :as select)
 (import "stogir.x64.switch" :as switch)
 (import "stogir.x64.uses" :as uses)
+(import "stogir.call-results" :as results)
+(import "stogir.x64.return-values" :as return-values)
+(import "stogir.native.private-types" :as private)
 (import "coil.alloc" :use [Allocator])
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.result" :use [Result Ok Err Some None])
@@ -110,13 +113,29 @@
               (unless (or (select/comparison-rule? rule) (= rule select/RULE-DIVIDE))
                 (uses/hint! (mut set) reference (.left tile)))))))
 
+;;; Whether every RETURN the function executes carries its result pieces as
+;;; values (stogir.x64.return-values): the frame buffer is then not needed.
+(defn direct-returns? [(graph g/Graph) (scheduled schedule/Schedule) (matched plan/Plan)]
+  (-> bool)
+  (let [(mut direct) false
+        (mut buffered) false]
+    (for reference (.nodes scheduled)
+      (when (and (= (n/opcode (get (.instructions graph) (cast i64 reference))) 120)
+                 (not (plan/omitted? matched reference)))
+        (if (> (return-values/pieces graph (.operands matched) reference) 0)
+            (set! direct true)
+            (set! buffered true))))
+    (and direct (not buffered))))
+
 (defn build-matched [(graph g/Graph)
                      (scheduled schedule/Schedule)
                      (matched plan/Plan)
+                     (context private/Context)
                      (allocator (dyn Allocator))]
   (-> (Result uses/Set (slice u8)))
   (let [(mut set) (uses/create allocator)
         (mut error) ""]
+    (set! (.private set) context)
     (for [i 0 (len (.instructions graph))]
       (push! (mut (.values set))
              (uses/Value
@@ -133,6 +152,27 @@
                   (set! (.parameter (elem (mut (.values set)) (cast i64 (.reference parameter))))
                         parameter))
                 (free! (mut owned))))))
+    ; The function's own result role (call family): register pieces are
+    ; returned from a private frame buffer whose address PARAM 0 is; an
+    ; indirect result's pointer is saved in a frame slot until RETURN. Both
+    ; objects are owned by the entry node.
+    (when (= error "")
+      (match (incoming/result-role graph)
+        (Err [message] (set! error message))
+        (Ok [role]
+            (cond (and (= (.kind role) 1) (direct-returns? graph scheduled matched)) 0
+                  (= (.kind role) 1)
+                    (push! (mut (.locals set))
+                           (uses/Local :owner (get (.nodes scheduled) 0)
+                                       :size (results/size role) :alignment 8))
+                  (= (.kind role) 2)
+                    (push! (mut (.locals set))
+                           (uses/Local :owner (get (.nodes scheduled) 0) :size 8 :alignment 8))
+                  :else 0))))
+    (for reference (.nodes scheduled)
+      (when (registers/simd-type? (cast i32 (n/type-id (get (.instructions graph)
+                                                            (cast i64 reference)))))
+        (set! (.floating set) true)))
     (for [i 0 (len (.nodes scheduled))]
       (when (= error "")
         (let [reference (get (.nodes scheduled) i)
@@ -161,17 +201,31 @@
                     (Ok [_] 0))
                 (= opcode 71)
                   (let [parameter (.parameter (at (.values set) (cast i64 reference)))]
-                    (cond (= (.kind parameter) 0)
+                    ; Register parameters are fixed definitions; stack
+                    ; parameters and the addresses of the result buffer and
+                    ; of MEMORY aggregates are produced into any register.
+                    (cond (or (= (.kind parameter) 0) (= (.kind parameter) 2))
                             (require! (mut error)
                                       (uses/define-fixed! (mut set) reference position
                                                           (.register parameter)))
-                          (= (.kind parameter) 1)
+                          (or (= (.kind parameter) 1) (= (.kind parameter) 3)
+                              (= (.kind parameter) 4))
                             (require! (mut error) (uses/define! (mut set) reference position))
-                          :else (set! error "unsupported x86-64 scalar parameter")))
+                          :else (set! error "x86-64 PARAM has no declared parameter")))
+                (and (= opcode 120) (> (return-values/pieces graph (.operands matched) reference) 0))
+                  ; A direct return: the pieces go to rax and rdx.
+                  (for [k 0 (return-values/pieces graph (.operands matched) reference)]
+                    (let [value (return-values/piece (.operands matched) reference k)]
+                      (require! (mut error) (uses/use-anywhere! (mut set) value position))
+                      (uses/prefer! (mut set) value
+                                    (if (= k 0) (: registers/RAX i32) registers/RDX))))
                 (= opcode 120)
                   (when (!= ty 0)
                     (require! (mut error) (uses/use-anywhere! (mut set) (.op2 node) position))
-                    (uses/prefer! (mut set) (.op2 node) registers/RAX))
+                    (uses/prefer! (mut set) (.op2 node)
+                                  (if (types/floating? ty)
+                                      (: registers/XMM0 i32)
+                                      registers/RAX)))
                 (= opcode 116)
                   (if (plan/fused? matched reference)
                       (operands! (mut set) (mut error) graph matched

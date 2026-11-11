@@ -19,10 +19,12 @@ FAMILIES = ["integer", "memory+stack", "calls+ABI", "floating", "vector", "switc
             "atomics", "private-leaf/module", "inlining/optimizer", "other"]
 
 FAMILY = {
-    "integer": """bit-literal-identities checked-object compile-image extension-idioms extrema-object
+    "integer": """bit-literal-identities checked-object checked-projection-fold compile-image
+        extension-idioms extrema-object
         integer-arithmetic-object jit-bit-test jit-checked-pressure jit-condition-merge
         jit-condition-merge-zero jit-conditional jit-conversions jit-division jit-extend
-        jit-literal-operands jit-multiply-literal jit-pressure jit-select-diamond
+        jit-literal-operands jit-multiply-literal jit-pressure jit-reciprocal-division
+        jit-select-diamond
         jit-subsumed-guard jit-unary-matrix jit-widened-view-bitcast jit-zero-branch macho
         narrow-binary-object narrow-truth-test trunc-view-coalesce unary-object zext-known-zero""",
     "memory+stack": """bulk frame-direct-access jit-bulk jit-bulk-pairs jit-byte-memory jit-local-frames
@@ -64,17 +66,13 @@ FAMILY = {
 
 # Facade tests that need more than the backend to run on x86-64 Linux.
 NOTES = {
-    "jit-hva-abi": "AArch64 HVA convention; x86-64 expectations to be decided",
-    "jit-hva-incoming": "AArch64 HVA convention; Linux Coil compiler aborts (SysV SSEUP unimplemented)",
-    "jit-hva-outgoing": "AArch64 HVA convention; Linux Coil compiler aborts (SysV SSEUP unimplemented)",
+    "jit-hva-abi": "AArch64 HVA convention. On System V an aggregate of two 16-byte vectors is MEMORY class (by value on the stack, returned through a hidden pointer), which tests/x64-call-abi.coil covers against C; this test itself needs vector values (vector family) and a Coil host callback the Linux compiler cannot build (SysV SSEUP unimplemented)",
+    "jit-hva-incoming": "AArch64 HVA convention; Linux Coil compiler aborts (SysV SSEUP unimplemented); System V equivalents in tests/x64-call-abi.coil",
+    "jit-hva-outgoing": "AArch64 HVA convention; Linux Coil compiler aborts (SysV SSEUP unimplemented); System V equivalents in tests/x64-call-abi.coil",
     "jit-vector-lane-returns": "x86-64 passes the vector arguments through a machine-code probe (the Linux Coil compiler cannot: SysV SSEUP unimplemented)",
     "jit-vector-select-returns": "x86-64 passes the vector arguments through a machine-code probe (the Linux Coil compiler cannot: SysV SSEUP unimplemented)",
-    "jit-bulk-pressure": "calls a machine-code probe: needs the call family",
-    "jit-vector-arithmetic": "pressure graphs call a machine-code probe: needs the call family; x86-64 leaves out trapping divisions",
-    "jit-vector-constants": "call graphs need the call family; x86-64 pool census excludes all-zero and all-ones constants",
-    "jit-vector-locals": "pressure graphs call a machine-code probe: needs the call family",
-    "jit-vector-transport": "pressure graphs call a machine-code probe: needs the call family",
-    "jit-vector-unary": "pressure graphs call a machine-code probe: needs the call family",
+    "jit-vector-arithmetic": "x86-64 leaves out the divisions that trap there (zero divisor, MIN / -1)",
+    "jit-vector-constants": "x86-64 pool census excludes all-zero and all-ones constants (built in the register)",
     "module-execution": "prefix image filler is `ret`+`nop` bytes per machine",
 }
 
@@ -118,6 +116,11 @@ def main():
     for name in names:
         text = texts[name]
         a64 = sorted(set(re.findall(r'"stogir\.a64\.([a-z0-9-]+)"', text)))
+        # The x86-64 backend's own tests: they import its modules directly.
+        # `encode` and `registers` alone are the host layer below it.
+        x64_backend = (sorted(set(re.findall(r'"stogir\.x64\.([a-z0-9-]+)"', text))
+                              - {"encode", "registers"})
+                       if name.startswith("x64-") else [])
         family = ""
         note = ""
         if name.endswith("-link") and not name.startswith("x64-"):
@@ -152,11 +155,11 @@ def main():
             if "target/arch-pick (" in text:
                 guarded.append(name)
                 note = (note + "; " if note else "") + "AArch64 instruction-shape checks guarded"
-        elif name.startswith("x64-"):
-            # Tests of the x86-64 backend's own modules (and of the layers
-            # below it); a few name AArch64 modules for comparison.
-            category = "host-layer"
-            note = "x86-64 backend internals or the image, JIT and object layers"
+        elif x64_backend:
+            # Before the AArch64 test: an x86-64 backend test may borrow a type
+            # from stogir.a64.private-leaf (the shared private-leaf contexts).
+            category = "x64-internal"
+            note = "imports " + " ".join(x64_backend)
         elif a64:
             category = "a64-internal"
             internal = [m for m in a64 if m not in ("compile", "private-leaf")]
@@ -191,9 +194,11 @@ def main():
         "ported-to-facade": "Import `stogir.native.compile` / `stogir.native.private-leaf` / `stogir.jit.native`. Must pass on both hosts; the gate for the x86-64 backend.",
         "a64-internal": "AArch64 backend internals, hand-encoded AArch64 code, or Mach-O. Not expected to run on x86-64.",
         "link-partner": "Links objects that a generator test wrote to /tmp; runs with `--link-flag` (README). Works on Linux once its generators pass there.",
-        "host-layer": "Image, JIT and object-writer layers below the backend, and the `x64-*` tests of the x86-64 backend's own modules.",
+        "host-layer": "Image, JIT and object-writer layers below the backend, including the `x64-*` encoder, image and link tests.",
+        "x64-internal": "x86-64 backend internals (`tests/x64-FAMILY-*.coil`), tested directly against `stogir.x64.*`. Run on the x86-64 host; they skip or check selection only elsewhere.",
     }
-    for category in ["neutral-IR", "ported-to-facade", "a64-internal", "link-partner", "host-layer"]:
+    for category in ["neutral-IR", "ported-to-facade", "a64-internal", "x64-internal", "link-partner",
+                     "host-layer"]:
         out.append(f"| {category} | {counts.get(category, 0)} | {meaning[category]} |")
     out += ["", "## Families of the ported tests", "",
             "The family is the operation family whose x86-64 implementation the test mainly",

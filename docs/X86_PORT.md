@@ -41,7 +41,15 @@ decision changes.
   the parallel-move skeleton, the node walk) is moved to `src/stogir/` and
   shared when an x64 file would otherwise be a copy. Moving is preferred over
   copying; a copy needs a reason written at the top of the file.
-  Moved so far: `stogir.phi-coalesce` (was `stogir.a64.phi-coalesce`).
+  Moved so far: `stogir.phi-coalesce` (was `stogir.a64.phi-coalesce`),
+  `stogir.tail-eligibility` (the target-neutral proofs of
+  `stogir.a64.tail-plan`). `x64/private-leaf` uses the context, registry and
+  publication functions of `stogir.a64.private-leaf` as they are (its neutral
+  state types are exported for that); only leaf creation, the clobber mask,
+  reference validation and binding are x86-64's own.
+  Also moved: `stogir.reciprocal` (the magic-number recipes of `stogir.a64.reciprocal`)
+  and `stogir.view-coalesce` (the view joining of `stogir.a64.coalesce`;
+  each backend's `coalesce` module says which nodes are views).
   The x64 driver, transfers and fixups are written again rather than shared,
   each with its reason at the top of the file (4-byte words, AArch64
   scratches, shrink-wrapping interleaved with the node walk).
@@ -65,7 +73,7 @@ registers are 32..47.
 | Integer arguments | rdi rsi rdx rcx r8 r9 |
 | Float arguments | xmm0..xmm7 |
 | Results | rax, rdx; xmm0, xmm1 |
-| Indirect call target, tail-call target | r11 |
+| Indirect call target, tail-call target | rax (r11 for a variadic call, where al is the vector count) |
 | Parallel-move cycle holder | r11, xmm15 |
 
 Two scratch registers per bank mirror a64's x16/x17 and v30/v31 so emitters
@@ -88,6 +96,20 @@ high bits (compares, SHR, SAR, rotates, the truth test) use the 8- and 16-bit
 instruction forms at the type's own width; DIV and MOD extend narrow operands
 to 32 bits. A returned value is extended to 32 bits by its signedness. The
 rule is written out at the top of `x64/value.coil`.
+
+Views. Because the bits above a value's width are unspecified, the low part
+of a wider value is already a valid narrower one: COPY, a same-size integer
+BITCAST and every integer TRUNC are *views*. They are emitted as nothing when
+source and result share a register and otherwise as a move of the whole
+64-bit register, and `x64/coalesce.coil` joins each with its source into one
+allocation group (`stogir.view-coalesce`). The whole-register move matters:
+a narrow view can share its group with a 64-bit value that lives on, so a
+move at the view's own width would cut that value. A conversion to BOOL is
+not a view (it canonicalizes to 0 or 1), nor is SEXT or ZEXT.
+
+Results the IR leaves undefined, chosen to match the AArch64 backend:
+CTLZ(0) is the type's width; CTTZ(0) is 64 for 64-bit types and 32 for
+every narrower type; ABS of the minimum is the minimum.
 
 ## What x86 needs that a64 did not
 
@@ -117,13 +139,16 @@ rule is written out at the top of `x64/value.coil`.
      Division by zero and the overflowing signed quotient trap (#DE); the IR
      leaves both undefined and nothing is checked. AArch64 hardware returns
      0 / the dividend / the minimum for those inputs, and
-     `tests/jit-division.coil` checks exactly those results, so that test
-     dies with SIGFPE on x86-64 until its zero-divisor and overflow inputs
-     are made target-specific or this backend emits a guarded sequence.
-     Trapping matches what an LLVM-built program does on x86-64. Division by a constant is
-     a plain `div` until `x64/reciprocal.coil` selects better rules.
-   - One-operand `mul`/`imul` and `cmpxchg` (families not written yet) follow
-     the same pattern: clobber, copy in, prefer.
+     `tests/jit-division.coil` checks exactly those results on AArch64 and,
+     on x86-64, that the same inputs die with SIGFPE. Trapping matches what
+     an LLVM-built program does on x86-64. Division by a constant other
+     than 0, 1 and -1 uses no `div` (`x64/reciprocal.coil`: shifts for
+     powers of two of either sign, multiply-high otherwise); 0, 1 and -1
+     keep the hardware division and with it the trap.
+   - One-operand `mul`/`imul` follow the same pattern (clobber, copy in,
+     prefer): unsigned 64-bit MUL_OV (`x64/checked.coil`) and the 64-bit
+     multiply-high of division by a constant (`x64/reciprocal.coil`).
+     `cmpxchg` (atomics, not written yet) will too.
 3. **Flags.** Almost every ALU instruction writes flags. Rules:
    - Moves emitted between any two nodes (spills, reloads, phi moves, constant
      and address materialization) never write flags: `mov`, `lea`, `movaps`,
@@ -135,7 +160,11 @@ rule is written out at the top of `x64/value.coil`.
      edge moves, `movzx` after `setcc`) is emitted.
    - No flag value is live between two nodes, so a node's own code may use
      any instruction once its last flag consumer is emitted (DIV zeroes edx
-     with `xor`).
+     with `xor`). The one exception: a checked producer (ADD_OV, SUB_OV,
+     MUL_OV) leaves its overflow condition in the flags for the OVERFLOW
+     projection, which the schedule keeps directly behind it
+     (`stogir.checked-schedule`); only allocator transfers, which are moves,
+     can sit between the two (`x64/checked.coil`, as NZCV on AArch64).
    - Floating compares use `ucomiss/ucomisd` and handle the parity flag for
      unordered operands exactly as upstream's `ir_emit_cmp_fp` does
      (`x64/fcompare.coil`): each predicate picks the operand order whose one
@@ -148,12 +177,33 @@ rule is written out at the top of `x64/value.coil`.
      zeroing, `movaps`/`movss`/`movsd`, `andps`, `pcmpeqd` and the like may
      sit between a flag producer and its consumer, unlike `xor r, r`.
 4. **Variable-length code.** Offsets are bytes. A branch is emitted as rel32
-   with a fixup record; shrinking to rel8 and loop alignment are a separate
-   pass over records, not word arithmetic. There are no veneers in text.
-   A record (`x64/fixups.coil`) holds the instruction's first byte, its
-   displacement field, its label and its condition; labels are a table of
-   byte offsets. Neither the relaxation pass nor alignment padding exists
-   yet: the block layout's alignment requests are ignored.
+   with a fixup record (`x64/fixups.coil`: the instruction's first byte, its
+   displacement field, its label, its condition, and whether it is short);
+   labels are a table of byte offsets. There are no veneers in text. Once a
+   function's code, edge stubs and jump tables are emitted, `fixups/relax!`
+   shrinks every `jmp`/`jcc` whose displacement fits rel8, iterating to a
+   fixed point (branches only shrink), inserts alignment padding, and moves
+   every recorded offset: labels, branch records, jump-table words and
+   bases, the buffer's references and text-data ranges. A branch that crosses
+   an alignment point is charged that point's full padding limit, so no
+   later padding can push a shrunk branch out of reach. Then the
+   displacements are written and `fixups/verify` decodes every branch again
+   and checks its target (in every compile; it is a few instructions per
+   branch). The floating constant pool is appended after all of this.
+   - Loop tops are aligned to 16 bytes with multi-byte NOPs when a jump
+     really goes back to them and the padding is at most 10 bytes
+     (`fixups/loop-alignment` is the policy; `function/loop-top-candidate?`
+     names the labels that ask). Functions are aligned to 16 bytes.
+   - Jump tables are 32-bit `target - table` words behind the function's
+     code, 4-byte aligned, reached with `lea r11, [rip + table]` (an ADDRESS
+     fixup record).
+   - What the last instruction left in the flags is recorded with the buffer
+     (`x64/code.coil`, `Flags`): a compare with zero directly behind the
+     instruction that produced the value emits nothing, and its consumer
+     reads a condition those flags answer (`emit/zero-flags!`). An emitter
+     that ends in a flag-setting instruction for its result calls
+     `code/note-flags!`; nothing else is needed to stay correct, since any
+     byte emitted afterwards and every block start invalidate the record.
 5. **Memory operands and LEA.** Done by the memory family
    (`x64/memory.coil`, `fuse!`), after the core's own tiles and comparison
    fusion:
@@ -172,8 +222,12 @@ rule is written out at the top of `x64/value.coil`.
      `op [a], x` (ADD SUB AND OR XOR with a register or immediate; NOT, NEG).
    - The scratch contract: a memory operand names allocated registers, rsp,
      rbp and at most r10, so r11 is free for the instruction's other operand.
-   `lea` for add-with-shift and three-operand adds of values (not addresses)
-   is still to do.
+   - Sums of values (not addresses) take the address form afterwards
+     (`x64/lea.coil`, RULE-LEA): what is still a register ADD, or ADD/SUB of
+     an immediate, once the memory family chose its operands becomes a base,
+     a scaled index and a displacement, absorbing single-use producers of
+     its block; multiplication by 2, 3, 5 and 9 is a `lea` and by other
+     powers of two a shift.
 
 ## Floating point
 
@@ -214,9 +268,11 @@ operand helpers in `x64/value.coil`, "Floating values").
   are, smaller ones go through `cvttsd2si`/`cvtsi2sd` or the add-and-subtract
   2^52 identity and keep the operand's sign. They assume MXCSR's default
   round-to-nearest mode, like every other arithmetic instruction. FMA has no
-  baseline instruction and is rejected with a clear error until the call
-  family can call libm's `fma`/`fmaf` from inside a node (which also needs an
-  image, not bare text).
+  baseline instruction: it is a call to libm's `fma` / `fmaf` (operands in
+  xmm0..xmm2 by one parallel group with the preservation transfers, every
+  caller-saved register clobbered, result in xmm0; `call/runtime-constraints!`,
+  `call/emit-runtime!`, a PLT32 reference to the runtime symbol). That needs
+  an image; `compile/text` reports a clear error for a function with FMA.
 - **Conversions.** INT2FP is exact for every integer type (u64 with the top
   bit set is halved with a sticky low bit and the result doubled). FP2INT is
   `cvttss2si/cvttsd2si`; u64 results add a second conversion of `x - 2^63`.
@@ -259,8 +315,15 @@ callee-saved area). Differences:
   (`lea`, or folded into a memory operand); it has no register.
 - rsp is 16-byte aligned at every call: entry rsp + 8 + N is a multiple of 16.
   N is the frame contents rounded up to 8 modulo 16; a function without
-  frame contents (no spill, no preserved register, no frame object) has
-  N = 0 and no prologue.
+  frame contents (no spill, no preserved register, no frame object) that
+  executes no call instruction has N = 0 and no prologue. A function that
+  calls always has a frame (N = 8 at least); one whose only calls are tail
+  jumps does not need one.
+- Two frame objects belong to the function's result role and are owned by its
+  entry node: the 16-byte buffer of register result pieces (PARAM 0 is its
+  address; RETURN loads the pieces from it) and the 8-byte slot in which the
+  prologue saves the hidden pointer of an indirect result (RETURN reloads it
+  into rax).
 - Frameless leaves may use the 128-byte red zone for spills. Not done yet:
   a function with any spill gets a frame.
 - Traps are `ud2`.
@@ -296,7 +359,43 @@ callee-saved area). Differences:
   `bswap` and `cmp`); their headers give the entry points and what they
   write.
 - Private leaf calls: the written-register set of a leaf is recorded while it
-  is emitted (no decoder).
+  is emitted (no decoder). `code/Buffer.written` collects every register an
+  allocated value occupies, every declared clobber, the scratches and the
+  result registers; `code/Buffer.calls` is set by any call or tail jump. An
+  emitter may therefore write only its destination, the scratches and
+  registers it declared with `uses/clobber!`; anything else it must record
+  with `code/wrote!`. A function without calls or relocations carries the
+  record in `Image.leaf-effects`, and `x64/private-leaf` narrows the clobbers
+  of a direct call to a registered leaf to (leaf writes + the call's own
+  argument registers) within the caller-saved allocatable set.
+- An indirect callee is moved into rax by the same parallel group that places
+  the arguments (no argument uses rax and every value living there is being
+  moved out anyway), so the reserved scratches stay free for that group's
+  cycles. A variadic call moves it on to r11 before al is set.
+- The call's own parallel group also carries the allocator's transfers at the
+  call's definition position (values leaving caller-saved registers): the
+  call family announces the position and the driver hands the transfers to
+  `call/emit-call!` instead of emitting them itself.
+- Tail calls (`x64/tail-plan.coil`): `jmp rel32` / `jmp rax` when no frame
+  address can reach the target, no ARGVAL is passed, the call is not
+  variadic, its stack arguments fit in the ones the function received and
+  the result role matches. Stack arguments are built in the outgoing area
+  and moved over the incoming ones, highest slot first, before the frame is
+  released; an anchored (rbp) frame finds the incoming slots through its
+  base and restores rsp from it, so functions with ALLOCA jump too. Otherwise a TAILCALL is a call
+  followed by the epilogue, and an ordinary CALL + RETURN stays as it is.
+- A builtin memmove of a literal size up to 256 bytes and a builtin memcmp
+  of a known count up to 16 are expanded inline (`call/inline-builtin!`,
+  `x64/block-move`, `x64/block-compare`); other builtin calls reach their
+  runtime routine. A builtin call in tail position is a jump to the routine.
+- Integer-pair results avoid memory in both directions. A function whose
+  result buffer can be promoted away returns the piece values straight in
+  rax/rdx and has no buffer (`x64/return-values.coil`, on the neutral
+  lowering of `a64/return-values`); a CALL whose pieces are only loaded back
+  from a private frame object defines those loads itself in rax/rdx
+  (`a64/result-projections`, which is target-neutral, run by `x64/match`).
+  Mixed and floating pairs use the frame buffer and the result place.
+- VA_START/VA_ARG have no lowering.
 
 ## Image and relocations
 
@@ -331,13 +430,13 @@ into a GOT load (`docs/X86_ADAPTER_REQUESTS.md`, item 7).
 ## Optimization levels
 
 As on AArch64: level 0 is rejected, level 1 generates the graph as given,
-levels 2 and 3 run SCCP first. The level-3 stages of the a64 path
-(global-load forwarding, fact folding, select diamonds, loop-load hoisting,
-rotation, loop strength reduction, the vectorizer) are not run on x86-64
-yet (`LEVEL-THREE-CHAIN` in `x64/compile.coil`): the strength stage uses an
-AArch64 cost module and the vectorizer produces vector operations no family
-emits. Level 3 generates what level 2 does. `a64.constant-hoist` and
-`a64.return-values` are not run either.
+levels 2 and 3 run SCCP first. Level 3 then runs the graph stages of the a64
+path under the same context switches (global-load forwarding, the fact fold
+or branch facts, select diamonds or if-conversion, loop-load hoisting,
+rotation, loop strength reduction with `x64/strength-cost.coil`). Its last
+stage, the loop vectorizer, creates vector operations and stays off behind
+`LEVEL-THREE-VECTORIZE` in `x64/compile.coil` until the vector family emits
+them. `a64.constant-hoist` and `a64.return-values` are not run.
 
 ## Phases
 

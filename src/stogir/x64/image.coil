@@ -15,14 +15,23 @@
 ;;; private names never collide. The a64 module of this name is not shared:
 ;;; its relocation kinds come in ADRP/ADD pairs without addends; the data
 ;;; builders have the same shape.
+;;;   PLT32 to a runtime    libm's `fma` / `fmaf`, which FMA calls
+;;;   routine               (code/RUNTIME-*): an undefined global symbol
+;;;
+;;; A private-leaf context may later bind an undefined function symbol to a
+;;; private body (stogir.x64.private-leaf/bind-image!). The emitter's leaf
+;;; record (code/Buffer `written`, `calls`) is carried into
+;;; `Image.leaf-effects` when the function makes no call and has no reference.
 (module stogir.x64.image)
 (import "stogir.bytes" :as bytes)
 (import "stogir.graph" :as g)
+(import "stogir.node" :as n)
 (import "stogir.image" :as image)
 (import "stogir.long-constant" :as long)
 (import "stogir.node" :as n)
 (import "stogir.strings" :as strings)
 (import "stogir.symbols" :as symbols)
+(import "stogir.target" :as target)
 (import "stogir.text-data" :as text-data)
 (import "stogir.x64.code" :as code)
 (import "coil.alloc" :use [Allocator])
@@ -181,13 +190,23 @@
         (match (get targets (.target pending))
           (Some [_] 0)
           (None []
-                (match (register-target! (mut output) graph (.target pending))
+                (match (if (code/runtime? pending)
+                           (image/symbol! (mut output)
+                                          (if (= (.target pending) code/RUNTIME-FMA)
+                                              (target/os-pick "_fma" "fma")
+                                              (target/os-pick "_fmaf" "fmaf"))
+                                          0 0)
+                           (register-target! (mut output) graph (.target pending)))
                   (Err [message] (set! error message))
                   (Ok [target] (set! (mut targets) (.target pending) target)))))))
     (for pending (.references source)
       (when (= error "")
-        (match (relocation-target! (mut output) graph pending targets (mut addresses)
-                                   (mut literals) allocator)
+        (match (if (code/runtime? pending)
+                   (match (get targets (.target pending))
+                     (Some [id] (Ok [i32 (slice u8)] id))
+                     (None [] (Err "runtime routine symbol missing")))
+                   (relocation-target! (mut output) graph pending targets (mut addresses)
+                                       (mut literals) allocator))
           (Err [message] (set! error message))
           (Ok [destination]
               (unless (image/relocate! (mut output)
@@ -201,4 +220,6 @@
     (free! (mut targets))
     (free! (mut addresses))
     (free! (mut literals))
+    (when (and (not (.calls source)) (= (len (.references source)) 0))
+      (set! (.leaf-effects output) (| image/LEAF-RECORDED (.written source))))
     (if (= error "") (Ok output) (do (image/release! (mut output)) (Err error)))))

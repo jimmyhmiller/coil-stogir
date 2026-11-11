@@ -13,6 +13,8 @@
 ;;;     other user needs the Boolean.
 ;;;   * A floating comparison (stogir.x64.fcompare, selected by the floating
 ;;;     family) fuses the same way, into IF, integer COND and floating COND.
+;;;   * Sums and small multiplications take the address form, and an address
+;;;     form absorbs single-use producers that fit it (stogir.x64.lea).
 ;;;   * Every other node goes to its operation family
 ;;;     (stogir.x64.families/select!).
 ;;;   * Afterwards the memory family selects address modes, folds single-use
@@ -33,7 +35,10 @@
 (import "stogir.schedule" :as schedule)
 (import "stogir.matched-uses" :as machine)
 (import "stogir.conditional" :as conditional)
+(import "stogir.x64.call" :as call)
+(import "stogir.a64.result-projections" :as result-projections)
 (import "stogir.x64.families" :as families)
+(import "stogir.x64.lea" :as lea)
 (import "stogir.x64.plan" :as plan)
 (import "stogir.x64.reciprocal" :as reciprocal)
 (import "stogir.x64.select" :as select)
@@ -50,10 +55,12 @@
   (free! (mut (.offsets state)))
   (free! (mut (.indices state)))
   (free! (mut (.index-shifts state)))
+  (free! (mut (.tails state)))
   (free! (mut (.omitted state)))
   (free! (mut (.counts state)))
   (free! (mut (.blocks state)))
-  (free! (mut (.protected state))))
+  (free! (mut (.protected state)))
+  (free! (mut (.switch-extensions state))))
 
 ;;; Let IF or COND `reference` read the flags of the comparison `source`.
 (defn fuse! [(state (mut plan/Matching)) (graph g/Graph) (reference i32) (source i32)
@@ -97,10 +104,12 @@
             :offsets (ArrayList::new [i64] a)
             :indices (ArrayList::new [i32] a)
             :index-shifts (ArrayList::new [i32] a)
+            :tails (ArrayList::new [i32] a)
             :omitted (ArrayList::new [bool] a)
             :counts (ArrayList::new [i64] a)
             :blocks (ArrayList::new [i32] a)
-            :protected (ArrayList::new [bool] a))
+            :protected (ArrayList::new [bool] a)
+            :switch-extensions (ArrayList::new [i32] a))
         (mut block) (: 0 i32)
         (mut error) ""]
     (fill/append! (mut (.tiles state)) cells (select/none))
@@ -132,6 +141,10 @@
                     (when (> value 0)
                       (set! (mut (.counts state)) (cast i64 value)
                             (+ (get (.counts state) (cast i64 value)) 1)))))))))
+    ; Tail calls are selected for the whole function at once (call family).
+    (match (call/select-tails! (mut state) graph scheduled roots a)
+      (Err [message] (set! error message))
+      (Ok [_] 0))
     ; Tiles, and the families' own selection.
     (for reference (.nodes scheduled)
       (when (= error "")
@@ -158,10 +171,11 @@
                         (set! (mut (.tiles state)) index
                               (if (= (.rule tile) select/RULE-DIVIDE)
                                   (reciprocal/select graph reference tile)
-                                  tile))))
+                                  (lea/strength tile)))))
                 :else 0))))
     ; Fusion, in schedule order.
     (when (and fuse (= error ""))
+      (switch/retire-extensions! (mut state) graph scheduled)
       (for reference (.nodes scheduled)
         (let [node (get (.instructions graph) (cast i64 reference))
               opcode (cast i32 (n/opcode node))]
@@ -181,6 +195,10 @@
       (match (families/fuse! (mut state) graph scheduled a)
         (Err [message] (set! error message))
         (Ok [_] 0)))
+    ; Address forms, over what is still a register sum after that.
+    (when (= error "")
+      (for reference (.nodes scheduled)
+        (lea/fuse! (mut state) graph reference fuse)))
     (if (!= error "")
         (do (release-matching! (mut state)) (Err error))
         (let [(mut operands) (machine/build graph scheduled (.omitted state)
@@ -203,9 +221,28 @@
                   (push! (mut (.inputs operands)) (.op3 node))
                   (set! (mut (.ranges operands)) index
                         (machine/Range :offset offset :count (+ (.count range) 2)))))))
+          ; An address-form node reads the terms of its tile: its own
+          ; operands, or those of the producers it absorbed.
+          (for reference (.nodes scheduled)
+            (let [index (cast i64 reference)
+                  tile (get (.tiles state) index)]
+              (when (and (= (.rule tile) select/RULE-LEA) (not (get (.omitted state) index)))
+                (let [offset (len (.inputs operands))]
+                  (when (> (.left tile) 0) (push! (mut (.inputs operands)) (.left tile)))
+                  (when (> (.right tile) 0) (push! (mut (.inputs operands)) (.right tile)))
+                  (set! (mut (.ranges operands)) index
+                        (machine/Range :offset offset
+                                       :count (- (len (.inputs operands)) offset)))))))
+          ; A CALL whose integer result pieces are only loaded back from a
+          ; private frame object defines those loads itself, in rax and rdx
+          ; (the target-neutral proof of stogir.a64.result-projections).
+          (when fuse
+            (result-projections/select! graph scheduled (.blocks state) (.protected state)
+                                        (.tails state) (mut operands) a))
           (free! (mut (.counts state)))
           (free! (mut (.blocks state)))
           (free! (mut (.protected state)))
+          (free! (mut (.switch-extensions state)))
           (Ok (plan/Plan
                 :operands operands
                 :tiles (.tiles state)
@@ -214,7 +251,8 @@
                 :addresses (.addresses state)
                 :offsets (.offsets state)
                 :indices (.indices state)
-                :index-shifts (.index-shifts state)))))))
+                :index-shifts (.index-shifts state)
+                :tails (.tails state)))))))
 
 (defn build [(graph g/Graph) (scheduled schedule/Schedule) (roots (slice i32))
              (a (dyn Allocator))] (-> (Result plan/Plan (slice u8)))

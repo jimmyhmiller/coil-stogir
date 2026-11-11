@@ -1,0 +1,203 @@
+;;; Seeded differential stress of x86-64 argument placement and call
+;;; lowering. For each random signature (integers of every width, FLOAT,
+;;; DOUBLE, one- and two-eightbyte groups, MEMORY aggregates) a generated
+;;; function F with that signature
+;;;   1. calls c_ints10 with constants, so every parameter is live across a
+;;;      call (moved to a preserved register or a spill slot),
+;;;   2. calls c_capture with all its parameters, under the same signature,
+;;;   3. returns the sum of both results.
+;;; c_inject calls F with every argument register and 32 stack words loaded
+;;; from a seed image; c_capture stores the image it receives. The two images
+;;; must agree at every location the signature uses, bit for bit at the
+;;; value's width, and narrow integers must arrive extended to 32 bits.
+;;;
+;;; The C side is tests/x64-call-helpers.c; run with tools/x86/call-tests.sh.
+(module stogir.tests.x64-call-stress)
+(import "stogir.graph" :as g)
+(import "stogir.calls" :as calls)
+(import "stogir.call-groups" :as groups)
+(import "stogir.call-results" :as results)
+(import "stogir.types" :as types)
+(import "stogir.jit.native" :as jit)
+(import "stogir.x64.abi-arguments" :as arguments)
+(import "stogir.x64.testing" :as t)
+(import "stogir.x64.call-testing" :as ct)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(extern c_ints10 :cc (cc/C) [i64 i64 i64 i64 i64 i64 i64 i64 i64 i64] (-> i64))
+(extern c_capture :cc (cc/C) [] (-> i64))
+(extern c_inject :cc (cc/C) [(ptr u8)] (-> i64))
+(extern c_seed_words :cc (cc/C) [] (-> (ptr u64)))
+(extern c_frame_words :cc (cc/C) [] (-> (ptr u64)))
+
+(defn address-of [(f Code)] (-> Code)
+  `(primitive/cast u64 (primitive/cast (ptr u8) (fnptr-of ~f))))
+
+(def NAMES ["c_ints10" "c_capture"])
+
+(def SCALARS [(: 11 u8) 11 11 5 6 10 4 9 3 8 2 12 12 13])
+
+(defn word [(base (ptr u64)) (index i64)] (-> u64)
+  (load (primitive/cast (ptr u64) (+ (primitive/cast u64 base) (cast u64 (* index 8))))))
+
+(defn byte-at [(base (ptr u64)) (offset i64)] (-> u8)
+  (load (primitive/cast (ptr u8) (+ (primitive/cast u64 base) (cast u64 offset)))))
+
+(defn set-word! [(base (ptr u64)) (index i64) (value u64)] (-> void)
+  (store! (primitive/cast (ptr u64) (+ (primitive/cast u64 base) (cast u64 (* index 8)))) value))
+
+;;; Whether the 64-bit word `got` carries the value of type `ty` whose
+;;; incoming bits were `sent`: the type's own bits must agree, and a narrow
+;;; integer must have been extended to 32 bits by its signedness.
+(defn carried? [(ty u8) (sent u64) (got u64)] (-> bool)
+  (cond (or (= ty 12) (= ty 5) (= ty 11) (= ty 6)) (= sent got)
+        (or (= ty 13) (= ty 10) (= ty 4)) (= (& sent 0xFFFFFFFF) (& got 0xFFFFFFFF))
+        :else
+          (let [bits (cast u64 (* 8 (types/size (cast i32 ty) 8)))
+                low (& sent (- (<< (: 1 u64) bits) 1))
+                negative (and (types/signed? (cast i32 ty))
+                              (!= (& low (<< (: 1 u64) (- bits 1))) 0))
+                extended (if negative (| low (& 0xFFFFFFFF (^ (- (<< (: 1 u64) bits) 1) 0xFFFFFFFFFFFFFFFF))) low)]
+            (= (& got 0xFFFFFFFF) extended))))
+
+(defn one! [(tally (mut t/Tally)) (state (mut u64)) (case i64) (a (dyn Allocator))] (-> void)
+  (let [(mut tys) (ArrayList::new [u8] a)
+        (mut descriptors) (ArrayList::new [groups/Group] a)
+        (mut memory) (ArrayList::new [groups/Memory] a)
+        count (+ 1 (cast i64 (% (t/random! (mut state)) 14)))
+        (mut i) (: 0 i64)]
+    ; A random signature: scalars, MEMORY aggregates, and groups over one or
+    ; two adjacent eightbyte-sized scalars.
+    (while (< i count)
+      (let [roll (% (t/random! (mut state)) 16)]
+        (cond
+          (= roll 0)
+            (do
+              (push! (mut memory)
+                     (groups/Memory :ordinal (cast i32 i)
+                                    :size (+ 1 (cast i64 (% (t/random! (mut state)) 40)))
+                                    :alignment (if (= (% (t/random! (mut state)) 3) 0) 16 8)))
+              (push! (mut tys) 6))
+          (and (< roll 5) (< (+ i 1) count))
+            (let [pick [(: 11 u8) 5 12 13]
+                  first (get pick (cast i64 (% (t/random! (mut state)) 4)))
+                  second (get pick (cast i64 (% (t/random! (mut state)) 4)))]
+              (push! (mut descriptors)
+                     (ct/group (cast i32 i) 2
+                               (if (and (= first 13) (= second 13))
+                                   8
+                                   (if (= (% (t/random! (mut state)) 4) 0) 16 8))))
+              (push! (mut tys) first)
+              (push! (mut tys) second)
+              (set! i (+ i 1)))
+          :else
+            (push! (mut tys)
+                   (get SCALARS (cast i64 (% (t/random! (mut state)) (cast u64 (len SCALARS))))))))
+      (set! i (+ i 1)))
+    (match (arguments/plan-result (slice tys) (len tys) false (slice descriptors) (slice memory)
+                                  (results/ordinary) a)
+      (Err [message]
+           (println "stress case {}: placement failed: {}" case message)
+           (t/fail! (mut tally)))
+      (Ok [planned]
+          (let [(mut planned) planned]
+            ; The seed image has 32 stack words.
+            (when (<= (.stack planned) 256)
+              (let [(mut graph) (g/create a)
+                    start (t/start! (mut graph))
+                    (mut proto) (ct/prototype false 11 (slice tys) (slice descriptors) a)
+                    (mut ten) (ct/prototype false 11 [(: 11 u8) 11 11 11 11 11 11 11 11 11] [] a)
+                    (mut passed) (ArrayList::new [i32] a)
+                    (mut constants) (primitive/zeroed (array i32 10))
+                    (mut record) (: 0 i64)]
+                (for item memory
+                  (ct/memory! (mut proto) (.ordinal item) (.size item) (.alignment item)))
+                (ct/declare! (mut graph) proto a)
+                (for [k 0 (len tys)]
+                  (let [parameter (t/param! (mut graph) start (cast i32 (get tys k)) (cast i32 k))]
+                    (if (and (< record (len memory))
+                             (= (cast i64 (.ordinal (get memory record))) k))
+                        (do
+                          (push! (mut passed)
+                                 (ct/by-value! (mut graph) parameter
+                                               (cast i32 (.size (get memory record)))
+                                               (.alignment (get memory record))))
+                          (set! record (+ record 1)))
+                        (push! (mut passed) parameter))))
+                (for [k 0 10]
+                  (set! (mut constants) k (t/constant! (mut graph) 11 (cast u64 (+ k case)))))
+                (let [c0 (ct/call! (mut graph) ten start (ct/named! (mut graph) "c_ints10")
+                                   constants a)
+                      c1 (ct/call! (mut graph) proto c0 (ct/named! (mut graph) "c_capture")
+                                   (slice passed) a)
+                      ret (t/return! (mut graph) c1 11 (t/binary! (mut graph) 26 11 c0 c1))
+                      table [(address-of c_ints10) (address-of c_capture)]
+                      (mut loaded) (ct/build "stress" graph start [ret] NAMES table a)
+                      seed (c_seed_words)
+                      frame (c_frame_words)]
+                  (set! (.functions tally) (+ (.functions tally) 1))
+                  (for [k 0 46]
+                    (set-word! seed k (t/random! (mut state)))
+                    (set-word! frame k 0))
+                  (let [result (c_inject (ct/entry loaded))
+                        (mut good)
+                          (= result
+                             (+ 12345 (c_ints10 case (+ case 1) (+ case 2) (+ case 3) (+ case 4)
+                                                (+ case 5) (+ case 6) (+ case 7) (+ case 8)
+                                                (+ case 9))))]
+                    (for [k 0 (len (.parts planned))]
+                      (let [part (get (.parts planned) k)
+                            ty (get tys k)
+                            register (.register part)]
+                        (cond
+                          (> (.memory part) 0)
+                            (for [b 0 (.memory part)]
+                              (when (!= (byte-at seed (+ 112 (.offset part) b))
+                                        (byte-at frame (+ 112 (.offset part) b)))
+                                (set! good false)))
+                          (>= register 32)
+                            (unless (carried? ty (word seed (+ 6 (cast i64 (- register 32))))
+                                              (word frame (+ 6 (cast i64 (- register 32)))))
+                              (set! good false))
+                          (>= register 0)
+                            (let [slot (cond (= register 7) (: 0 i64) (= register 6) 1
+                                             (= register 2) 2 (= register 1) 3
+                                             (= register 8) 4 :else 5)]
+                              (unless (carried? ty (word seed slot) (word frame slot))
+                                (set! good false)))
+                          :else
+                            (unless (carried? ty (word seed (+ 14 (/ (.offset part) 8)))
+                                              (word frame (+ 14 (/ (.offset part) 8))))
+                              (set! good false)))))
+                    (set! (.checks tally) (+ (.checks tally) 1))
+                    (unless good
+                      (when (< (.failures tally) 10)
+                        (println "stress case {}: argument image differs ({} parameters, {} stack bytes)"
+                                 case (len tys) (.stack planned))
+                        (for ty tys (print " {}" ty))
+                        (println ""))
+                      (t/fail! (mut tally))))
+                  (jit/release-image! (mut loaded)))
+                (free! (mut passed))
+                (calls/release! (mut proto))
+                (calls/release! (mut ten))
+                (g/release! (mut graph))))
+            (arguments/release! (mut planned)))))
+    (free! (mut tys))
+    (free! (mut descriptors))
+    (free! (mut memory))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 call stress: skipped (not an x86-64 host)") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)
+            (mut state) (: 0x9E3779B97F4A7C15 u64)]
+        (for [case 0 3000] (one! (mut tally) (mut state) case a))
+        (println "x64 call stress: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))

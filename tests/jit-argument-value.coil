@@ -60,6 +60,33 @@
         (set! i (+ i 1))))
     (if (= errors 0) 7 errors)))
 
+;;; System V passes an ARGVAL as the aggregate's bytes in the stack arguments
+;;; (upstream `pass_struct_by_val`), not as a pointer to a private copy. With
+;;; ten aggregates of 17 to 24 bytes, the copies are thirty consecutive stack
+;;; words, three per aggregate, and the three trailing integers (the original's
+;;; address, the size and the alignment) take rdi, rsi and rdx. This callback
+;;; receives exactly that image through the C ABI: six integer register
+;;; parameters, then the thirty stack words. Every copy must hold the pattern
+;;; and the original must be untouched. (A by-value struct parameter would say
+;;; the same thing, but the Linux Coil compiler does not yet receive MEMORY
+;;; class aggregates correctly in a C-convention function.)
+(defn inspect-words :cc (cc/C) [(original u64) (size u64) (alignment u64)
+                                (r3 u64) (r4 u64) (r5 u64)
+                                (w0 u64) (w1 u64) (w2 u64) (w3 u64) (w4 u64) (w5 u64) (w6 u64) (w7 u64) (w8 u64) (w9 u64) (w10 u64) (w11 u64) (w12 u64) (w13 u64) (w14 u64) (w15 u64) (w16 u64) (w17 u64) (w18 u64) (w19 u64) (w20 u64) (w21 u64) (w22 u64) (w23 u64) (w24 u64) (w25 u64) (w26 u64) (w27 u64) (w28 u64) (w29 u64)] (-> u64)
+  (let [words [w0 w1 w2 w3 w4 w5 w6 w7 w8 w9 w10 w11 w12 w13 w14 w15 w16 w17 w18 w19 w20 w21 w22 w23 w24 w25 w26 w27 w28 w29]
+        (mut errors) (: 0 u64)]
+    (for [copy 0 10]
+      (for [i 0 (cast i64 size)]
+        (let [word (get words (+ (* copy 3) (/ i 8)))
+              byte (cast u8 (& (>> word (cast u64 (* 8 (% i 8)))) 255))]
+          (when (!= byte (pattern i)) (set! errors (+ errors 1))))))
+    (let [p (primitive/cast (ptr u8) original)]
+      (for [i 0 (cast i64 size)]
+        (when (!= (primitive/load (primitive/index p i)) (pattern i))
+          (set! errors (+ errors 1)))))
+    (when (or (< size 17) (> size 24)) (set! errors (+ errors 1)))
+    (if (= errors 0) 7 (+ 1000000 errors))))
+
 (defn check [(size i32)
              (alignment i32)
              (dynamic? bool)
@@ -116,8 +143,8 @@
           (set! control loaded))
         (set! i (+ i 1)))
       (match (if variadic?
-                 (calls/create 25 5 [(: 6 u8) 6 6 6 6 6 6 6] allocator)
-                 (calls/create 9 5 [(: 6 u8) 6 6 6 6 6 6 6 6 6 6 5 5] allocator))
+                 (calls/create (target/arch-pick 25 24) 5 [(: 6 u8) 6 6 6 6 6 6 6] allocator)
+                 (calls/create (target/arch-pick 9 8) 5 [(: 6 u8) 6 6 6 6 6 6 6 6 6 6 5 5] allocator))
         (Err [message] (println "{}" message) (set! failures (+ failures 1)))
         (Ok [prototype]
             (let [(mut prototype) prototype
@@ -203,9 +230,13 @@
                                                              f64)
                                                       (.base image))
                                     target
-                                      (primitive/cast u64
-                                                      (primitive/cast (ptr u8)
-                                                                      (fnptr-of inspect)))]
+                                      (target/arch-pick
+                                        (primitive/cast u64
+                                                        (primitive/cast (ptr u8)
+                                                                        (fnptr-of inspect)))
+                                        (primitive/cast u64
+                                                        (primitive/cast (ptr u8)
+                                                                        (fnptr-of inspect-words))))]
                                 (set! i 0)
                                 (while (< i (+ (cast i64 size) 16))
                                   (push! (mut bytes)
@@ -257,28 +288,13 @@
 
 (defn main [] (-> i64)
   (let [(mut failures) 0]
-    (for size [(: 0 i32)
-               1
-               2
-               3
-               7
-               8
-               9
-               15
-               16
-               17
-               21
-               31
-               32
-               33
-               63
-               64
-               65
-               127
-               129
-               4097
-               65537]
-      (for alignment [(: 0 i32) 16 64 4096]
+    ; x86-64: sizes whose copies are three stack words each, which is what
+    ; inspect-words receives, at the 8-byte stack alignment of a C aggregate
+    ; of bytes (the pointer form above has no such limits).
+    (for size (target/arch-pick
+                [(: 0 i32) 1 2 3 7 8 9 15 16 17 21 31 32 33 63 64 65 127 129 4097 65537]
+                [(: 17 i32) 21 24])
+      (for alignment (target/arch-pick [(: 0 i32) 16 64 4096] [(: 0 i32)])
         (for dynamic? [false true]
           (for ty [(: 5 i32) 12]
             (for variadic? [false true]
