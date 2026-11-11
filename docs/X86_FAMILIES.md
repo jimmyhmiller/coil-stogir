@@ -15,7 +15,7 @@ whose entry points currently return a clear `Err`.
 
 | Family constant | Module(s) | Operations |
 |---|---|---|
-| `MEMORY` | `x64/memory.coil` | LOAD, STORE, RLOAD, RSTORE, TLS_ADDR; named constants (FUNC, SYM, STR) as operands |
+| `MEMORY` | `x64/memory.coil`, `x64/address.coil` | LOAD, STORE (integer values; RLOAD, RSTORE, TLS_ADDR report an error); address modes, fused loads, read-modify-write stores |
 | `LOCALS` | `x64/locals.coil` | VAR, VADDR, VLOAD, VSTORE |
 | `STACK` | `x64/stack.coil` | ALLOCA, AFREE, BLOCK_BEGIN, BLOCK_END, FRAME_ADDR |
 | `CALL` | `x64/call.coil`, `x64/call-abi.coil` | CALL, TAILCALL, ARGVAL, PROTO, EXITCALL, VA_* |
@@ -39,11 +39,18 @@ places it meets the core (listed under "Families with a different shape").
 
 - `families/of graph reference` classifies a scheduled node (by opcode, by its
   type, and by the types of its data operands: a comparison of two doubles
-  is `FLOATING` although its own type is BOOL; an ADD of a symbol address is
-  `MEMORY`). The matcher calls it once per node and stores the answer in
+  is `FLOATING` although its own type is BOOL). A named constant (FUNC, SYM,
+  STR) is an ordinary integer operand and does not change a node's family.
+  The matcher calls it once per node and stores the answer in
   `Plan.families`; later stages read `plan/family`.
 - `families/select!`, `families/constrain!`, `families/emit!` forward to the
   family's module.
+- `families/fuse!` and `families/inputs!` are the memory family's
+  whole-function selection (address modes, fused loads, read-modify-write
+  stores); the matcher calls them once, after its own comparison fusion.
+- `families/constrain-recipe!` is called for a scheduled node that defines no
+  register and is rebuilt at each use (a static frame object): it requests
+  the object's frame slot.
 
 The three stages call into it at exactly one place each:
 
@@ -55,6 +62,14 @@ The three stages call into it at exactly one place each:
 
 To move an opcode into a family, or to make a family claim a new shape,
 change `families/of` only.
+
+A family that makes a load disappear into its own instruction (a call result
+projection, a floating operand) must do so in `select!`, by setting
+`omitted[load]`: the memory family's `fuse!` runs afterwards and never
+touches an omitted access. A load it leaves alone may be fused by the memory
+family into a core tile (`select/memory-operand tile` names it); a family
+that reads core tiles of its operands must look at the tile's register
+operand, not at an omitted load.
 
 ## The three entry points
 
@@ -141,12 +156,43 @@ the location view, the frame base, the plan, the frame and the frame size.
   load every operand first and return the condition code.
 - Narrow integers: bits above the type's width are unspecified
   (`x64/value.coil`, header). Extend before any instruction that reads them.
-- Frame objects: `(get (.locals (.frame cx)) owner)` is the logical offset;
-  `frame-address/slot (.base cx) offset` its memory operand. Stack parameters
-  are at `[rsp + frame-size + 8 + offset]`.
-- References to named symbols: push a `code/Reference` (kind PC32 or PLT32,
-  explicit addend) and resolve it in `x64/image.coil` `finish!`, which today
-  rejects any reference.
+- Frame objects: `(get (.locals (.frame cx)) owner)` is the index of the
+  owner's slot in `(.slots (.frame cx))`; `frame-address/slot (.base cx)
+  offset` is the memory operand of a logical offset, whatever the frame base
+  (`locals/slot cx variable` does both for a VAR).
+- The frame base may be rbp (`frame-address/anchored?`: dynamic stack,
+  FRAME_ADDR or over-alignment; the header of `x64/frame-address.coil` has
+  the picture). Two things are then not at `slot`: the outgoing call area,
+  which is always `frame-address/outgoing offset` (`[rsp + offset]`; its
+  size, rounded to the frame alignment, is `(.outgoing-size cx)`), and stack
+  parameters, which are `frame-address/parameter! text base frame-size offset
+  scratch` (it loads the anchor into `scratch` in an over-aligned frame).
+  Never write `[rsp + frame-size + 8 + offset]` by hand.
+- Memory operands: `address/operand! out cx access position` is the
+  `encode/Mem` of LOAD/STORE `access` with the address mode selection chose
+  (base, index, scale, displacement, a frame object folded into the
+  displacement), for values of any class; `address/plain!` is `[value]` for
+  a node that takes an address operand. Both emit only `mov`/`lea`, may
+  write r10 and r11, and return an operand that names at most r10, so r11 is
+  free afterwards. A LOAD/STORE of another value class is routed to its
+  family in `families/of` (floating: `float-memory/claims?`); the accesses'
+  address tables and machine inputs are built for every value class, so the
+  family constrains the selected base and index (`address/parts`) and emits
+  its move on `address/operand!`, as `x64/float-memory.coil` does. It must
+  not read the node's own address operand, which may have been absorbed.
+- A constraints builder that reads the condition tile of an IF or COND uses
+  `address/tile-operands`, never the tile's `left`/`right`: the comparison
+  may read a fused load.
+- References to named symbols: an integer operand that is a FUNC, SYM or STR
+  needs nothing: `emit/operand!` and `value/constant!` rebuild it
+  (`code/reference-address!`). For anything else use the helpers in
+  `x64/code.coil`: `direct-call!` / `direct-jump!` (PLT32),
+  `long-address!`, and `rip-reference!` after any instruction encoded with
+  an `encode/mem-rip` operand. `x64/image.coil` `finish!` resolves them.
+- Builtin block operations: `block-move/emit! text size` (memmove, rdi and
+  rsi in, rax out) and `block-compare/emit! text count` (memcmp, rdi and rsi
+  in, eax out) replace the `call` of a builtin move or compare with a
+  literal size; see their headers for the ranges and the registers written.
 
 ### Families with a different shape
 
@@ -166,9 +212,10 @@ the location view, the frame base, the plan, the frame and the frame size.
   (`function.coil` reports "definition-position transfers are not lowered
   yet" where that hook goes), plus private-leaf contexts in
   `x64/compile.coil`.
-- **Stack** needs anchored frames: `allocate.coil` rejects
-  `(.anchored set)` and alignments above 16, and `function.coil`'s
-  `prologue!`/`epilogue!` only know the rsp base.
+- **Stack** sets `(.anchored set)` and raises `(.alignment set)`;
+  `allocate.coil` then builds the rbp base and `function.coil`'s
+  `prologue!`/`epilogue!` establish and release it. A frame object or VAR
+  raises the alignment through its `uses/Local`.
 - **Floating** (`x64/floating.coil`) meets the core in these places, each a
   few delimited lines:
   - `families/of` sends floating LOAD/STORE and floating locals to it

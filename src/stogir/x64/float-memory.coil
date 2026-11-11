@@ -8,14 +8,15 @@
 ;;;   VLOAD, VLOAD_v (85, 86) of a floating type    movss/movsd rd, [slot]
 ;;;   VSTORE, VSTORE_v (87, 88) of a floating value movss/movsd [slot], value
 ;;;
-;;; The address of a LOAD or STORE is one general register with no
-;;; displacement: the ADDR value itself, or r10 for a numeric constant
-;;; address. Folding `base + displacement` and indexes into the operand is the
-;;; memory family's address-mode selection; when that exists these accesses
-;;; should go through it (the access is then only a different move opcode).
-;;; A local access addresses its VAR's slot from the frame base. A VAR that
-;;; is not of a floating type belongs to the locals family, so a floating
-;;; view of an integer variable is rejected there until that family exists.
+;;; The address of a LOAD or STORE is the addressing mode the memory family
+;;; selected for it (stogir.x64.memory/fuse!: base, index, scale and
+;;; displacement in the plan's address tables, for accesses of every value
+;;; class): its base and index are the access's register operands and
+;;; stogir.x64.address/operand! is its memory operand. The address operand
+;;; of the node itself may have been absorbed and must not be read.
+;;; A local access addresses its VAR's slot from the frame base; a VAR that
+;;; is not of a floating type belongs to the locals family, which requests
+;;; its slot.
 ;;;
 ;;; `claims?` is what stogir.x64.families asks to route a node here.
 (module stogir.x64.float-memory)
@@ -23,6 +24,7 @@
 (import "stogir.locals" :as local)
 (import "stogir.node" :as n)
 (import "stogir.types" :as types)
+(import "stogir.x64.address" :as address)
 (import "stogir.x64.code" :as code)
 (import "stogir.x64.context" :as context)
 (import "stogir.x64.emit" :as emit)
@@ -99,7 +101,10 @@
             (match (validate graph reference)
               (Err [message] (set! error message))
               (Ok [_]
-                  (unless (uses/use! (mut set) (.op2 node) position) (set! error CONFLICT)))))
+                  (let [selected (address/parts matched graph reference)]
+                    (unless (and (uses/use! (mut set) (.base selected) position)
+                                 (uses/use! (mut set) (.index selected) position))
+                      (set! error CONFLICT))))))
     (when (and (= error "") (!= opcode 72))
       (unless (if (load? opcode)
                   (uses/define! (mut set) reference position)
@@ -125,9 +130,7 @@
     (when (!= opcode 72)
       (match (if (local? opcode)
                  (slot cx (.op2 node))
-                 (match (emit/operand! (mut out) cx (.op2 node) position registers/SCRATCH-GPR)
-                   (Err [message] (Err [encode/Mem (slice u8)] message))
-                   (Ok [address] (Ok (encode/mem address 0)))))
+                 (address/operand! (mut out) cx reference position))
         (Err [message] (set! error message))
         (Ok [m]
             (if (load? opcode)

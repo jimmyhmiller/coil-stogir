@@ -15,6 +15,7 @@
 (import "stogir.locations" :as locations)
 (import "stogir.x64.code" :as code)
 (import "stogir.x64.encode" :as encode)
+(import "stogir.x64.frame-address" :as frame)
 (import "stogir.x64.registers" :as registers)
 (import "stogir.x64.value" :as value)
 (import "stogir.graph" :as g)
@@ -133,15 +134,17 @@
 
 ;;; Load stack parameter `parameter` into its allocated register at its PARAM
 ;;; definition (`position + 1`). `frame-size` is the rsp adjustment of the
-;;; prologue, so the first stack argument is at rsp + frame-size + 8.
-;;; Register parameters (general and XMM) are already in place and emit
-;;; nothing. A floating stack parameter is loaded with movss/movsd.
+;;; prologue and `base` the frame base, which together locate the first
+;;; stack argument (stogir.x64.frame-address/parameter!). Register
+;;; parameters (general and XMM) are already in place and emit nothing. A
+;;; floating stack parameter is loaded with movss/movsd.
 (defn emit-entry-with-locations! [(out (mut code/Buffer))
                                   (graph g/Graph)
                                   (parts locations/View)
                                   (parameter Parameter)
                                   (position i64)
-                                  (frame-size i64)] (-> (Result i32 (slice u8)))
+                                  (frame-size i64)
+                                  (base frame/Base)] (-> (Result i32 (slice u8)))
   (let [begin (len (.text out))
         ty (value/type-of graph (.reference parameter))]
     (cond (or (= (.kind parameter) 0) (= (.kind parameter) 2)) (Ok 0)
@@ -151,13 +154,15 @@
             (match (value/float-destination graph parts (.reference parameter) position)
               (Err [message] (Err message))
               (Ok [destination]
-                  (match (encode/sse-mov-rm (mut (.text out))
-                                            (value/float-move ty)
-                                            destination
-                                            (encode/mem registers/RSP
-                                                        (+ frame-size 8 (.offset parameter))))
+                  ; r10 carries the anchor of an over-aligned frame.
+                  (match (frame/parameter! (mut (.text out)) base frame-size
+                                           (.offset parameter) registers/SCRATCH-GPR)
                     (Err [message] (Err message))
-                    (Ok [_] (Ok (cast i32 (- (len (.text out)) begin)))))))
+                    (Ok [m]
+                        (match (encode/sse-mov-rm (mut (.text out)) (value/float-move ty)
+                                                  destination m)
+                          (Err [message] (Err message))
+                          (Ok [_] (Ok (cast i32 (- (len (.text out)) begin)))))))))
           ; ---- end floating family ----
           (not (types/integer? ty))
             (Err "x86-64 backend: vector stack parameters are not implemented yet (call family)")
@@ -165,10 +170,12 @@
             (match (value/destination graph parts (.reference parameter) position)
               (Err [message] (Err message))
               (Ok [destination]
-                  (match (encode/mov-rm (mut (.text out))
-                                        (value/operation-bits ty)
-                                        destination
-                                        (encode/mem registers/RSP
-                                                    (+ frame-size 8 (.offset parameter))))
+                  ; The destination doubles as the anchor scratch.
+                  (match (frame/parameter! (mut (.text out)) base frame-size
+                                           (.offset parameter) destination)
                     (Err [message] (Err message))
-                    (Ok [_] (Ok (cast i32 (- (len (.text out)) begin))))))))))
+                    (Ok [m]
+                        (match (encode/mov-rm (mut (.text out)) (value/operation-bits ty)
+                                              destination m)
+                          (Err [message] (Err message))
+                          (Ok [_] (Ok (cast i32 (- (len (.text out)) begin))))))))))))

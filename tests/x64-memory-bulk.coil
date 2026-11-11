@@ -1,0 +1,145 @@
+(module stogir.tests.x64-memory-bulk)
+(import "stogir.x64.block-compare" :as block-compare)
+(import "stogir.x64.block-move" :as block-move)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.testing" :as t)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+;;; The straight-line memmove and memcmp emitters the call family uses in
+;;; place of a builtin call (stogir.x64.block-move, stogir.x64.block-compare),
+;;; run as functions of their own: every size, disjoint and overlapping
+;;; regions in both directions, guard bytes around the destination, and for
+;;; the comparison every position of the first difference with later bytes
+;;; that disagree the other way.
+
+(defn pattern [(index i64) (salt i64)] (-> u8)
+  (cast u8 (+ (* index 37) (* salt 11) 5)))
+
+;;; Map `code` followed by `ret`.
+(defn finish [(tally (mut t/Tally)) (code (mut (ArrayList u8)))] (-> (Result t/Mapped (slice u8)))
+  (set! (.functions tally) (+ (.functions tally) 1))
+  (match (encode/ret (mut code))
+    (Err [message] (Err message))
+    (Ok [_] (t/map (slice code)))))
+
+;;; memmove of `size` bytes with the destination `delta` bytes after the
+;;; source (negative: before; 512: disjoint).
+(defn move-case! [(tally (mut t/Tally)) (mapped t/Mapped) (size i64) (delta i64)] (-> void)
+  (let [(mut memory) (primitive/zeroed (array u8 1400))
+        (mut wanted) (primitive/zeroed (array u8 1400))
+        source (: 600 i64)
+        destination (+ source delta)
+        base (primitive/cast u64 (primitive/cast (ptr u8) (mut memory)))
+        f (primitive/cast (fnptr (cc/C) [u64 u64] u64) (.base (.image mapped)))]
+    (for [i 0 1400]
+      (set! (mut memory) i (pattern i size))
+      (set! (mut wanted) i (pattern i size)))
+    (for [i 0 size] (set! (mut wanted) (+ destination i) (pattern (+ source i) size)))
+    (let [got (call-ptr f (+ base (cast u64 destination)) (+ base (cast u64 source)))
+          (mut good) (= got (+ base (cast u64 destination)))]
+      (for [i 0 1400]
+        (when (!= (get memory i) (get wanted i)) (set! good false)))
+      (set! (.checks tally) (+ (.checks tally) 1))
+      (unless good
+        (when (< (.failures tally) 20)
+          (println "block move of {} bytes, destination {} after source: wrong bytes or result"
+                   size delta))
+        (t/fail! (mut tally))))))
+
+;;; memcmp of `count` bytes that first differ at `position` (-1: equal),
+;;; where the first range holds `low` and the second `high` (or the reverse
+;;; when `swapped`); the bytes after it differ the other way.
+(defn compare-case! [(tally (mut t/Tally)) (mapped t/Mapped) (count i64) (position i64)
+                     (low u8) (high u8) (swapped bool)] (-> void)
+  (let [(mut first) (primitive/zeroed (array u8 48))
+        (mut second) (primitive/zeroed (array u8 48))
+        f (primitive/cast (fnptr (cc/C) [u64 u64 u64] i32) (.base (.image mapped)))]
+    ; Bytes outside the compared range differ and must not matter.
+    (for [i 0 48]
+      (set! (mut first) i (if (or (< i 16) (>= i (+ 16 count))) (: 0 u8) (pattern i count)))
+      (set! (mut second) i (if (or (< i 16) (>= i (+ 16 count))) (: 255 u8) (pattern i count))))
+    (when (>= position 0)
+      (set! (mut first) (+ 16 position) (if swapped high low))
+      (set! (mut second) (+ 16 position) (if swapped low high))
+      (for [i (+ position 1) count]
+        (set! (mut first) (+ 16 i) (if swapped (: 0 u8) 255))
+        (set! (mut second) (+ 16 i) (if swapped (: 255 u8) 0))))
+    (let [got (call-ptr f
+                        (+ (primitive/cast u64 (primitive/cast (ptr u8) (mut first))) 16)
+                        (+ (primitive/cast u64 (primitive/cast (ptr u8) (mut second))) 16)
+                        (cast u64 count))
+          wanted (cond (< position 0) (: 0 i32) swapped 1 :else -1)]
+      (set! (.checks tally) (+ (.checks tally) 1))
+      (when (!= got wanted)
+        (when (< (.failures tally) 20)
+          (println "block compare of {} bytes differing at {} ({} vs {}, swapped {}): got {} expected {}"
+                   count position low high swapped got wanted))
+        (t/fail! (mut tally))))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 memory bulk: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (for [size 1 257]
+          (let [(mut code) (ArrayList::new [u8] a)]
+            (match (block-move/emit! (mut code) size)
+              (Err [message]
+                   (println "block move {}: {}" size message)
+                   (t/fail! (mut tally)))
+              (Ok [_]
+                  (match (finish (mut tally) (mut code))
+                    (Err [message]
+                         (println "block move {}: {}" size message)
+                         (t/fail! (mut tally)))
+                    (Ok [mapped]
+                        (let [(mut mapped) mapped]
+                          (for delta [(: 512 i64) 0 1 -1 7 -7 8 -8 15 -15 16 -16 17 -17 33 -33
+                                      64 -64 255 -255]
+                            (move-case! (mut tally) mapped size delta))
+                          (t/unmap! (mut mapped)))))))
+            (free! (mut code))))
+        (for [count 0 17]
+          (let [(mut code) (ArrayList::new [u8] a)]
+            (match (block-compare/emit! (mut code) count)
+              (Err [message]
+                   (println "block compare {}: {}" count message)
+                   (t/fail! (mut tally)))
+              (Ok [_]
+                  (match (finish (mut tally) (mut code))
+                    (Err [message]
+                         (println "block compare {}: {}" count message)
+                         (t/fail! (mut tally)))
+                    (Ok [mapped]
+                        (let [(mut mapped) mapped]
+                          (compare-case! (mut tally) mapped count -1 0 0 false)
+                          (for [position 0 count]
+                            (for swapped [false true]
+                              (compare-case! (mut tally) mapped count position 0 1 swapped)
+                              (compare-case! (mut tally) mapped count position 0x7F 0x80 swapped)
+                              (compare-case! (mut tally) mapped count position 0 0xFF swapped)
+                              (compare-case! (mut tally) mapped count position 0xFE 0xFF swapped)))
+                          (t/unmap! (mut mapped)))))))
+            (free! (mut code))))
+        ; Sizes outside the inline ranges are refused and emit nothing.
+        (let [(mut code) (ArrayList::new [u8] a)]
+          (set! (.checks tally) (+ (.checks tally) 1))
+          (unless (and (match (block-move/emit! (mut code) 0) (Err [_] true) (Ok [_] false))
+                       (match (block-move/emit! (mut code) 257) (Err [_] true) (Ok [_] false))
+                       (match (block-compare/emit! (mut code) 17) (Err [_] true) (Ok [_] false))
+                       (match (block-compare/emit! (mut code) -1) (Err [_] true) (Ok [_] false))
+                       (= (len code) 0)
+                       (not (block-move/inline? 0)) (block-move/inline? 1)
+                       (block-move/inline? 256) (not (block-move/inline? 257))
+                       (block-compare/inline? 0) (block-compare/inline? 16)
+                       (not (block-compare/inline? 17)))
+            (println "block emitters accept a size outside their range")
+            (t/fail! (mut tally)))
+          (free! (mut code)))
+        (println "x64 memory bulk: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))
