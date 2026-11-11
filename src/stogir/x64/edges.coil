@@ -32,6 +32,8 @@
 (import "stogir.locations" :as locations)
 (import "stogir.text-data" :as text-data)
 (import "stogir.x64.code" :as code)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.fcompare" :as fcompare)
 (import "stogir.x64.fixups" :as fixups)
 (import "stogir.x64.frame-address" :as frame)
 (import "stogir.x64.registers" :as registers)
@@ -219,10 +221,28 @@
                         (for literal (.literals phis)
                           (when (= error "")
                             (let [destination (.destination literal)
+                                  floating? (types/floating?
+                                              (value/type-of graph (.reference literal)))
+                                  ; A floating constant for a spill slot is
+                                  ; its bits in r10: no XMM register and no
+                                  ; pool load are needed.
                                   register (if (= (.kind destination) 0)
                                                (cast i32 (.value destination))
                                                registers/SCRATCH-GPR)]
-                              (match (value/constant! (mut out) graph (.reference literal) register)
+                              (match (cond (not floating?)
+                                             (value/constant! (mut out) graph
+                                                              (.reference literal) register)
+                                           (registers/simd? register)
+                                             (value/float-constant! (mut out) graph
+                                                                    (.reference literal)
+                                                                    register)
+                                           :else
+                                             (match (value/float-constant-bits
+                                                      graph (.reference literal))
+                                               (None [] (Err [i32 (slice u8)]
+                                                             "floating PHI constant is not numeric"))
+                                               (Some [raw]
+                                                     (value/bits! (mut out) register raw 64))))
                                 (Err [message] (set! error message))
                                 (Ok [_] 0))
                               (when (and (= error "") (= (.kind destination) 1))
@@ -322,6 +342,56 @@
           (set! (.entries (.summary out)) (+ (.entries (.summary out)) 1))
           (set! (.label (elem (mut (.stubs control)) i)) ENTRY-PLACED))))
     (if (= error "") (Ok 0) (Err error))))
+
+;;; As branch-edge! for an extended condition (stogir.x64.fcompare), which
+;;; may need the parity flag as well as a condition code:
+;;;   cc or parity       jp target; jcc target
+;;;   cc and not parity  jp skip; jcc target; skip:
+;;; `skip` is a label of its own in the branch table, so the jumps stay
+;;; ordinary fixup records. `entry` is as for branch-edge!; the two-jump
+;;; forms always use an edge stub.
+(defn branch-edge-parity! [(out (mut code/Buffer))
+                           (flow Flow)
+                           (control (mut Control))
+                           (target i32)
+                           (source-position i64)
+                           (condition i32)
+                           (entry bool)
+                           (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (if (or (= condition -1) (fcompare/simple? condition))
+      (branch-edge! (mut out) flow (mut control) target source-position condition entry
+                    allocator)
+      (let [(mut transfer) (code/create allocator)]
+        (match (edge! (mut transfer) flow target source-position allocator)
+          (Err [message] (code/release! (mut transfer)) (Err message))
+          (Ok [_]
+              (let [(mut label) target
+                    (mut error) ""]
+                (if (= (len (.text transfer)) 0)
+                    (code/release! (mut transfer))
+                    (do
+                      (set! label (cast i32 (len (.labels control))))
+                      (push! (mut (.labels control)) -1)
+                      (push! (mut (.stubs control))
+                             (EdgeStub :label label :target target :body transfer))))
+                (if (fcompare/or-p? condition)
+                    (do
+                      (code/accept-count! (mut error)
+                                          (fixups/jump! (mut out) (mut (.branches control))
+                                                        label encode/CC-P))
+                      (code/accept-count! (mut error)
+                                          (fixups/jump! (mut out) (mut (.branches control))
+                                                        label (fcompare/code-of condition))))
+                    (let [skip (cast i32 (len (.labels control)))]
+                      (push! (mut (.labels control)) -1)
+                      (code/accept-count! (mut error)
+                                          (fixups/jump! (mut out) (mut (.branches control))
+                                                        skip encode/CC-P))
+                      (code/accept-count! (mut error)
+                                          (fixups/jump! (mut out) (mut (.branches control))
+                                                        label (fcompare/code-of condition)))
+                      (set! (mut (.labels control)) (cast i64 skip) (len (.text out)))))
+                (if (= error "") (Ok 0) (Err error))))))))
 
 ;;; Append every out-of-line edge stub: its moves, then a jump to its target.
 (defn finish-stubs! [(out (mut code/Buffer)) (control (mut Control))]

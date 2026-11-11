@@ -1,0 +1,140 @@
+(module stogir.tests.x64-float-memory)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.x64.testing" :as t)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; Floating LOAD/STORE and floating local variables on x86-64
+;;; (stogir.x64.float-memory), both widths:
+;;;
+;;;   memory  STORE a value at an address, LOAD it back, STORE the loaded
+;;;           value plus one at a second address computed with ADD; the
+;;;           buffer is checked byte for byte (a FLOAT store writes four
+;;;           bytes and leaves its neighbours alone). The stored value is a
+;;;           parameter, a constant NaN or +0.0; the address a parameter or
+;;;           a numeric constant; plain and volatile opcodes.
+;;;   locals  two VARs (one of each width when `mixed`): VSTORE, VLOAD,
+;;;           VSTORE of a computed value, VLOAD again, with other values
+;;;           live across so the frame holds locals and spill slots.
+
+(const SENTINEL (: 0xA5A5A5A5A5A5A5A5 u64))
+
+(defn one [(ty i32)] (-> u64)
+  (if (= ty 12) (: 0x3FF0000000000000 u64) 0x3F800000))
+
+(defn width-mask [(ty i32)] (-> u64)
+  (if (= ty 12) (: 0xFFFFFFFFFFFFFFFF u64) 0xFFFFFFFF))
+
+;;; What a cell holding SENTINEL contains after a store of `value`.
+(defn stored [(ty i32) (value u64)] (-> u64)
+  (| (& value (width-mask ty)) (& SENTINEL (^ (width-mask ty) 0xFFFFFFFFFFFFFFFF))))
+
+(defn expect! [(tally (mut t/Tally)) (label (slice u8)) (ty i32) (mode i32) (actual u64)
+               (expected u64)] (-> void)
+  (set! (.checks tally) (+ (.checks tally) 1))
+  (when (!= actual expected)
+    (when (< (.failures tally) 30)
+      (println "{} type {} mode {}: got {:x} expected {:x}" label ty mode actual expected))
+    (t/fail! (mut tally))))
+
+;;; mode: 0 parameter value, 1 constant NaN, 2 constant +0.0, 3 as 0 with a
+;;; constant address. `volatile` picks LOAD_v/STORE_v.
+(defn memory! [(tally (mut t/Tally)) (ty i32) (mode i32) (volatile bool)
+               (a (dyn Allocator))] (-> void)
+  (let [(mut cells) [SENTINEL SENTINEL SENTINEL SENTINEL]
+        base (primitive/cast u64 (primitive/cast (ptr u64) (mut cells)))
+        (mut graph) (g/create a)
+        start (t/start! (mut graph))
+        pointer (t/param! (mut graph) start 6 0)
+        x (t/param! (mut graph) start ty 1)
+        nan (if (= ty 12) (: 0xFFF8123456789ABC u64) 0xFFC12345)
+        address (if (= mode 3) (t/constant! (mut graph) 6 (+ base 8)) pointer)
+        value (cond (= mode 1) (t/constant! (mut graph) ty nan)
+                    (= mode 2) (t/constant! (mut graph) ty 0)
+                    :else x)
+        first (t/require (b/emit! (mut graph) (if volatile 94 93) 0 [start address value]))
+        loaded (t/require (b/emit! (mut graph) (if volatile 92 91) ty [first address]))
+        second-address (t/binary! (mut graph) 26 6 address (t/constant! (mut graph) 6 16))
+        second (t/require (b/emit! (mut graph) (if volatile 94 93) 0
+                                   [loaded second-address
+                                    (t/binary! (mut graph) 26 ty loaded
+                                               (t/constant! (mut graph) ty (one ty)))]))
+        ret (t/return! (mut graph) second ty loaded)]
+    (match (t/compiled (mut tally) "x64 float memory" graph start [ret] a)
+      (None [] (println "  (type {} mode {})" ty mode))
+      (Some [mapped]
+            (let [(mut mapped) mapped]
+              (for [i 0 t/FLOAT-SPECIALS]
+                (for [k 0 4] (set! (mut cells) k SENTINEL))
+                (let [given (t/float-specials ty i)
+                      written (cond (= mode 1) nan
+                                    (= mode 2) 0
+                                    :else given)
+                      slot (if (= mode 3) (: 1 i64) 0)
+                      raw (t/invoke-floating mapped [given] [(+ base (cast u64 (* slot 8)))])]
+                  (expect! (mut tally) "returned" ty mode (& raw (width-mask ty)) written)
+                  (expect! (mut tally) "first cell" ty mode (get cells slot) (stored ty written))
+                  (expect! (mut tally) "second cell" ty mode (get cells (+ slot 2))
+                           (stored ty (t/float-binary 26 ty written (one ty))))
+                  (expect! (mut tally) "untouched cell" ty mode (get cells (+ slot 1)) SENTINEL)))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+;;; u = VAR ty; v = VAR other; u = x; v = convert(y); u = u * v' ...
+(defn locals! [(tally (mut t/Tally)) (ty i32) (mixed bool) (extra i64) (a (dyn Allocator))]
+  (-> void)
+  (let [other (if mixed (if (= ty 12) (: 13 i32) 12) ty)
+        (mut graph) (g/create a)
+        start (t/start! (mut graph))
+        x (t/param! (mut graph) start ty 0)
+        y (t/param! (mut graph) start other 1)
+        u (t/require (b/variable! (mut graph) ty start "u" 0))
+        v (t/require (b/variable! (mut graph) other start "v" 0))
+        (mut live) x]
+    ; Values that stay live across the local accesses.
+    (for [k 0 extra]
+      (set! live (t/binary! (mut graph) 26 ty live x)))
+    (let [s1 (t/require (b/emit! (mut graph) 87 0 [start u x]))
+          s2 (t/require (b/emit! (mut graph) 88 0 [s1 v y]))
+          l1 (t/require (b/emit! (mut graph) 85 ty [s2 u]))
+          l2 (t/require (b/emit! (mut graph) 86 other [l1 v]))
+          product (t/binary! (mut graph) 28 ty l1 (t/unary! (mut graph) 39 ty l2))
+          s3 (t/require (b/emit! (mut graph) 87 0 [l2 u product]))
+          l3 (t/require (b/emit! (mut graph) 85 ty [s3 u]))
+          ret (t/return! (mut graph) l3 ty (t/binary! (mut graph) 26 ty l3 live))]
+      (match (t/compiled (mut tally) "x64 float locals" graph start [ret] a)
+        (None [] (println "  (type {} mixed {} extra {})" ty mixed extra))
+        (Some [mapped]
+              (let [(mut mapped) mapped]
+                (for [i 0 t/FLOAT-SPECIALS]
+                  (for [j 6 14]
+                    (let [p (t/float-specials ty i)
+                          q (t/float-specials other j)
+                          (mut carried) p]
+                      (for [k 0 extra] (set! carried (t/float-binary 26 ty carried p)))
+                      (let [product (t/float-binary 28 ty p (t/float-to-float other ty q))
+                            expected (t/float-binary 26 ty product carried)
+                            raw (t/invoke-floating mapped [p q] [])]
+                        (unless (t/float-ambiguous? ty product carried)
+                          (expect! (mut tally) "locals" ty (cast i32 extra)
+                                   (& raw (width-mask ty)) expected))))))
+                (t/unmap! (mut mapped))))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 float memory: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (for ty [(: 12 i32) 13]
+          (for mode [(: 0 i32) 1 2 3]
+            (memory! (mut tally) ty mode false a)
+            (memory! (mut tally) ty mode true a))
+          (for extra [(: 0 i64) 20]
+            (locals! (mut tally) ty false extra a)
+            (locals! (mut tally) ty true extra a)))
+        (println "x64 float memory: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))

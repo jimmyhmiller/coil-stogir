@@ -1,0 +1,226 @@
+(module stogir.tests.x64-float-compare)
+(import "stogir.graph" :as g)
+(import "stogir.x64.testing" :as t)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; Floating comparisons as conditions on x86-64: every predicate (EQ .. UGT,
+;;; ORDERED, UNORDERED) at both widths over every pair of the special values
+;;; of stogir.x64.testing, so each is seen with ordered and unordered
+;;; operands, in every way a condition is consumed:
+;;;
+;;;    0  IF with two RETURNs (the comparison fused: ucomis + jcc, with jp
+;;;       for the equality predicates)
+;;;    1  IF, MERGE and a PHI of integers (moves on the conditional edge, so
+;;;       the two-branch forms go through an edge stub)
+;;;    2  IF, MERGE and a PHI of floating constants, one of them +0.0: the
+;;;       xorps that builds it sits between the compare and its branch
+;;;    3  IF, MERGE and a PHI of floating parameters
+;;;    4  integer COND (cmovcc, two of them for the equality predicates)
+;;;    5  floating COND of two parameters
+;;;    6  floating COND of two constants (+0.0 and a NaN)
+;;;    7  floating COND of a parameter and +0.0
+;;;    8  the BOOL used twice (not fused): added to a COND on it
+;;;    9  IF with a constant right operand (several constants)
+;;;   10  IF with a constant left operand
+;;;   11  IF comparing a value with itself
+;;;   12  floating COND whose arms are the compared values, returned in xmm0
+;;; and the truth test of a floating value (zero is false, a NaN true):
+;;;   20  IF   21 IF with a PHI   22 integer COND   23 floating COND
+;;;   24  floating COND of the value itself and +0.0
+;;; and 30: a floating COND chosen by an integer comparison.
+
+(defn two [(ty i32)] (-> u64)
+  (if (= ty 12) (: 0x4004000000000000 u64) 0x40200000))
+
+(defn minus-seven [(ty i32)] (-> u64)
+  (if (= ty 12) (: 0xC01C000000000000 u64) 0xC0E00000))
+
+(defn one-and-half [(ty i32)] (-> u64)
+  (if (= ty 12) (: 0x3FF8000000000000 u64) 0x3FC00000))
+
+(defn payload-nan [(ty i32)] (-> u64)
+  (if (= ty 12) (: 0xFFF8123456789ABC u64) 0xFFC12345))
+
+(defn fixed-at [(ty i32) (index i64)] (-> u64)
+  ; +0.0, -0.0, 1.5, a NaN, +infinity
+  (t/float-specials ty (get [(: 0 i64) 1 12 23 20] index)))
+
+(const FIXED 5)
+
+(const I (: 0x1111222233334444 u64))
+
+(const J (: 0x5555666677778888 u64))
+
+;;; The value of a diamond on `condition`: PHI(yes, no) at the MERGE, and the
+;;; MERGE itself in `region`.
+(defstruct Diamond [(region i32) (value i32)])
+
+(defn diamond! [(graph (mut g/Graph)) (control i32) (condition i32) (ty i32)
+                (yes i32) (no i32)] (-> Diamond)
+  (let [branch (t/if! (mut graph) control condition)
+        taken (t/if-true! (mut graph) branch)
+        other (t/if-false! (mut graph) branch)
+        region (t/merge! (mut graph) (t/end! (mut graph) taken) (t/end! (mut graph) other))]
+    (Diamond :region region :value (t/phi! (mut graph) ty region yes no))))
+
+;;; Build and run one function of `shape` for `opcode` (ignored by the truth
+;;; shapes). `fixed` is the constant operand of shapes 9 and 10.
+(defn run! [(tally (mut t/Tally)) (opcode i32) (ty i32) (shape i32) (fixed u64)
+            (allocator (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create allocator)
+        start (t/start! (mut graph))
+        a (t/param! (mut graph) start ty 0)
+        b (t/param! (mut graph) start ty 1)
+        u (t/param! (mut graph) start ty 2)
+        v (t/param! (mut graph) start ty 3)
+        i (t/param! (mut graph) start 5 4)
+        j (t/param! (mut graph) start 5 5)
+        literal (t/constant! (mut graph) ty fixed)
+        zero (t/constant! (mut graph) ty 0)
+        nan (t/constant! (mut graph) ty (payload-nan ty))
+        half (t/constant! (mut graph) ty (one-and-half ty))
+        truth (and (>= shape 20) (< shape 30))
+        left (if (= shape 10) literal a)
+        right (cond (= shape 9) literal
+                    (= shape 10) a
+                    (= shape 11) a
+                    :else b)
+        condition (cond truth a
+                        (= shape 30) (t/compare! (mut graph) 16 i j)
+                        :else (t/compare! (mut graph) opcode left right))
+        (mut roots) [(: 0 i32) 0]
+        (mut count) 1
+        ; What the function returns: 0 an integer in rax, 1 the bits of a
+        ; floating value in rax, 2 a floating value in xmm0.
+        (mut kind) (: 0 i32)]
+    (cond (or (= shape 0) (= shape 9) (= shape 10) (= shape 11) (= shape 20))
+            (let [branch (t/if! (mut graph) start condition)
+                  taken (t/if-true! (mut graph) branch)
+                  other (t/if-false! (mut graph) branch)]
+              (set! (mut roots) 0 (t/return! (mut graph) taken 5 (t/constant! (mut graph) 5 1)))
+              (set! (mut roots) 1 (t/return! (mut graph) other 5 (t/constant! (mut graph) 5 2)))
+              (set! count 2))
+          (or (= shape 1) (= shape 21))
+            (let [d (diamond! (mut graph) start condition 5 i j)]
+              (set! (mut roots) 0 (t/return! (mut graph) (.region d) 5 (.value d))))
+          (= shape 2)
+            (let [d (diamond! (mut graph) start condition ty zero half)]
+              (set! kind 1)
+              (set! (mut roots) 0
+                    (t/return! (mut graph) (.region d) 5
+                               (t/float-bits! (mut graph) ty (.value d)))))
+          (= shape 3)
+            (let [d (diamond! (mut graph) start condition ty u v)]
+              (set! kind 2)
+              (set! (mut roots) 0 (t/return! (mut graph) (.region d) ty (.value d))))
+          (or (= shape 4) (= shape 22))
+            (set! (mut roots) 0
+                  (t/return! (mut graph) start 5 (t/select! (mut graph) 5 condition i j)))
+          (or (= shape 5) (= shape 23) (= shape 30))
+            (do
+              (set! kind 1)
+              (set! (mut roots) 0
+                    (t/return! (mut graph) start 5
+                               (t/float-bits! (mut graph) ty
+                                              (t/select! (mut graph) ty condition u v)))))
+          (= shape 6)
+            (do
+              (set! kind 1)
+              (set! (mut roots) 0
+                    (t/return! (mut graph) start 5
+                               (t/float-bits! (mut graph) ty
+                                              (t/select! (mut graph) ty condition zero nan)))))
+          (= shape 7)
+            (do
+              (set! kind 2)
+              (set! (mut roots) 0
+                    (t/return! (mut graph) start ty
+                               (t/select! (mut graph) ty condition u zero))))
+          (= shape 8)
+            (set! (mut roots) 0
+                  (t/return! (mut graph) start 5
+                             (t/binary! (mut graph) 26 5
+                                        (t/unary! (mut graph) 34 5 condition)
+                                        (t/select! (mut graph) 5 condition i j))))
+          (= shape 12)
+            (do
+              (set! kind 2)
+              (set! (mut roots) 0
+                    (t/return! (mut graph) start ty (t/select! (mut graph) ty condition a b))))
+          (= shape 24)
+            (do
+              (set! kind 2)
+              (set! (mut roots) 0
+                    (t/return! (mut graph) start ty (t/select! (mut graph) ty condition a zero))))
+          :else (panic "x64 float compare: unknown shape {}" shape))
+    (match (let [(mut only) [(get roots 0)]]
+             (if (= count 2)
+                 (t/compiled (mut tally) "x64 float compare" graph start roots allocator)
+                 (t/compiled (mut tally) "x64 float compare" graph start only
+                             allocator)))
+      (None [] (println "  (op {} type {} shape {})" opcode ty shape))
+      (Some [mapped]
+            (let [(mut mapped) mapped
+                  width (if (= ty 12) (: 0xFFFFFFFFFFFFFFFF u64) 0xFFFFFFFF)
+                  uu (two ty)
+                  vv (minus-seven ty)
+                  single (or truth (= shape 9) (= shape 10) (= shape 11) (= shape 30))]
+              (for [x 0 t/FLOAT-SPECIALS]
+                (for [y 0 (if single 1 t/FLOAT-SPECIALS)]
+                  (for [flip 0 (if (= shape 30) 2 1)]
+                    (let [p (t/float-specials ty x)
+                          q (t/float-specials ty y)
+                          ii (if (= flip 1) J I)
+                          jj (if (= flip 1) I J)
+                          l (if (= shape 10) fixed p)
+                          r (cond (= shape 9) fixed
+                                  (or (= shape 10) (= shape 11)) p
+                                  :else q)
+                          holds (cond truth (t/float-truth ty p)
+                                      (= shape 30) (< (cast i64 ii) (cast i64 jj))
+                                      :else (= (t/float-compare opcode ty l r) 1))
+                          expected
+                            (cond (or (= shape 0) (= shape 9) (= shape 10) (= shape 11)
+                                      (= shape 20))
+                                    (if holds (: 1 u64) 2)
+                                  (or (= shape 1) (= shape 21) (= shape 4) (= shape 22))
+                                    (if holds ii jj)
+                                  (= shape 2) (if holds 0 (one-and-half ty))
+                                  (or (= shape 3) (= shape 5) (= shape 23) (= shape 30))
+                                    (if holds uu vv)
+                                  (= shape 6) (if holds 0 (payload-nan ty))
+                                  (= shape 7) (if holds uu 0)
+                                  (= shape 8) (+ (if holds (: 1 u64) 0) (if holds ii jj))
+                                  (= shape 12) (if holds p q)
+                                  :else (if holds p 0))
+                          raw (if (= kind 2)
+                                  (t/invoke-floating mapped [p q uu vv] [ii jj])
+                                  (t/invoke-mixed mapped [p q uu vv] [ii jj]))
+                          actual (if (= kind 0) raw (& raw width))]
+                      (set! (.checks tally) (+ (.checks tally) 1))
+                      (when (!= actual expected)
+                        (when (< (.failures tally) 30)
+                          (println "op {} type {} shape {} constant {:x}: {:x} , {:x} gave {:x}, expected {:x}"
+                                   opcode ty shape fixed p q actual expected))
+                        (t/fail! (mut tally)))))))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 float compare: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (for ty [(: 12 i32) 13]
+          (for opcode [(: 14 i32) 15 16 17 18 19 20 21 22 23 24 25]
+            (for shape [(: 0 i32) 1 2 3 4 5 6 7 8 11 12]
+              (run! (mut tally) opcode ty shape 0 a))
+            (for shape [(: 9 i32) 10]
+              (for [k 0 FIXED]
+                (run! (mut tally) opcode ty shape (fixed-at ty k) a))))
+          (for shape [(: 20 i32) 21 22 23 24 30]
+            (run! (mut tally) 0 ty shape 0 a)))
+        (println "x64 float compare: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))

@@ -11,12 +11,18 @@
 ;;;     is called through one twelve-argument System V signature: the first
 ;;;     six arguments arrive in registers, the rest on the stack, and a
 ;;;     function that declares fewer simply ignores the others.
+;;;   * for the floating family: an independent reference evaluator for the
+;;;     floating operations (bit patterns in, bit patterns out, with the
+;;;     x86-64 NaN rules), and calls with floating arguments and results
+;;;     ("Floating support" below).
 (module stogir.x64.testing)
 (import "stogir.graph" :as g)
 (import "stogir.builder" :as b)
 (import "stogir.types" :as types)
 (import "stogir.target" :as target)
 (import "stogir.jit.native" :as jit)
+(import "stogir.numeric-conversion" :as numeric)
+(import "coil.math" :as math)
 (import "stogir.x64.compile" :as compile)
 (import "stogir.x64.code" :as buffer)
 (import "coil.arraylist" :use [ArrayList])
@@ -379,3 +385,293 @@
 
 (defn case-default! [(graph (mut g/Graph)) (source i32)] (-> i32)
   (require (b/case-default! (mut graph) source)))
+
+;;; ---- Floating support -------------------------------------------------------
+;;;
+;;; Values are bit patterns (u64; a FLOAT in the low 32 bits). The reference
+;;; functions below define what the x86-64 backend must produce, bit for bit:
+;;;
+;;;   * ADD SUB MUL DIV SQRT: IEEE round-to-nearest results (computed by the
+;;;     host on non-NaN operands). A NaN operand is returned quieted, the
+;;;     left one first; an invalid operation gives the x86 default NaN (sign
+;;;     set, quiet bit only).
+;;;   * NEG ABS: the sign bit flipped or cleared.
+;;;   * MIN MAX (selecting): left <= right ? left : right, left >= right ? ...
+;;;   * FMIN FMAX FMINNM FMAXNM: IEEE 754-2019 / minNum with the AArch64 NaN
+;;;     selection (a signalling NaN first, the left operand first).
+;;;   * ROUND_*: computed with integer arithmetic on the truncated value.
+;;;   * comparisons: by classifying the bit patterns.
+;;; `float-ambiguous?` names the one case the IR leaves to the machine in a
+;;; way an optimizer may legitimately change: arithmetic on two different
+;;; NaNs (constant folding may pick the other payload).
+
+(defn float-sign [(ty i32)] (-> u64)
+  (if (= ty 12) (: 0x8000000000000000 u64) 0x80000000))
+
+(defn float-quiet-bit [(ty i32)] (-> u64)
+  (if (= ty 12) (: 0x0008000000000000 u64) 0x00400000))
+
+(defn float-infinity [(ty i32)] (-> u64)
+  (if (= ty 12) (: 0x7FF0000000000000 u64) 0x7F800000))
+
+(defn float-nan? [(ty i32) (value u64)] (-> bool)
+  (> (& value (- (float-sign ty) 1)) (float-infinity ty)))
+
+(defn float-signalling? [(ty i32) (value u64)] (-> bool)
+  (and (float-nan? ty value) (= (& value (float-quiet-bit ty)) 0)))
+
+(defn float-quiet [(ty i32) (value u64)] (-> u64)
+  (| value (float-quiet-bit ty)))
+
+;;; The NaN x86-64 produces for an invalid operation.
+(defn float-default-nan [(ty i32)] (-> u64)
+  (| (float-sign ty) (float-infinity ty) (float-quiet-bit ty)))
+
+(defn f64-of [(value u64)] (-> f64)
+  (let [(mut x) (: 0.0 f64)]
+    (store! (primitive/cast (ptr u64) (mut x)) value)
+    x))
+
+(defn f64-bits [(value f64)] (-> u64)
+  (let [(mut x) value]
+    (load (primitive/cast (ptr u64) (mut x)))))
+
+(defn f32-of [(value u64)] (-> f32)
+  (let [(mut x) (: 0.0 f32)]
+    (store! (primitive/cast (ptr u32) (mut x)) (cast u32 (& value 0xFFFFFFFF)))
+    x))
+
+(defn f32-bits [(value f32)] (-> u64)
+  (let [(mut x) value]
+    (cast u64 (load (primitive/cast (ptr u32) (mut x))))))
+
+;;; A key that orders non-NaN values as numbers, with -0 directly below +0.
+(defn float-key [(ty i32) (value u64)] (-> i128)
+  (let [magnitude (cast i128 (& value (- (float-sign ty) 1)))]
+    (if (!= (& value (float-sign ty)) 0) (- (- 0 magnitude) 1) magnitude)))
+
+(defn float-zero? [(ty i32) (value u64)] (-> bool)
+  (= (& value (- (float-sign ty) 1)) 0))
+
+;;; -1, 0, 1 for less, equal, greater (the zeros are equal); 2 when unordered.
+(defn float-order [(ty i32) (a u64) (b u64)] (-> i32)
+  (cond (or (float-nan? ty a) (float-nan? ty b)) 2
+        (and (float-zero? ty a) (float-zero? ty b)) 0
+        (< (float-key ty a) (float-key ty b)) -1
+        (> (float-key ty a) (float-key ty b)) 1
+        :else 0))
+
+;;; Reference result (0 or 1) of comparison `opcode` (14..25) on floats.
+(defn float-compare [(opcode i32) (ty i32) (a u64) (b u64)] (-> u64)
+  (let [order (float-order ty a b)
+        unordered (= order 2)
+        truth (cond (= opcode 14) (= order 0)
+                    (= opcode 15) (!= order 0)
+                    (= opcode 16) (= order -1)
+                    (= opcode 17) (or (= order 1) (= order 0))
+                    (= opcode 18) (or (= order -1) (= order 0))
+                    (= opcode 19) (= order 1)
+                    (= opcode 20) (or unordered (= order -1))
+                    (= opcode 21) (or unordered (= order 1) (= order 0))
+                    (= opcode 22) (or unordered (= order -1) (= order 0))
+                    (= opcode 23) (or unordered (= order 1))
+                    (= opcode 24) (not unordered)
+                    (= opcode 25) unordered
+                    :else (panic "x64 test reference: unknown floating comparison {}" opcode))]
+    (if truth 1 0)))
+
+;;; A floating value used as a condition: true unless it is a zero.
+(defn float-truth [(ty i32) (value u64)] (-> bool)
+  (not (float-zero? ty value)))
+
+;;; Whether arithmetic on these operands may give either NaN.
+(defn float-ambiguous? [(ty i32) (a u64) (b u64)] (-> bool)
+  (and (float-nan? ty a) (float-nan? ty b) (!= a b)))
+
+;;; AArch64's NaN choice for two operands of which at least one is a NaN.
+(defn float-processed-nan [(ty i32) (a u64) (b u64)] (-> u64)
+  (cond (float-signalling? ty a) (float-quiet ty a)
+        (float-signalling? ty b) (float-quiet ty b)
+        (float-nan? ty a) a
+        :else b))
+
+;;; Reference result of a floating binary operation: ADD SUB MUL DIV (26..29),
+;;; MIN MAX (58, 59), FMIN FMAX FMINNM FMAXNM (133..136).
+(defn float-binary [(opcode i32) (ty i32) (a u64) (b u64)] (-> u64)
+  (let [order (float-order ty a b)]
+    (cond (and (>= opcode 26) (<= opcode 29))
+            (cond (float-nan? ty a) (float-quiet ty a)
+                  (float-nan? ty b) (float-quiet ty b)
+                  :else
+                    (let [result
+                            (if (= ty 12)
+                                (let [x (f64-of a)
+                                      y (f64-of b)]
+                                  (f64-bits (cond (= opcode 26) (+ x y)
+                                                  (= opcode 27) (- x y)
+                                                  (= opcode 28) (* x y)
+                                                  :else (/ x y))))
+                                (let [x (f32-of a)
+                                      y (f32-of b)]
+                                  (f32-bits (cond (= opcode 26) (+ x y)
+                                                  (= opcode 27) (- x y)
+                                                  (= opcode 28) (* x y)
+                                                  :else (/ x y)))))]
+                      (if (float-nan? ty result) (float-default-nan ty) result)))
+          (= opcode 58) (if (or (= order -1) (= order 0)) a b)
+          (= opcode 59) (if (or (= order 1) (= order 0)) a b)
+          (and (>= opcode 133) (<= opcode 136))
+            (let [minimum (or (= opcode 133) (= opcode 135))
+                  number (>= opcode 135)]
+              (cond (and number (float-nan? ty a) (not (float-signalling? ty a))
+                         (not (float-nan? ty b)))
+                      b
+                    (and number (float-nan? ty b) (not (float-signalling? ty b))
+                         (not (float-nan? ty a)))
+                      a
+                    (= order 2) (float-processed-nan ty a b)
+                    (= order 0) (if minimum (| a b) (& a b))
+                    (= (= order -1) minimum) a
+                    :else b))
+          :else (panic "x64 test reference: unknown floating binary opcode {}" opcode))))
+
+;;; The value of `value` (magnitude below 2^52, not a NaN) rounded to an
+;;; integral value by ROUND_EVEN UP DOWN ZERO AWAY (137..141), as a double.
+(defn rounded [(opcode i32) (value f64)] (-> f64)
+  (let [whole (cast i64 value)
+        fraction (- value (cast f64 whole))
+        magnitude (if (< fraction 0.0) (- 0.0 fraction) fraction)
+        away (if (< value 0.0) (- whole 1) (+ whole 1))
+        odd (!= (& whole 1) 0)
+        chosen (cond (= fraction 0.0) whole
+                     (= opcode 137)
+                       (if (or (> magnitude 0.5) (and (= magnitude 0.5) odd)) away whole)
+                     (= opcode 138) (if (> fraction 0.0) (+ whole 1) whole)
+                     (= opcode 139) (if (< fraction 0.0) (- whole 1) whole)
+                     (= opcode 140) whole
+                     :else (if (>= magnitude 0.5) away whole))]
+    (cast f64 chosen)))
+
+;;; Reference result of a floating unary operation: NEG (31), ABS (32),
+;;; SQRT (131), ROUND_* (137..141).
+(defn float-unary [(opcode i32) (ty i32) (a u64)] (-> u64)
+  (let [sign (float-sign ty)
+        negative (!= (& a sign) 0)
+        magnitude (& a (- sign 1))]
+    (cond (= opcode 31) (^ a sign)
+          (= opcode 32) magnitude
+          (float-nan? ty a) (float-quiet ty a)
+          (= opcode 131)
+            (cond (float-zero? ty a) a
+                  negative (float-default-nan ty)
+                  (= ty 12) (f64-bits (math/sqrt (f64-of a)))
+                  :else (f32-bits (math/sqrt (f32-of a))))
+          (and (>= opcode 137) (<= opcode 141))
+            (let [limit (if (= ty 12) (: 0x4330000000000000 u64) 0x4B000000)]
+              (if (>= magnitude limit)
+                  a
+                  (let [result (rounded opcode (if (= ty 12)
+                                                   (f64-of a)
+                                                   (cast f64 (f32-of a))))
+                        raw (if (= ty 12) (f64-bits result) (f32-bits (cast f32 result)))]
+                    ; The operand's sign survives, for -0.0 and for values
+                    ; that round to zero.
+                    (| (& raw (- sign 1)) (& a sign)))))
+          :else (panic "x64 test reference: unknown floating unary opcode {}" opcode))))
+
+;;; Reference result of INT2FP from integer type `source` (the value in the
+;;; low bits of `a`) to floating type `target`.
+(defn float-from-integer [(source i32) (target i32) (a u64)] (-> u64)
+  (let [x (& a (mask source))]
+    (if (types/signed? source)
+        (let [value (cast i64 (signed source a))]
+          (if (= target 12) (f64-bits (cast f64 value)) (f32-bits (cast f32 value))))
+        (if (= target 12) (f64-bits (cast f64 x)) (f32-bits (cast f32 x))))))
+
+;;; Reference result of FP2INT from floating type `source` to integer type
+;;; `target`: what constant folding gives (stogir.numeric-conversion, exact
+;;; integer decoding). None when the IR leaves the conversion undefined (a
+;;; NaN, or a truncated value the target type cannot hold).
+(defn float-to-integer [(source i32) (target i32) (a u64)] (-> (Option u64))
+  (numeric/evaluate 38 source target 8 a))
+
+;;; Reference result of FP2FP between the two floating types.
+(defn float-to-float [(source i32) (target i32) (a u64)] (-> u64)
+  (cond (= source target) (& a (mask source))
+        (= source 13) (f64-bits (cast f64 (f32-of a)))
+        :else (f32-bits (cast f32 (f64-of a)))))
+
+;;; Call mapped code whose parameters are, in order, up to twelve floating
+;;; values (xmm0..xmm7, then four stack slots) followed by up to twelve
+;;; integers (six registers, then six stack slots). A FLOAT argument is
+;;; passed as the low 32 bits of its slot. Returns rax.
+(defn invoke-mixed [(mapped Mapped) (floats (slice u64)) (integers (slice u64))] (-> u64)
+  (let [f (primitive/cast (fnptr (cc/C) [f64 f64 f64 f64 f64 f64 f64 f64 f64 f64 f64 f64
+                                         u64 u64 u64 u64 u64 u64 u64 u64 u64 u64 u64 u64]
+                                 u64)
+                          (.base (.image mapped)))
+        (mut x) (primitive/zeroed (array f64 12))
+        (mut a) (primitive/zeroed (array u64 12))]
+    (when (or (> (len floats) 12) (> (len integers) 12))
+      (panic "x64 test call with more than twelve arguments of one class"))
+    (for [i 0 (len floats)] (set! (mut x) i (f64-of (get floats i))))
+    (for [i 0 (len integers)] (set! (mut a) i (get integers i)))
+    (call-ptr f (get x 0) (get x 1) (get x 2) (get x 3) (get x 4) (get x 5)
+              (get x 6) (get x 7) (get x 8) (get x 9) (get x 10) (get x 11)
+              (get a 0) (get a 1) (get a 2) (get a 3) (get a 4) (get a 5)
+              (get a 6) (get a 7) (get a 8) (get a 9) (get a 10) (get a 11))))
+
+;;; As invoke-mixed for a function that returns a floating value: the bits
+;;; of xmm0 (mask to 32 bits for a FLOAT).
+(defn invoke-floating [(mapped Mapped) (floats (slice u64)) (integers (slice u64))] (-> u64)
+  (let [f (primitive/cast (fnptr (cc/C) [f64 f64 f64 f64 f64 f64 f64 f64 f64 f64 f64 f64
+                                         u64 u64 u64 u64 u64 u64 u64 u64 u64 u64 u64 u64]
+                                 f64)
+                          (.base (.image mapped)))
+        (mut x) (primitive/zeroed (array f64 12))
+        (mut a) (primitive/zeroed (array u64 12))]
+    (when (or (> (len floats) 12) (> (len integers) 12))
+      (panic "x64 test call with more than twelve arguments of one class"))
+    (for [i 0 (len floats)] (set! (mut x) i (f64-of (get floats i))))
+    (for [i 0 (len integers)] (set! (mut a) i (get integers i)))
+    (f64-bits (call-ptr f (get x 0) (get x 1) (get x 2) (get x 3) (get x 4) (get x 5)
+                        (get x 6) (get x 7) (get x 8) (get x 9) (get x 10) (get x 11)
+                        (get a 0) (get a 1) (get a 2) (get a 3) (get a 4) (get a 5)
+                        (get a 6) (get a 7) (get a 8) (get a 9) (get a 10) (get a 11)))))
+
+;;; The bits of floating `value` as an integer the function can return in
+;;; rax: BITCAST to U64, or to U32 and then ZEXT for a FLOAT.
+(defn float-bits! [(graph (mut g/Graph)) (ty i32) (value i32)] (-> i32)
+  (if (= ty 12)
+      (unary! (mut graph) 36 5 value)
+      (unary! (mut graph) 34 5 (unary! (mut graph) 36 4 value))))
+
+;;; The floating value of `ty` whose bits are integer `value` (a U64): the
+;;; inverse of float-bits!.
+(defn float-value! [(graph (mut g/Graph)) (ty i32) (value i32)] (-> i32)
+  (if (= ty 12)
+      (unary! (mut graph) 36 12 value)
+      (unary! (mut graph) 36 13 (unary! (mut graph) 35 4 value))))
+
+;;; Bit patterns every floating test should cover, for type `ty`: zeros, the
+;;; smallest and largest subnormals and normals, ones, values around one
+;;; half, integers at the edge of exact representation, infinities, and
+;;; quiet and signalling NaNs of both signs with payloads.
+(defn float-specials [(ty i32) (index i64)] (-> u64)
+  (let [wide [(: 0x0000000000000000 u64) 0x8000000000000000 0x0000000000000001
+              0x8000000000000001 0x000FFFFFFFFFFFFF 0x0010000000000000
+              0x3FF0000000000000 0xBFF0000000000000 0x3FE0000000000000
+              0xBFE0000000000000 0x3FDFFFFFFFFFFFFF 0x3FE0000000000001
+              0x3FF8000000000000 0xC004000000000000 0x400921FB54442D18
+              0x4330000000000000 0x432FFFFFFFFFFFFF 0xC32FFFFFFFFFFFFF
+              0x7FEFFFFFFFFFFFFF 0xFFEFFFFFFFFFFFFF 0x7FF0000000000000
+              0xFFF0000000000000 0x7FF8000000000000 0xFFF8123456789ABC
+              0x7FF0123456789ABC 0xFFF0000000000001]
+        narrow [(: 0x00000000 u64) 0x80000000 0x00000001 0x80000001 0x007FFFFF 0x00800000
+                0x3F800000 0xBF800000 0x3F000000 0xBF000000 0x3EFFFFFF 0x3F000001
+                0x3FC00000 0xC0200000 0x40490FDB 0x4B000000 0x4AFFFFFF 0xCAFFFFFF
+                0x7F7FFFFF 0xFF7FFFFF 0x7F800000 0xFF800000 0x7FC00000 0xFFC12345
+                0x7F812345 0xFF800001]]
+    (if (= ty 12) (get wide index) (get narrow index))))
+
+(const FLOAT-SPECIALS 26)

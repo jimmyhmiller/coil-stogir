@@ -1,0 +1,207 @@
+(module stogir.tests.x64-float-convert)
+(import "stogir.graph" :as g)
+(import "stogir.conversion" :as conversion)
+(import "stogir.types" :as types)
+(import "stogir.x64.testing" :as t)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; Conversions with a floating side on x86-64, against the reference
+;;; evaluator of stogir.x64.testing and against constant folding:
+;;;
+;;;   INT2FP  every integer type (BOOL, the unsigned and signed 8..64-bit
+;;;           types, ADDR) to f32 and f64, with garbage above a narrow
+;;;           argument, at the values where rounding happens: 2^24 and 2^53
+;;;           neighbours, and for u64 the neighbours and ties around 2^63
+;;;           and 2^64, where the halve-and-round sequence is used;
+;;;   FP2INT  f32 and f64 to every integer type at each type's limits (the
+;;;           largest and smallest values that still convert, with
+;;;           fractions), the whole u64 range, negative fractions, and the
+;;;           inputs the IR leaves undefined (NaNs, infinities, out of
+;;;           range): for those only the I32 and I64 results are checked,
+;;;           where x86-64 returns the "integer indefinite" 0x8000...;
+;;;   FP2FP   both directions, including ties, overflow, subnormal results
+;;;           and NaNs (payload moved, quieted);
+;;;   BITCAST between each floating type and the integer types of its size.
+;;; The operand is a parameter or (form 1) a constant.
+
+(defn double-of [(value f64)] (-> u64)
+  (t/f64-bits value))
+
+;;; Integer inputs for INT2FP.
+(defn integer-at [(index i64)] (-> u64)
+  (get [(: 0 u64) 1 2 0x7F 0x80 0xFF 0x7FFF 0x8000 0xFFFF 0x7FFFFFFF 0x80000000 0xFFFFFFFF
+        0x1000000 0x1000001 0x1000003 0xFFFFFF 0x2000001
+        0x20000000000000 0x20000000000001 0x20000000000003 0x1FFFFFFFFFFFFF
+        0x7FFFFFFFFFFFFFFF 0x7FFFFFFFFFFFFC00 0x7FFFFFFFFFFFFE00 0x7FFFFFFFFFFFFDFF
+        0x8000000000000000 0x8000000000000001 0x8000000000000400 0x8000000000000401
+        0x80000000000003FF 0x8000000000000800 0x8000000000000C00 0x8000000000000BFF
+        0x8000008000000000 0x8000008000000001 0x800000C000000000 0x8000007FFFFFFFFF
+        0xFFFFFFFFFFFFFFFF 0xFFFFFFFFFFFFFBFF 0xFFFFFFFFFFFFFC00 0xFFFFFFFFFFFFF800
+        0xFFFFFF7FFFFFFFFF 0xFFFFFF8000000000 0xFFFFFE8000000000 0xFFFFFFFFFFFFFFFE
+        0xC000000000000001 0x123456789ABCDEF0 0xFEDCBA9876543210 0xAAAAAAAAAAAAAAAA
+        0x5555555555555555]
+       index))
+
+(const INTEGERS 50)
+
+;;; Floating inputs for FP2INT, as doubles; a FLOAT source gets each rounded
+;;; to f32 (so the value is always exactly representable in the source type)
+;;; plus the special patterns of the type.
+(defn limit-at [(index i64)] (-> f64)
+  (get [(: 0.0 f64) 0.5 0.99 1.0 1.5 2.5 -0.5 -0.99 -1.0 -1.5
+        127.0 127.9 128.0 -128.0 -128.9 -129.0 255.0 255.9 256.0
+        32767.0 32767.9 32768.0 -32768.0 -32768.9 -32769.0 65535.0 65535.9 65536.0
+        2147483647.0 2147483647.5 2147483648.0 2147483520.0 -2147483648.0 -2147483648.5
+        -2147483649.0 4294967295.0 4294967295.5 4294967296.0 4294967040.0
+        9223372036854774784.0 9223372036854775808.0 9223371487098961920.0
+        -9223372036854775808.0 -9223372036854777856.0 -9223373136366403584.0
+        9223372036854777856.0 18446744073709549568.0 18446744073709551616.0
+        18446742974197923840.0 13835058055282163712.0 1e30 -1e30 4503599627370497.0
+        123456789.75 -123456789.75]
+       index))
+
+(const LIMITS 55)
+
+(defn check! [(tally (mut t/Tally)) (opcode i32) (source i32) (target i32) (form i32)
+              (input u64) (actual u64) (expected u64)] (-> void)
+  (set! (.checks tally) (+ (.checks tally) 1))
+  (when (!= actual expected)
+    (when (< (.failures tally) 40)
+      (println "op {} {} -> {} form {}: {:x} gave {:x}, expected {:x}"
+               opcode source target form input actual expected))
+    (t/fail! (mut tally))))
+
+;;; One function converting `source` to `target` with `opcode`; in form 1 the
+;;; operand is the constant `fixed`. Returns None when it does not compile.
+(defn build [(tally (mut t/Tally)) (opcode i32) (source i32) (target i32) (form i32)
+             (fixed u64) (a (dyn Allocator))] (-> (Option t/Mapped))
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        parameter (t/param! (mut graph) start source 0)
+        operand (if (= form 1)
+                    (t/constant! (mut graph) source (if (= source 1) (& fixed 1) fixed))
+                    parameter)
+        value (t/unary! (mut graph) opcode target operand)
+        ret (if (types/floating? target)
+                (t/return! (mut graph) start 5 (t/float-bits! (mut graph) target value))
+                (t/return! (mut graph) start target value))
+        mapped (t/compiled (mut tally) "x64 float convert" graph start [ret] a)]
+    (g/release! (mut graph))
+    mapped))
+
+(defn apply-to [(mapped t/Mapped) (source i32) (input u64)] (-> u64)
+  (if (types/floating? source)
+      (t/invoke-mixed mapped [input] [])
+      (t/invoke-mixed mapped [] [(t/dirty source input)])))
+
+;;; What the caller compares for a result of type `target` with bits `value`.
+(defn seen [(target i32) (value u64)] (-> u64)
+  (cond (= target 12) value
+        (= target 13) (& value 0xFFFFFFFF)
+        :else (t/returned target value)))
+
+(defn seen-mask [(target i32)] (-> u64)
+  (cond (= target 12) (: 0xFFFFFFFFFFFFFFFF u64)
+        (= target 13) 0xFFFFFFFF
+        :else (t/returned-mask target)))
+
+;;; The reference result; None where the IR leaves the conversion undefined.
+(defn reference [(opcode i32) (source i32) (target i32) (input u64)] (-> (Option u64))
+  (cond (= opcode 37) (Some (t/float-from-integer source target input))
+        (= opcode 38) (t/float-to-integer source target input)
+        (= opcode 39) (Some (t/float-to-float source target input))
+        :else (Some (& input (t/mask source)))))
+
+(defn run-value! [(tally (mut t/Tally)) (mapped t/Mapped) (opcode i32) (source i32)
+                  (target i32) (form i32) (input u64)] (-> void)
+  (let [given (if (= source 1) (& input 1) (& input (t/mask source)))
+        actual (& (apply-to mapped source given) (seen-mask target))]
+    (match (reference opcode source target given)
+      (Some [expected]
+            (check! (mut tally) opcode source target form given actual (seen target expected))
+            ; Constant folding agrees on every defined input. (FP2FP of a
+            ; NaN is not folded: the payload rule is the machine's.)
+            (match (conversion/evaluate opcode source target 8 given)
+              (None [] 0)
+              (Some [folded]
+                    (check! (mut tally) opcode source target 9 given (seen target folded)
+                            (seen target expected)))))
+      (None []
+            ; Undefined in the IR. cvttss2si/cvttsd2si return the integer
+            ; indefinite for the two types converted at their own width.
+            (when (or (= target 10) (= target 11))
+              (check! (mut tally) opcode source target form given actual
+                      (seen target (if (= target 10) (: 0x80000000 u64) 0x8000000000000000))))))))
+
+(defn run! [(tally (mut t/Tally)) (opcode i32) (source i32) (target i32) (a (dyn Allocator))]
+  (-> void)
+  (match (build (mut tally) opcode source target 0 0 a)
+    (None [] (println "  (op {} {} -> {})" opcode source target))
+    (Some [mapped]
+          (let [(mut mapped) mapped]
+            (if (types/floating? source)
+                (do
+                  (for [i 0 t/FLOAT-SPECIALS]
+                    (run-value! (mut tally) mapped opcode source target 0
+                                (t/float-specials source i)))
+                  (for [i 0 LIMITS]
+                    (let [value (limit-at i)]
+                      (run-value! (mut tally) mapped opcode source target 0
+                                  (if (= source 12)
+                                      (double-of value)
+                                      (t/f32-bits (cast f32 value))))
+                      ; The neighbours of each limit in the source type.
+                      (when (= source 12)
+                        (run-value! (mut tally) mapped opcode source target 0
+                                    (+ (double-of value) 1))
+                        (run-value! (mut tally) mapped opcode source target 0
+                                    (- (double-of value) 1)))
+                      (when (= source 13)
+                        (run-value! (mut tally) mapped opcode source target 0
+                                    (+ (t/f32-bits (cast f32 value)) 1))
+                        (run-value! (mut tally) mapped opcode source target 0
+                                    (- (t/f32-bits (cast f32 value)) 1))))))
+                (do
+                  (for [i 0 INTEGERS]
+                    (run-value! (mut tally) mapped opcode source target 0 (integer-at i)))
+                  (when (= opcode 36)
+                    (for [i 0 t/FLOAT-SPECIALS]
+                      (run-value! (mut tally) mapped opcode source target 0
+                                  (t/float-specials target i))))))
+            (t/unmap! (mut mapped)))))
+  ; The same conversion of a constant operand.
+  (for [k 0 6]
+    (let [fixed (if (types/floating? source)
+                    (if (< k 3)
+                        (t/float-specials source (get [(: 0 i64) 12 13] k))
+                        (let [value (limit-at (get [(: 4 i64) 28 39] (- k 3)))]
+                          (if (= source 12) (double-of value) (t/f32-bits (cast f32 value)))))
+                    (integer-at (get [(: 0 i64) 1 13 26 38 47] k)))]
+      (match (build (mut tally) opcode source target 1 fixed a)
+        (None [] (println "  (op {} {} -> {} constant {:x})" opcode source target fixed))
+        (Some [mapped]
+              (let [(mut mapped) mapped]
+                (run-value! (mut tally) mapped opcode source target 1 fixed)
+                (t/unmap! (mut mapped))))))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 float convert: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (for floating [(: 12 i32) 13]
+          (for integer [(: 1 i32) 2 3 4 5 6 7 8 9 10 11]
+            (run! (mut tally) 37 integer floating a)
+            (run! (mut tally) 38 floating integer a))
+          (for other [(: 12 i32) 13]
+            (run! (mut tally) 39 floating other a)))
+        (for integer [(: 5 i32) 6 11]
+          (run! (mut tally) 36 integer 12 a)
+          (run! (mut tally) 36 12 integer a))
+        (for integer [(: 4 i32) 10]
+          (run! (mut tally) 36 integer 13 a)
+          (run! (mut tally) 36 13 integer a))
+        (println "x64 float convert: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))
