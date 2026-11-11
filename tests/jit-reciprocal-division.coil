@@ -1,12 +1,13 @@
 (module stogir.tests.jit-reciprocal-division)
 (import "stogir.graph" :as g)
+(import "stogir.target" :as target)
 (import "stogir.builder" :as b)
 (import "stogir.calls" :as calls)
 (import "stogir.types" :as types)
 (import "stogir.node" :as n)
-(import "stogir.a64.compile" :as compile)
+(import "stogir.native.compile" :as compile)
 (import "stogir.reciprocal" :as reciprocal)
-(import "stogir.jit.darwin" :as jit)
+(import "stogir.jit.native" :as jit)
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.primitive" :as primitive)
 (import "coil.cc" :as cc)
@@ -89,14 +90,14 @@
                 (mut divides) 0
                 (mut at) (: 0 i64)]
             ; A reciprocal sequence holds no UDIV/SDIV instruction.
-            (while (< (+ at 3) (len code))
+            (target/arch-pick (while (< (+ at 3) (len code))
               (let [word (| (cast u32 (get code at))
                             (<< (cast u32 (get code (+ at 1))) 8)
                             (<< (cast u32 (get code (+ at 2))) 16)
                             (<< (cast u32 (get code (+ at 3))) 24))]
                 (when (= (& word 0x7FE0F800) 0x1AC00800)
                   (set! divides (+ divides 1))))
-              (set! at (+ at 4)))
+              (set! at (+ at 4))) (do))
             (when (and (> divides 0) (>= d 2) (!= (& d (- d 1)) 0)
                        (or (not (types/signed? (cast i32 ty))) (!= d mask)))
               (when (= failures 0)
@@ -146,7 +147,16 @@
                                        (^ (expected 29 (cast i32 ty) x d)
                                           (expected 30 (cast i32 ty) x d))
                                        (expected opcode (cast i32 ty) x d))
-                            actual (& (call-ptr f a) mask)]
+                            ; The minimum divided by -1 is undefined in the
+                            ; IR: AArch64 returns the minimum (as `expected`
+                            ; computes), x86-64 traps (docs/X86_PORT.md), so
+                            ; that one input is not called there.
+                            skipped (target/arch-pick
+                                      false
+                                      (and (types/signed? (cast i32 ty))
+                                           (= d mask)
+                                           (= x (+ (>> mask 1) 1))))
+                            actual (if skipped wanted (& (call-ptr f a) mask))]
                         (when (!= actual wanted)
                           (when (= failures 0)
                             (println "op={} ty={} d={} halved={} a={} expected={} actual={}"

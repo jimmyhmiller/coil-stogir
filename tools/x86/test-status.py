@@ -22,7 +22,8 @@ FAMILY = {
     "integer": """bit-literal-identities checked-object compile-image extension-idioms extrema-object
         integer-arithmetic-object jit-bit-test jit-checked-pressure jit-condition-merge
         jit-condition-merge-zero jit-conditional jit-conversions jit-division jit-extend
-        jit-literal-operands jit-multiply-literal jit-pressure jit-select-diamond
+        jit-literal-operands jit-multiply-literal jit-pressure jit-reciprocal-division
+        jit-select-diamond
         jit-subsumed-guard jit-unary-matrix jit-widened-view-bitcast jit-zero-branch macho
         narrow-binary-object narrow-truth-test trunc-view-coalesce unary-object zext-known-zero""",
     "memory+stack": """bulk frame-direct-access jit-bulk jit-bulk-pairs jit-byte-memory jit-local-frames
