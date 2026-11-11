@@ -3,6 +3,7 @@
 (import "stogir.builder" :as b)
 (import "stogir.calls" :as calls)
 (import "stogir.call-groups" :as groups)
+(import "stogir.target" :as target)
 (import "stogir.native.compile" :as compile)
 (import "coil.alloc" :use [malloc-allocator])
 (import "coil.arraylist" :use [ArrayList])
@@ -17,6 +18,14 @@
 (defn invalid-prototype [(r (Result calls/Prototype (slice u8)))] (-> i64)
   (match r (Err [_] 0) (Ok [p] (let [(mut p) p] (calls/release! (mut p)) 1))))
 
+;;; The platform convention number (9 AArch64 Darwin, 8 System V x86-64),
+;;; plain and variadic, and a type that cannot follow a U64 in one group.
+(const PLATFORM (target/arch-pick 9 8))
+
+(const VARIADIC (target/arch-pick 25 24))
+
+(const STRANGER-TYPE (target/arch-pick 13 6))
+
 (defn main [] (-> i64)
   (let [allocator (malloc-allocator)
         (mut graph) (g/create allocator)
@@ -29,15 +38,19 @@
             :first 1
             :count 2
             :alignment 8)
+        ; A value whose type cannot join a U64 in one group: a FLOAT on
+        ; AArch64 (members are homogeneous), an ADDR on x86-64 (System V
+        ; pairs U64 with FLOAT, but an ADDR is no group member).
+        stranger (target/arch-pick single target)
         (mut failures) 0]
     (set! failures
           (+ failures
-             (invalid-prototype (calls/create-grouped 9
+             (invalid-prototype (calls/create-grouped PLATFORM
                                                       5
                                                       [(: 5 u8)]
                                                       [descriptor]
                                                       allocator))
-             (invalid-prototype (calls/create-grouped 25
+             (invalid-prototype (calls/create-grouped VARIADIC
                                                       5
                                                       [(: 5 u8)]
                                                       [(groups/Group
@@ -45,15 +58,15 @@
                                                          :count 4
                                                          :alignment 8)]
                                                       allocator))
-             (invalid-prototype (calls/create-grouped 9
+             (invalid-prototype (calls/create-grouped PLATFORM
                                                       5
-                                                      [(: 5 u8) 13]
+                                                      [(: 5 u8) STRANGER-TYPE]
                                                       [(groups/Group
                                                          :first 0
                                                          :count 2
                                                          :alignment 8)]
                                                       allocator))))
-    (match (calls/create-grouped 25 5 [(: 5 u8)] [descriptor] allocator)
+    (match (calls/create-grouped VARIADIC 5 [(: 5 u8)] [descriptor] allocator)
       (Err [message] (println "{}" message) (set! failures (+ failures 1)))
       (Ok [prototype]
           (let [(mut prototype) prototype
@@ -70,7 +83,7 @@
                                             prototype
                                             start
                                             target
-                                            [integer integer single]
+                                            [integer integer stranger]
                                             allocator))
                      (rejected (calls/function! (mut graph) prototype allocator))))
             (when (or (!= (.function-prototype graph) 0)
@@ -93,7 +106,7 @@
                      (println "{}" message)
                      (set! failures (+ failures 1)))
                 (Ok [_] 0))
-              (b/patch! (mut graph) called 4 single)
+              (b/patch! (mut graph) called 4 stranger)
               (match (calls/validate-call graph called)
                 (Err [_] 0)
                 (Ok [_] (set! failures (+ failures 1))))
@@ -120,7 +133,7 @@
     ; A corrupted 256-byte parameter vector can masquerade as a valid SGAG
     ; trailer when its one-byte scalar count wraps. Validate the owned model,
     ; not just the serialized interpretation, before touching graph metadata.
-    (match (calls/create 25 5 [] allocator)
+    (match (calls/create VARIADIC 5 [] allocator)
       (Err [_] (set! failures (+ failures 1)))
       (Ok [prototype]
           (let [(mut prototype) prototype
