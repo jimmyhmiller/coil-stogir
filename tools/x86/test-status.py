@@ -30,7 +30,7 @@ FAMILY = {
     "memory+stack": """bulk frame-direct-access jit-bulk jit-bulk-pairs jit-byte-memory jit-local-frames
         jit-local-loop jit-locals jit-memory jit-stack jit-stack-branch jit-stack-invalid
         jit-stack-loop jit-stack-scopes locals sext-load shrink-wrap stack volatile-access""",
-    "calls+ABI": """aggregate-result-recursion call-abi-validation grouped-prototypes jit-argument-value
+    "calls+ABI": """aggregate-result-recursion call-abi-validation grouped-prototypes inline-argval jit-argument-value x64-inline-argval
         jit-call-narrow jit-call-narrow-return jit-call-narrow-varargs jit-call-stack
         jit-call-varargs jit-call-void jit-grouped-arguments jit-hva-abi jit-hva-incoming
         jit-hva-outgoing jit-incoming jit-incoming-fp-layout jit-incoming-widths
@@ -49,7 +49,7 @@ FAMILY = {
         jit-termination loop-carried-update-order rotated-test-block switch-prune-default
         terminal""",
     "atomics": "jit-atomics",
-    "private-leaf/module": "module-execution",
+    "private-leaf/module": "compile-module-concurrent compile-reads-graph module-execution x64-verify-borrowed-graph",
     "inlining/optimizer": """adjacent-field-promotion backend-validation-proof branch-facts
         call-effect-records copy-forward dead-stores entry-load finite-countdown
         general-if-conversion global-load-forward induction-ranges inline-call-exemptions
