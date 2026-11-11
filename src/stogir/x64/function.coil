@@ -45,7 +45,10 @@
 (import "stogir.uses" :as graph-uses)
 (import "stogir.register-live" :as live)
 (import "stogir.x64.allocate" :as allocate)
+(import "stogir.x64.abi-arguments" :as arguments)
+(import "stogir.x64.call" :as call)
 (import "stogir.x64.call-abi" :as abi)
+(import "stogir.call-results" :as results)
 (import "stogir.x64.callee-saved" :as callee)
 (import "stogir.x64.code" :as code)
 (import "stogir.x64.conditional" :as conditional)
@@ -90,10 +93,15 @@
       (while (> (len moves) kept) (pop! (mut moves))))
     moves))
 
-;;; sub rsp, N and the preserved-register stores. Nothing for a frameless
-;;; function.
-(defn prologue! [(out (mut code/Buffer)) (assigned allocate/Assigned) (frame-size i64)]
-  (-> (Result i32 (slice u8)))
+;;; The function's result role and the logical frame offset of the object it
+;;; needs: the buffer of register result pieces (kind 1) or the save slot of
+;;; the indirect result pointer (kind 2); -1 for an ordinary result.
+(defstruct Role [(spec results/Spec) (slot i64)])
+
+;;; sub rsp, N and the preserved-register stores; an indirect result's hidden
+;;; pointer (rdi) is saved for RETURN. Nothing for a frameless function.
+(defn prologue! [(out (mut code/Buffer)) (assigned allocate/Assigned) (frame-size i64)
+                 (role Role)] (-> (Result i32 (slice u8)))
   (let [(mut error) ""]
     (when (> frame-size 0)
       (code/accept! (mut error)
@@ -101,10 +109,19 @@
       (code/accept-count! (mut error)
                           (callee/emit! (mut (.text out)) (.callee assigned) false
                                         (.base assigned))))
+    (when (= (.kind (.spec role)) 2)
+      (if (or (< (.slot role) 0) (<= frame-size 0))
+          (set! error "indirect result pointer has no frame slot")
+          (code/accept! (mut error)
+                        (encode/mov-mr (mut (.text out)) 64
+                                       (encode/mem registers/RSP (.slot role))
+                                       registers/RDI))))
     (if (= error "") (Ok 0) (Err error))))
 
-;;; The preserved-register reloads, add rsp, N and ret.
-(defn epilogue! [(out (mut code/Buffer)) (assigned allocate/Assigned) (frame-size i64)]
+;;; The preserved-register reloads and add rsp, N: rsp is back at the return
+;;; address. Only moves and the add; every argument and result register
+;;; survives.
+(defn release-frame! [(out (mut code/Buffer)) (assigned allocate/Assigned) (frame-size i64)]
   (-> (Result i32 (slice u8)))
   (let [(mut error) ""]
     (when (> frame-size 0)
@@ -113,22 +130,112 @@
                                         (.base assigned)))
       (code/accept! (mut error)
                     (encode/alu-ri (mut (.text out)) encode/ADD 64 registers/RSP frame-size)))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; release-frame! and ret.
+(defn epilogue! [(out (mut code/Buffer)) (assigned allocate/Assigned) (frame-size i64)]
+  (-> (Result i32 (slice u8)))
+  (let [(mut error) ""]
+    (code/accept-count! (mut error) (release-frame! (mut out) assigned frame-size))
     (code/accept! (mut error) (encode/ret (mut (.text out))))
     (if (= error "") (Ok 0) (Err error))))
 
-;;; RETURN: the integer value (register, spill slot or constant) goes to rax,
-;;; extended to 32 bits by its type's signedness; then the epilogue.
+;;; RETURN, by the function's result role (System V):
+;;;   ordinary  the value (register, spill slot or constant) goes to rax,
+;;;             extended to 32 bits by its type's signedness, or to xmm0;
+;;;   pieces    each register piece is loaded from the frame buffer: integer
+;;;             pieces into rax then rdx, floating ones into xmm0 then xmm1;
+;;;   indirect  the saved hidden pointer is returned in rax.
+;;; Then the epilogue.
 (defn return! [(out (mut code/Buffer)) (cx context/Context) (assigned allocate/Assigned)
-               (reference i32) (position i64)] (-> (Result i32 (slice u8)))
+               (role Role) (reference i32) (position i64)] (-> (Result i32 (slice u8)))
   (let [node (get (.instructions (.graph cx)) (cast i64 reference))
         ty (cast i32 (n/type-id node))
+        spec (.spec role)
         (mut error) ""]
-    (when (!= ty 0)
-      (code/accept-count! (mut error)
-                          (emit/into! (mut out) cx (.op2 node) position registers/RAX))
-      (code/accept-count! (mut error) (abi/normalize! (mut out) ty registers/RAX)))
+    (cond
+      (= (.kind spec) 0)
+        (when (!= ty 0)
+          (code/accept-count! (mut error)
+                              (call/load! (mut out) cx (.op2 node) position
+                                          (call/result-register ty)))
+          (code/accept-count! (mut error) (abi/normalize! (mut out) ty registers/RAX)))
+      (< (.slot role) 0) (set! error "aggregate result has no frame slot")
+      (= (.kind spec) 2)
+        (code/accept! (mut error)
+                      (encode/mov-rm (mut (.text out)) 64 registers/RAX
+                                     (encode/mem registers/RSP (.slot role))))
+      :else
+        (for [i 0 (cast i64 (.count spec))]
+          (let [piece (cast i32 i)
+                register (arguments/result-register spec piece)
+                slot (encode/mem registers/RSP (+ (.slot role) (results/piece-offset spec piece)))]
+            (code/accept! (mut error)
+                          (cond (registers/gpr? register)
+                                  (encode/mov-rm (mut (.text out)) 64 register slot)
+                                (= (results/piece-type spec piece) 13)
+                                  (encode/sse-mov-rm (mut (.text out)) encode/MOVSS register slot)
+                                :else
+                                  (encode/sse-mov-rm (mut (.text out)) encode/MOVSD register
+                                                     slot))))))
     (code/accept-count! (mut error) (epilogue! (mut out) assigned (.frame-size cx)))
     (if (= error "") (Ok 0) (Err error))))
+
+;;; CALL and TAILCALL by their selected mode (stogir.x64.tail-plan).
+;;;   0  the call, results captured (stogir.x64.call/emit-call!).
+;;;   2  the call, then this function's epilogue: the callee's result
+;;;      registers are this function's own.
+;;;   1  a jump. The arguments are installed as for a call; the stack
+;;;      arguments, built in the outgoing area, are moved over the ones this
+;;;      function received (the selection proved they fit), highest slot
+;;;      first because the destination lies above the source and may overlap
+;;;      it; the frame is released, which leaves rsp at the return address;
+;;;      then `jmp rel32` or `jmp rax`. Only r10 is used for the move: the
+;;;      argument registers and an indirect target are already in place.
+(defn call-node! [(out (mut code/Buffer)) (cx context/Context) (assigned allocate/Assigned)
+                  (reference i32) (position i64) (preserve (slice locations/Transfer))
+                  (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (let [graph (.graph cx)
+        node (get (.instructions graph) (cast i64 reference))
+        mode (plan/tail-mode (.matched cx) reference)
+        frame-size (.frame-size cx)
+        (mut error) ""]
+    (cond
+      (and (= (n/opcode node) 80) (= mode 0)) (Err "TAILCALL has no selected lowering")
+      (= mode 0) (call/emit-call! (mut out) cx reference position preserve 0 allocator)
+      :else
+        (do
+          (code/accept-count! (mut error)
+                              (call/emit-call! (mut out) cx reference position preserve mode
+                                               allocator))
+          (if (= mode 2)
+              (code/accept-count! (mut error) (epilogue! (mut out) assigned frame-size))
+              (match (abi/layout graph reference allocator)
+                (Err [message] (when (= error "") (set! error message)))
+                (Ok [planned]
+                    (let [(mut planned) planned
+                          (mut offset) (.passed planned)]
+                      (while (> offset 0)
+                        (set! offset (- offset 8))
+                        (code/accept! (mut error)
+                                      (encode/mov-rm (mut (.text out)) 64 registers/SCRATCH-GPR
+                                                     (encode/mem registers/RSP offset)))
+                        (code/accept! (mut error)
+                                      (encode/mov-mr (mut (.text out)) 64
+                                                     (encode/mem registers/RSP
+                                                                 (+ frame-size 8 offset))
+                                                     registers/SCRATCH-GPR)))
+                      (code/accept-count! (mut error)
+                                          (release-frame! (mut out) assigned frame-size))
+                      (if (abi/direct-callee? graph (.op2 node))
+                          (code/accept-count! (mut error)
+                                              (call/direct-jump! (mut out) (.op2 node)))
+                          (code/accept! (mut error)
+                                        (encode/jmp-r (mut (.text out))
+                                                      (call/target-register planned))))
+                      (code/called! (mut out))
+                      (abi/release! (mut planned))))))
+          (if (= error "") (Ok 0) (Err error))))))
 
 ;;; The IF_TRUE and IF_FALSE projections of IF `reference`.
 (defstruct Arms [(yes i32) (no i32)])
@@ -289,7 +396,16 @@
             :stubs (ArrayList::new [edges/EdgeStub] allocator))
         (mut group) (ArrayList::new [locations/Transfer] allocator)
         (mut move-index) (transfer-index/create allocator)
+        (mut role) (Role :spec (results/ordinary) :slot -1)
         (mut error) ""]
+    (match (incoming/result-role graph)
+      (Err [message] (set! error message))
+      (Ok [spec]
+          (set! role (Role :spec spec
+                           :slot (if (and (!= (.kind spec) 0) (> (len (.nodes scheduled)) 0))
+                                     (abi/local-offset (.frame assigned)
+                                                       (get (.nodes scheduled) 0))
+                                     -1)))))
     (match (checked-schedule/validate graph scheduled)
       (Err [message] (set! error message))
       (Ok [_] 0))
@@ -300,7 +416,8 @@
     ; A transfer at an odd (definition) position runs before the node. That
     ; is right for a store into a spill slot, which preserves the register's
     ; old value; any other odd transfer needs lowering by the node's own
-    ; emitter, which only a family that announced the position provides.
+    ; emitter. Calls announce their position and lower every transfer there
+    ; inside their own parallel group (call-node!).
     (for move moves
       (when (and (= error "")
                  (!= (% (.position move) 2) 0)
@@ -308,12 +425,10 @@
         (let [(mut announced) false]
           (for position (.definition-moves set)
             (when (= position (.position move)) (set! announced true)))
-          (set! error
-                (if announced
-                    "x86-64 backend: definition-position transfers are not lowered yet (call family)"
-                    "odd split boundary needs instruction-specific lowering")))))
+          (unless announced
+            (set! error "odd split boundary needs instruction-specific lowering")))))
     (when (= error "")
-      (match (prologue! (mut output) assigned frame-size)
+      (match (prologue! (mut output) assigned frame-size role)
         (Err [message] (set! error message))
         (Ok [_] 0)))
     (for [cursor 0 (len (.indices physical))]
@@ -338,7 +453,9 @@
                 (while (>= at 0)
                   (push! (mut group) (get moves at))
                   (set! at (get (.next move-index) at))))
-              (when (> (len group) 0)
+              ; A call lowers its definition-position transfers itself.
+              (when (and (> (len group) 0)
+                         (not (and (= phase 1) (or (= opcode 79) (= opcode 80)))))
                 (match (edges/typed-group! (mut (.text output)) graph (slice group)
                                            allocator (.base assigned))
                   (Err [message] (set! error message))
@@ -357,6 +474,9 @@
                     (= opcode 117)
                       (switch/emit! (mut output) cx flow (mut control) reference position
                                     (edges/next-successor flow reference next) allocator)
+                    (or (= opcode 79) (= opcode 80))
+                      (call-node! (mut output) cx assigned reference position (slice group)
+                                  allocator)
                     (!= (plan/family matched reference) families/CORE)
                       (families/emit! (mut output) cx reference position
                                       (plan/family matched reference))
@@ -364,12 +484,12 @@
                       (incoming/emit-entry-with-locations!
                         (mut output) graph (.parts cx)
                         (.parameter (at (.values set) (cast i64 reference)))
-                        position frame-size)
+                        position frame-size (.slot role))
                     (or (= opcode 96) (= opcode 121))
                       (match (encode/ud2 (mut (.text output)))
                         (Err [message] (Err [i32 (slice u8)] message))
                         (Ok [_] (Ok 0)))
-                    (= opcode 120) (return! (mut output) cx assigned reference position)
+                    (= opcode 120) (return! (mut output) cx assigned role reference position)
                     (= opcode 116)
                       (conditional-branch! (mut output) cx flow (mut control) reference position
                                            (edges/next-successor flow reference next)
@@ -407,6 +527,18 @@
                                      (.relatives control))
         (Err [message] (set! error message))
         (Ok [_] 0)))
+    ; The registers this code may write (stogir.x64.code): every allocated
+    ; register, every declared clobber, the scratches and the result
+    ; registers of the function's role.
+    (for part (.parts assigned) (code/wrote! (mut output) (.register part)))
+    (for clobber (.clobbers set) (code/wrote! (mut output) (.register clobber)))
+    (for scratch [(: registers/SCRATCH-GPR i32) registers/SCRATCH-GPR-2
+                  registers/SCRATCH-SIMD registers/SCRATCH-SIMD-2 registers/RAX
+                  registers/XMM0]
+      (code/wrote! (mut output) scratch))
+    (when (= (.kind (.spec role)) 1)
+      (for [i 0 (cast i64 (.count (.spec role)))]
+        (code/wrote! (mut output) (arguments/result-register (.spec role) (cast i32 i)))))
     (edges/release-control! (mut control))
     (free! (mut group))
     (transfer-index/release! (mut move-index))

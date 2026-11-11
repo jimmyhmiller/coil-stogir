@@ -21,8 +21,13 @@
 ;;;   * a64.constant-hoist and a64.return-values (direct aggregate returns):
 ;;;     AArch64 tuning and call-family work.
 ;;;   * Level zero is rejected, as on AArch64.
-;;;   * Private-leaf contexts and module publications (call family). The
-;;;     context types come from stogir.native.private-types.
+;;;
+;;; Private-leaf contexts (stogir.x64.private-leaf; the context types come
+;;; from stogir.native.private-types): a frozen context narrows the clobbers
+;;; of direct calls to its leaves. `image-with-private` then appends a private
+;;; copy of every referenced leaf to the image; the `image-for-private-module`
+;;; entries leave the leaf names undefined for a sealed module publication.
+;;; The context's option switches are AArch64 tuning and are not read here.
 (module stogir.x64.compile)
 (export validate generate text image vector-image image-with-options image-with-private image-for-private-module image-for-private-module-optimized image-with-options-optimized image-for-private-module-proven image-with-options-proven)
 (import "stogir.graph" :as g)
@@ -38,6 +43,7 @@
 (import "stogir.live-ranges" :as ranges)
 (import "stogir.split-position" :as split-position)
 (import "stogir.native.private-types" :as private)
+(import "stogir.x64.private-leaf" :as leaves)
 (import "stogir.x64.allocate" :as allocate)
 (import "stogir.x64.code" :as buffer)
 (import "stogir.x64.constraints" :as constraints)
@@ -54,23 +60,22 @@
 ;;; not usable on x86-64 yet (see the module comment), so it is off.
 (const LEVEL-THREE-CHAIN false)
 
-(const PRIVATE-PENDING "x86-64 backend: private-leaf contexts and module publications are not implemented yet (call family); see docs/X86_FAMILIES.md")
-
 (defn validate [(graph g/Graph)] (-> (Result i32 (slice u8)))
   (verify/native-operations graph))
 
 ;;; Liveness through emission for a prepared, matched function.
-(defn generate-matched [(graph g/Graph)
-                        (owned pipeline/Prepared)
-                        (matched plan/Plan)
-                        (allocator (dyn Allocator))]
+(defn generate-matched-private [(graph g/Graph)
+                                (owned pipeline/Prepared)
+                                (matched plan/Plan)
+                                (allocator (dyn Allocator))
+                                (context private/Context)]
   (-> (Result buffer/Buffer (slice u8)))
   (let [(mut analysis) (live/analyze-matched graph (.blocks owned) (.schedule owned)
                                              (.order owned) (.operands matched) allocator)
         (mut intervals) (ranges/build-matched graph (.schedule owned) analysis (.order owned)
                                               (.operands matched) allocator)
         result
-          (match (constraints/build-matched graph (.schedule owned) matched allocator)
+          (match (constraints/build-matched graph (.schedule owned) matched context allocator)
             (Err [message] (Err [buffer/Buffer (slice u8)] message))
             (Ok [requirements]
                 (let [(mut set) requirements
@@ -95,9 +100,17 @@
     (live/release-analysis! (mut analysis))
     result))
 
+(defn generate-matched [(graph g/Graph)
+                        (owned pipeline/Prepared)
+                        (matched plan/Plan)
+                        (allocator (dyn Allocator))]
+  (-> (Result buffer/Buffer (slice u8)))
+  (generate-matched-private graph owned matched allocator (private/no-context)))
+
 ;;; Owned text plus pending graph references of one function. Finish it as an
 ;;; image before releasing the graph.
-(defn generate [(graph g/Graph) (entry i32) (roots (slice i32)) (allocator (dyn Allocator))]
+(defn generate-private [(graph g/Graph) (entry i32) (roots (slice i32))
+                        (allocator (dyn Allocator)) (context private/Context)]
   (-> (Result buffer/Buffer (slice u8)))
   (match (pipeline/prepare-native graph entry roots allocator)
     (Err [message] (Err message))
@@ -108,11 +121,16 @@
                   (Err [message] (Err [buffer/Buffer (slice u8)] message))
                   (Ok [selected]
                       (let [(mut matched) selected
-                            emitted (generate-matched graph owned matched allocator)]
+                            emitted (generate-matched-private graph owned matched allocator
+                                                              context)]
                         (matching/release! (mut matched))
                         emitted)))]
           (pipeline/release! (mut owned))
           result))))
+
+(defn generate [(graph g/Graph) (entry i32) (roots (slice i32)) (allocator (dyn Allocator))]
+  (-> (Result buffer/Buffer (slice u8)))
+  (generate-private graph entry roots allocator (private/no-context)))
 
 ;;; Byte-only output is valid only when no relocation remains to be resolved.
 (defn text [(graph g/Graph)
@@ -132,15 +150,32 @@
 
 ;;; Transfer compiled text into an owned, address-independent shared image.
 ;;; The symbol is an exact target object name; the image is directly JIT-able.
-(defn image [(graph g/Graph) (entry i32) (roots (slice i32)) (symbol (slice u8))
-             (a (dyn Allocator))] (-> (Result code/Image (slice u8)))
-  (match (generate graph entry roots a)
+;;; References to the context's leaves are validated against their ABI; with
+;;; `embed` a private copy of each referenced leaf is appended.
+(defn image-private [(graph g/Graph) (entry i32) (roots (slice i32)) (symbol (slice u8))
+                     (a (dyn Allocator)) (context private/Context) (embed bool)]
+  (-> (Result code/Image (slice u8)))
+  (match (generate-private graph entry roots a context)
     (Err [message] (Err message))
     (Ok [compiled]
         (let [(mut owned) compiled
-              result (emitted-image/finish! (mut owned) graph symbol a)]
+              result (match (leaves/validate-references context graph (slice (.references owned)))
+                       (Err [message] (Err [code/Image (slice u8)] message))
+                       (Ok [_] (emitted-image/finish! (mut owned) graph symbol a)))]
           (buffer/release! (mut owned))
-          result))))
+          (match result
+            (Err [message] (Err message))
+            (Ok [finished]
+                (let [(mut finished) finished]
+                  (match (if embed
+                             (leaves/bind-image! context (mut finished))
+                             (Ok [i32 (slice u8)] 0))
+                    (Err [message] (code/release! (mut finished)) (Err message))
+                    (Ok [_] (Ok finished))))))))))
+
+(defn image [(graph g/Graph) (entry i32) (roots (slice i32)) (symbol (slice u8))
+             (a (dyn Allocator))] (-> (Result code/Image (slice u8)))
+  (image-private graph entry roots symbol a (private/no-context) true))
 
 ;;; The image's SCCP works on its own copy of the caller's graph. When at
 ;;; least an eighth of the cells are dead NOPs, that copy is the compacted
@@ -162,15 +197,17 @@
 ;;; join gets its own RETURN (tail-split), in an owned copy that lives until
 ;;; the image is finished.
 (defn image-split [(graph g/Graph) (entry i32) (roots (slice i32)) (symbol (slice u8))
-                   (allocator (dyn Allocator))] (-> (Result code/Image (slice u8)))
+                   (allocator (dyn Allocator)) (context private/Context) (embed bool)]
+  (-> (Result code/Image (slice u8)))
   (match (tail-split/run graph roots allocator)
     (Err [message] (Err message))
     (Ok [split]
         (match split
-          (None [] (image graph entry roots symbol allocator))
+          (None [] (image-private graph entry roots symbol allocator context embed))
           (Some [owned]
                 (let [(mut owned) owned
-                      output (image (.graph owned) entry (slice (.roots owned)) symbol allocator)]
+                      output (image-private (.graph owned) entry (slice (.roots owned)) symbol
+                                            allocator context embed)]
                   (tail-split/release! (mut owned))
                   output))))))
 
@@ -179,14 +216,16 @@
 ;;; distinct pipeline and is rejected.
 (defn image-with-level [(graph g/Graph) (entry i32) (roots (slice i32)) (symbol (slice u8))
                         (configuration options/Options) (allocator (dyn Allocator))
-                        (optimized bool)] (-> (Result code/Image (slice u8)))
+                        (optimized bool) (context private/Context) (embed bool)]
+  (-> (Result code/Image (slice u8)))
   (match (options/validate configuration)
     (Err [message] (Err message))
     (Ok [level]
         (cond (= level 0) (Err "x86-64 O0 pipeline is not implemented")
               (and (= level 3) LEVEL-THREE-CHAIN)
                 (Err "x86-64 backend: the level-three vector and loop stages are not implemented yet")
-              (or (= level 1) optimized) (image-split graph entry roots symbol allocator)
+              (or (= level 1) optimized)
+                (image-split graph entry roots symbol allocator context embed)
               (!= entry 1) (Err "SCCP requires START at reference one")
               :else
                 (match (optimize-for-image graph roots allocator)
@@ -194,7 +233,8 @@
                   (Ok [rewritten]
                       (let [(mut rewritten) rewritten
                             output (image-split (.graph rewritten) entry
-                                                (slice (.roots rewritten)) symbol allocator)]
+                                                (slice (.roots rewritten)) symbol allocator
+                                                context embed)]
                         (rewrite/release! (mut rewritten))
                         output)))))))
 
@@ -207,32 +247,36 @@
 (defn image-with-options [(graph g/Graph) (entry i32) (roots (slice i32))
                           (symbol (slice u8)) (configuration options/Options)
                           (a (dyn Allocator))] (-> (Result code/Image (slice u8)))
-  (image-with-level graph entry roots symbol configuration a false))
+  (image-with-level graph entry roots symbol configuration a false (private/no-context) true))
 
-;;; An inactive context (private/no-context and its option variants) carries
-;;; only AArch64 tuning switches, which have no x86-64 counterpart yet and
-;;; never change results. A context that owns private leaves is rejected.
+;;; Self-contained images own a private instance of every referenced leaf.
 (defn image-with-private [(graph g/Graph) (entry i32) (roots (slice i32))
                           (symbol (slice u8)) (configuration options/Options)
                           (a (dyn Allocator)) (context private/Context)]
   (-> (Result code/Image (slice u8)))
-  (if (private/active? context)
-      (Err PRIVATE-PENDING)
-      (image-with-level graph entry roots symbol configuration a false)))
+  (image-with-level graph entry roots symbol configuration a false context true))
 
+;;; A target transport must bind the returned undefined declarations to
+;;; binding() from this exact sealed publication. It may not resolve them
+;;; externally or emit the private bodies again.
 (defn image-for-private-module [(graph g/Graph) (entry i32) (roots (slice i32))
                                 (symbol (slice u8)) (configuration options/Options)
                                 (a (dyn Allocator)) (context private/Context)
                                 (publication private/Publication) (scope usize)]
   (-> (Result code/Image (slice u8)))
-  (Err PRIVATE-PENDING))
+  (if (not (leaves/module-valid? context publication scope))
+      (Err "private module publication is not valid for this target")
+      (image-with-level graph entry roots symbol configuration a false context false)))
 
+;;; As image-for-private-module for a graph that is already the output of
+;;; sccp/optimize-memory for these roots and unchanged since.
 (defn image-for-private-module-optimized [(graph g/Graph) (entry i32) (roots (slice i32))
                                           (symbol (slice u8)) (configuration options/Options)
                                           (a (dyn Allocator)) (context private/Context)
                                           (publication private/Publication) (scope usize)]
   (-> (Result code/Image (slice u8)))
-  (Err PRIVATE-PENDING))
+  (image-for-private-module-proven graph entry roots symbol configuration a context
+                                   publication scope 0))
 
 ;;; As image-with-options for a graph that is already the output of
 ;;; sccp/optimize-memory for these roots and unchanged since: levels two and
@@ -240,15 +284,19 @@
 (defn image-with-options-optimized [(graph g/Graph) (entry i32) (roots (slice i32))
                                     (symbol (slice u8)) (configuration options/Options)
                                     (a (dyn Allocator))] (-> (Result code/Image (slice u8)))
-  (image-with-level graph entry roots symbol configuration a true))
+  (image-with-level graph entry roots symbol configuration a true (private/no-context) true))
 
+;;; The proof only lets the AArch64 path skip validation it already did;
+;;; here the full native validation runs.
 (defn image-for-private-module-proven [(graph g/Graph) (entry i32) (roots (slice i32))
                                        (symbol (slice u8)) (configuration options/Options)
                                        (a (dyn Allocator)) (context private/Context)
                                        (publication private/Publication) (scope usize)
                                        (proof u128)]
   (-> (Result code/Image (slice u8)))
-  (Err PRIVATE-PENDING))
+  (if (not (leaves/module-valid? context publication scope))
+      (Err "private module publication is not valid for this target")
+      (image-with-level graph entry roots symbol configuration a true context false)))
 
 ;;; As image-with-options-optimized. The proof only lets the AArch64 path
 ;;; skip validation it already did; here the full native validation runs.
@@ -256,4 +304,4 @@
                                  (symbol (slice u8)) (configuration options/Options)
                                  (a (dyn Allocator)) (proof u128)]
   (-> (Result code/Image (slice u8)))
-  (image-with-level graph entry roots symbol configuration a true))
+  (image-with-level graph entry roots symbol configuration a true (private/no-context) true))

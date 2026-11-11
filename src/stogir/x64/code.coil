@@ -22,18 +22,38 @@
 ;;; instruction; see stogir.x64.encode's header).
 (defstruct Reference [(offset i64) (kind i32) (target i32) (addend i64)])
 
+;;; `written` is the set of registers the code may write, one bit per library
+;;; register (general 0..15, XMM 32..47), and `calls` whether it executes a
+;;; call or a tail jump. The driver records every allocated register, every
+;;; declared clobber, the scratches and the result registers; an emitter that
+;;; writes any other register must record it with `wrote!`. A function that
+;;; makes no call is a leaf whose write set stogir.x64.private-leaf uses to
+;;; narrow the clobbers of direct calls to it.
 (defstruct Buffer
   [(alignment i64)
    (text (ArrayList u8))
    (references (ArrayList Reference))
-   (text-data (ArrayList text-data/Range))])
+   (text-data (ArrayList text-data/Range))
+   (written u64)
+   (calls bool)])
 
 (defn create [(allocator (dyn Allocator))] (-> Buffer)
   (Buffer
     :alignment 1
     :text (ArrayList::new [u8] allocator)
     :references (ArrayList::new [Reference] allocator)
-    :text-data (ArrayList::new [text-data/Range] allocator)))
+    :text-data (ArrayList::new [text-data/Range] allocator)
+    :written 0
+    :calls false))
+
+;;; Record that the code may write `register`.
+(defn wrote! [(buffer (mut Buffer)) (register i32)] (-> void)
+  (when (and (>= register 0) (< register 48))
+    (set! (.written buffer) (| (.written buffer) (<< (: 1 u64) (cast u64 register))))))
+
+;;; Record that the code executes a call or a tail jump.
+(defn called! [(buffer (mut Buffer))] (-> void)
+  (set! (.calls buffer) true))
 
 (defn release! [(buffer (mut Buffer))] (-> void)
   (free! (mut (.text buffer)))
@@ -87,6 +107,8 @@
         (do
           (set! (.alignment output)
                 (alignment/maximum (.alignment output) (.alignment source)))
+          (set! (.written output) (| (.written output) (.written source)))
+          (when (.calls source) (set! (.calls output) true))
           (for range (.text-data source)
             (push! (mut (.text-data output))
                    (text-data/Range

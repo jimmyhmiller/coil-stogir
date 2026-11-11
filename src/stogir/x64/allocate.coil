@@ -48,7 +48,8 @@
    (base address/Base)
    (outgoing-size i64)
    (alignment i64)
-   (callee callee/Saved)])
+   (callee callee/Saved)
+   (calls bool)])
 
 (defn release! [(assigned (mut Assigned))] (-> void)
   (for [i 0 (len (.parts assigned))]
@@ -59,10 +60,11 @@
 
 ;;; The rsp adjustment of the prologue for this frame: its contents rounded
 ;;; so rsp is 16-byte aligned afterwards (entry rsp + 8 + N is a multiple of
-;;; 16). Zero for a frame without contents: the function is frameless.
+;;; 16). Zero for a frame without contents in a function that makes no call:
+;;; the function is frameless. One that calls needs at least the 8 bytes.
 (defn frame-size [(assigned Assigned)] (-> i64)
   (let [contents (.size (.frame assigned))]
-    (if (= contents 0)
+    (if (and (= contents 0) (not (.calls assigned)))
         0
         (+ (& (+ contents 7) (- 0 16)) 8))))
 
@@ -82,7 +84,8 @@
             :base (address/stack-base)
             :outgoing-size 0
             :alignment (.alignment set)
-            :callee (callee/none))
+            :callee (callee/none)
+            :calls (.calls set))
         (mut shapes) (ArrayList::new [allocation/SpillShape] allocator)
         (mut error) ""
         (mut register-count) (: 16 i32)
@@ -128,9 +131,15 @@
                 (allocation/reserve! (mut (.parts assigned)) (.register parameter)
                                      0 (+ (* i 2) 1) allocator))))))
       (for clobber (.clobbers set)
-        (if (or (< (.register clobber) 0) (>= (.register clobber) 48)
-                (>= (.start clobber) (.end clobber)))
+        (cond
+          (or (< (.register clobber) 0) (>= (.register clobber) 48)
+              (>= (.start clobber) (.end clobber))
+              (>= (cast i64 (.except clobber)) (len intervals)))
             (set! error "invalid x86-64 register clobber")
+          (and (> (.except clobber) 0)
+               (> (len (.ranges (at intervals (cast i64 (.except clobber))))) 0))
+            0
+          :else
             (do
               (when (>= (.register clobber) 32)
                 (set! register-count 48)

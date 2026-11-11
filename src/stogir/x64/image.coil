@@ -1,40 +1,76 @@
 ;;; Finish x86-64 code as a shared, address-independent image
-;;; (stogir.image, machine x86-64): the text, its data ranges and the entry
-;;; symbol at text offset 0.
+;;; (stogir.image, machine x86-64): the text, its data ranges, the entry
+;;; symbol at text offset 0 and one relocation per pending reference.
 ;;;
-;;; Pending references (named functions, data, strings, long constants) are
-;;; produced only by operation families that do not exist yet. When the
-;;; memory and call families add them, this is where each
-;;; stogir.x64.code/Reference becomes an image relocation of its own kind and
-;;; explicit addend (PC32 to a private address slot or to string/constant
-;;; data, PLT32 to a named function), as stogir.a64.image/finish! does for
-;;; AArch64. Until then a buffer with references is rejected.
+;;; Pending references (stogir.x64.code/Reference)
+;;;   * PLT32 to a named function (FUNC): a `call rel32` or `jmp rel32`. The
+;;;     function's name becomes an undefined global symbol of the image; a
+;;;     private-leaf context may later bind it to a private body
+;;;     (stogir.x64.private-leaf/bind-image!).
+;;;   * Everything else (PC32 to address slots, strings and long constants)
+;;;     belongs to the memory family and is rejected here until it adds them,
+;;;     as stogir.a64.image/finish! does for AArch64.
+;;;
+;;; The emitter's leaf record (code/Buffer `written`, `calls`) is carried into
+;;; `Image.leaf-effects` when the function makes no call and has no reference.
 (module stogir.x64.image)
 (import "stogir.graph" :as g)
+(import "stogir.node" :as n)
 (import "stogir.image" :as image)
+(import "stogir.strings" :as strings)
+(import "stogir.symbols" :as symbols)
 (import "stogir.text-data" :as text-data)
 (import "stogir.x64.code" :as code)
 (import "coil.alloc" :use [Allocator])
-(import "coil.result" :use [Result Ok Err])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; The image symbol of the named function a PLT32 reference targets.
+(defn function-symbol! [(output (mut image/Image)) (graph g/Graph) (pending code/Reference)]
+  (-> (Result i32 (slice u8)))
+  (match (g/lookup graph (.target pending))
+    (None [] (Err "emitted constant missing"))
+    (Some [node]
+          (cond (or (>= (.target pending) 0) (!= (n/opcode node) 74)
+                    (not (symbols/validate graph node)))
+                  (Err "direct branch requires a named function")
+                :else
+                  (match (strings/lookup (.strings graph) (cast i32 (n/constant-bits node)))
+                    (None [] (Err "symbol name missing"))
+                    (Some [name] (image/symbol! (mut output) name 0 0)))))))
 
 (defn finish! [(source (mut code/Buffer))
                (graph g/Graph)
                (entry (slice u8))
                (allocator (dyn Allocator))] (-> (Result image/Image (slice u8)))
-  (if (> (len (.references source)) 0)
-      (Err "x86-64 backend: relocations against named constants are not implemented yet (memory/call families); see docs/X86_FAMILIES.md")
-      (let [(mut output) (image/create-x64 allocator)
-            (mut error) ""]
-        (match (image/require-alignments! (mut output) (.alignment source) 8)
-          (Err [message] (set! error message))
-          (Ok [_] 0))
-        (match (text-data/validate (.text-data source) (len (.text source)))
-          (Err [message] (set! error message))
-          (Ok [_] 0))
-        (free! (mut (.text output)))
-        (set! (.text output) (code/take-text! (mut source) allocator))
-        (for range (.text-data source) (push! (mut (.text-data output)) range))
-        (match (image/symbol! (mut output) entry 1 0)
-          (Err [message] (set! error message))
-          (Ok [_] 0))
-        (if (= error "") (Ok output) (do (image/release! (mut output)) (Err error))))))
+  (let [(mut output) (image/create-x64 allocator)
+        (mut error) ""]
+    (match (image/require-alignments! (mut output) (.alignment source) 8)
+      (Err [message] (set! error message))
+      (Ok [_] 0))
+    (match (text-data/validate (.text-data source) (len (.text source)))
+      (Err [message] (set! error message))
+      (Ok [_] 0))
+    (free! (mut (.text output)))
+    (set! (.text output) (code/take-text! (mut source) allocator))
+    (for range (.text-data source) (push! (mut (.text-data output)) range))
+    (match (image/symbol! (mut output) entry 1 0)
+      (Err [message] (set! error message))
+      (Ok [_] 0))
+    (for pending (.references source)
+      (when (= error "")
+        (if (!= (.kind pending) image/X64-PLT32)
+            (set! error "x86-64 backend: PC32 references to named data, strings and constants are not implemented yet (memory family); see docs/X86_FAMILIES.md")
+            (match (function-symbol! (mut output) graph pending)
+              (Err [message] (set! error message))
+              (Ok [symbol]
+                  (unless (image/relocate! (mut output)
+                                           (image/Relocation
+                                             :section 1
+                                             :offset (.offset pending)
+                                             :kind (.kind pending)
+                                             :symbol symbol
+                                             :addend (.addend pending)))
+                    (set! error "invalid emitted relocation offset or target")))))))
+    (when (and (not (.calls source)) (= (len (.references source)) 0))
+      (set! (.leaf-effects output) (| image/LEAF-RECORDED (.written source))))
+    (if (= error "") (Ok output) (do (image/release! (mut output)) (Err error)))))
