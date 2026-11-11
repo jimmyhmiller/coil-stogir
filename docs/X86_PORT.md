@@ -287,6 +287,72 @@ operand helpers in `x64/value.coil`, "Floating values").
 - **Parameters and results.** xmm0..xmm7, then 8-byte stack slots; a result
   in xmm0. The driver emits floating PARAM, RETURN and IF itself.
 
+## Vectors
+
+Short vectors (8 and 16 bytes, every lane type) live in XMM registers
+(`x64/vector.coil` and the modules its header lists). The baseline is SSE2,
+and the results are the AArch64 backend's, lane for lane.
+
+- **Representation.** A 16-byte vector fills the register. An 8-byte vector
+  is the low quadword and the upper quadword is unspecified: lane-wise
+  instructions run on the whole register (nothing there can trap: SSE
+  exceptions are masked, integer division never happens in an XMM register,
+  and the one-lane DOUBLE vector uses the scalar instructions), and loads,
+  stores and spills of an 8-byte vector move exactly eight bytes (`movq`).
+  Copies are `movaps`; memory moves are `movups`/`movq`, no alignment assumed.
+- **Constants** are LONG_CONST payloads: all zeros is `pxor`, all ones
+  `pcmpeqd`, anything else `movups/movq x, [rip + payload]` from the
+  constant's private image data (a PC32 reference the image layer resolves;
+  such a function needs an image, as on AArch64). Masks an emitter needs
+  itself are built without memory (`pcmpeqd` and shifts, or `mov r10, imm` +
+  `movq`).
+- **Operands and temporaries.** A vector operand may be in a register or in
+  its spill slot; a constant or spilled first operand is read into xmm14 and
+  a second into xmm15. A sequence longer than one two-address instruction
+  computes in temporaries and moves the result to its register last, so no
+  aliasing of result and operands needs a special case. The temporaries are
+  xmm13, xmm12 and xmm11, clobbered through `uses/clobber!` over the node's
+  two positions, as many as the emitter module's `temporaries` declares
+  (`tests/x64-vector-emit.coil` checks that nothing else is written).
+- **What SSE2 lacks is synthesized in registers:** byte and quadword
+  multiplies and the 32-bit one (`pmullw` on even and odd bytes, `pmuludq`),
+  unsigned and 64-bit compares (sign bias; the borrow of `b - a` corrected
+  for overflow), every extremum but `pminub/pmaxub/pminsw/pmaxsw` (compare
+  and `pand/pandn/por`), byte shifts and `psraq`, rotates, absolute values,
+  byte swaps (`pshuflw/pshufhw`), set-bit and trailing-zero counts (the
+  parallel reduction). Floating MIN/MAX keep the scalar selection contract
+  (`a <= b ? a : b`), so they are `cmpleps` and a select, not `minps`.
+- **What goes through memory.** Four kinds of node own a 32-byte scratch
+  frame object (`vector-value/scratch!`, an ordinary `uses/Local`): integer
+  DIV and MOD (one `div`/`idiv` per lane, with rax and rdx clobbered: the
+  same extension and the same traps as scalar division, where AArch64
+  returns 0, the dividend or MIN), shifts with one count per lane (`shl
+  [lane], cl`, rcx clobbered), leading-zero counts (`bsr` per lane) and
+  EXTRACT/REPLACE at a run-time index (an indexed load or store; an index
+  out of range gives zero or changes nothing, as on AArch64). The a64
+  backend does all four in registers; SSE2 has no per-lane shift, no
+  lane-wise count, no variable shuffle. One slot per such node is simple and
+  costs frame; a shared per-function slot is a tuning step.
+- **COND** on a vector is a scalar truth test and a short branch over a
+  `movaps`, like a floating COND (the matcher never fuses a comparison into
+  it, as on AArch64).
+- **Memory.** `families/of` routes LOAD/STORE and VLOAD/VSTORE of a vector to
+  the vector family (`x64/vector-memory.coil`), which reads the memory
+  family's selected address mode (`address/operand!`) and the locals
+  family's slot (`locals/slot`). A VAR of a vector type stays a locals node.
+- **Parameters and results: the minimum.** An 8- or 16-byte vector outside
+  an argument group takes the next of xmm0..xmm7 (counted with the floating
+  arguments) and is returned in xmm0, in functions and at calls
+  (`x64/abi-arguments.coil`, `x64/call.coil`, each change delimited). A
+  vector that finds no register, or sits in a group, is refused with a clear
+  error: the System V stack and aggregate forms are not placed. For a
+  16-byte vector and for 8-byte floating vectors this is what System V does;
+  compilers pass some 8-byte integer vectors in general registers, which a
+  full treatment has to decide.
+- **Not selected:** the AArch64 rule that emits an integer multiplication by
+  SPLAT(2) as an addition (`docs/VECTOR_DOUBLING.md`); the multiplication
+  is emitted. SHUFFLE has no emitter on either target.
+
 ## Frame
 
 The a64 frame model is kept: logical offsets measured upward from rsp after
@@ -434,9 +500,9 @@ levels 2 and 3 run SCCP first. Level 3 then runs the graph stages of the a64
 path under the same context switches (global-load forwarding, the fact fold
 or branch facts, select diamonds or if-conversion, loop-load hoisting,
 rotation, loop strength reduction with `x64/strength-cost.coil`). Its last
-stage, the loop vectorizer, creates vector operations and stays off behind
-`LEVEL-THREE-VECTORIZE` in `x64/compile.coil` until the vector family emits
-them. `a64.constant-hoist` and `a64.return-values` are not run.
+stage, the loop vectorizer, creates vector operations, which the vector
+family emits; `LEVEL-THREE-VECTORIZE` in `x64/compile.coil` is its switch and
+is on. `a64.constant-hoist` and `a64.return-values` are not run.
 
 ## Phases
 

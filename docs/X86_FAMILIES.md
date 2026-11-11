@@ -23,7 +23,7 @@ address-form arithmetic (`x64/lea.coil`) and view coalescing
 | `STACK` | `x64/stack.coil` | ALLOCA, AFREE, BLOCK_BEGIN, BLOCK_END, FRAME_ADDR |
 | `CALL` | `x64/call.coil`, `x64/call-abi.coil` | CALL, TAILCALL, ARGVAL, PROTO, EXITCALL, VA_* |
 | `FLOATING` | `x64/floating.coil`, `x64/fcompare.coil`, `x64/float-memory.coil`, `x64/pool.coil` | every node of FLOAT/DOUBLE type or reading one (implemented, except FMA) |
-| `VECTOR` | `x64/vector.coil` | every node of a vector type or reading one |
+| `VECTOR` | `x64/vector.coil`, `x64/vector-*.coil`, `x64/simd-lanes.coil` | every node of an 8- or 16-byte vector type or reading one (implemented, SSE2; `docs/X86_PORT.md`, "Vectors") |
 | `ATOMIC` | `x64/atomic.coil` | ATOMIC_LOAD/STORE/RMW/CMPXCHG/FENCE |
 | `CHECKED` | `x64/checked.coil` | ADD_OV, SUB_OV, MUL_OV, OVERFLOW |
 | `SWITCH` | `x64/switch.coil` | SWITCH (the CASE_* projections are block starts); implemented |
@@ -265,10 +265,26 @@ the location view, the frame base, the plan, the frame and the frame size.
   `float-destination`, `float-constant!`, and `float-apply!` (an SSE
   instruction with its second operand in a register, a spill slot or the
   constant pool). Short jumps inside one node: `x64/local.coil`.
-- **Vector** registers already allocate (the bridge switches to the
-  48-register domain when a value of those types is live) and move
-  (`x64/transfers.coil`); constants, parameters, returns and PHI constants
-  of vector types report a clear error at the place to extend.
+- **Vector** (`x64/vector.coil`) meets the core in these places, each a few
+  delimited lines:
+  - `families/of` gives a node to it when its type or any data operand is a
+    vector (a vector operand wins over a floating type: EXTRACT of a FLOAT
+    lane, BITCAST of a vector to a DOUBLE), and sends vector LOAD/STORE and
+    VLOAD/VSTORE to it (`vector-memory/claims?`) ahead of the floating,
+    locals and memory families;
+  - the driver emits vector PARAM and RETURN itself (xmm0..xmm7, xmm0), as
+    it does the floating ones; `abi-arguments/plan-result`,
+    `call/result-register` and `call/load!` place and move a short vector
+    like a floating eightbyte;
+  - edges build vector PHI constants (`edges.coil`; one bound for a spill
+    slot goes through xmm14).
+  Its building blocks are reusable by another family that needs an XMM
+  sequence: `x64/simd-lanes.coil` (instruction wrappers, two-address
+  lowering, lane transfers to and from general registers, masks built
+  without memory) and `x64/vector-value.coil` (operands, constants, the
+  scratch frame object). A node that needs XMM temporaries clobbers xmm13,
+  xmm12, xmm11 over `[position, position + 2)`; `tests/x64-vector-emit.coil`
+  shows how to check such a promise.
 
 ## Tests
 
@@ -283,6 +299,20 @@ reference evaluator with the x86-64 NaN rules (`float-binary`, `float-unary`,
 `invoke-floating` (twelve floating arguments, then twelve integers; the
 result in rax or xmm0). The floating family's tests (`tests/x64-float-*.coil`)
 follow the pattern below.
+
+`src/stogir/x64/vector-testing.coil` is the same for vectors: a lane-wise
+reference evaluator (`lane-binary`, `lane-unary`, with `lane-defined?` and
+`lane-ambiguous?` for what the machine or the IR leaves open), edge lane
+values for every lane type (`special`), every supported vector type
+(`vector-type`), compile-as-image and call helpers (a vector constant is
+image data, so vector tests map images), and byte-buffer lane access. The
+vector family's tests are `tests/x64-vector-*.coil`: one matrix per
+operation group, `-transport` (spills, PHIs, locals, constants, by-value
+passing and calls), `-emit` (every aliasing of result and operand registers,
+and that only the declared temporaries are written) and `-stress` (seeded
+random functions against the reference). A test that has to call generated
+code in a way Coil cannot express (a 16-byte vector by value) uses a probe
+in x86-64 machine code whose bytes come from `tools/x86/asm-bytes.sh`.
 
 For a new family, follow the core's pattern:
 

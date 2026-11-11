@@ -16,6 +16,7 @@
 (import "stogir.builder" :as b)
 (import "stogir.image" :as image)
 (import "stogir.jit.native" :as jit)
+(import "stogir.options" :as options)
 (import "stogir.types" :as types)
 (import "stogir.x64.compile" :as compile)
 (import "stogir.x64.testing" :as t)
@@ -228,14 +229,20 @@
 
 ;;; ---- Compiling and calling ------------------------------------------------------
 
-(defstruct Mapped [(loaded jit/Loaded)])
+;;; Mapped generated code and the size of its text in bytes.
+(defstruct Mapped [(loaded jit/Loaded) (text-size i64)])
 
-;;; Compile `graph` as an image (stogir.x64.compile/image) and map it. A
-;;; failure is printed with `label` and counted.
-(defn compiled [(counts (mut t/Tally)) (label (slice u8)) (graph g/Graph) (start i32)
-                (roots (slice i32)) (allocator (dyn Allocator))] (-> (Option Mapped))
+;;; Compile `graph` as an image and map it: as given at `level` 1
+;;; (stogir.x64.compile/image), else through image-with-options at that
+;;; optimization level. A failure is printed with `label` and counted.
+(defn compiled-at [(counts (mut t/Tally)) (label (slice u8)) (graph g/Graph) (start i32)
+                   (roots (slice i32)) (level i32) (allocator (dyn Allocator))]
+  (-> (Option Mapped))
   (set! (.functions counts) (+ (.functions counts) 1))
-  (match (compile/image graph start roots "vector_test" allocator)
+  (match (if (= level 1)
+             (compile/image graph start roots "vector_test" allocator)
+             (compile/image-with-options graph start roots "vector_test"
+                                         (options/Options :level level) allocator))
     (Err [message]
          (println "{}: compile failed: {}" label message)
          (t/fail! (mut counts))
@@ -247,9 +254,15 @@
                             (println "{}: map failed: {}" label message)
                             (t/fail! (mut counts))
                             (None [Mapped]))
-                       (Ok [loaded] (Some (Mapped :loaded loaded))))]
+                       (Ok [loaded]
+                           (Some (Mapped :loaded loaded :text-size (len (.text source))))))]
           (image/release! (mut source))
           result))))
+
+;;; Compile `graph` as given and map it.
+(defn compiled [(counts (mut t/Tally)) (label (slice u8)) (graph g/Graph) (start i32)
+                (roots (slice i32)) (allocator (dyn Allocator))] (-> (Option Mapped))
+  (compiled-at (mut counts) label graph start roots 1 allocator))
 
 (defn release! [(code (mut Mapped))] (-> void)
   (jit/release-image! (mut (.loaded code)))

@@ -1,6 +1,7 @@
 (module stogir.tests.x64-vector-transport)
 (import "stogir.graph" :as g)
 (import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
 (import "stogir.target" :as target)
 (import "stogir.types" :as types)
 (import "stogir.x64.testing" :as t)
@@ -31,6 +32,14 @@
 ;;;              result in xmm0, called through a probe written in x86-64
 ;;;              machine code (the Linux Coil compiler cannot pass a 16-byte
 ;;;              vector across a C function pointer)
+;;;   calls      a generated function calls another one with two vector
+;;;              arguments and a vector result, 8 and 16 bytes; a vector live
+;;;              across the call survives it (every XMM register is
+;;;              caller-saved, so it is spilled)
+;;;   level 3    a counted byte or word loop compiled at optimization level
+;;;              three gets a vector prefix (its text is longer than at level
+;;;              two) and computes what the scalar loop does, for trip counts
+;;;              around the chunk size and for overlapping buffers
 
 (const SENTINEL 0xA5)
 
@@ -452,6 +461,164 @@
               (vt/release! (mut code)))))
     (g/release! (mut graph))))
 
+;;; g(out, pa, pb, h): r = h(x, y); out[0] = r; out[16] = x. `h` is a generated
+;;; function of two vectors: bits(p) ^ bits(q).
+(defn calls! [(tally (mut t/Tally)) (ty i32) (a (dyn Allocator))] (-> void)
+  (let [base (types/base-type ty)
+        size (vt/lane-bytes base)
+        lanes (cast i64 (types/lanes ty))
+        width (cast i64 (types/size ty 8))
+        raw (types/vector-type (vt/integer-of base false) (types/lanes ty))
+        (mut callee) (g/create a)
+        callee-start (t/start! (mut callee))
+        p (t/param! (mut callee) callee-start ty 0)
+        q (t/param! (mut callee) callee-start ty 1)
+        mixed (t/require (b/vector-binary! (mut callee) 48 raw
+                                           (t/unary! (mut callee) 36 raw p)
+                                           (t/unary! (mut callee) 36 raw q) 0))
+        callee-ret (t/return! (mut callee) callee-start ty (t/unary! (mut callee) 36 ty mixed))
+        (mut graph) (g/create a)
+        start (t/start! (mut graph))
+        out (t/param! (mut graph) start 6 0)
+        pa (t/param! (mut graph) start 6 1)
+        pb (t/param! (mut graph) start 6 2)
+        target (t/param! (mut graph) start 6 3)
+        x (vt/load! (mut graph) ty start pa)
+        y (vt/load! (mut graph) ty x pb)]
+    (match (calls/create 8 (cast u8 ty) [(cast u8 ty) (cast u8 ty)] a)
+      (Err [message] (println "x64 vector calls: {}" message) (t/fail! (mut tally)))
+      (Ok [prototype]
+          (let [(mut prototype) prototype
+                called (t/require (calls/emit! (mut graph) prototype y target [x y] a))
+                c1 (vt/save! (mut graph) called out called)
+                c2 (vt/save! (mut graph) c1 (vt/offset! (mut graph) out 16) x)
+                ret (t/return! (mut graph) c2 0 0)]
+            (calls/release! (mut prototype))
+            (match (vt/compiled (mut tally) "x64 vector callee" callee callee-start [callee-ret] a)
+              (None [] (println "  (type {})" ty))
+              (Some [inner]
+                    (let [(mut inner) inner]
+                      (match (vt/compiled (mut tally) "x64 vector caller" graph start [ret] a)
+                        (None [] (println "  (type {})" ty))
+                        (Some [code]
+                              (let [(mut code) code
+                                    (mut first) (vt/buffer 16 0 a)
+                                    (mut second) (vt/buffer 16 0 a)
+                                    (mut output) (vt/buffer 32 SENTINEL a)]
+                                (for [seed 0 vt/SPECIALS]
+                                  (fill! (mut first) 0 base seed)
+                                  (fill! (mut second) 0 base (+ seed 4))
+                                  (for [i 0 32] (set! (mut output) i SENTINEL))
+                                  (vt/invoke code
+                                             [(vt/address output 0) (vt/address first 0)
+                                              (vt/address second 0)
+                                              (primitive/cast u64
+                                                              (.base (.memory (.loaded inner))))])
+                                  (for [lane 0 lanes]
+                                    (let [at (* lane (cast i64 size))]
+                                      (vt/expect! (mut tally) "call result" ty 79 0 lane
+                                                  (vt/word (slice output) at size)
+                                                  (^ (lane-value base lane seed)
+                                                     (lane-value base lane (+ seed 4))))
+                                      (vt/expect! (mut tally) "live across call" ty 79 1 lane
+                                                  (vt/word (slice output) (+ 16 at) size)
+                                                  (lane-value base lane seed))))
+                                  (for [i width 16]
+                                    (vt/expect! (mut tally) "call gap" ty 79 2 i
+                                                (cast u64 (get output i)) SENTINEL)))
+                                (free! (mut first))
+                                (free! (mut second))
+                                (free! (mut output))
+                                (vt/release! (mut code)))))
+                      (vt/release! (mut inner))))))))
+    (g/release! (mut callee))
+    (g/release! (mut graph))))
+
+;;; f(dst, src, first, bound): for i in first..bound: dst[i] = src[i] * 2 + i,
+;;; elements of integer type `element`; returns the final i. Compiled at
+;;; levels two and three.
+(defn level-three! [(tally (mut t/Tally)) (element i32) (a (dyn Allocator))] (-> void)
+  (let [bytes (cast i64 (types/scalar-size element 8))
+        (mut graph) (g/create a)
+        start (t/start! (mut graph))
+        dst (t/param! (mut graph) start 6 0)
+        src (t/param! (mut graph) start 6 1)
+        initial (t/param! (mut graph) start 5 2)
+        bound (t/param! (mut graph) start 5 3)
+        header (t/loop-begin! (mut graph) (t/end! (mut graph) start))
+        one (t/constant! (mut graph) 5 1)
+        iv (t/loop-phi! (mut graph) header initial)
+        branch (t/if! (mut graph) header (t/compare! (mut graph) 20 iv bound))
+        body (t/if-true! (mut graph) branch)
+        exit (t/if-false! (mut graph) branch)
+        offset (t/binary! (mut graph) 28 5 iv (t/constant! (mut graph) 5 (cast u64 bytes)))
+        loaded (t/require (b/emit! (mut graph) 91 element
+                                   [body (t/binary! (mut graph) 26 6 src offset)]))
+        wide (if (= bytes 8) loaded (t/unary! (mut graph) 34 5 loaded))
+        sum (t/binary! (mut graph) 26 5
+                       (t/binary! (mut graph) 28 5 wide (t/constant! (mut graph) 5 2)) iv)
+        narrowed (if (= bytes 8) sum (t/unary! (mut graph) 35 element sum))
+        store (t/require (b/emit! (mut graph) 93 0
+                                  [loaded (t/binary! (mut graph) 26 6 dst offset) narrowed]))
+        next (t/binary! (mut graph) 26 5 iv one)
+        back (t/loop-end! (mut graph) store)
+        ret (t/return! (mut graph) exit 5 iv)]
+    (t/patch! (mut graph) header 2 back)
+    (t/patch! (mut graph) iv 3 next)
+    (match (vt/compiled-at (mut tally) "x64 vector level two" graph start [ret] 2 a)
+      (None [] (println "  (element {})" element))
+      (Some [scalar]
+            (let [(mut scalar) scalar]
+              (match (vt/compiled-at (mut tally) "x64 vector level three" graph start [ret] 3 a)
+                (None [] (println "  (element {})" element))
+                (Some [vectorized]
+                      (let [(mut vectorized) vectorized
+                            (mut memory) (vt/buffer 2048 0 a)
+                            (mut expected) (vt/buffer 2048 0 a)
+                            mask (vt/lane-mask element)]
+                        ; The vector prefix and its guards are extra code.
+                        (set! (.checks tally) (+ (.checks tally) 1))
+                        (unless (> (.text-size vectorized) (.text-size scalar))
+                          (println "x64 vector level three: element {} was not vectorized ({} and {} bytes of text)"
+                                   element (.text-size vectorized) (.text-size scalar))
+                          (t/fail! (mut tally)))
+                        ; src at byte 0; dst far away, or overlapping it by
+                        ; `gap` elements in either direction.
+                        (for gap [(: 64 i64) 1 3 -2 0]
+                          (for trips [(: 0 i64) 1 7 15 16 17 31 32 33 64 65 100]
+                            (for which [(: 0 i32) 1]
+                              (let [source (if (< gap 0) (* (- 0 gap) bytes) 0)
+                                    target (if (< gap 0) 0 (* gap bytes))
+                                    code (if (= which 0) scalar vectorized)]
+                                (for [i 0 2048]
+                                  (set! (mut memory) i (cast u8 (+ (* i 7) 3))))
+                                (for [i 0 2048] (set! (mut expected) i (get memory i)))
+                                ; The scalar loop, element by element.
+                                (for [i 0 trips]
+                                  (vt/put! (mut expected) (+ target (* i bytes))
+                                           (cast i32 bytes)
+                                           (& (+ (* (vt/word (slice expected)
+                                                             (+ source (* i bytes))
+                                                             (cast i32 bytes))
+                                                    2)
+                                                 (cast u64 i))
+                                              mask)))
+                                (vt/expect! (mut tally) "level three result" element which gap trips
+                                            (vt/invoke code [(vt/address memory target)
+                                                             (vt/address memory source)
+                                                             0 (cast u64 trips)])
+                                            (cast u64 trips))
+                                (for [i 0 256]
+                                  (vt/expect! (mut tally) "level three memory" element which gap
+                                              (* i 8)
+                                              (vt/word (slice memory) (* i 8) 8)
+                                              (vt/word (slice expected) (* i 8) 8)))))))
+                        (free! (mut memory))
+                        (free! (mut expected))
+                        (vt/release! (mut vectorized)))))
+              (vt/release! (mut scalar)))))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
   (if (not (t/host?))
       (do (println "x64 vector transport: skipped, not an x86-64 host") 0)
@@ -472,7 +639,10 @@
               ; The 8-byte vector of the same lane type views the variable.
               (locals! (mut tally) ty (vt/vector-type (- index 1)) false 0 a)
               (by-value! (mut tally) ty a))
-            (constants! (mut tally) ty a)))
+            (constants! (mut tally) ty a)
+            (calls! (mut tally) ty a)))
+        (for element [(: 2 i32) 3 4 5 8 10]
+          (level-three! (mut tally) element a))
         (println "x64 vector transport: {} functions, {} checks, {} failures"
                  (.functions tally) (.checks tally) (.failures tally))
         (if (= (.failures tally) 0) 0 1))))
