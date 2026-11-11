@@ -198,6 +198,55 @@
                 (Err [message] (Err message))
                 (Ok [_] (Ok (cast i32 (- (len (.text out)) begin))))))))))
 
+;;; Copy the whole register of integer value `reference` into general
+;;; register `destination`: all 64 bits from a register or a spill slot, or
+;;; the constant. For the views COPY, BITCAST and TRUNC (stogir.x64.coalesce):
+;;; a view may share its register group with a wider source that lives on,
+;;; and the bits above the view's own type are that source's. A spill slot
+;;; is eight bytes; what a narrow value left above its extent is as
+;;; unspecified as the bits above it in a register. Flags are untouched.
+(defn whole-into! [(out (mut code/Buffer))
+                   (graph g/Graph)
+                   (parts loc/View)
+                   (base frame/Base)
+                   (reference i32)
+                   (position i64)
+                   (destination i32)] (-> (Result i32 (slice u8)))
+  (let [begin (len (.text out))
+        ; A register or an integer spill slot is copied here; a constant and
+        ; every other location is `into!`'s.
+        location (if (> reference 0)
+                     (match (loc/resolve parts reference position)
+                       (Err [_] (None))
+                       (Ok [found] (Some found)))
+                     (None))
+        source (match location
+                 (Some [found]
+                       (if (and (= (.kind found) 0) (registers/gpr? (cast i32 (.value found))))
+                           (cast i32 (.value found))
+                           -1))
+                 (None [] -1))
+        slot (match location
+               (Some [found]
+                     (and (= (.kind found) 1) (types/integer? (type-of graph reference))))
+               (None [] false))]
+    (cond (= source destination) (Ok 0)
+          (>= source 0)
+            (match (encode/mov-rr (mut (.text out)) 64 destination source)
+              (Err [message] (Err message))
+              (Ok [_] (Ok (cast i32 (- (len (.text out)) begin)))))
+          slot
+            (match location
+              (None [] (Err "spill operand missing"))
+              (Some [found]
+                    (match (spill found base)
+                      (Err [message] (Err message))
+                      (Ok [m]
+                          (match (encode/mov-rm (mut (.text out)) 64 destination m)
+                            (Err [message] (Err message))
+                            (Ok [_] (Ok (cast i32 (- (len (.text out)) begin)))))))))
+          :else (into! (mut out) graph parts base reference position destination))))
+
 ;;; Extend the low `type-bits` of `source` into at least 32 bits of
 ;;; `destination` by the type's signedness (BOOL and ADDR are unsigned).
 ;;; Types of four or eight bytes are copied at their width.
