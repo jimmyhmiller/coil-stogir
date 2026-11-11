@@ -85,60 +85,39 @@
                           (apply! (mut out) (mut error) tile rd rb)))))))
     (if (= error "") (Ok 0) (Err error))))
 
-;;; rd = left SHIFT cl (RULE-SHIFT-RC). The allocator put the count in rcx.
-(defn count-shift! [(out (mut code/Buffer)) (cx context/Context) (position i64)
-                    (tile select/Tile) (rd i32)] (-> (Result i32 (slice u8)))
-  (let [(mut error) ""]
-    (when (!= (value/register-of (.graph cx) (.parts cx) (.right tile) position)
-              registers/RCX)
-      (set! error "x86-64 variable shift count is not in rcx"))
-    (when (= error "")
-      (match (operand! (mut out) cx (.left tile) position registers/SCRATCH-GPR)
-        (Err [message] (set! error message))
-        (Ok [ra]
-            (if (= rd registers/RCX)
-                ; The result reuses the dying count's register: shift beside
-                ; it and move in afterwards.
-                (let [temporary (if (= ra registers/SCRATCH-GPR)
-                                    (: registers/SCRATCH-GPR i32)
-                                    registers/SCRATCH-GPR-2)]
-                  (move! (mut out) (mut error) (value/operation-bits
-                                                 (value/type-of (.graph cx) (.left tile)))
-                         temporary ra)
-                  (code/accept! (mut error)
-                                (encode/shift-rc (mut (.text out)) (.operation tile)
-                                                 (.bits tile) temporary))
-                  (move! (mut out) (mut error) (.bits tile) rd temporary))
-                (do
-                  (move! (mut out) (mut error) (.bits tile) rd ra)
-                  (code/accept! (mut error)
-                                (encode/shift-rc (mut (.text out)) (.operation tile)
-                                                 (.bits tile) rd)))))))
-    (if (= error "") (Ok 0) (Err error))))
-
-;;; rd = left SHIFT (right & immediate) for 8- and 16-bit values
-;;; (RULE-SHIFT-MASKED). rcx is reserved across the instruction: no operand,
-;;; no live value and not the result is in it.
-(defn masked-shift! [(out (mut code/Buffer)) (cx context/Context) (position i64)
-                     (tile select/Tile) (rd i32)] (-> (Result i32 (slice u8)))
-  (let [(mut error) ""]
+;;; rd = left SHIFT right for a variable count (RULE-SHIFT-RC and
+;;; RULE-SHIFT-MASKED). rcx is clobbered while the operands are read, so no
+;;; operand and no live value is in it: the count is copied into ecx (and
+;;; reduced modulo the width for 8- and 16-bit values, where the hardware
+;;; would reduce it modulo 32). The result may be rcx itself; it is then
+;;; computed in a scratch register and moved in afterwards.
+(defn variable-shift! [(out (mut code/Buffer)) (cx context/Context) (position i64)
+                       (tile select/Tile) (rd i32)] (-> (Result i32 (slice u8)))
+  (let [(mut error) ""
+        wide (value/operation-bits (value/type-of (.graph cx) (.left tile)))]
     (match (operand! (mut out) cx (.right tile) position registers/SCRATCH-GPR-2)
       (Err [message] (set! error message))
       (Ok [rc]
           (match (operand! (mut out) cx (.left tile) position registers/SCRATCH-GPR)
             (Err [message] (set! error message))
             (Ok [ra]
-                (if (or (= rd registers/RCX) (= ra registers/RCX) (= rc registers/RCX))
-                    (set! error "x86-64 narrow shift found a value in reserved rcx")
-                    (do
+                (if (or (= ra registers/RCX) (= rc registers/RCX))
+                    (set! error "x86-64 variable shift found an operand in clobbered rcx")
+                    ; Once the count is in ecx, r11 is free even if it held
+                    ; the count; r10 may hold a constant first operand.
+                    (let [target (cond (!= rd registers/RCX) rd
+                                       (= ra registers/SCRATCH-GPR) (: registers/SCRATCH-GPR i32)
+                                       :else registers/SCRATCH-GPR-2)]
                       (move! (mut out) (mut error) 32 registers/RCX rc)
-                      (code/accept! (mut error)
-                                    (encode/alu-ri (mut (.text out)) encode/AND 32
-                                                   registers/RCX (.immediate tile)))
-                      (move! (mut out) (mut error) 32 rd ra)
+                      (when (= (.rule tile) select/RULE-SHIFT-MASKED)
+                        (code/accept! (mut error)
+                                      (encode/alu-ri (mut (.text out)) encode/AND 32
+                                                     registers/RCX (.immediate tile))))
+                      (move! (mut out) (mut error) wide target ra)
                       (code/accept! (mut error)
                                     (encode/shift-rc (mut (.text out)) (.operation tile)
-                                                     (.bits tile) rd))))))))
+                                                     (.bits tile) target))
+                      (move! (mut out) (mut error) wide rd target)))))))
     (if (= error "") (Ok 0) (Err error))))
 
 ;;; One division operand in `target` at the 32- or 64-bit operation width:
@@ -277,10 +256,8 @@
                                     (encode/shift-ri (mut (.text out)) (.operation tile)
                                                      (.bits tile) rd
                                                      (cast i32 (.immediate tile))))))
-                (= rule select/RULE-SHIFT-RC)
-                  (code/accept-count! (mut error) (count-shift! (mut out) cx position tile rd))
-                (= rule select/RULE-SHIFT-MASKED)
-                  (code/accept-count! (mut error) (masked-shift! (mut out) cx position tile rd))
+                (or (= rule select/RULE-SHIFT-RC) (= rule select/RULE-SHIFT-MASKED))
+                  (code/accept-count! (mut error) (variable-shift! (mut out) cx position tile rd))
                 (= rule select/RULE-DIVIDE)
                   (code/accept-count! (mut error) (divide! (mut out) cx position tile rd))
                 (select/comparison-rule? rule)
