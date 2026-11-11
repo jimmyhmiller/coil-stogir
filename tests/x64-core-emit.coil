@@ -1,0 +1,323 @@
+(module stogir.tests.x64-core-emit)
+(import "stogir.graph" :as g)
+(import "stogir.fill" :as fill)
+(import "stogir.types" :as types)
+(import "stogir.allocation" :as allocation)
+(import "stogir.interval" :as interval)
+(import "stogir.locations" :as locations)
+(import "stogir.frame" :as frame)
+(import "stogir.matched-uses" :as machine)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.context" :as context)
+(import "stogir.x64.conditional" :as conditional)
+(import "stogir.x64.emit" :as emit)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.frame-address" :as address)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.select" :as select)
+(import "stogir.x64.testing" :as t)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+;;; The emitters under a hand-made register assignment: every way the result
+;;; register can alias the operand registers of a two-address instruction
+;;; (rd = ra, rd = rb, rd = ra = rb, all distinct), for register, immediate
+;;; and large-constant operands, plus the fixed-register cases of shifts and
+;;; division and every aliasing case of COND. The allocator would only reach
+;;; some of these by chance; here each is constructed.
+;;;
+;;; A function under test is: copy the two arguments into the chosen operand
+;;; registers, the emitter's code, copy the chosen result register to rax.
+
+(defstruct Tally [(checks i64) (failures i64) (functions i64)])
+
+(const RAX 0)
+(const RCX 1)
+(const RDX 2)
+(const RSI 6)
+(const RDI 7)
+(const R8 8)
+(const R9 9)
+
+;;; Caller-saved registers that are not the two argument registers.
+(defn pool [] (-> (array i32 5))
+  [(: 0 i32) 1 2 8 9])
+
+;;; A part that holds graph value `reference` in `register` everywhere.
+(defn hold! [(parts (mut (ArrayList allocation/Part))) (reference i32) (register i32)
+             (a (dyn Allocator))] (-> void)
+  (let [(mut part) (allocation/create reference a)]
+    (interval/add! (mut (.ranges part)) 0 100)
+    (set! (.register part) register)
+    (push! (mut parts) part)))
+
+(defn release-parts! [(parts (mut (ArrayList allocation/Part)))] (-> void)
+  (for [i 0 (len parts)] (allocation/release! (elem (mut parts) i)))
+  (free! (mut parts)))
+
+;;; A plan with every table zeroed for `cells` graph cells.
+(defn blank-plan [(cells i64) (a (dyn Allocator))] (-> plan/Plan)
+  (let [(mut result)
+          (plan/Plan
+            :operands (machine/Plan
+                        :ranges (ArrayList::new [machine/Range] a)
+                        :inputs (ArrayList::new [i32] a)
+                        :definitions (ArrayList::new [bool] a)
+                        :omitted (ArrayList::new [bool] a)
+                        :rematerialized (ArrayList::new [bool] a)
+                        :output-ranges (ArrayList::new [machine/Range] a)
+                        :outputs (ArrayList::new [i32] a)
+                        :definers (ArrayList::new [i32] a))
+            :tiles (ArrayList::new [select/Tile] a)
+            :comparisons (ArrayList::new [i32] a)
+            :addresses (ArrayList::new [i32] a)
+            :offsets (ArrayList::new [i64] a)
+            :indices (ArrayList::new [i32] a)
+            :index-shifts (ArrayList::new [i32] a))]
+    (extend-zeroed! (mut (.omitted (.operands result))) cells)
+    (fill/append! (mut (.tiles result)) cells (select/none))
+    (extend-zeroed! (mut (.comparisons result)) cells)
+    result))
+
+(defn dirty [(ty i32) (value u64)] (-> u64)
+  (| (& value (t/mask ty)) (& (: 0x5AC3F00DDEADBE00 u64) (^ (t/mask ty) 0xFFFFFFFFFFFFFFFF))))
+
+(defn accept! [(tally (mut Tally)) (result (Result i64 (slice u8)))] (-> void)
+  (match result
+    (Err [message]
+         (println "encode failed: {}" message)
+         (set! (.failures tally) (+ (.failures tally) 1)))
+    (Ok [_] 0)))
+
+;;; Map `out` and compare it with the reference over `inputs`: all pairs, or
+;;; each value with itself when `same`.
+(defn run! [(tally (mut Tally)) (out (mut code/Buffer)) (ty i32) (result-type i32)
+            (opcode i32) (form i32) (same bool) (fixed u64) (inputs (slice u64))
+            (ra i32) (rb i32) (rd i32)] (-> void)
+  (set! (.functions tally) (+ (.functions tally) 1))
+  (match (t/map (slice (.text out)))
+    (Err [message]
+         (println "map failed: {}" message)
+         (set! (.failures tally) (+ (.failures tally) 1)))
+    (Ok [mapped]
+        (let [(mut mapped) mapped]
+          (for x inputs
+            (for [j 0 (if same 1 (len inputs))]
+              (let [y (if same x (get inputs j))
+                    a (if (= form 2) fixed x)
+                    c (if (= form 1) fixed y)]
+                (when (or (not (or (= opcode 29) (= opcode 30))) (t/divisible? ty a c))
+                  (let [expected (& (t/binary opcode ty a c) (t/mask result-type))
+                        actual (& (t/invoke mapped [(dirty ty x) (dirty ty y)])
+                                  (t/mask result-type))]
+                    (set! (.checks tally) (+ (.checks tally) 1))
+                    (when (!= actual expected)
+                      (when (< (.failures tally) 20)
+                        (println "opcode {} type {} form {} same {} ra {} rb {} rd {} a {:x} b {:x}: got {:x} expected {:x}"
+                                 opcode ty form same ra rb rd a c actual expected))
+                      (set! (.failures tally) (+ (.failures tally) 1))))))))
+          (t/unmap! (mut mapped))))))
+
+;;; One binary operation. Parameter 0 is held in `ra` and parameter 1 in `rb`;
+;;; the result is defined in `rd`. `form`: 0 = p0 OP p1 (p0 OP p0 when
+;;; `same`), 1 = p0 OP constant, 2 = constant OP p1.
+(defn binary-case! [(tally (mut Tally)) (opcode i32) (ty i32) (form i32) (same bool)
+                    (fixed u64) (ra i32) (rb i32) (rd i32) (inputs (slice u64))
+                    (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        result-type (if (and (>= opcode 14) (<= opcode 23)) (: 1 i32) ty)
+        start (t/start! (mut graph))
+        p0 (t/param! (mut graph) start ty 0)
+        p1 (t/param! (mut graph) start ty 1)
+        constant (t/constant! (mut graph) ty fixed)
+        left (if (= form 2) constant p0)
+        right (cond (= form 1) constant (= form 2) p1 same p0 :else p1)
+        node (t/binary! (mut graph) opcode result-type left right)
+        (mut parts) (ArrayList::new [allocation/Part] a)
+        (mut matched) (blank-plan (len (.instructions graph)) a)
+        (mut layout) (frame/create a)
+        (mut out) (code/create a)]
+    (hold! (mut parts) p0 ra a)
+    (hold! (mut parts) p1 rb a)
+    (hold! (mut parts) node rd a)
+    ; Parameter 0 arrives in rdi and parameter 1 in rsi; neither is in the pool.
+    (accept! (mut tally) (encode/mov-rr (mut (.text out)) 64 ra RDI))
+    (accept! (mut tally) (encode/mov-rr (mut (.text out)) 64 rb RSI))
+    (let [cx (context/Context
+               :graph graph
+               :parts (locations/linear-view parts)
+               :base (address/stack-base)
+               :matched matched
+               :frame layout
+               :frame-size 0)]
+      (match (if (and (>= opcode 14) (<= opcode 23))
+                 (select/comparison graph node)
+                 (select/arithmetic graph node))
+        (Err [message]
+             (println "select failed: opcode {} type {}: {}" opcode ty message)
+             (set! (.failures tally) (+ (.failures tally) 1)))
+        (Ok [tile]
+            (match (emit/tile! (mut out) cx node 10 tile)
+              (Err [message]
+                   (println "emit failed: opcode {} type {} form {} ra {} rb {} rd {}: {}"
+                            opcode ty form ra rb rd message)
+                   (set! (.failures tally) (+ (.failures tally) 1)))
+              (Ok [_]
+                  (accept! (mut tally) (encode/mov-rr (mut (.text out)) 64 RAX rd))
+                  (accept! (mut tally) (encode/ret (mut (.text out))))
+                  (run! (mut tally) (mut out) ty result-type opcode form same fixed inputs
+                        ra rb rd))))))
+    (code/release! (mut out))
+    (frame/release! (mut layout))
+    (plan/release! (mut matched))
+    (release-parts! (mut parts))
+    (g/release! (mut graph))))
+
+;;; Whether the register assignment respects what the constraints builder
+;;; guarantees the emitter for this operation. p0 (in `ra`) is an operand in
+;;; forms 0 and 1, p1 (in `rb`) in form 2 and in form 0 unless `same`.
+(defn usable? [(opcode i32) (ty i32) (form i32) (same bool) (ra i32) (rb i32) (rd i32)] (-> bool)
+  (let [shift (and (>= opcode 49) (<= opcode 53))
+        division (or (= opcode 29) (= opcode 30))
+        narrow (< (t/bits ty) 32)
+        reads-p0 (!= form 2)
+        reads-p1 (or (= form 2) (and (= form 0) (not same)))
+        count (if (and (= form 0) same) ra rb)]
+    (cond
+      ; The two parameters are loaded into distinct registers.
+      (= ra rb) false
+      ; A wide variable shift has its count in rcx; the result may be rcx.
+      (and shift (!= form 1) (not narrow)) (= count RCX)
+      ; A narrow variable shift has rcx reserved.
+      (and shift (!= form 1) narrow)
+        (and (!= rd RCX)
+             (or (not reads-p0) (!= ra RCX))
+             (or (not reads-p1) (!= rb RCX)))
+      ; Division has rax and rdx reserved while its operands are read.
+      division
+        (and (or (not reads-p0) (and (!= ra RAX) (!= ra RDX)))
+             (or (not reads-p1) (and (!= rb RAX) (!= rb RDX))))
+      :else true)))
+
+(defn cond-case! [(tally (mut Tally)) (ty i32) (fused bool) (yes-constant bool)
+                  (no-constant bool) (rc i32) (ryes i32) (rd i32)
+                  (a (dyn Allocator))] (-> void)
+  ; f(c, v) = (c < 5 or c != 0) ? yes : no, with yes = v (or 77) and no = c
+  ; when it has no register of its own (or 1000).
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        p0 (t/param! (mut graph) start ty 0)
+        p1 (t/param! (mut graph) start ty 1)
+        five (t/constant! (mut graph) ty 5)
+        seventy (t/constant! (mut graph) ty 77)
+        thousand (t/constant! (mut graph) ty 100)
+        compare (t/compare! (mut graph) 16 p0 five)
+        yes (if yes-constant seventy p1)
+        no (if no-constant thousand p0)
+        node (t/select! (mut graph) ty (if fused compare p0) yes no)
+        (mut parts) (ArrayList::new [allocation/Part] a)
+        (mut matched) (blank-plan (len (.instructions graph)) a)
+        (mut layout) (frame/create a)
+        (mut out) (code/create a)]
+    (hold! (mut parts) p0 rc a)
+    (hold! (mut parts) p1 ryes a)
+    (hold! (mut parts) node rd a)
+    (when fused
+      (match (select/comparison graph compare)
+        (Err [_] (set! (.failures tally) (+ (.failures tally) 1)))
+        (Ok [tile]
+            (set! (mut (.tiles matched)) (cast i64 compare) tile)
+            (set! (mut (.comparisons matched)) (cast i64 node) compare))))
+    (accept! (mut tally) (encode/mov-rr (mut (.text out)) 64 rc RDI))
+    (accept! (mut tally) (encode/mov-rr (mut (.text out)) 64 ryes RSI))
+    (let [cx (context/Context
+               :graph graph
+               :parts (locations/linear-view parts)
+               :base (address/stack-base)
+               :matched matched
+               :frame layout
+               :frame-size 0)]
+      (match (conditional/emit! (mut out) cx node 10)
+        (Err [message]
+             (println "COND emit failed: type {} rc {} ryes {} rd {}: {}" ty rc ryes rd message)
+             (set! (.failures tally) (+ (.failures tally) 1)))
+        (Ok [_]
+            (accept! (mut tally) (encode/mov-rr (mut (.text out)) 64 RAX rd))
+            (accept! (mut tally) (encode/ret (mut (.text out))))
+            (set! (.functions tally) (+ (.functions tally) 1))
+            (match (t/map (slice (.text out)))
+              (Err [_] (set! (.failures tally) (+ (.failures tally) 1)))
+              (Ok [mapped]
+                  (let [(mut mapped) mapped]
+                    (for c [(: 0 u64) 1 4 5 6 200 0xFFFFFFFFFFFFFFFF 0x8000000000000000]
+                      (for v [(: 0 u64) 9 0xFFFFFFFFFFFFFFFE]
+                        (let [truth (if fused
+                                        (= (t/binary 16 ty c 5) 1)
+                                        (!= (& c (t/mask ty)) 0))
+                              expected (& (if truth
+                                              (if yes-constant 77 v)
+                                              (if no-constant 100 c))
+                                          (t/mask ty))
+                              actual (& (t/invoke mapped [(dirty ty c) (dirty ty v)]) (t/mask ty))]
+                          (set! (.checks tally) (+ (.checks tally) 1))
+                          (when (!= actual expected)
+                            (when (< (.failures tally) 20)
+                              (println "COND type {} fused {} rc {} ryes {} rd {} c {:x} v {:x}: got {:x} expected {:x}"
+                                       ty fused rc ryes rd c v actual expected))
+                            (set! (.failures tally) (+ (.failures tally) 1))))))
+                    (t/unmap! (mut mapped))))))))
+    (code/release! (mut out))
+    (frame/release! (mut layout))
+    (plan/release! (mut matched))
+    (release-parts! (mut parts))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 core emit: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (Tally :checks 0 :failures 0 :functions 0)
+            registers (pool)]
+        (for ty [(: 11 i32) 5 10 4 9 3 8 2]
+          (let [width (cast u64 (t/bits ty))
+                (mut inputs) (ArrayList::new [u64] a)
+                (mut constants) (ArrayList::new [u64] a)]
+            (for value [(: 0 u64) 1 2 5 (- width 1) width 0xFFFFFFFFFFFFFFFF
+                        (<< (: 1 u64) (- width 1)) (- (<< (: 1 u64) (- width 1)) 1)
+                        0x123456789ABCDEF1]
+              (push! (mut inputs) value))
+            (for value [(: 3 u64) 0 0xFFFFFFFFFFFFFFFF 0x7FFFFFFF 0x80000000 0x123456789ABCDEF1]
+              (push! (mut constants) value))
+            (for opcode [(: 26 i32) 27 28 29 30 46 47 48 49 50 51 52 53 14 16 20 23]
+              (for ra registers
+                (for rb registers
+                  (for rd registers
+                    (when (usable? opcode ty 0 false ra rb rd)
+                      (binary-case! (mut tally) opcode ty 0 false 0 ra rb rd (slice inputs) a))
+                    (when (usable? opcode ty 0 true ra rb rd)
+                      (binary-case! (mut tally) opcode ty 0 true 0 ra rb rd (slice inputs) a))
+                    (for fixed constants
+                      (when (and (usable? opcode ty 1 false ra rb rd)
+                                 (not (and (or (= opcode 29) (= opcode 30))
+                                           (= (& fixed (t/mask ty)) 0))))
+                        (binary-case! (mut tally) opcode ty 1 false fixed ra rb rd
+                                      (slice inputs) a))
+                      (when (usable? opcode ty 2 false ra rb rd)
+                        (binary-case! (mut tally) opcode ty 2 false fixed ra rb rd
+                                      (slice inputs) a)))))))
+            (free! (mut inputs))
+            (free! (mut constants))))
+        (for ty [(: 11 i32) 10 9 2]
+          (for fused [true false]
+            (for yes-constant [false true]
+              (for no-constant [false true]
+                (for rc registers
+                  (for ryes registers
+                    (for rd registers
+                      (when (!= rc ryes)
+                        (cond-case! (mut tally) ty fused yes-constant no-constant
+                                    rc ryes rd a)))))))))
+        (println "x64 core emit: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))
