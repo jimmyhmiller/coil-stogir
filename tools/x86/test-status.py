@@ -19,7 +19,8 @@ FAMILIES = ["integer", "memory+stack", "calls+ABI", "floating", "vector", "switc
             "atomics", "private-leaf/module", "inlining/optimizer", "other"]
 
 FAMILY = {
-    "integer": """bit-literal-identities checked-object compile-image extension-idioms extrema-object
+    "integer": """bit-literal-identities checked-object checked-projection-fold compile-image
+        extension-idioms extrema-object
         integer-arithmetic-object jit-bit-test jit-checked-pressure jit-condition-merge
         jit-condition-merge-zero jit-conditional jit-conversions jit-division jit-extend
         jit-literal-operands jit-multiply-literal jit-pressure jit-reciprocal-division
