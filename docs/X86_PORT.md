@@ -115,7 +115,12 @@ rule is written out at the top of `x64/value.coil`.
      result prefers rax (DIV) or rdx (MOD) and is moved when it landed
      elsewhere. The dividend is copied into rax, a constant divisor into r11.
      Division by zero and the overflowing signed quotient trap (#DE); the IR
-     leaves both undefined and nothing is checked. Division by a constant is
+     leaves both undefined and nothing is checked. AArch64 hardware returns
+     0 / the dividend / the minimum for those inputs, and
+     `tests/jit-division.coil` checks exactly those results, so that test
+     dies with SIGFPE on x86-64 until its zero-divisor and overflow inputs
+     are made target-specific or this backend emits a guarded sequence.
+     Trapping matches what an LLVM-built program does on x86-64. Division by a constant is
      a plain `div` until `x64/reciprocal.coil` selects better rules.
    - One-operand `mul`/`imul` and `cmpxchg` (families not written yet) follow
      the same pattern: clobber, copy in, prefer.

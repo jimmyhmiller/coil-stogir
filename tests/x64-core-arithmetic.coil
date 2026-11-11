@@ -132,6 +132,49 @@
             (free! (mut bytes)))))
     (g/release! (mut graph))))
 
+;;; Address arithmetic: ADDR + offset and ADDR - offset with a U64 or I64
+;;; offset, from a parameter and from constants at the immediate boundaries.
+(defn check-pointer! [(tally (mut Tally)) (allocator (dyn Allocator))] (-> void)
+  (for offset-type [(: 5 i32) 11]
+    (for opcode [(: 26 i32) 27]
+      (for form [(: 0 i32) 1 2 3 4]
+        (let [fixed (cond (= form 1) (: 8 u64)
+                          (= form 2) 0x7FFFFFFF
+                          (= form 3) 0x80000000
+                          :else 0xFFFFFFFFFFFFFFF0)
+              (mut graph) (g/create allocator)
+              start (t/start! (mut graph))
+              base (t/param! (mut graph) start 6 0)
+              offset (if (= form 0)
+                         (t/param! (mut graph) start offset-type 1)
+                         (t/constant! (mut graph) offset-type fixed))
+              value (t/binary! (mut graph) opcode 6 base offset)
+              ret (t/return! (mut graph) start 6 value)]
+          (set! (.functions tally) (+ (.functions tally) 1))
+          (match (compile/text graph start [ret] allocator)
+            (Err [message]
+                 (println "pointer arithmetic compile failed: {}" message)
+                 (set! (.failures tally) (+ (.failures tally) 1)))
+            (Ok [text]
+                (let [(mut bytes) text]
+                  (match (t/map (slice bytes))
+                    (Err [_] (set! (.failures tally) (+ (.failures tally) 1)))
+                    (Ok [mapped]
+                        (let [(mut code) mapped]
+                          (for x [(: 0 u64) 0x1000 0x7FFFFFFFFFFFFFF8 0xFFFFFFFFFFFFFFFF]
+                            (for y [(: 0 u64) 1 0xFFFFFFFFFFFFFFFF 0x123456789]
+                              (let [c (if (= form 0) y fixed)
+                                    expected (t/binary opcode 5 x c)
+                                    actual (t/invoke code [x y])]
+                                (set! (.checks tally) (+ (.checks tally) 1))
+                                (when (!= actual expected)
+                                  (println "pointer opcode {} form {}: {:x} {:x} got {:x} expected {:x}"
+                                           opcode form x c actual expected)
+                                  (set! (.failures tally) (+ (.failures tally) 1))))))
+                          (t/unmap! (mut code)))))
+                  (free! (mut bytes)))))
+          (g/release! (mut graph)))))))
+
 (defn main [] (-> i64)
   (if (not (t/host?))
       (do (println "x64 core arithmetic: skipped, not an x86-64 host") 0)
@@ -153,6 +196,7 @@
               (when (unary/valid-type? opcode ty)
                 (check-unary! (mut tally) opcode ty inputs allocator)))
             (free! (mut inputs))))
+        (check-pointer! (mut tally) allocator)
         (println "x64 core arithmetic: {} functions, {} checks, {} failures"
                  (.functions tally) (.checks tally) (.failures tally))
         (if (= (.failures tally) 0) 0 1))))
