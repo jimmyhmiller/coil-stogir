@@ -410,6 +410,90 @@
     (calls/release! (mut signature))
     (g/release! (mut leaf-graph))))
 
+;;; The module path: the leaf is published once by its owner, the context is
+;;; sealed, and a caller compiled for that publication keeps the leaf's name
+;;; undefined (the transport binds it) while still using the narrowed clobbers.
+(defn private-module! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (let [(mut leaf-graph) (g/create a)
+        leaf-start (t/start! (mut leaf-graph))
+        (mut signature) (ct/prototype false 11 [(: 11 u8) 11] [] a)
+        (mut context) (private/context-create a)
+        scope (: 77 usize)]
+    (ct/declare! (mut leaf-graph) signature a)
+    (let [x (t/param! (mut leaf-graph) leaf-start 11 0)
+          y (t/param! (mut leaf-graph) leaf-start 11 1)
+          ret (t/return! (mut leaf-graph) leaf-start 11
+                         (add! (mut leaf-graph) (times! (mut leaf-graph) x 5) y))
+          (mut leaf) (ct/image-of "module leaf" leaf-graph leaf-start [ret] a)
+          (mut bytes) (calls/encode signature a)
+          local (ct/need (image/local-symbol! (mut leaf) "module_leaf_body" 1 0))]
+      (match (private/register-as! (mut context) "module_leaf" leaf local (len (.text leaf))
+                                   (slice bytes))
+        (Ok [registered] (check! (mut tally) "module leaf registered" registered))
+        (Err [message] (panic "module leaf registration: {}" message)))
+      (check! (mut tally) "unpublished context does not seal"
+              (match (private/seal-module! (mut context) scope) (None [] true) (Some [_] false)))
+      (match (private/confirm-publication! (mut context) scope "module_leaf" 9 0
+                                           (slice (.text leaf)))
+        (Ok [confirmed] (check! (mut tally) "publication confirmed" confirmed))
+        (Err [message] (panic "module publication: {}" message)))
+      (match (private/seal-module! (mut context) scope)
+        (None [] (check! (mut tally) "module sealed" false))
+        (Some [publication]
+              (let [(mut graph) (g/create a)
+                    start (t/start! (mut graph))
+                    (mut own) (ct/prototype false 11 [(: 11 u8) 11 11] [] a)]
+                (ct/declare! (mut graph) own a)
+                (check! (mut tally) "module binding"
+                        (match (private/binding context publication scope "module_leaf")
+                          (Some [symbol] (= symbol 9))
+                          (None [] false)))
+                (let [p0 (t/param! (mut graph) start 11 0)
+                      p1 (t/param! (mut graph) start 11 1)
+                      p2 (t/param! (mut graph) start 11 2)
+                      kept (add! (mut graph) p0 (times! (mut graph) p2 9))
+                      call (ct/call! (mut graph) signature start
+                                     (ct/named! (mut graph) "module_leaf") [p1 p2] a)
+                      ret (t/return! (mut graph) call 11 (add! (mut graph) call kept))
+                      (mut code)
+                        (match (compile/image-for-private-module
+                                 graph start [ret] "x64_call_test_entry" (options/Options :level 1)
+                                 a context publication scope)
+                          (Ok [built] built)
+                          (Err [message] (panic "module caller: {}" message)))
+                      (mut leaf-loaded) (ct/map-resolved "module leaf" leaf [] [] a)
+                      (mut loaded)
+                        (ct/map-resolved "module caller" code ["module_leaf"]
+                                         [(primitive/cast u64 (ct/entry leaf-loaded))] a)
+                      f (primitive/cast (fnptr (cc/C) [i64 i64 i64] i64) (ct/entry loaded))]
+                  ; The leaf's name stays an undefined declaration for the transport.
+                  (check! (mut tally) "module leaf stays undefined"
+                          (match (image/find-symbol code "module_leaf")
+                            (None [] false)
+                            (Some [id] (= (.section (get (.symbols code) (cast i64 id))) 0))))
+                  (for s [(: -11 i64) 0 3 77777]
+                    (check! (mut tally) "module call"
+                            (= (call-ptr f s (+ s 1) (+ s 2))
+                               (+ (* (+ s 1) 5) (+ s 2) s (* (+ s 2) 9)))))
+                  (jit/release-image! (mut loaded))
+                  (jit/release-image! (mut leaf-loaded))
+                  (image/release! (mut code)))
+                ; A publication of another scope is not valid for this module.
+                (check! (mut tally) "foreign scope rejected"
+                        (match (compile/image-for-private-module
+                                 graph start [] "x64_call_test_entry" (options/Options :level 1)
+                                 a context publication (+ scope 1))
+                          (Ok [built]
+                              (let [(mut built) built] (image/release! (mut built)) false))
+                          (Err [_] true)))
+                (calls/release! (mut own))
+                (g/release! (mut graph)))))
+      (free! (mut bytes))
+      (image/release! (mut leaf)))
+    (private/context-release! (mut context))
+    (calls/release! (mut signature))
+    (g/release! (mut leaf-graph))))
+
 (defn main [] (-> i64)
   (if (not (t/host?))
       (do (println "x64 call flow: skipped (not an x86-64 host)") 0)
@@ -423,5 +507,6 @@
         (tail-recursion! (mut tally) false a)
         (tail-to-c! (mut tally) a)
         (private-leaf! (mut tally) a)
+        (private-module! (mut tally) a)
         (println "x64 call flow: {} checks, {} failures" (.checks tally) (.failures tally))
         (if (= (.failures tally) 0) 0 1))))

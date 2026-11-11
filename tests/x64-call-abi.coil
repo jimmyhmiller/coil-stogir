@@ -14,6 +14,7 @@
 (import "stogir.x64.testing" :as t)
 (import "stogir.x64.call-testing" :as ct)
 (import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
 (import "coil.primitive" :as primitive)
 (import "coil.cc" :as cc)
 
@@ -45,6 +46,10 @@
 (extern c_take_wide :cc (cc/C) [] (-> void))
 (extern c_sum_va :cc (cc/C) [i64 ...] (-> f64))
 (extern snprintf :cc (cc/C) [(ptr u8) u64 (ptr i8) ...] (-> i32))
+(extern memmove :cc (cc/C) [(ptr u8) (ptr u8) u64] (-> (ptr u8)))
+(extern memcmp :cc (cc/C) [(ptr u8) (ptr u8) u64] (-> i32))
+(extern c_capture :cc (cc/C) [] (-> i64))
+(extern c_captured_rax :cc (cc/C) [] (-> u64))
 (extern c_drive_take_ii :cc (cc/C) [(ptr u8) i64 i64 i64] (-> i64))
 (extern c_drive_take_id :cc (cc/C) [(ptr u8) i64 f64 i64 f64] (-> f64))
 (extern c_drive_group_stack :cc (cc/C) [(ptr u8) i64] (-> i64))
@@ -65,9 +70,9 @@
    "c_wide_view" "c_ret_i8" "c_ret_u16" "c_take_ii" "c_take_dd" "c_take_id" "c_take_di"
    "c_take_fi" "c_group_stack" "c_group_banks" "c_ret_ii" "c_ret_dd" "c_ret_id" "c_ret_di"
    "c_ret_big" "c_take_big" "c_take_big16" "c_take_two_big" "c_take_wide" "c_sum_va"
-   "snprintf"])
+   "snprintf" "memmove" "memcmp" "c_capture"])
 
-(defn addresses [] (-> (array u64 28))
+(defn addresses [] (-> (array u64 31))
   (let [table [(address-of c_load64) (address-of c_store64) (address-of c_loadf64) (address-of c_storef64)
    (address-of c_ints10) (address-of c_doubles12) (address-of c_mixed) (address-of c_wide_view)
    (address-of c_ret_i8) (address-of c_ret_u16) (address-of c_take_ii) (address-of c_take_dd)
@@ -75,7 +80,8 @@
    (address-of c_group_stack) (address-of c_group_banks) (address-of c_ret_ii)
    (address-of c_ret_dd) (address-of c_ret_id) (address-of c_ret_di) (address-of c_ret_big)
    (address-of c_take_big) (address-of c_take_big16) (address-of c_take_two_big)
-   (address-of c_take_wide) (address-of c_sum_va) (address-of snprintf)]]
+   (address-of c_take_wide) (address-of c_sum_va) (address-of snprintf)
+               (address-of memmove) (address-of memcmp) (address-of c_capture)]]
     table))
 
 (defn finish [(label (slice u8)) (graph g/Graph) (start i32) (roots (slice i32))
@@ -713,6 +719,82 @@
     (calls/release! (mut store))
     (g/release! (mut graph))))
 
+;;; al of a variadic call is exactly the number of vector registers used:
+;;; none, three, and all eight when ten floating values are passed.
+(defn vector-count! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (for floats [(: 0 i64) 3 10]
+    (let [(mut graph) (g/create a)
+          start (t/start! (mut graph))
+          (mut own) (ct/prototype false 11 [(: 11 u8) 12] [] a)
+          (mut variadic) (ct/prototype true 11 [(: 11 u8)] [] a)
+          (mut passed) (ArrayList::new [i32] a)]
+      (ct/declare! (mut graph) own a)
+      (let [n (t/param! (mut graph) start 11 0)
+            d (t/param! (mut graph) start 12 1)]
+        (push! (mut passed) n)
+        (for [i 0 floats] (push! (mut passed) d))
+        (push! (mut passed) n)
+        (let [call (ct/call! (mut graph) variadic start (ct/named! (mut graph) "c_capture")
+                             (slice passed) a)
+              ret (t/return! (mut graph) call 11 call)
+              (mut loaded) (finish "vector count" graph start [ret] a)
+              f (primitive/cast (fnptr (cc/C) [i64 f64] i64) (ct/entry loaded))]
+          (check! (mut tally) "vector count call" (= (call-ptr f 7 1.5) 12345))
+          (check! (mut tally) "vector count in al"
+                  (= (& (c_captured_rax) 0xFF) (cast u64 (if (> floats 8) 8 floats))))
+          (jit/release-image! (mut loaded))))
+      (free! (mut passed))
+      (calls/release! (mut own))
+      (calls/release! (mut variadic))
+      (g/release! (mut graph)))))
+
+;;; Calls declared BUILTIN-MOVE and BUILTIN-COMPARE reach their runtime
+;;; routines (no inline expansion is plugged in yet).
+(defn builtins! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        (mut own) (ct/prototype false 10 [(: 6 u8) 6 6] [] a)
+        (mut move) (match (calls/create-builtin-move 8 a)
+                     (Ok [built] built)
+                     (Err [message] (panic "{}" message)))
+        (mut compare) (match (calls/create-builtin-compare 8 10 5 a)
+                        (Ok [built] built)
+                        (Err [message] (panic "{}" message)))]
+    (ct/declare! (mut graph) own a)
+    (let [destination (t/param! (mut graph) start 6 0)
+          source (t/param! (mut graph) start 6 1)
+          other (t/param! (mut graph) start 6 2)
+          size (t/constant! (mut graph) 5 24)
+          c1 (ct/call! (mut graph) move start (ct/named! (mut graph) "memmove")
+                       [destination source size] a)
+          c2 (ct/call! (mut graph) compare c1 (ct/named! (mut graph) "memcmp") [c1 other size] a)
+          ret (t/return! (mut graph) c2 10 c2)
+          (mut loaded) (finish "builtins" graph start [ret] a)
+          f (primitive/cast (fnptr (cc/C) [(ptr u8) (ptr u8) (ptr u8)] i32) (ct/entry loaded))
+          (mut from) (primitive/zeroed (array u8 24))
+          (mut to) (primitive/zeroed (array u8 24))
+          (mut same) (primitive/zeroed (array u8 24))
+          (mut larger) (primitive/zeroed (array u8 24))]
+      (for [i 0 24]
+        (set! (mut from) i (cast u8 (+ 3 (* i 7))))
+        (set! (mut same) i (cast u8 (+ 3 (* i 7))))
+        (set! (mut larger) i (cast u8 (+ 3 (* i 7)))))
+      (set! (mut larger) 20 255)
+      (check! (mut tally) "builtin equal"
+              (= (call-ptr f (primitive/cast (ptr u8) (mut to)) (primitive/cast (ptr u8) (mut from))
+                           (primitive/cast (ptr u8) (mut same)))
+                 0))
+      (check! (mut tally) "builtin moved" (= (get to 23) (get from 23)))
+      (check! (mut tally) "builtin less"
+              (< (call-ptr f (primitive/cast (ptr u8) (mut to)) (primitive/cast (ptr u8) (mut from))
+                           (primitive/cast (ptr u8) (mut larger)))
+                 0))
+      (jit/release-image! (mut loaded)))
+    (calls/release! (mut own))
+    (calls/release! (mut move))
+    (calls/release! (mut compare))
+    (g/release! (mut graph))))
+
 (defn main [] (-> i64)
   (if (not (t/host?))
       (do (println "x64 call abi: skipped (not an x86-64 host)") 0)
@@ -734,5 +816,7 @@
         (memory-to-c! (mut tally) a)
         (memory-from-c! (mut tally) a)
         (variadic! (mut tally) a)
+        (vector-count! (mut tally) a)
+        (builtins! (mut tally) a)
         (println "x64 call abi: {} checks, {} failures" (.checks tally) (.failures tally))
         (if (= (.failures tally) 0) 0 1))))
