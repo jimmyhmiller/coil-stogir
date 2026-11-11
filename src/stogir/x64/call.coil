@@ -326,6 +326,85 @@
                        (planned abi/Layout)] (-> (Result bool (slice u8)))
   (Ok false))
 
+;;; Constraints of a node lowered as a call to a runtime routine that takes
+;;; its `operands` in xmm0, xmm1, ... and returns in xmm0 (FMA through libm's
+;;; fma/fmaf): the operands may be anywhere, every caller-saved register is
+;;; clobbered across the node (the routine is ordinary C), the result is a
+;;; fixed definition in xmm0, and the node lowers its own definition-position
+;;; transfers like any call.
+(defn runtime-constraints! [(set (mut uses/Set)) (reference i32) (position i64)
+                            (operands (slice i32))] (-> (Result i32 (slice u8)))
+  (let [mask (private/full-clobbers)
+        (mut error) ""]
+    (for operand operands
+      (unless (uses/use-anywhere! (mut set) operand position) (set! error CONFLICT)))
+    (for [register 0 48]
+      (when (!= (& mask (<< (: 1 u64) (cast u64 register))) 0)
+        (if (= (cast i32 register) registers/XMM0)
+            (uses/clobber-unless-live! (mut set) (cast i32 register) (+ position 1)
+                                       (+ position 2) reference)
+            (uses/clobber! (mut set) (cast i32 register) (+ position 1) (+ position 2)))))
+    (unless (uses/define-fixed! (mut set) reference position registers/XMM0)
+      (set! error CONFLICT))
+    (push! (mut (.definition-moves set)) (+ position 1))
+    (set! (.calls set) true)
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; Emit the runtime call of `runtime-constraints!`: one parallel group moves
+;;; the located operands into xmm0.. together with the allocator's
+;;; preservation transfers, constants are materialized, then `call rel32` to
+;;; `routine` (code/RUNTIME-*). The result is in xmm0.
+(defn emit-runtime! [(out (mut code/Buffer)) (cx context/Context) (position i64)
+                     (operands (slice i32)) (routine i32)
+                     (preserve (slice loc/Transfer)) (allocator (dyn Allocator))]
+  (-> (Result i32 (slice u8)))
+  (let [graph (.graph cx)
+        (mut copies) (ArrayList::new [typed/Copy] allocator)
+        (mut error) ""]
+    (for [i 0 (len operands)]
+      (let [operand (get operands i)]
+        (when (and (= error "") (located? cx operand position))
+          (match (loc/resolve (.parts cx) operand position)
+            (Err [message] (set! error message))
+            (Ok [source]
+                (push! (mut copies)
+                       (typed/Copy
+                         :transfer (loc/Transfer
+                                     :position position
+                                     :parent operand
+                                     :source source
+                                     :destination (loc/Location
+                                                    :kind 0
+                                                    :value (+ (cast i64 registers/XMM0) i)))
+                         :size (extent (value/type-of graph operand)))))))))
+    (for copy preserve
+      (when (= error "")
+        (let [ty (value/type-of graph (.parent copy))]
+          (if (or (!= (.position copy) (+ position 1)) (<= (.parent copy) 0) (<= ty 0))
+              (set! error "runtime call preservation has an invalid position or owner")
+              (push! (mut copies)
+                     (typed/Copy
+                       :transfer (loc/Transfer
+                                   :position position
+                                   :parent (.parent copy)
+                                   :source (.source copy)
+                                   :destination (.destination copy))
+                       :size (extent ty)))))))
+    (when (and (= error "") (> (len copies) 0))
+      (code/accept-count! (mut error)
+                          (typed/parallel-frame! (mut (.text out)) (slice copies) allocator
+                                                 (.base cx))))
+    (for [i 0 (len operands)]
+      (when (and (= error "") (not (located? cx (get operands i) position)))
+        (code/accept-count! (mut error)
+                            (load! (mut out) cx (get operands i) position
+                                   (+ (: registers/XMM0 i32) (cast i32 i))))))
+    (when (= error "")
+      (code/accept-count! (mut error) (code/runtime-call! (mut out) routine))
+      (code/called! (mut out)))
+    (free! (mut copies))
+    (if (= error "") (Ok 0) (Err error))))
+
 ;;; The register an indirect callee is in once `emit-call!` has installed the
 ;;; arguments: r11 for a variadic call (al carries the vector count), rax
 ;;; otherwise.

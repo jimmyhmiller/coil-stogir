@@ -51,6 +51,8 @@
 (import "stogir.call-results" :as results)
 (import "stogir.x64.callee-saved" :as callee)
 (import "stogir.x64.frame-address" :as address)
+(import "stogir.x64.floating" :as floating)
+(import "stogir.floating" :as floating-ops)
 (import "stogir.x64.code" :as code)
 (import "stogir.x64.conditional" :as conditional)
 (import "stogir.x64.context" :as context)
@@ -96,6 +98,16 @@
             (set! kept (+ kept 1)))))
       (while (> (len moves) kept) (pop! (mut moves))))
     moves))
+
+;;; Whether scheduled node `reference` lowers the allocator's transfers at its
+;;; own definition position: calls, and FMA, which is a call to libm.
+(defn self-lowered? [(graph g/Graph) (matched plan/Plan) (reference i32)] (-> bool)
+  (let [opcode (cast i32 (n/opcode (get (.instructions graph) (cast i64 reference))))]
+    (or (= opcode 79) (= opcode 80)
+        (and (floating-ops/ternary? opcode)
+             (= (plan/family matched reference) families/FLOATING)
+             (not (machine/rematerialized? (.operands matched) reference))
+             (not (plan/omitted? matched reference))))))
 
 ;;; The function's result role and the logical frame offset of the object it
 ;;; needs: the buffer of register result pieces (kind 1) or the save slot of
@@ -471,7 +483,7 @@
                   (set! at (get (.next move-index) at))))
               ; A call lowers its definition-position transfers itself.
               (when (and (> (len group) 0)
-                         (not (and (= phase 1) (or (= opcode 79) (= opcode 80)))))
+                         (not (and (= phase 1) (self-lowered? graph matched reference))))
                 (match (edges/typed-group! (mut (.text output)) graph (slice group)
                                            allocator (.base assigned))
                   (Err [message] (set! error message))
@@ -493,6 +505,8 @@
                     (or (= opcode 79) (= opcode 80))
                       (call-node! (mut output) cx assigned reference position (slice group)
                                   allocator)
+                    (self-lowered? graph matched reference)
+                      (floating/fma! (mut output) cx reference position (slice group) allocator)
                     ; A family's node, except the floating forms of PARAM,
                     ; RETURN and IF, which need the driver's state and are
                     ; emitted by the cases below.

@@ -24,7 +24,9 @@
 ;;; A pending image relocation of 4 bytes at `offset`: `kind` is an image
 ;;; relocation kind (5 PC32, 6 PLT32), `target` a negative graph constant
 ;;; reference, and `addend` the explicit addend (-4 when the field ends the
-;;; instruction; see stogir.x64.encode's header).
+;;; instruction; see stogir.x64.encode's header). A PLT32 reference may
+;;; instead name a runtime routine the backend itself calls: `target` is then
+;;; one of the positive RUNTIME-* ids below and the image names its symbol.
 (defstruct Reference [(offset i64) (kind i32) (target i32) (addend i64)])
 
 ;;; `written` is the set of registers the code may write, one bit per library
@@ -41,6 +43,30 @@
    (text-data (ArrayList text-data/Range))
    (written u64)
    (calls bool)])
+
+;;; libm's `double fma(double, double, double)`.
+(const RUNTIME-FMA 1)
+
+;;; libm's `float fmaf(float, float, float)`.
+(const RUNTIME-FMAF 2)
+
+(defn runtime? [(reference Reference)] (-> bool)
+  (and (= (.kind reference) image/X64-PLT32)
+       (or (= (.target reference) RUNTIME-FMA) (= (.target reference) RUNTIME-FMAF))))
+
+;;; `call rel32` to runtime routine `routine` (a RUNTIME-* id), PLT32.
+(defn runtime-call! [(output (mut Buffer)) (routine i32)] (-> (Result i32 (slice u8)))
+  (match (encode/call-rel32 (mut (.text output)) 0)
+    (Err [message] (Err message))
+    (Ok [field]
+        (let [pending (Reference
+                        :offset field
+                        :kind image/X64-PLT32
+                        :target routine
+                        :addend (- 0 (encode/field-to-end (.text output) field)))]
+          (if (runtime? pending)
+              (do (push! (mut (.references output)) pending) (Ok 5))
+              (Err "unknown x86-64 runtime routine"))))))
 
 (defn create [(allocator (dyn Allocator))] (-> Buffer)
   (Buffer
@@ -102,7 +128,7 @@
     (for reference (.references source)
       (when (or (< (.offset reference) 0)
                 (> (.offset reference) (- (len (.text source)) 4))
-                (>= (.target reference) 0)
+                (and (>= (.target reference) 0) (not (runtime? reference)))
                 (< (.kind reference) 5)
                 (> (.kind reference) 6))
         (set! valid? false)))

@@ -203,9 +203,11 @@ operand helpers in `x64/value.coil`, "Floating values").
   are, smaller ones go through `cvttsd2si`/`cvtsi2sd` or the add-and-subtract
   2^52 identity and keep the operand's sign. They assume MXCSR's default
   round-to-nearest mode, like every other arithmetic instruction. FMA has no
-  baseline instruction and is rejected with a clear error until the call
-  family can call libm's `fma`/`fmaf` from inside a node (which also needs an
-  image, not bare text).
+  baseline instruction: it is a call to libm's `fma` / `fmaf` (operands in
+  xmm0..xmm2 by one parallel group with the preservation transfers, every
+  caller-saved register clobbered, result in xmm0; `call/runtime-constraints!`,
+  `call/emit-runtime!`, a PLT32 reference to the runtime symbol). That needs
+  an image; `compile/text` reports a clear error for a function with FMA.
 - **Conversions.** INT2FP is exact for every integer type (u64 with the top
   bit set is halved with a sticky low bit and the result doubled). FP2INT is
   `cvttss2si/cvttsd2si`; u64 results add a second conversion of `x - 2^63`.

@@ -1,0 +1,162 @@
+;;; FMA on x86-64: the SSE2 baseline has no fused multiply-add, so the node is
+;;; a call to libm's fma (DOUBLE) or fmaf (FLOAT) through the call family's
+;;; runtime-call sequence. Checked against the host's libm for both types,
+;;; with operands in registers, repeated, constant and live across the call,
+;;; and with integer and floating values that must survive it. Bare text
+;;; cannot carry the call and reports a clear error.
+;;;
+;;; Run with tools/x86/call-tests.sh (links libm).
+(module stogir.tests.x64-call-fma)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.jit.native" :as jit)
+(import "stogir.x64.compile" :as compile)
+(import "stogir.x64.testing" :as t)
+(import "stogir.x64.call-testing" :as ct)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err])
+
+(extern fma :cc (cc/C) [f64 f64 f64] (-> f64))
+(extern fmaf :cc (cc/C) [f32 f32 f32] (-> f32))
+
+(defn address-of [(f Code)] (-> Code)
+  `(primitive/cast u64 (primitive/cast (ptr u8) (fnptr-of ~f))))
+
+(defn check! [(tally (mut t/Tally)) (label (slice u8)) (good bool)] (-> void)
+  (set! (.checks tally) (+ (.checks tally) 1))
+  (unless good
+    (when (< (.failures tally) 40) (println "{}: wrong result" label))
+    (t/fail! (mut tally))))
+
+(defn fma! [(graph (mut g/Graph)) (ty i32) (x i32) (y i32) (z i32)] (-> i32)
+  (t/require (b/floating! (mut graph) 132 ty x y z)))
+
+(defn finish [(label (slice u8)) (graph g/Graph) (start i32) (roots (slice i32))
+              (a (dyn Allocator))] (-> jit/Loaded)
+  (let [table [(address-of fma) (address-of fmaf)]]
+    (ct/build label graph start roots ["fma" "fmaf"] table a)))
+
+;;; f(x, y, z) = fma(fma(x, y, z), x, fma(y, y, 0.5)): x and y stay live across
+;;; calls, an operand is repeated, and one is a constant.
+(defn doubles! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        (mut own) (ct/prototype false 12 [(: 12 u8) 12 12] [] a)]
+    (ct/declare! (mut graph) own a)
+    (let [x (t/param! (mut graph) start 12 0)
+          y (t/param! (mut graph) start 12 1)
+          z (t/param! (mut graph) start 12 2)
+          half (t/constant! (mut graph) 12 0x3FE0000000000000)
+          first (fma! (mut graph) 12 x y z)
+          second (fma! (mut graph) 12 y y half)
+          third (fma! (mut graph) 12 first x second)
+          ret (t/return! (mut graph) start 12 third)
+          (mut loaded) (finish "fma double" graph start [ret] a)
+          f (primitive/cast (fnptr (cc/C) [f64 f64 f64] f64) (ct/entry loaded))]
+      (for x [(: 0.1 f64) -3.5 1.0e100 1.0000000000000002 0.0]
+        (for y [(: 10.0 f64) 0.3 -1.0000000000000002 1.0e-200]
+          (for z [(: -1.0 f64) 1.0e-17 3.0]
+            (let [expected (fma (fma x y z) x (fma y y 0.5))
+                  actual (call-ptr f x y z)]
+              (check! (mut tally) "fma double"
+                      (or (= actual expected) (and (!= actual actual) (!= expected expected))))))))
+      (jit/release-image! (mut loaded)))
+    (calls/release! (mut own))
+    (g/release! (mut graph))))
+
+;;; g(x, y, z) = fmaf(fmaf(x, y, z), z, x) on FLOAT values.
+(defn floats! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        (mut own) (ct/prototype false 13 [(: 13 u8) 13 13] [] a)]
+    (ct/declare! (mut graph) own a)
+    (let [x (t/param! (mut graph) start 13 0)
+          y (t/param! (mut graph) start 13 1)
+          z (t/param! (mut graph) start 13 2)
+          first (fma! (mut graph) 13 x y z)
+          second (fma! (mut graph) 13 first z x)
+          ret (t/return! (mut graph) start 13 second)
+          (mut loaded) (finish "fma float" graph start [ret] a)
+          f (primitive/cast (fnptr (cc/C) [f32 f32 f32] f32) (ct/entry loaded))]
+      (for x [(: 0.1 f32) -3.5 1.0e30 1.0000001]
+        (for y [(: 10.0 f32) 0.3 -1.0000001]
+          (for z [(: -1.0 f32) 1.0e-9 3.0]
+            (let [expected (fmaf (fmaf x y z) z x)
+                  actual (call-ptr f x y z)]
+              (check! (mut tally) "fma float"
+                      (or (= actual expected) (and (!= actual actual) (!= expected expected))))))))
+      (jit/release-image! (mut loaded)))
+    (calls/release! (mut own))
+    (g/release! (mut graph))))
+
+;;; Integer values in caller-saved registers survive the libm call.
+(defn survivors! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        (mut own) (ct/prototype false 11 [(: 12 u8) 11 11 11 11 11 11 6] [] a)
+        (mut store) (ct/prototype false 0 [(: 6 u8) 11 12] [] a)]
+    (ct/declare! (mut graph) own a)
+    (let [x (t/param! (mut graph) start 12 0)
+          out (t/param! (mut graph) start 6 7)
+          (mut total) (t/param! (mut graph) start 11 1)
+          product (fma! (mut graph) 12 x x x)]
+      (for [i 2 7]
+        (set! total (t/binary! (mut graph) 26 11
+                               (t/binary! (mut graph) 28 11 total (t/constant! (mut graph) 11 3))
+                               (t/param! (mut graph) start 11 (cast i32 i)))))
+      ; The sum is computed after the call from parameters live across it.
+      (let [converted (t/unary! (mut graph) 38 11 product)
+            ret (t/return! (mut graph) start 11 (t/binary! (mut graph) 26 11 total converted))
+            (mut loaded) (finish "fma survivors" graph start [ret] a)
+            f (primitive/cast (fnptr (cc/C) [f64 i64 i64 i64 i64 i64 i64 (ptr u8)] i64)
+                              (ct/entry loaded))]
+        (for s [(: -5 i64) 0 9 1003]
+          (let [x (+ (cast f64 s) 0.5)
+                (mut expected) (+ s 1)]
+            (for [i 2 7] (set! expected (+ (* expected 3) (+ s i))))
+            (check! (mut tally) "fma survivors"
+                    (= (call-ptr f x (+ s 1) (+ s 2) (+ s 3) (+ s 4) (+ s 5) (+ s 6)
+                                 (primitive/cast (ptr u8) 0))
+                       (+ expected (cast i64 (fma x x x)))))))
+        (jit/release-image! (mut loaded))))
+    (calls/release! (mut own))
+    (calls/release! (mut store))
+    (g/release! (mut graph))))
+
+;;; Bare text has no relocations: FMA is rejected there with a clear error.
+(defn text! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        x (t/param! (mut graph) start 12 0)
+        ret (t/return! (mut graph) start 12 (fma! (mut graph) 12 x x x))]
+    (match (compile/text graph start [ret] a)
+      (Ok [text]
+          (let [(mut text) text] (free! (mut text)))
+          (check! (mut tally) "fma text is rejected" false))
+      (Err [message]
+           (let [(mut found) false
+                 needle "needs an image"]
+             (when (>= (len message) (len needle))
+               (for [i 0 (+ (- (len message) (len needle)) 1)]
+                 (let [(mut same) true]
+                   (for [j 0 (len needle)]
+                     (when (!= (get message (+ i j)) (get needle j)) (set! same false)))
+                   (when same (set! found true)))))
+             (unless found (println "fma text error: {}" message))
+             (check! (mut tally) "fma text error names the image" found))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 call fma: skipped (not an x86-64 host)") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (doubles! (mut tally) a)
+        (floats! (mut tally) a)
+        (survivors! (mut tally) a)
+        (text! (mut tally) a)
+        (println "x64 call fma: {} checks, {} failures" (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))
