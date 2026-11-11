@@ -9,6 +9,17 @@
 ;;; Frame (docs/X86_PORT.md): logical offsets upward from rsp after the
 ;;; prologue: outgoing call area, frame objects of operation families,
 ;;; spill slots, callee-saved area. The return address sits above the frame.
+;;; A function with dynamic stack (`(.anchored set)`) or any alignment above
+;;; 16 gets an anchored frame: rbp is the base of every logical offset
+;;; (stogir.x64.frame-address), the frame size is a multiple of the frame
+;;; alignment, and an over-aligned frame owns an 8-byte entry slot for its
+;;; anchor.
+;;;
+;;; A static frame object (stogir.stack/frame-object?) defines no register:
+;;; its value is the address of its frame slot, indexed here as a
+;;; rematerialized location whose `value` is the slot's logical offset
+;;; (kind 2 in an anchored frame, kind 3 otherwise; resolve it with
+;;; stogir.x64.frame-address/slot).
 ;;;
 ;;; Operation families never edit this module: clobbers, hints, frame
 ;;; objects, the outgoing area and odd-position transfer sites all arrive
@@ -31,6 +42,7 @@
 (import "stogir.node" :as n)
 (import "stogir.types" :as types)
 (import "stogir.schedule" :as schedule)
+(import "stogir.stack" :as stack)
 (import "stogir.x64.callee-saved" :as callee)
 (import "stogir.x64.coalesce" :as coalesce)
 (import "stogir.x64.frame-address" :as address)
@@ -62,9 +74,35 @@
 ;;; 16). Zero for a frame without contents: the function is frameless.
 (defn frame-size [(assigned Assigned)] (-> i64)
   (let [contents (.size (.frame assigned))]
-    (if (= contents 0)
-        0
-        (+ (& (+ contents 7) (- 0 16)) 8))))
+    (cond (address/anchored? (.base assigned)) (.bias (.base assigned))
+          (= contents 0) 0
+          :else (+ (& (+ contents 7) (- 0 16)) 8))))
+
+;;; Index every scheduled static frame object as the read-only address of
+;;; its slot, in reference order.
+(defn index-objects! [(assigned (mut Assigned)) (graph g/Graph)] (-> (Result i32 (slice u8)))
+  (let [(mut error) ""
+        kind (if (address/anchored? (.base assigned)) (: 2 i32) 3)
+        (mut r) 1]
+    ; Instruction cells span several slots; only cell starts are nodes.
+    (while (and (= error "") (< r (len (.instructions graph))))
+      (when (stack/frame-object? (get (.instructions graph) r))
+        (match (get (.locals (.frame assigned)) (cast i32 r))
+          ; An unscheduled object has no slot and no reader.
+          (None [] 0)
+          (Some [slot]
+                (if (or (>= r (len (.parents (.locations assigned))))
+                        (!= (.count (get (.parents (.locations assigned)) r)) 0))
+                    (set! error "static frame address still has a virtual allocation")
+                    (push! (mut (.rematerialized (.locations assigned)))
+                           (locations/Rematerialized
+                             :parent (cast i32 r)
+                             :location
+                               (locations/Location
+                                 :kind kind
+                                 :value (.offset (get (.slots (.frame assigned)) slot)))))))))
+      (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4))))
+    (if (= error "") (Ok 0) (Err error))))
 
 (defn build [(intervals (ArrayList ranges/Value))
              (set uses/Set)
@@ -113,8 +151,11 @@
               (extend! (mut (.uses part)) (.data (.uses requirement))
                        (len (.uses requirement))))
             (push! (mut (.parts assigned)) part)))))
-    (when (or (.anchored set) (> (.alignment set) 16))
-      (set! error "x86-64 backend: anchored (rbp) frames for dynamic stack or over-alignment are not implemented yet (stack family)"))
+    (for local (.locals set)
+      (when (> (.alignment local) (.alignment assigned))
+        (set! (.alignment assigned) (.alignment local))))
+    (when (or (< (.alignment assigned) 16) (not (frame/valid-alignment? (.alignment assigned))))
+      (set! error "invalid x86-64 frame alignment"))
     (let [(mut aliases) (coalesce/run-prepared! (mut (.parts assigned)) graph scheduled
                                                 blocks depths allocator)]
       (preferences/apply! (mut (.parts assigned)) aliases set)
@@ -141,8 +182,12 @@
       ; objects follow, then the allocator's spill slots.
       (when (or (< (.outgoing-size set) 0) (!= (% (.outgoing-size set) 16) 0))
         (set! error "invalid x86-64 outgoing call area size"))
-      (set! (.outgoing-size assigned) (.outgoing-size set))
-      (set! (.size (.frame assigned)) (.outgoing-size set))
+      ; ALLOCA results are rsp + outgoing size, so the area is rounded to the
+      ; frame alignment like every dynamic object.
+      (set! (.outgoing-size assigned)
+            (* (/ (+ (.outgoing-size set) (- (.alignment assigned) 1)) (.alignment assigned))
+               (.alignment assigned)))
+      (set! (.size (.frame assigned)) (.outgoing-size assigned))
       (for local (.locals set)
         (match (frame/local-slot! (mut (.frame assigned)) (.owner local) (.size local)
                                   (.alignment local))
@@ -175,6 +220,20 @@
         (match (callee/layout! (.parts assigned) (mut (.frame assigned)))
           (Err [message] (set! error message))
           (Ok [saved] (set! (.callee assigned) saved))))
+      ; The frame is complete: an anchored frame fixes its size and base.
+      (when (and (= error "") (or (.anchored set) (> (.alignment assigned) 16)))
+        (let [(mut entry) (: -1 i64)]
+          (when (> (.alignment assigned) 16)
+            (match (frame/private-slot! (mut (.frame assigned)) 8 8)
+              (Err [message] (set! error message))
+              (Ok [offset] (set! entry offset))))
+          (match (frame/aligned-size (.frame assigned) (.alignment assigned))
+            (Err [message] (set! error message))
+            (Ok [size] (set! (.base assigned) (address/anchored-base size entry))))))
+      (when (= error "")
+        (match (index-objects! (mut assigned) graph)
+          (Err [message] (set! error message))
+          (Ok [_] 0)))
       (free! (mut aliases)))
     (free! (mut shapes))
     (if (= error "")
