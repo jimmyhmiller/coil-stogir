@@ -7,6 +7,13 @@
 ;;; register and moved to rd. Constants that do not fit an immediate are
 ;;; built in r10 (first operand) or r11 (second operand) with `mov`.
 ;;;
+;;; Memory operands: a tile whose second operand is a fused LOAD (the memory
+;;; family's RULE-ALU-RM, RULE-MUL-RM and RULE-COMPARE-RM/MR/MI) reads it
+;;; in place through stogir.x64.address/operand!, at the load's own width.
+;;; The address is formed first, with `mov` and `lea` only; when the result
+;;; register is one the address names, the address is collapsed into r10
+;;; before the result is written.
+;;;
 ;;; Flags: every instruction emitted for one node is a unit. Nothing here
 ;;; leaves a flag value for another node, and `flags!` emits every operand
 ;;; load before the compare, so its caller places the consumer (jcc, setcc,
@@ -16,6 +23,7 @@
 (import "stogir.node" :as n)
 (import "stogir.types" :as types)
 (import "stogir.locations" :as loc)
+(import "stogir.x64.address" :as address)
 (import "stogir.x64.code" :as code)
 (import "stogir.x64.context" :as context)
 (import "stogir.x64.encode" :as encode)
@@ -189,6 +197,51 @@
                                  registers/RDX))))))))
     (if (= error "") (Ok 0) (Err error))))
 
+;;; rd = left OP [load] for RULE-ALU-RM and RULE-MUL-RM.
+(defn memory-binary! [(out (mut code/Buffer)) (cx context/Context) (position i64)
+                      (tile select/Tile) (rd i32)] (-> (Result i32 (slice u8)))
+  (let [(mut error) ""]
+    (match (address/operand! (mut out) cx (.right tile) position)
+      (Err [message] (set! error message))
+      (Ok [found]
+          (match (if (address/names? found rd)
+                     (address/collapse! (mut out) found)
+                     (Ok [encode/Mem (slice u8)] found))
+            (Err [message] (set! error message))
+            (Ok [m]
+                (code/accept-count! (mut error) (into! (mut out) cx (.left tile) position rd))
+                (code/accept! (mut error)
+                              (if (= (.rule tile) select/RULE-MUL-RM)
+                                  (encode/imul-rm (mut (.text out)) (.bits tile) rd m)
+                                  (encode/alu-rm (mut (.text out)) (.operation tile)
+                                                 (.bits tile) rd m)))))))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; The flags of a comparison with a fused load (RULE-COMPARE-RM/MR/MI).
+(defn memory-flags! [(out (mut code/Buffer)) (cx context/Context) (position i64)
+                     (tile select/Tile)] (-> (Result i32 (slice u8)))
+  (let [(mut error) ""
+        rule (.rule tile)]
+    (match (address/operand! (mut out) cx (select/memory-operand tile) position)
+      (Err [message] (set! error message))
+      (Ok [m]
+          (if (= rule select/RULE-COMPARE-MI)
+              (code/accept! (mut error)
+                            (encode/alu-mi (mut (.text out)) encode/CMP (.bits tile) m
+                                           (.immediate tile)))
+              ; The address never names r11.
+              (match (operand! (mut out) cx (select/register-operand tile) position
+                               registers/SCRATCH-GPR-2)
+                (Err [message] (set! error message))
+                (Ok [register]
+                    (code/accept! (mut error)
+                                  (if (= rule select/RULE-COMPARE-RM)
+                                      (encode/alu-rm (mut (.text out)) encode/CMP (.bits tile)
+                                                     register m)
+                                      (encode/alu-mr (mut (.text out)) encode/CMP (.bits tile)
+                                                     m register))))))))
+    (if (= error "") (Ok (.operation tile)) (Err error))))
+
 ;;; Emit the flags of comparison `tile`, reading its operands at `position`,
 ;;; and return the condition that holds when the comparison is true: a
 ;;; condition code for an integer comparison, an extended condition
@@ -198,9 +251,13 @@
 (defn integer-flags! [(out (mut code/Buffer)) (cx context/Context) (position i64)
                       (tile select/Tile)] (-> (Result i32 (slice u8)))
   (let [(mut error) ""]
-    (if (or (not (select/comparison-rule? (.rule tile)))
-            (= (.rule tile) select/RULE-FCOMPARE))
+    (cond
+      (or (not (select/comparison-rule? (.rule tile)))
+          (= (.rule tile) select/RULE-FCOMPARE))
         (set! error "x86-64 flags requested from a tile that is not an integer comparison")
+      (!= (select/memory-operand tile) 0)
+        (code/accept-count! (mut error) (memory-flags! (mut out) cx position tile))
+      :else
         (match (operand! (mut out) cx (.left tile) position registers/SCRATCH-GPR)
           (Err [message] (set! error message))
           (Ok [ra]
@@ -246,6 +303,8 @@
               (mut error) ""]
           (cond (or (= rule select/RULE-ALU-RR) (= rule select/RULE-MUL-RR))
                   (code/accept-count! (mut error) (register-binary! (mut out) cx position tile rd))
+                (or (= rule select/RULE-ALU-RM) (= rule select/RULE-MUL-RM))
+                  (code/accept-count! (mut error) (memory-binary! (mut out) cx position tile rd))
                 (= rule select/RULE-ALU-RI)
                   (do
                     (code/accept-count! (mut error) (into! (mut out) cx (.left tile) position rd))

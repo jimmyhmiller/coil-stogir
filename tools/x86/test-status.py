@@ -113,6 +113,11 @@ def main():
     for name in names:
         text = texts[name]
         a64 = sorted(set(re.findall(r'"stogir\.a64\.([a-z0-9-]+)"', text)))
+        # The x86-64 backend's own tests: they import its modules directly.
+        # `encode` and `registers` alone are the host layer below it.
+        x64_backend = (sorted(set(re.findall(r'"stogir\.x64\.([a-z0-9-]+)"', text))
+                              - {"encode", "registers"})
+                       if name.startswith("x64-") else [])
         family = ""
         note = ""
         if name.endswith("-link") and not name.startswith("x64-"):
@@ -147,6 +152,11 @@ def main():
             if "target/arch-pick (" in text:
                 guarded.append(name)
                 note = (note + "; " if note else "") + "AArch64 instruction-shape checks guarded"
+        elif x64_backend:
+            # Before the AArch64 test: an x86-64 backend test may borrow a type
+            # from stogir.a64.private-leaf (the shared private-leaf contexts).
+            category = "x64-internal"
+            note = "imports " + " ".join(x64_backend)
         elif a64:
             category = "a64-internal"
             internal = [m for m in a64 if m not in ("compile", "private-leaf")]
@@ -181,9 +191,11 @@ def main():
         "ported-to-facade": "Import `stogir.native.compile` / `stogir.native.private-leaf` / `stogir.jit.native`. Must pass on both hosts; the gate for the x86-64 backend.",
         "a64-internal": "AArch64 backend internals, hand-encoded AArch64 code, or Mach-O. Not expected to run on x86-64.",
         "link-partner": "Links objects that a generator test wrote to /tmp; runs with `--link-flag` (README). Works on Linux once its generators pass there.",
-        "host-layer": "Image, JIT and object-writer layers below the backend, including the `x64-*` tests.",
+        "host-layer": "Image, JIT and object-writer layers below the backend, including the `x64-*` encoder, image and link tests.",
+        "x64-internal": "x86-64 backend internals (`tests/x64-FAMILY-*.coil`), tested directly against `stogir.x64.*`. Run on the x86-64 host; they skip or check selection only elsewhere.",
     }
-    for category in ["neutral-IR", "ported-to-facade", "a64-internal", "link-partner", "host-layer"]:
+    for category in ["neutral-IR", "ported-to-facade", "a64-internal", "x64-internal", "link-partner",
+                     "host-layer"]:
         out.append(f"| {category} | {counts.get(category, 0)} | {meaning[category]} |")
     out += ["", "## Families of the ported tests", "",
             "The family is the operation family whose x86-64 implementation the test mainly",

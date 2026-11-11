@@ -1,0 +1,353 @@
+(module stogir.tests.x64-memory-select)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.pipeline" :as pipeline)
+(import "stogir.matched-uses" :as machine)
+(import "stogir.x64.match" :as matching)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.select" :as select)
+(import "stogir.x64.testing" :as t)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Option Some None])
+
+;;; What the memory family's selection decides, case by case: which address
+;;; expressions become addressing modes, which loads become memory operands,
+;;; which stores become read-modify-write instructions, and every condition
+;;; under which they must not (a second use, a store in between, a volatile
+;;; load, a comparison that is emitted more than once). Each graph is also
+;;; compiled and run, so a decision is never checked without its result.
+
+(defn emit! [(graph (mut g/Graph)) (opcode i32) (ty i32) (inputs (slice i32))] (-> i32)
+  (t/require (b/emit! (mut graph) opcode ty inputs)))
+
+(defn expect! [(tally (mut t/Tally)) (label (slice u8)) (what (slice u8)) (holds bool)] (-> void)
+  (set! (.checks tally) (+ (.checks tally) 1))
+  (unless holds
+    (println "{}: expected {}" label what)
+    (t/fail! (mut tally))))
+
+;;; The matching plan of `graph`, or None after counting the failure.
+(defn selected [(tally (mut t/Tally)) (label (slice u8)) (graph g/Graph) (start i32)
+                (roots (slice i32)) (a (dyn Allocator))] (-> (Option plan/Plan))
+  (match (pipeline/prepare-native graph start roots a)
+    (Err [message]
+         (println "{}: prepare failed: {}" label message)
+         (t/fail! (mut tally))
+         (None))
+    (Ok [prepared]
+        (let [(mut owned) prepared
+              result (match (matching/build graph (.schedule owned) roots a)
+                       (Err [message]
+                            (println "{}: match failed: {}" label message)
+                            (t/fail! (mut tally))
+                            (None [plan/Plan]))
+                       (Ok [matched] (Some matched)))]
+          (pipeline/release! (mut owned))
+          result))))
+
+(defn rule [(matched plan/Plan) (reference i32)] (-> i32)
+  (.rule (get (.tiles matched) (cast i64 reference))))
+
+;;; Whether the machine inputs of `reference` are exactly `wanted`.
+(defn inputs? [(matched plan/Plan) (reference i32) (wanted (slice i32))] (-> bool)
+  (let [range (get (.ranges (.operands matched)) (cast i64 reference))
+        (mut same) (= (.count range) (len wanted))]
+    (when same
+      (for [i 0 (len wanted)]
+        (when (!= (get (.inputs (.operands matched)) (+ (.offset range) i)) (get wanted i))
+          (set! same false))))
+    same))
+
+;;; Run `graph` as f(pointer to `cells`, x, y) and compare with `expected`;
+;;; `after` is what cells[1] must hold afterwards.
+(defn run! [(tally (mut t/Tally)) (label (slice u8)) (graph g/Graph) (start i32)
+            (roots (slice i32)) (x u64) (y u64) (expected u64) (after u64)
+            (a (dyn Allocator))] (-> void)
+  (match (t/compiled (mut tally) label graph start roots a)
+    (None [] 0)
+    (Some [mapped]
+          (let [(mut mapped) mapped
+                (mut cells) [(: 0x1111111111111111 u64) 1000 0x3333333333333333 77]
+                pointer (primitive/cast u64 (primitive/cast (ptr u64) (mut cells)))
+                got (t/invoke mapped [pointer x y])]
+            (set! (.checks tally) (+ (.checks tally) 1))
+            (when (or (!= got expected) (!= (get cells 1) after)
+                      (!= (get cells 0) 0x1111111111111111)
+                      (!= (get cells 2) 0x3333333333333333))
+              (println "{}: got {:x} expected {:x}; cell {:x} expected {:x}"
+                       label got expected (get cells 1) after)
+              (t/fail! (mut tally)))
+            (t/unmap! (mut mapped))))))
+
+;;; f(p, x, y) = x OP [p + 8] (or [p + 8] OP x when `load-left`), I64.
+(defn operand-case! [(tally (mut t/Tally)) (label (slice u8)) (opcode i32) (load-left bool)
+                     (extra i32) (expected-rule i32) (expected u64) (after u64)
+                     (a (dyn Allocator))] (-> void)
+  ; extra: 0 nothing, 1 the load has a second use, 2 a store to p + 8 sits
+  ; between the load and its use (whose other operand is then a volatile
+  ; load of cells[0] after the store, so the use cannot be scheduled before
+  ; it), 3 the load is volatile, 4 another load sits between.
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        p (t/param! (mut graph) start 6 0)
+        x (t/param! (mut graph) start 11 1)
+        y (t/param! (mut graph) start 11 2)
+        address (emit! (mut graph) 26 6 [p (t/constant! (mut graph) 11 8)])
+        load (emit! (mut graph) (if (= extra 3) 92 91) 11 [start address])
+        control (cond (= extra 2)
+                        (emit! (mut graph) 92 11 [(emit! (mut graph) 93 0 [load address y]) p])
+                      (= extra 4) (emit! (mut graph) 91 11 [load p])
+                      :else load)
+        other (if (= extra 2) control x)
+        value (t/binary! (mut graph) opcode 11 (if load-left load other)
+                         (if load-left other load))
+        result (if (= extra 1) (t/binary! (mut graph) 48 11 value load) value)
+        ret (t/return! (mut graph) control 11 result)]
+    (match (selected (mut tally) label graph start [ret] a)
+      (None [] 0)
+      (Some [matched]
+            (let [(mut matched) matched
+                  fused (!= (select/memory-operand (get (.tiles matched) (cast i64 value))) 0)]
+              (expect! (mut tally) label "the selected rule" (= (rule matched value) expected-rule))
+              (expect! (mut tally) label "the load omitted exactly when fused"
+                       (= (plan/omitted? matched load) fused))
+              (expect! (mut tally) label "the address folded into base and displacement"
+                       (and (plan/omitted? matched address)
+                            (= (get (.addresses matched) (cast i64 load)) p)
+                            (= (get (.offsets matched) (cast i64 load)) 8)))
+              (when fused
+                (expect! (mut tally) label "the consumer reads the operand and the base"
+                         (inputs? matched value [x p])))
+              (plan/release! (mut matched)))))
+    (run! (mut tally) label graph start [ret] 7 5 expected after a)
+    (g/release! (mut graph))))
+
+;;; f(p, x, y) = ([p + 8] CMP x) ? 1 : 2 through a COND (`branch` false) or an
+;;; IF diamond; `shape` 0: load CMP x, 1: x CMP load, 2: load CMP 1000,
+;;; 3: load CMP 1000 read by two CONDs (never a memory operand).
+(defn compare-case! [(tally (mut t/Tally)) (label (slice u8)) (opcode i32) (shape i32)
+                     (branch bool) (expected-rule i32) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        p (t/param! (mut graph) start 6 0)
+        x (t/param! (mut graph) start 11 1)
+        y (t/param! (mut graph) start 11 2)
+        address (emit! (mut graph) 26 6 [p (t/constant! (mut graph) 11 8)])
+        load (emit! (mut graph) 91 11 [start address])
+        thousand (t/constant! (mut graph) 11 1000)
+        one (t/constant! (mut graph) 11 1)
+        two (t/constant! (mut graph) 11 2)
+        compare (cond (= shape 0) (t/compare! (mut graph) opcode load x)
+                      (= shape 1) (t/compare! (mut graph) opcode x load)
+                      :else (t/compare! (mut graph) opcode load thousand))
+        ret (if branch
+                (let [split (t/if! (mut graph) load compare)
+                      yes (t/if-true! (mut graph) split)
+                      no (t/if-false! (mut graph) split)
+                      merge (t/merge! (mut graph) (t/end! (mut graph) yes) (t/end! (mut graph) no))
+                      phi (t/phi! (mut graph) 11 merge one two)]
+                  (t/return! (mut graph) merge 11 phi))
+                (let [first (t/select! (mut graph) 11 compare one two)
+                      result (if (= shape 3)
+                                 (t/binary! (mut graph) 26 11 first
+                                            (t/select! (mut graph) 11 compare y two))
+                                 first)]
+                  (t/return! (mut graph) load 11 result)))]
+    (match (selected (mut tally) label graph start [ret] a)
+      (None [] 0)
+      (Some [matched]
+            (let [(mut matched) matched]
+              (expect! (mut tally) label "the selected rule" (= (rule matched compare) expected-rule))
+              (expect! (mut tally) label "the load omitted exactly when fused"
+                       (= (plan/omitted? matched load) (!= expected-rule select/RULE-COMPARE-RI)))
+              (plan/release! (mut matched)))))
+    ; cells[1] is 1000.
+    (for x-value [(: 999 u64) 1000 1001 0xFFFFFFFFFFFFFFFF]
+      (let [left (if (= shape 1) x-value (: 1000 u64))
+            right (cond (= shape 0) x-value (= shape 1) (: 1000 u64) :else 1000)
+            truth (= (t/binary opcode 11 left right) 1)
+            value (if truth (: 1 u64) 2)]
+        (run! (mut tally) label graph start [ret] x-value 40
+              (if (= shape 3) (+ value (if truth (: 40 u64) 2)) value) 1000 a)))
+    (g/release! (mut graph))))
+
+;;; STORE(p + 8, OP(LOAD(p + 8), x)); `shape` 0: load OP x, 1: x OP load,
+;;; 2: load OP 5, 3: NOT load, 4: NEG load, 5: load OP x with the load read
+;;; again afterwards (never read-modify-write).
+(defn modify-case! [(tally (mut t/Tally)) (label (slice u8)) (opcode i32) (shape i32)
+                    (expected-rule i32) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        p (t/param! (mut graph) start 6 0)
+        x (t/param! (mut graph) start 11 1)
+        address (emit! (mut graph) 26 6 [p (t/constant! (mut graph) 11 8)])
+        load (emit! (mut graph) 91 11 [start address])
+        five (t/constant! (mut graph) 11 5)
+        value (cond (= shape 1) (t/binary! (mut graph) opcode 11 x load)
+                    (= shape 2) (t/binary! (mut graph) opcode 11 load five)
+                    (= shape 3) (t/unary! (mut graph) 45 11 load)
+                    (= shape 4) (t/unary! (mut graph) 31 11 load)
+                    :else (t/binary! (mut graph) opcode 11 load x))
+        store (emit! (mut graph) 93 0 [load address value])
+        ret (t/return! (mut graph) store 11 (if (= shape 5) load x))
+        x-value (: 7 u64)
+        updated (cond (= shape 1) (t/binary opcode 11 x-value 1000)
+                      (= shape 2) (t/binary opcode 11 1000 5)
+                      (= shape 3) (t/unary 45 11 1000)
+                      (= shape 4) (t/unary 31 11 1000)
+                      :else (t/binary opcode 11 1000 x-value))]
+    (match (selected (mut tally) label graph start [ret] a)
+      (None [] 0)
+      (Some [matched]
+            (let [(mut matched) matched
+                  modified (!= expected-rule select/RULE-NONE)]
+              (expect! (mut tally) label "the selected store rule" (= (rule matched store) expected-rule))
+              (when modified
+                (expect! (mut tally) label "the load and the operation omitted"
+                         (and (plan/omitted? matched load) (plan/omitted? matched value)))
+                (expect! (mut tally) label "the store reads its base and register operand"
+                         (inputs? matched store
+                                  (if (= expected-rule select/RULE-STORE-ALU-MR) [p x] [p]))))
+              (plan/release! (mut matched)))))
+    (run! (mut tally) label graph start [ret] x-value 0 (if (= shape 5) 1000 x-value) updated a)
+    (g/release! (mut graph))))
+
+;;; f(p, x, y) = load at an address of shape `shape`, each with cells[1] as
+;;; the target: 0 p + x*8 (x = 1), 1 (p - 16) + x*8 + 16 via SHL, 2 via MUL,
+;;; 3 a displacement that needs 33 bits (not folded), 4 an address that is
+;;; also returned (not absorbed), 5 two loads through one ADD, 6 a word view.
+(defn address-case! [(tally (mut t/Tally)) (label (slice u8)) (shape i32) (a (dyn Allocator))]
+  (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        p (t/param! (mut graph) start 6 0)
+        x (t/param! (mut graph) start 5 1)
+        y (t/param! (mut graph) start 5 2)
+        three (t/constant! (mut graph) 5 3)
+        eight (t/constant! (mut graph) 5 8)
+        scaled (if (= shape 2)
+                   (emit! (mut graph) 28 5 [x eight])
+                   (emit! (mut graph) 49 5 [x three]))
+        inner (cond (or (= shape 1) (= shape 2))
+                      (emit! (mut graph) 26 6
+                             [(emit! (mut graph) 26 6 [p (t/constant! (mut graph) 11 (cast u64 (: -16 i64)))])
+                              scaled])
+                    (= shape 3) (emit! (mut graph) 26 6 [p y])
+                    :else p)
+        address (cond (= shape 0) (emit! (mut graph) 26 6 [p scaled])
+                      (or (= shape 1) (= shape 2))
+                        (emit! (mut graph) 26 6 [inner (t/constant! (mut graph) 11 16)])
+                      (= shape 3)
+                        (emit! (mut graph) 26 6
+                               [inner (t/constant! (mut graph) 11 0x80000008)])
+                      (= shape 6)
+                        (emit! (mut graph) 36 6
+                               [(emit! (mut graph) 26 11
+                                       [(emit! (mut graph) 36 11 [p])
+                                        (t/constant! (mut graph) 11 8)])])
+                      :else (emit! (mut graph) 26 6 [p (t/constant! (mut graph) 11 8)]))
+        load (emit! (mut graph) 91 5 [start address])
+        second (if (= shape 5) (emit! (mut graph) 91 4 [load address]) load)
+        result (cond (= shape 4)
+                       (t/binary! (mut graph) 27 5 load (t/unary! (mut graph) 36 5 address))
+                     (= shape 5)
+                       (t/binary! (mut graph) 26 5 load (t/unary! (mut graph) 34 5 second))
+                     :else load)
+        ret (t/return! (mut graph) second 5 result)
+        (mut cells) [(: 0 u64) 1000 0 0]
+        pointer (primitive/cast u64 (primitive/cast (ptr u64) (mut cells)))]
+    (match (selected (mut tally) label graph start [ret] a)
+      (None [] 0)
+      (Some [matched]
+            (let [(mut matched) matched
+                  slot (cast i64 load)
+                  base (get (.addresses matched) slot)
+                  offset (get (.offsets matched) slot)
+                  index (get (.indices matched) slot)
+                  shift (get (.index-shifts matched) slot)]
+              (expect! (mut tally) label "the selected address"
+                       (cond (= shape 0) (and (= base p) (= offset 0) (= index x) (= shift 3))
+                             (or (= shape 1) (= shape 2))
+                               (and (= base p) (= offset 0) (= index x) (= shift 3))
+                             (= shape 3) (and (= base address) (= offset 0) (= index 0))
+                             (= shape 4) (and (= base address) (= offset 0) (= index 0))
+                             :else (and (= base p) (= offset 8) (= index 0))))
+              (expect! (mut tally) label "the address expression omitted exactly when absorbed"
+                       (= (plan/omitted? matched address) (and (!= shape 3) (!= shape 4))))
+              (when (= shape 5)
+                (expect! (mut tally) label "the second load folded too"
+                         (and (= (get (.addresses matched) (cast i64 second)) p)
+                              (= (get (.offsets matched) (cast i64 second)) 8))))
+              (when (<= shape 2)
+                (expect! (mut tally) label "the load reads base and index"
+                         (inputs? matched load [p x])))
+              (plan/release! (mut matched)))))
+    (match (t/compiled (mut tally) label graph start [ret] a)
+      (None [] 0)
+      (Some [mapped]
+            (let [(mut mapped) mapped
+                  got (t/invoke mapped [(if (= shape 3) (- (+ pointer 8) 0x80000008) pointer) 1 0])
+                  wanted (cond (= shape 4) (primitive/isub (: 1000 u64) (+ pointer 8))
+                               (= shape 5) (: 2000 u64)
+                               :else 1000)]
+              (set! (.checks tally) (+ (.checks tally) 1))
+              (when (!= got wanted)
+                (println "{}: got {:x} expected {:x}" label got wanted)
+                (t/fail! (mut tally)))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 memory select: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        ; Loads as arithmetic operands (cells[1] is 1000, x is 7).
+        (operand-case! (mut tally) "x + [m]" 26 false 0 select/RULE-ALU-RM 1007 1000 a)
+        (operand-case! (mut tally) "[m] + x" 26 true 0 select/RULE-ALU-RM 1007 1000 a)
+        (operand-case! (mut tally) "x - [m]" 27 false 0 select/RULE-ALU-RM
+                       (t/binary 27 11 7 1000) 1000 a)
+        (operand-case! (mut tally) "[m] - x" 27 true 0 select/RULE-ALU-RR 993 1000 a)
+        (operand-case! (mut tally) "x & [m]" 47 false 0 select/RULE-ALU-RM (t/binary 47 11 7 1000) 1000 a)
+        (operand-case! (mut tally) "[m] | x" 46 true 0 select/RULE-ALU-RM (t/binary 46 11 7 1000) 1000 a)
+        (operand-case! (mut tally) "x ^ [m]" 48 false 0 select/RULE-ALU-RM (t/binary 48 11 7 1000) 1000 a)
+        (operand-case! (mut tally) "x * [m]" 28 false 0 select/RULE-MUL-RM 7000 1000 a)
+        (operand-case! (mut tally) "[m] * x" 28 true 0 select/RULE-MUL-RM 7000 1000 a)
+        ; An ADD that keeps both operands in registers is the address form
+        ; (stogir.x64.lea), selected after the memory operands.
+        (operand-case! (mut tally) "second use" 26 false 1 select/RULE-LEA
+                       (t/binary 48 11 1007 1000) 1000 a)
+        (operand-case! (mut tally) "store between" 26 false 2 select/RULE-LEA
+                       0x11111111111114F9 5 a)
+        (operand-case! (mut tally) "volatile load" 26 false 3 select/RULE-LEA 1007 1000 a)
+        (operand-case! (mut tally) "load between" 26 false 4 select/RULE-ALU-RM 1007 1000 a)
+        ; Loads as comparison operands, for a COND and for a branch.
+        (for opcode [(: 14 i32) 15 16 17 18 19 20 21 22 23]
+          (for branch [false true]
+            (compare-case! (mut tally) "[m] cmp x" opcode 0 branch select/RULE-COMPARE-MR a)
+            (compare-case! (mut tally) "x cmp [m]" opcode 1 branch select/RULE-COMPARE-RM a)
+            (compare-case! (mut tally) "[m] cmp imm" opcode 2 branch select/RULE-COMPARE-MI a))
+          (compare-case! (mut tally) "[m] cmp imm, two readers" opcode 3 false
+                         select/RULE-COMPARE-RI a))
+        ; Read-modify-write stores.
+        (for opcode [(: 26 i32) 27 46 47 48]
+          (modify-case! (mut tally) "[m] op= x" opcode 0 select/RULE-STORE-ALU-MR a)
+          (modify-case! (mut tally) "[m] = x op [m]" opcode 1
+                        (if (= opcode 27) (: select/RULE-NONE i32) select/RULE-STORE-ALU-MR) a)
+          (modify-case! (mut tally) "[m] op= 5" opcode 2 select/RULE-STORE-ALU-MI a)
+          (modify-case! (mut tally) "[m] op= x, load read again" opcode 5 select/RULE-NONE a))
+        (modify-case! (mut tally) "not [m]" 45 3 select/RULE-STORE-UNARY-M a)
+        (modify-case! (mut tally) "neg [m]" 31 4 select/RULE-STORE-UNARY-M a)
+        (modify-case! (mut tally) "[m] *= x" 28 0 select/RULE-NONE a)
+        ; Addressing modes.
+        (address-case! (mut tally) "[p + x*8]" 0 a)
+        (address-case! (mut tally) "[p + x*8] through SHL and two displacements" 1 a)
+        (address-case! (mut tally) "[p + x*8] through MUL and two displacements" 2 a)
+        (address-case! (mut tally) "33-bit displacement" 3 a)
+        (address-case! (mut tally) "address also used as a value" 4 a)
+        (address-case! (mut tally) "two loads through one address" 5 a)
+        (address-case! (mut tally) "word view" 6 a)
+        (println "x64 memory select: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))

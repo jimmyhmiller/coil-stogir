@@ -111,6 +111,33 @@
           (check-error! (mut tally) label false "" parts)))
     (Err [message] (check-error! (mut tally) label true message parts))))
 
+;;; Compile `graph` to text and run it. `mode` 0: f(p) loads the i64 at p;
+;;; 1: f(x) returns x through a local variable; 2: f(n) returns the address
+;;; of n freshly allocated stack bytes, which is 16-byte aligned, lies below
+;;; this frame and is writable.
+(defn text-run! [(tally (mut t/Tally)) (label (slice u8)) (graph g/Graph) (start i32)
+                 (roots (slice i32)) (mode i32) (a (dyn Allocator))] (-> void)
+  (match (t/compiled (mut tally) label graph start roots a)
+    (None [] 0)
+    (Some [mapped]
+          (let [(mut mapped) mapped
+                (mut cell) (: 0x1122334455667788 u64)
+                (mut local) (: 0 u64)
+                here (primitive/cast u64 (primitive/cast (ptr u64) (mut local)))]
+            (for value [(: 0 u64) 1 77 0xFFFFFFFFFFFFFFFF 0x8000000000000001]
+              (set! (.checks tally) (+ (.checks tally) 1))
+              (set! cell value)
+              (let [got (t/invoke mapped
+                                  [(if (= mode 0)
+                                       (primitive/cast u64 (primitive/cast (ptr u64) (mut cell)))
+                                       (if (= mode 2) (& value 4095) value))])]
+                (unless (if (= mode 2)
+                            (and (!= got 0) (= (& got 15) 0) (< got here))
+                            (= got value))
+                  (println "{}: wrong result {:x} for {:x}" label got value)
+                  (t/fail! (mut tally)))))
+            (t/unmap! (mut mapped))))))
+
 (defn image-error! [(tally (mut t/Tally)) (label (slice u8))
                     (result (Result image/Image (slice u8))) (parts (slice (slice u8)))] (-> void)
   (match result
@@ -209,14 +236,14 @@
                       pending)
         (free! (mut roots))
         (g/release! (mut graph))
-        ; One graph per operation family: a clear error while the family is
-        ; not implemented, a real check once it is.
+        ; One graph per operation family: a real check for the implemented
+        ; ones, the clear error for the others.
         (let [(mut graph) (g/create a)
               start (t/start! (mut graph))
               p (t/param! (mut graph) start 6 0)
               load (t/require (b/emit! (mut graph) 91 11 [start p]))
               ret (t/return! (mut graph) load 11 load)]
-          (text-error! (mut tally) "LOAD" graph start [ret] ["x86-64 backend" "memory family"] a)
+          (text-run! (mut tally) "LOAD" graph start [ret] 0 a)
           (g/release! (mut graph)))
         (let [(mut graph) (g/create a)
               start (t/start! (mut graph))
@@ -256,7 +283,7 @@
               store (t/require (b/emit! (mut graph) 87 0 [start variable x]))
               load (t/require (b/emit! (mut graph) 85 11 [store variable]))
               ret (t/return! (mut graph) load 11 load)]
-          (text-error! (mut tally) "VAR" graph start [ret] ["x86-64 backend" "locals family"] a)
+          (text-run! (mut tally) "VAR" graph start [ret] 1 a)
           (g/release! (mut graph)))
         (let [(mut graph) (g/create a)
               start (t/start! (mut graph))
@@ -307,8 +334,7 @@
               allocation (t/require (b/stack-allocate! (mut graph) start count 16))
               address (t/unary! (mut graph) 36 11 allocation)
               ret (t/return! (mut graph) allocation 11 address)]
-          (text-error! (mut tally) "ALLOCA" graph start [ret]
-                       ["x86-64 backend" "stack family"] a)
+          (text-run! (mut tally) "ALLOCA" graph start [ret] 2 a)
           (g/release! (mut graph)))
         (println "x64 core entry: {} functions, {} checks, {} failures"
                  (.functions tally) (.checks tally) (.failures tally))

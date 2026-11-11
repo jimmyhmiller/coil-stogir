@@ -36,6 +36,7 @@ EXCLUDED = {
     "global-alignment": "fixtures are hand-encoded AArch64 words (RET, ADRP/ADD patches) and decode ADRP",
     "jit-hva-varargs": "calls a hand-encoded AArch64 probe function",
     "private-leaf": "registers hand-encoded AArch64 leaves and checks their register masks",
+    "x64-core-entry": "x86-64 backend test; borrows the private-leaf context types",
 }
 
 # A probe function written as AArch64 bytes does not compile for another machine.

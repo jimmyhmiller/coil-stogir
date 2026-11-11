@@ -6,7 +6,8 @@
 ;;; the end of the source and at the start of the target) and writes the
 ;;; target's PHIs, as one simultaneous group through the neutral move
 ;;; resolver. Cycles go through the reserved holder register. PHI inputs that
-;;; are constants are built afterwards with `mov`. Only moves are emitted, so
+;;; are constants are built afterwards with `mov`, and inputs that are static
+;;; frame objects with `lea`. Only moves are emitted, so
 ;;; an edge never disturbs flags.
 ;;;
 ;;; An unconditional edge runs its moves in line. A conditional edge with
@@ -163,6 +164,7 @@
           (Err [message] (Err message))
           (Ok [moves]
               (let [(mut owned) moves
+                    (mut recipes) (ArrayList::new [locations/Transfer] allocator)
                     (mut error) ""]
                 (match (edges/phis-indexed graph (.scheduled flow) (.parts flow)
                                            (.locations flow) target ordinal
@@ -170,11 +172,36 @@
                   (Err [message] (set! error message))
                   (Ok [group]
                       (let [(mut phis) group]
-                        (for move (.moves phis) (push! (mut owned) move))
+                        ; A PHI input that is a static frame object has no
+                        ; location to move from: its address is rebuilt
+                        ; after the group, like a constant.
+                        (for move (.moves phis)
+                          (if (locations/rematerialized? (.source move))
+                              (push! (mut recipes) move)
+                              (push! (mut owned) move)))
                         (match (typed-group! (mut (.text out)) graph (slice owned)
                                              allocator (.base flow))
                           (Err [message] (set! error message))
                           (Ok [_] 0))
+                        (for move recipes
+                          (when (= error "")
+                            (let [destination (.destination move)
+                                  register (if (= (.kind destination) 0)
+                                               (cast i32 (.value destination))
+                                               registers/SCRATCH-GPR)]
+                              (match (frame/slot (.base flow) (.value (.source move)))
+                                (Err [message] (set! error message))
+                                (Ok [m]
+                                    (match (encode/lea (mut (.text out)) 64 register m)
+                                      (Err [message] (set! error message))
+                                      (Ok [_] 0))))
+                              (when (and (= error "") (= (.kind destination) 1))
+                                (match (transfers/emit-with!
+                                         (mut (.text out))
+                                         (locations/Location :kind 0 :value (cast i64 register))
+                                         destination 8 (.base flow) true)
+                                  (Err [message] (set! error message))
+                                  (Ok [_] 0))))))
                         ; Constants are written after the group has consumed
                         ; every physical source.
                         (for literal (.literals phis)
@@ -216,6 +243,7 @@
                                   (Ok [_] 0))))))
                         (edges/release-phis! (mut phis)))))
                 (free! (mut owned))
+                (free! (mut recipes))
                 (if (= error "") (Ok 0) (Err error))))))))
 
 ;;; Branch to `target` when `condition` holds (-1: always). An edge without

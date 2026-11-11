@@ -17,7 +17,9 @@
 ;;;
 ;;; Frame: `sub rsp, N` and the used preserved registers stored with `mov`
 ;;; at entry; every RETURN reloads them, `add rsp, N` and `ret`
-;;; (docs/X86_PORT.md). A function without frame contents is frameless.
+;;; (docs/X86_PORT.md). A function without frame contents is frameless. A
+;;; function with dynamic stack or an over-aligned frame is anchored on rbp
+;;; (stogir.x64.frame-address).
 ;;;
 ;;; Not ported from the a64 driver (tuning, hard-disabled here):
 ;;; shrink-wrapping, spill-home planning, return tails and test blocks run in
@@ -58,6 +60,7 @@
 (import "stogir.x64.families" :as families)
 (import "stogir.x64.fcompare" :as fcompare)
 (import "stogir.x64.fixups" :as fixups)
+(import "stogir.x64.frame-address" :as frame-address)
 (import "stogir.x64.incoming" :as incoming)
 (import "stogir.x64.lea" :as lea)
 (import "stogir.x64.plan" :as plan)
@@ -101,28 +104,61 @@
     moves))
 
 ;;; sub rsp, N and the preserved-register stores. Nothing for a frameless
-;;; function.
+;;; function. An anchored frame first establishes rbp
+;;; (stogir.x64.frame-address shows both forms).
 (defn prologue! [(out (mut code/Buffer)) (assigned allocate/Assigned) (frame-size i64)]
   (-> (Result i32 (slice u8)))
-  (let [(mut error) ""]
-    (when (> frame-size 0)
-      (code/accept! (mut error)
-                    (encode/alu-ri (mut (.text out)) encode/SUB 64 registers/RSP frame-size))
-      (code/accept-count! (mut error)
-                          (callee/emit! (mut (.text out)) (.callee assigned) false
-                                        (.base assigned))))
+  (let [(mut error) ""
+        base (.base assigned)]
+    (if (frame-address/anchored? base)
+        (do
+          (code/accept! (mut error) (encode/push-r (mut (.text out)) registers/RBP))
+          (code/accept! (mut error)
+                        (encode/mov-rr (mut (.text out)) 64 registers/RBP registers/RSP))
+          (when (> frame-size 0)
+            (code/accept! (mut error)
+                          (encode/alu-ri (mut (.text out)) encode/SUB 64 registers/RSP
+                                         frame-size)))
+          (when (>= (.entry-slot base) 0)
+            (code/accept! (mut error)
+                          (encode/alu-ri (mut (.text out)) encode/AND 64 registers/RSP
+                                         (- 0 (.alignment assigned))))
+            (code/accept! (mut error)
+                          (encode/mov-mr (mut (.text out)) 64
+                                         (encode/mem registers/RSP (.entry-slot base))
+                                         registers/RBP))
+            (code/accept! (mut error)
+                          (encode/lea (mut (.text out)) 64 registers/RBP
+                                      (encode/mem registers/RSP frame-size))))
+          (code/accept-count! (mut error)
+                              (callee/emit! (mut (.text out)) (.callee assigned) false base)))
+        (when (> frame-size 0)
+          (code/accept! (mut error)
+                        (encode/alu-ri (mut (.text out)) encode/SUB 64 registers/RSP frame-size))
+          (code/accept-count! (mut error)
+                              (callee/emit! (mut (.text out)) (.callee assigned) false base))))
     (if (= error "") (Ok 0) (Err error))))
 
-;;; The preserved-register reloads, add rsp, N and ret.
+;;; The preserved-register reloads, the release of the frame and ret. An
+;;; anchored frame restores rsp from its anchor, wherever ALLOCA left it.
+;;; Only moves, `add` and `pop` are emitted and rax/rdx/xmm0/xmm1 are kept.
 (defn epilogue! [(out (mut code/Buffer)) (assigned allocate/Assigned) (frame-size i64)]
   (-> (Result i32 (slice u8)))
-  (let [(mut error) ""]
-    (when (> frame-size 0)
-      (code/accept-count! (mut error)
-                          (callee/emit! (mut (.text out)) (.callee assigned) true
-                                        (.base assigned)))
-      (code/accept! (mut error)
-                    (encode/alu-ri (mut (.text out)) encode/ADD 64 registers/RSP frame-size)))
+  (let [(mut error) ""
+        base (.base assigned)]
+    (if (frame-address/anchored? base)
+        (do
+          (code/accept-count! (mut error)
+                              (callee/emit! (mut (.text out)) (.callee assigned) true base))
+          (code/accept-count! (mut error)
+                              (frame-address/anchor! (mut (.text out)) base registers/RSP))
+          (code/accept! (mut error) (encode/pop-r (mut (.text out)) registers/RBP)))
+        (when (> frame-size 0)
+          (code/accept-count! (mut error)
+                              (callee/emit! (mut (.text out)) (.callee assigned) true base))
+          (code/accept! (mut error)
+                        (encode/alu-ri (mut (.text out)) encode/ADD 64 registers/RSP
+                                       frame-size))))
     (code/accept! (mut error) (encode/ret (mut (.text out))))
     (if (= error "") (Ok 0) (Err error))))
 
@@ -288,7 +324,9 @@
              :base (.base assigned)
              :matched matched
              :frame (.frame assigned)
-             :frame-size frame-size)
+             :frame-size frame-size
+             :outgoing-size (.outgoing-size assigned)
+             :alignment (.alignment assigned))
         flow (edges/Flow
                :graph graph
                :scheduled scheduled
@@ -388,7 +426,7 @@
                       (incoming/emit-entry-with-locations!
                         (mut output) graph (.parts cx)
                         (.parameter (at (.values set) (cast i64 reference)))
-                        position frame-size)
+                        position frame-size (.base cx))
                     (or (= opcode 96) (= opcode 121))
                       (match (encode/ud2 (mut (.text output)))
                         (Err [message] (Err [i32 (slice u8)] message))

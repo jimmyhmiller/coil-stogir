@@ -11,16 +11,20 @@
 ;;;   immediate  the displacement, a sign-extended 32-bit value
 ;;;   bits       32 or 64; a 32-bit lea computes the low bits of narrow types
 ;;;
-;;; `strength` rewrites the core's tiles, following upstream's rules
-;;; (ir_x86.dasc, IR_LEA_* and IR_MUL_PWR2):
-;;;   ADD(x, y)            RULE-LEA x + y
-;;;   ADD(x, c), SUB(x, c) RULE-LEA x + c, x - c
+;;; Selection follows upstream's rules (ir_x86.dasc, IR_LEA_* and
+;;; IR_MUL_PWR2) in two steps.
+;;; `strength`, when a tile is selected:
 ;;;   MUL(x, 2)            RULE-LEA x + x
 ;;;   MUL(x, 3 | 5 | 9)    RULE-LEA x + x * (2 | 4 | 8)
 ;;;   MUL(x, 2^k)          RULE-SHIFT-RI shl k
 ;;; Other multiplications keep the three-operand imul.
+;;; `fuse!`, after the memory family chose its memory operands (an ADD it
+;;; gave a memory operand, or absorbed into an address or a read-modify-write
+;;; store, is no longer a register sum and is left alone):
+;;;   ADD(x, y)            RULE-LEA x + y
+;;;   ADD(x, c), SUB(x, c) RULE-LEA x + c, x - c
 ;;;
-;;; `fuse!` then lets a RULE-LEA node absorb a producer that is read only by
+;;; `fuse!` then lets the RULE-LEA node absorb a producer that is read only by
 ;;; it, in its own block and not observed, when the sum still has at most a
 ;;; base, one scaled index and a 32-bit displacement:
 ;;;   x + (y << k), x + y * (2 | 4 | 8)     k = 1..3     base + index * scale
@@ -69,13 +73,30 @@
       (set! result (+ result 1)))
     result))
 
-;;; The address or shift form of core tile `selected`, or the tile itself.
+;;; The address or shift form of a multiplication by a constant, or the
+;;; tile itself.
 (defn strength [(selected select/Tile)] (-> select/Tile)
-  (let [rule (.rule selected)
-        bits (.bits selected)
+  (let [bits (.bits selected)
         left (.left selected)
         full (if (= bits 64) (: 0xFFFFFFFFFFFFFFFF u64) 0xFFFFFFFF)
         factor (& (cast u64 (.immediate selected)) full)]
+    (cond (or (<= left 0) (not (or (= bits 32) (= bits 64)))
+              (!= (.rule selected) select/RULE-MUL-RI))
+            selected
+          (= factor 2) (tile bits left left 0 0)
+          (or (= factor 3) (= factor 5) (= factor 9))
+            (tile bits left left (exponent (- factor 1)) 0)
+          (power-of-two? factor)
+            (select/Tile :rule select/RULE-SHIFT-RI :operation encode/SHL :bits bits
+                         :left left :right 0 :immediate (cast i64 (exponent factor)))
+          :else selected)))
+
+;;; The address form of a register sum (ADD of two registers, ADD or SUB of
+;;; a register and an immediate), or the tile itself.
+(defn sum [(selected select/Tile)] (-> select/Tile)
+  (let [rule (.rule selected)
+        bits (.bits selected)
+        left (.left selected)]
     (cond (or (<= left 0) (not (or (= bits 32) (= bits 64)))) selected
           (and (= rule select/RULE-ALU-RR) (= (.operation selected) encode/ADD)
                (> (.right selected) 0))
@@ -87,13 +108,6 @@
                                           (- 0 (.immediate selected))))
               (None [] selected)
               (Some [value] (tile bits left 0 0 value)))
-          (!= rule select/RULE-MUL-RI) selected
-          (= factor 2) (tile bits left left 0 0)
-          (or (= factor 3) (= factor 5) (= factor 9))
-            (tile bits left left (exponent (- factor 1)) 0)
-          (power-of-two? factor)
-            (select/Tile :rule select/RULE-SHIFT-RI :operation encode/SHL :bits bits
-                         :left left :right 0 :immediate (cast i64 (exponent factor)))
           :else selected)))
 
 ;;; Whether node `producer` may be absorbed by node `reference`: a core node
@@ -137,11 +151,21 @@
                         (Some (tile bits (.left part) other other-shift sum))
                       :else (None)))))))
 
-;;; Let RULE-LEA node `reference` absorb its producers while the address
-;;; form holds. Called in schedule order, so a producer's own absorptions
-;;; are already in its tile.
-(defn fuse! [(state (mut plan/Matching)) (graph g/Graph) (reference i32)] (-> void)
-  (let [(mut progress) (= (.rule (get (.tiles state) (cast i64 reference))) select/RULE-LEA)]
+;;; Give core node `reference` the address form when it is a register sum,
+;;; and with `absorb` let an address-form node take in its producers while
+;;; the form holds. Called in schedule order after the memory family's
+;;; fusion, so a producer's own form and absorptions are already in its
+;;; tile. An omitted node is left alone: whoever absorbed it reads its
+;;; operands as they are.
+(defn fuse! [(state (mut plan/Matching)) (graph g/Graph) (reference i32) (absorb bool)]
+  (-> void)
+  (let [cell (cast i64 reference)
+        ; families/CORE; that module is above this one.
+        live (and (= (get (.families state) cell) 0) (not (get (.omitted state) cell)))
+        (mut progress) false]
+    (when live
+      (set! (mut (.tiles state)) cell (sum (get (.tiles state) cell)))
+      (set! progress (and absorb (= (.rule (get (.tiles state) cell)) select/RULE-LEA))))
     (while progress
       (set! progress false)
       (let [whole (get (.tiles state) (cast i64 reference))

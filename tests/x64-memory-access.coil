@@ -1,0 +1,148 @@
+(module stogir.tests.x64-memory-access)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.types" :as types)
+(import "stogir.x64.testing" :as t)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; LOAD and STORE of every integer type through every addressing form, with
+;;; the displacements at the encoding boundaries (disp8/disp32, the largest
+;;; and smallest 32-bit displacement, one past them) and positive and
+;;; negative index values. A load is checked through an explicit extension
+;;; to 64 bits and as a returned narrow value; a store must change exactly
+;;; the bytes of its type, from a register whose upper bits are garbage and
+;;; from constants at the immediate boundaries (a 64-bit store takes an
+;;; immediate only when it fits a sign-extended 32 bits). Volatile forms
+;;; behave the same.
+
+(defn emit! [(graph (mut g/Graph)) (opcode i32) (ty i32) (inputs (slice i32))] (-> i32)
+  (t/require (b/emit! (mut graph) opcode ty inputs)))
+
+;;; The address p + (i << shift) + disp, built as the matcher sees it from
+;;; the Coil adapter: `form` 0 [p + disp], 1 [p + i + disp],
+;;; 2 [p + (i << shift) + disp], 3 [p + disp + i * 2^shift].
+(defn address! [(graph (mut g/Graph)) (p i32) (i i32) (form i32) (shift i32) (disp i64)]
+  (-> i32)
+  (let [c (t/constant! (mut graph) 11 (cast u64 disp))
+        scaled (cond (= form 2)
+                       (emit! (mut graph) 49 11 [i (t/constant! (mut graph) 11 (cast u64 shift))])
+                     (= form 3)
+                       (emit! (mut graph) 28 11
+                              [i (t/constant! (mut graph) 11 (<< (: 1 u64) (cast u64 shift)))])
+                     :else i)]
+    (cond (and (= form 0) (= disp 0)) p
+          (= form 0) (emit! (mut graph) 26 6 [p c])
+          (= form 3) (emit! (mut graph) 26 6 [(emit! (mut graph) 26 6 [p c]) scaled])
+          (= disp 0) (emit! (mut graph) 26 6 [p scaled])
+          :else (emit! (mut graph) 26 6 [(emit! (mut graph) 26 6 [p scaled]) c]))))
+
+(const TARGET 24)
+
+(defn pattern [(index i64)] (-> u8)
+  (cast u8 (+ 0x81 (* index 7))))
+
+;;; mode 0: f(p, i) = the T at the address, extended to 64 bits by its
+;;; signedness; 1: the same returned as T; 2: f(p, i, v) stores v;
+;;; 3: stores the constant `fixed`.
+(defn case! [(tally (mut t/Tally)) (ty i32) (form i32) (shift i32) (disp i64) (index i64)
+             (volatile bool) (mode i32) (fixed u64) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        p (t/param! (mut graph) start 6 0)
+        i (t/param! (mut graph) start 11 1)
+        v (t/param! (mut graph) start ty 2)
+        address (address! (mut graph) p i form shift disp)
+        width (cast i64 (types/scalar-size ty 8))
+        wide (if (types/signed? ty) (: 11 i32) 5)
+        ret (cond (= mode 0)
+                    (let [load (emit! (mut graph) (if volatile 92 91) ty [start address])
+                          value (if (= width 8)
+                                    load
+                                    (t/unary! (mut graph) (if (types/signed? ty) 33 34) wide load))]
+                      (t/return! (mut graph) load (if (= width 8) ty wide) value))
+                  (= mode 1)
+                    (let [load (emit! (mut graph) (if volatile 92 91) ty [start address])]
+                      (t/return! (mut graph) load ty load))
+                  :else
+                    (let [store (emit! (mut graph) (if volatile 94 93) 0
+                                       [start address
+                                        (if (= mode 2) v
+                                            (t/constant! (mut graph) ty
+                                                         (if (= ty 1) (& fixed 1) fixed)))])]
+                      (t/return! (mut graph) store 11 i)))]
+    (match (t/compiled (mut tally) "access" graph start [ret] a)
+      (None []
+            (println "  type {} form {} shift {} disp {} mode {}" ty form shift disp mode)
+            0)
+      (Some [mapped]
+            (let [(mut mapped) mapped
+                  (mut buffer) (primitive/zeroed (array u8 64))
+                  base (primitive/cast u64 (primitive/cast (ptr u8) (mut buffer)))
+                  used (if (= form 0) (: 0 i64) index)
+                  pointer (primitive/isub
+                            (primitive/isub (+ base TARGET) (cast u64 disp))
+                            (cast u64 (<< used (cast i64 (if (>= form 2) shift (: 0 i32))))))
+                  value (if (= ty 1) (& fixed 1) (& fixed (t/mask ty)))
+                  (mut held) (: 0 u64)]
+              (for [k 0 64] (set! (mut buffer) k (pattern k)))
+              (when (= ty 1) (set! (mut buffer) TARGET (cast u8 (& fixed 1))))
+              (for [k 0 width]
+                (set! held (| held (<< (cast u64 (get buffer (+ TARGET k))) (cast u64 (* k 8))))))
+              (let [got (t/invoke mapped [pointer (cast u64 used) (t/dirty ty value)])
+                    (mut good) true]
+                (cond (= mode 0)
+                        (set! good (= got (if (types/signed? ty)
+                                              (cast u64 (cast i64 (t/signed ty held)))
+                                              held)))
+                      (= mode 1)
+                        (set! good (= (& got (t/returned-mask ty)) (t/returned ty held)))
+                      :else (set! good (= got (cast u64 used))))
+                (for [k 0 64]
+                  (let [wanted (if (and (>= mode 2) (>= k TARGET) (< k (+ TARGET width)))
+                                   (cast u8 (>> value (cast u64 (* (- k TARGET) 8))))
+                                   (if (and (= ty 1) (= k TARGET)) (cast u8 (& fixed 1)) (pattern k)))]
+                    (when (!= (get buffer k) wanted) (set! good false))))
+                (set! (.checks tally) (+ (.checks tally) 1))
+                (unless good
+                  (when (< (.failures tally) 20)
+                    (println "type {} form {} shift {} disp {} index {} volatile {} mode {} value {:x}: got {:x}"
+                             ty form shift disp index volatile mode value got))
+                  (t/fail! (mut tally))))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 memory access: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)
+            disps [(: 0 i64) 1 -1 127 128 -128 -129 4096 0x7FFFFFFF -2147483648
+                   0x80000000 -2147483649]
+            values [(: 0 u64) 1 0x7F 0x80 0xFF 0x7FFF 0x8000 0x7FFFFFFF 0x80000000
+                    0xFFFFFFFF 0x123456789ABCDEF0 0xFFFFFFFF80000000 0xFFFFFFFF7FFFFFFF
+                    0xFFFFFFFFFFFFFFFF]]
+        (for ty [(: 1 i32) 2 3 4 5 6 8 9 10 11]
+          ; Every form and displacement, loading and storing a register.
+          (for disp disps
+            (for form [(: 0 i32) 1 2 3]
+              (let [shift (cast i32 (+ 1 (% (+ (cast i64 ty) (if (< disp 0) (- 0 disp) disp)) 3)))]
+                (for index [(: 3 i64) -2]
+                  (when (or (!= form 0) (= index 3))
+                    (case! (mut tally) ty form shift disp index false 0 0 a)
+                    (case! (mut tally) ty form shift disp index false 2 0xA1B2C3D4E5F60718 a))))))
+          ; Every scale, both volatile forms, the returned narrow value.
+          (for shift [(: 1 i32) 2 3]
+            (for volatile [false true]
+              (case! (mut tally) ty 2 shift 16 5 volatile 0 0 a)
+              (case! (mut tally) ty 3 shift -16 5 volatile 1 0 a)
+              (case! (mut tally) ty 2 shift 16 -3 volatile 2 0x8091A2B3C4D5E6F7 a)))
+          ; Stored constants at the immediate boundaries, and register values.
+          (for value values
+            (case! (mut tally) ty 0 0 8 0 false 3 value a)
+            (case! (mut tally) ty 1 0 -8 2 true 3 value a)
+            (case! (mut tally) ty 0 0 0 0 false 2 value a)))
+        (println "x64 memory access: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))
