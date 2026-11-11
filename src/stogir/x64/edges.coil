@@ -30,6 +30,7 @@
 (import "stogir.edge-moves" :as edges)
 (import "stogir.allocation" :as allocation)
 (import "stogir.locations" :as locations)
+(import "stogir.text-data" :as text-data)
 (import "stogir.x64.code" :as code)
 (import "stogir.x64.fixups" :as fixups)
 (import "stogir.x64.frame-address" :as frame)
@@ -56,16 +57,40 @@
    (selected (ArrayList bool))
    (aliases (ArrayList i32))])
 
-;;; Moves of one conditional edge, emitted after the body under `label`
-;;; followed by a jump to `target`.
+;;; Moves of one conditional edge with a jump to `target` behind them. They
+;;; are emitted after the function body under `label`, or, with label
+;;; ENTRY-PENDING, at the start of block `target` itself (the block's only
+;;; way in is this edge; see entry-placeable?), which then becomes
+;;; ENTRY-PLACED.
 (defstruct EdgeStub [(label i32) (target i32) (body code/Buffer)])
+
+(const ENTRY-PENDING -1)
+
+(const ENTRY-PLACED -2)
+
+;;; A jump table of `count` words, whose targets are
+;;; `table-targets[first ..]`, placed under `label` after the function body.
+(defstruct Table [(label i32) (first i64) (count i64)])
 
 ;;; The mutable branch state of one function.
 (defstruct Control
   [(labels (ArrayList i64))
    (branches (ArrayList fixups/Branch))
    (relatives (ArrayList fixups/Relative))
-   (stubs (ArrayList EdgeStub))])
+   (stubs (ArrayList EdgeStub))
+   (tables (ArrayList Table))
+   (table-targets (ArrayList i32))
+   (alignments (ArrayList fixups/Alignment))])
+
+(defn create-control [(allocator (dyn Allocator))] (-> Control)
+  (Control
+    :labels (ArrayList::new [i64] allocator)
+    :branches (ArrayList::new [fixups/Branch] allocator)
+    :relatives (ArrayList::new [fixups/Relative] allocator)
+    :stubs (ArrayList::new [EdgeStub] allocator)
+    :tables (ArrayList::new [Table] allocator)
+    :table-targets (ArrayList::new [i32] allocator)
+    :alignments (ArrayList::new [fixups/Alignment] allocator)))
 
 (defn release-control! [(control (mut Control))] (-> void)
   (for [i 0 (len (.stubs control))]
@@ -73,7 +98,23 @@
   (free! (mut (.stubs control)))
   (free! (mut (.labels control)))
   (free! (mut (.branches control)))
-  (free! (mut (.relatives control))))
+  (free! (mut (.relatives control)))
+  (free! (mut (.tables control)))
+  (free! (mut (.table-targets control)))
+  (free! (mut (.alignments control))))
+
+;;; The block that `entered` stands for once skipped (empty) blocks are
+;;; followed to the block that is actually emitted.
+(defn resolve-alias [(aliases (ArrayList i32)) (entered i32)] (-> i32)
+  (let [(mut target) entered
+        (mut steps) (: 0 i64)]
+    (while (and (> target 0)
+                (< (cast i64 target) (len aliases))
+                (!= (get aliases (cast i64 target)) target)
+                (< steps (len aliases)))
+      (set! target (get aliases (cast i64 target)))
+      (set! steps (+ steps 1)))
+    target))
 
 ;;; The transfer extent of a graph value: 4 bytes for every integer of at
 ;;; most four bytes (the arithmetic width), else the type's size.
@@ -198,40 +239,126 @@
                 (free! (mut owned))
                 (if (= error "") (Ok 0) (Err error))))))))
 
+;;; The label a branch along the edge into `target` goes to: the block
+;;; itself when the edge has no moves, otherwise a new edge stub after the
+;;; function body.
+(defn stub-or-target! [(flow Flow)
+                       (control (mut Control))
+                       (target i32)
+                       (source-position i64)
+                       (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
+  (let [(mut transfer) (code/create allocator)]
+    (match (edge! (mut transfer) flow target source-position allocator)
+      (Err [message] (code/release! (mut transfer)) (Err message))
+      (Ok [_]
+          (if (= (len (.text transfer)) 0)
+              (do (code/release! (mut transfer)) (Ok target))
+              (let [id (cast i32 (len (.labels control)))]
+                (push! (mut (.labels control)) -1)
+                (push! (mut (.stubs control))
+                       (EdgeStub :label id :target target :body transfer))
+                (Ok id)))))))
+
+;;; An IF projection has exactly one predecessor, its IF. When it is emitted
+;;; later as its own block, the moves of the taken edge into it can run at
+;;; its entry instead of in an out-of-line stub, which saves a taken jump.
+;;; Not for a block the layout skipped, one already emitted, or one that
+;;; already has entry code.
+(defn entry-placeable? [(flow Flow) (control Control) (target i32)] (-> bool)
+  (and (> target 0)
+       (< (cast i64 target) (len (.aliases flow)))
+       (= (get (.aliases flow) (cast i64 target)) target)
+       (< (get (.labels control) (cast i64 target)) 0)
+       (let [opcode (n/opcode (get (.instructions (.graph flow)) (cast i64 target)))]
+         (or (= opcode 107) (= opcode 108)))
+       (let [(mut free) true]
+         (for stub (.stubs control)
+           (when (and (= (.label stub) ENTRY-PENDING) (= (.target stub) target))
+             (set! free false)))
+         free)))
+
 ;;; Branch to `target` when `condition` holds (-1: always). An edge without
-;;; moves branches straight to the block; otherwise to a new edge stub.
+;;; moves branches straight to the block. With moves, the branch goes to the
+;;; block when the moves can be its entry code (`entry`: the caller allows
+;;; it, and entry-placeable? holds), otherwise to a new edge stub.
 (defn branch-edge! [(out (mut code/Buffer))
                     (flow Flow)
                     (control (mut Control))
                     (target i32)
                     (source-position i64)
                     (condition i32)
+                    (entry bool)
                     (allocator (dyn Allocator))] (-> (Result i32 (slice u8)))
   (let [(mut transfer) (code/create allocator)]
     (match (edge! (mut transfer) flow target source-position allocator)
       (Err [message] (code/release! (mut transfer)) (Err message))
       (Ok [_]
-          (if (= (len (.text transfer)) 0)
-              (do
-                (code/release! (mut transfer))
-                (fixups/jump! (mut out) (mut (.branches control)) target condition))
-              (let [id (cast i32 (len (.labels control)))]
-                (push! (mut (.labels control)) -1)
-                (push! (mut (.stubs control))
-                       (EdgeStub :label id :target target :body transfer))
-                (fixups/jump! (mut out) (mut (.branches control)) id condition)))))))
+          (cond (= (len (.text transfer)) 0)
+                  (do
+                    (code/release! (mut transfer))
+                    (fixups/jump! (mut out) (mut (.branches control)) target condition))
+                (and entry (entry-placeable? flow control target))
+                  (do
+                    (push! (mut (.stubs control))
+                           (EdgeStub :label ENTRY-PENDING :target target :body transfer))
+                    (fixups/jump! (mut out) (mut (.branches control)) target condition))
+                :else
+                  (let [id (cast i32 (len (.labels control)))]
+                    (push! (mut (.labels control)) -1)
+                    (push! (mut (.stubs control))
+                           (EdgeStub :label id :target target :body transfer))
+                    (fixups/jump! (mut out) (mut (.branches control)) id condition)))))))
 
-;;; Append every edge stub: its moves, then a jump to its target.
+;;; Append the entry code waiting for block `target`, whose label was just
+;;; bound.
+(defn place-entry! [(out (mut code/Buffer)) (control (mut Control)) (target i32)]
+  (-> (Result i32 (slice u8)))
+  (let [(mut error) ""]
+    (for [i 0 (len (.stubs control))]
+      (let [stub (get (.stubs control) i)]
+        (when (and (= error "") (= (.label stub) ENTRY-PENDING) (= (.target stub) target))
+          (unless (code/append! (mut out) (.body stub))
+            (set! error "invalid deferred entry code"))
+          (set! (.label (elem (mut (.stubs control)) i)) ENTRY-PLACED))))
+    (if (= error "") (Ok 0) (Err error))))
+
+;;; Append every out-of-line edge stub: its moves, then a jump to its target.
 (defn finish-stubs! [(out (mut code/Buffer)) (control (mut Control))]
   (-> (Result i32 (slice u8)))
   (let [(mut error) ""]
     (for [i 0 (len (.stubs control))]
       (when (= error "")
         (let [stub (get (.stubs control) i)]
-          (set! (mut (.labels control)) (cast i64 (.label stub)) (len (.text out)))
-          (if (code/append! (mut out) (.body stub))
-              (match (fixups/jump! (mut out) (mut (.branches control)) (.target stub) -1)
-                (Err [message] (set! error message))
-                (Ok [_] 0))
-              (set! error "invalid deferred edge code")))))
+          (cond (= (.label stub) ENTRY-PLACED) 0
+                (= (.label stub) ENTRY-PENDING)
+                  (set! error "edge moves placed at a block entry that was never emitted")
+                :else
+                  (do
+                    (set! (mut (.labels control)) (cast i64 (.label stub)) (len (.text out)))
+                    (if (code/append! (mut out) (.body stub))
+                        (match (fixups/jump! (mut out) (mut (.branches control))
+                                             (.target stub) -1)
+                          (Err [message] (set! error message))
+                          (Ok [_] 0))
+                        (set! error "invalid deferred edge code")))))))
     (if (= error "") (Ok 0) (Err error))))
+
+;;; Append every jump table after the code: zero words now, one Relative
+;;; record per word, a text-data range, and a request to align the table to
+;;; its word size (the relaxation pass inserts the padding).
+(defn finish-tables! [(out (mut code/Buffer)) (control (mut Control))] (-> void)
+  (for table (.tables control)
+    (let [base (len (.text out))]
+      (set! (mut (.labels control)) (cast i64 (.label table)) base)
+      (push! (mut (.alignments control))
+             (fixups/Alignment :label (.label table) :boundary 4 :limit 3 :loop false))
+      (for [slot 0 (.count table)]
+        (push! (mut (.relatives control))
+               (fixups/Relative
+                 :offset (len (.text out))
+                 :base base
+                 :label (get (.table-targets control) (+ (.first table) slot))))
+        (for [k 0 4] (push! (mut (.text out)) 0)))
+      (push! (mut (.text-data out))
+             (text-data/Range :offset base :length (* (.count table) 4) :kind 4))
+      (set! (.tables (.summary out)) (+ (.tables (.summary out)) 1)))))
