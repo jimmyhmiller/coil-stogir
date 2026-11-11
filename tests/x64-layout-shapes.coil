@@ -1,0 +1,451 @@
+(module stogir.tests.x64-layout-shapes)
+(import "stogir.graph" :as g)
+(import "stogir.x64.testing" :as t)
+(import "stogir.x64.code" :as code)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; The block shapes the x86-64 driver emits (stogir.x64.function), counted.
+;;;
+;;; Each canonical function is compiled, run against its definition, and its
+;;; emission summary compared with the shape it must have: how many `jcc`
+;;; and `jmp` instructions the whole function contains, that all of them
+;;; are short, how many bytes it takes, whether its loop top is aligned.
+;;; The counts are exact: one jump more is a taken branch per iteration or
+;;; per call that the layout was supposed to remove.
+;;;
+;;;   * a loop whose test is in its header: guard, body, test at the bottom;
+;;;     one conditional jump per iteration and no `jmp`
+;;;   * a loop whose test is at its bottom already
+;;;   * nested loops
+;;;   * a diamond whose join only returns: both arms return in place
+;;;   * a diamond with code after the join
+;;;   * arms that are empty: no branch survives a pointless IF's arms
+;;;   * an early exit and a trap that needs no jump around it
+;;;   * loop tops at every offset modulo 16: padded up to the limit, never
+;;;     beyond, and never when nothing jumps back
+
+(extern fork :cc (cc/C) [] (-> i32))
+(extern waitpid :cc (cc/C) [i32 (ptr i32) i32] (-> i32))
+(extern exit-child :as "_exit" :cc (cc/C) [i32] (-> void))
+(extern signal :cc (cc/C) [i32 u64] (-> u64))
+
+(defn illegal-handler :cc (cc/C) [(number i32)] (-> void)
+  (exit-child 77))
+
+;;; 0 when calling `mapped` raises SIGILL (the ud2 trap), in a child process.
+(defn traps [(mapped t/Mapped) (argument u64)] (-> i64)
+  (let [child (fork)]
+    (if (< child 0)
+        1
+        (if (= child 0)
+            (do
+              (signal 4 (primitive/cast u64 (primitive/cast (ptr u8) (fnptr-of illegal-handler))))
+              (t/invoke mapped [argument])
+              (exit-child 99)
+              1)
+            (let [(mut status) (: 0 i32)]
+              (if (and (= (waitpid child (mut status) 0) child)
+                       (= (& status 127) 0)
+                       (= (& (>> status 8) 255) 77))
+                  0
+                  1))))))
+
+(defn add [(x u64) (y u64)] (-> u64) (primitive/iadd x y))
+
+(defn mul [(x u64) (y u64)] (-> u64) (primitive/imul x y))
+
+;;; Whether every function's summary is printed.
+(const VERBOSE false)
+
+;;; The shape a function must have. A negative bound is not checked.
+(defstruct Shape [(conditional i64) (unconditional i64) (size i64) (loops i64)])
+
+(defn shape! [(tally (mut t/Tally)) (label (slice u8)) (made t/Generated) (want Shape)]
+  (-> void)
+  (let [summary (.summary made)]
+    (when (>= (.conditional want) 0)
+      (t/check! (mut tally) (= (.conditional summary) (.conditional want)) label
+                (.conditional summary) (.conditional want)))
+    (when (>= (.unconditional want) 0)
+      (t/check! (mut tally) (= (.unconditional summary) (.unconditional want)) label
+                (.unconditional summary) (.unconditional want)))
+    ; Every jump of these small functions is in rel8 reach.
+    (t/check! (mut tally)
+              (= (.short summary) (+ (.conditional summary) (.unconditional summary)))
+              label (.short summary) (+ (.conditional summary) (.unconditional summary)))
+    (when (>= (.size want) 0)
+      (t/check! (mut tally) (<= (.size made) (.size want)) label (.size made) (.size want)))
+    (when (>= (.loops want) 0)
+      (t/check! (mut tally) (= (.loops summary) (.loops want)) label
+                (.loops summary) (.loops want)))
+    ; Padding never exceeds the limit per loop.
+    (t/check! (mut tally) (<= (.padding summary) (* 10 (.loops summary))) label
+              (.padding summary) (* 10 (.loops summary)))
+    (when VERBOSE
+      (println "  {}: {} bytes, {} jcc, {} jmp, {} short, {} padding, {} of {} loops aligned"
+               label (.size made) (.conditional summary) (.unconditional summary)
+               (.short summary) (.padding summary) (.aligned-loops summary)
+               (.loops summary)))))
+
+;;; sum = 0; for (i = 0; i < n; i += step) sum += i * scale;  -- the test is
+;;; in the loop header, as a front end writes a `while`.
+(defn header-loop! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        n (t/param! (mut graph) start 11 0)
+        scale (t/param! (mut graph) start 11 1)
+        zero (t/constant! (mut graph) 11 0)
+        header (t/loop-begin! (mut graph) (t/end! (mut graph) start))
+        i (t/loop-phi! (mut graph) header zero)
+        sum (t/loop-phi! (mut graph) header zero)
+        branch (t/if! (mut graph) header (t/compare! (mut graph) 16 i n))
+        body (t/if-true! (mut graph) branch)
+        exit (t/if-false! (mut graph) branch)
+        next-sum (t/binary! (mut graph) 26 11 sum (t/binary! (mut graph) 28 11 i scale))
+        next-i (t/binary! (mut graph) 26 11 i (t/constant! (mut graph) 11 3))
+        back (t/loop-end! (mut graph) body)
+        ret (t/return! (mut graph) exit 11 sum)]
+    (t/patch! (mut graph) header 2 back)
+    (t/patch! (mut graph) i 3 next-i)
+    (t/patch! (mut graph) sum 3 next-sum)
+    (match (t/generated (mut tally) "header loop" graph start [ret] a)
+      (None [] 0)
+      (Some [made]
+            (let [(mut mapped) (.mapped made)]
+              ; The guard and the bottom test; the back edge is the bottom
+              ; test's own jump.
+              (shape! (mut tally) "header loop" made
+                      (Shape :conditional 2 :unconditional 0 :size 48 :loops 1))
+              (for n [(: 0 u64) 1 2 3 4 100 1000 0xFFFFFFFFFFFFFFFF 0x8000000000000000]
+                (let [(mut model) (: 0 u64)
+                      (mut k) (: 0 i64)]
+                  (while (< k (cast i64 n))
+                    (set! model (add model (mul (cast u64 k) 7)))
+                    (set! k (+ k 3)))
+                  (t/expect! (mut tally) "header loop" mapped 11 [n 7] model)))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+;;; do { sum += i; i -= 1; } while (i != 0);  -- the test is at the bottom
+;;; and reads the flags of the decrement.
+(defn bottom-loop! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        n (t/param! (mut graph) start 11 0)
+        header (t/loop-begin! (mut graph) (t/end! (mut graph) start))
+        i (t/loop-phi! (mut graph) header n)
+        sum (t/loop-phi! (mut graph) header (t/constant! (mut graph) 11 0))
+        next-sum (t/binary! (mut graph) 26 11 sum i)
+        next-i (t/binary! (mut graph) 27 11 i (t/constant! (mut graph) 11 1))
+        branch (t/if! (mut graph) header
+                      (t/compare! (mut graph) 15 next-i (t/constant! (mut graph) 11 0)))
+        again (t/if-true! (mut graph) branch)
+        exit (t/if-false! (mut graph) branch)
+        back (t/loop-end! (mut graph) again)
+        ret (t/return! (mut graph) exit 11 next-sum)]
+    (t/patch! (mut graph) header 2 back)
+    (t/patch! (mut graph) i 3 next-i)
+    (t/patch! (mut graph) sum 3 next-sum)
+    (match (t/generated (mut tally) "bottom loop" graph start [ret] a)
+      (None [] 0)
+      (Some [made]
+            (let [(mut mapped) (.mapped made)]
+              (shape! (mut tally) "bottom loop" made
+                      (Shape :conditional 1 :unconditional 0 :size 32 :loops 1))
+              ; `sub` then `jne`: no compare.
+              (t/check! (mut tally) (= (.fused-tests (.summary made)) 1) "bottom loop flags"
+                        (.fused-tests (.summary made)) 1)
+              (for n [(: 1 u64) 2 3 10 1000]
+                (t/expect! (mut tally) "bottom loop" mapped 11 [n] (/ (* n (+ n 1)) 2)))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+;;; total = 0; for (i = 0; i < n; i++) for (j = 0; j < m; j++) total += i ^ j;
+(defn nested-loops! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        n (t/param! (mut graph) start 11 0)
+        m (t/param! (mut graph) start 11 1)
+        zero (t/constant! (mut graph) 11 0)
+        one (t/constant! (mut graph) 11 1)
+        outer (t/loop-begin! (mut graph) (t/end! (mut graph) start))
+        i (t/loop-phi! (mut graph) outer zero)
+        total (t/loop-phi! (mut graph) outer zero)
+        outer-branch (t/if! (mut graph) outer (t/compare! (mut graph) 16 i n))
+        outer-body (t/if-true! (mut graph) outer-branch)
+        exit (t/if-false! (mut graph) outer-branch)
+        inner (t/loop-begin! (mut graph) (t/end! (mut graph) outer-body))
+        j (t/loop-phi! (mut graph) inner zero)
+        running (t/loop-phi! (mut graph) inner total)
+        inner-branch (t/if! (mut graph) inner (t/compare! (mut graph) 16 j m))
+        inner-body (t/if-true! (mut graph) inner-branch)
+        inner-exit (t/if-false! (mut graph) inner-branch)
+        next-running (t/binary! (mut graph) 26 11 running (t/binary! (mut graph) 48 11 i j))
+        next-j (t/binary! (mut graph) 26 11 j one)
+        inner-back (t/loop-end! (mut graph) inner-body)
+        next-i (t/binary! (mut graph) 26 11 i one)
+        outer-back (t/loop-end! (mut graph) inner-exit)
+        ret (t/return! (mut graph) exit 11 total)]
+    (t/patch! (mut graph) inner 2 inner-back)
+    (t/patch! (mut graph) j 3 next-j)
+    (t/patch! (mut graph) running 3 next-running)
+    (t/patch! (mut graph) outer 2 outer-back)
+    (t/patch! (mut graph) i 3 next-i)
+    (t/patch! (mut graph) total 3 running)
+    (match (t/generated (mut tally) "nested loops" graph start [ret] a)
+      (None [] 0)
+      (Some [made]
+            (let [(mut mapped) (.mapped made)]
+              ; Two guards and two bottom tests. The layout puts the inner
+              ; loop before the outer body, so each guard also has a `jmp`
+              ; for its zero-trip case; neither is on a path a running loop
+              ; takes: an inner iteration is one taken `jl`, an outer one a
+              ; fall-through `jge` and the inner guard's taken `jl`.
+              (shape! (mut tally) "nested loops" made
+                      (Shape :conditional 4 :unconditional 2 :size 96 :loops 2))
+              (for n [(: 0 u64) 1 2 7 20]
+                (for m [(: 0 u64) 1 3 16]
+                  (let [(mut model) (: 0 u64)]
+                    (for [x 0 (cast i64 n)]
+                      (for [y 0 (cast i64 m)]
+                        (set! model (add model (cast u64 (^ x y))))))
+                    (t/expect! (mut tally) "nested loops" mapped 11 [n m] model))))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+;;; return a < b ? a + 1 : b * 3;  -- through IF, MERGE and PHI. The join
+;;; holds only the RETURN: each arm returns in place.
+(defn returning-diamond! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        p (t/param! (mut graph) start 11 0)
+        q (t/param! (mut graph) start 11 1)
+        branch (t/if! (mut graph) start (t/compare! (mut graph) 16 p q))
+        yes (t/if-true! (mut graph) branch)
+        no (t/if-false! (mut graph) branch)
+        left (t/binary! (mut graph) 26 11 p (t/constant! (mut graph) 11 1))
+        right (t/binary! (mut graph) 28 11 q (t/constant! (mut graph) 11 3))
+        merge (t/merge! (mut graph) (t/end! (mut graph) yes) (t/end! (mut graph) no))
+        phi (t/phi! (mut graph) 11 merge left right)
+        ret (t/return! (mut graph) merge 11 phi)]
+    (match (t/generated (mut tally) "returning diamond" graph start [ret] a)
+      (None [] 0)
+      (Some [made]
+            (let [(mut mapped) (.mapped made)]
+              (shape! (mut tally) "returning diamond" made
+                      (Shape :conditional 1 :unconditional 0 :size 32 :loops 0))
+              (for x [(: 0 u64) 1 5 0xFFFFFFFFFFFFFFFF 0x7FFFFFFFFFFFFFFF]
+                (for y [(: 0 u64) 1 5 0xFFFFFFFFFFFFFFFE 0x8000000000000000]
+                  (t/expect! (mut tally) "returning diamond" mapped 11 [x y]
+                             (if (= (t/binary 16 11 x y) 1) (add x 1) (mul y 3)))))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+;;; x = a < b ? a + 1 : b * 3; return (x ^ a) * b;  -- code behind the join:
+;;; one arm jumps over the other, the other falls in.
+(defn joined-diamond! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        p (t/param! (mut graph) start 11 0)
+        q (t/param! (mut graph) start 11 1)
+        branch (t/if! (mut graph) start (t/compare! (mut graph) 16 p q))
+        yes (t/if-true! (mut graph) branch)
+        no (t/if-false! (mut graph) branch)
+        left (t/binary! (mut graph) 26 11 p (t/constant! (mut graph) 11 1))
+        right (t/binary! (mut graph) 28 11 q (t/constant! (mut graph) 11 3))
+        merge (t/merge! (mut graph) (t/end! (mut graph) yes) (t/end! (mut graph) no))
+        phi (t/phi! (mut graph) 11 merge left right)
+        result (t/binary! (mut graph) 28 11 (t/binary! (mut graph) 48 11 phi p) q)
+        ret (t/return! (mut graph) merge 11 result)]
+    (match (t/generated (mut tally) "joined diamond" graph start [ret] a)
+      (None [] 0)
+      (Some [made]
+            (let [(mut mapped) (.mapped made)]
+              (shape! (mut tally) "joined diamond" made
+                      (Shape :conditional 1 :unconditional 1 :size 40 :loops 0))
+              (for x [(: 0 u64) 1 5 0xFFFFFFFFFFFFFFFF 0x7FFFFFFFFFFFFFFF]
+                (for y [(: 0 u64) 1 5 0xFFFFFFFFFFFFFFFE 0x8000000000000000]
+                  (t/expect! (mut tally) "joined diamond" mapped 11 [x y]
+                             (mul (^ (if (= (t/binary 16 11 x y) 1) (add x 1) (mul y 3)) x) y))))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+;;; if (a < b) {} else {}  return a + b;  -- both arms are empty blocks that
+;;; forward to the join; `chain` such diamonds in a row.
+(defn empty-arms! [(tally (mut t/Tally)) (chain i64) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        p (t/param! (mut graph) start 11 0)
+        q (t/param! (mut graph) start 11 1)
+        (mut control) start]
+    (for [k 0 chain]
+      (let [branch (t/if! (mut graph) control
+                          (t/compare! (mut graph) 16 p
+                                      (t/constant! (mut graph) 11 (cast u64 (+ k 10)))))
+            yes (t/if-true! (mut graph) branch)
+            no (t/if-false! (mut graph) branch)]
+        (set! control (t/merge! (mut graph) (t/end! (mut graph) yes) (t/end! (mut graph) no)))))
+    (let [ret (t/return! (mut graph) control 11 (t/binary! (mut graph) 26 11 p q))]
+      (match (t/generated (mut tally) "empty arms" graph start [ret] a)
+        (None [] 0)
+        (Some [made]
+              (let [(mut mapped) (.mapped made)]
+                ; Both edges of each IF reach the same address: its jump
+                ; goes to the next instruction and no `jmp` exists.
+                (shape! (mut tally) "empty arms" made
+                        (Shape :conditional chain :unconditional 0 :size -1 :loops 0))
+                (for x [(: 0 u64) 9 10 11 12 13 100]
+                  (t/expect! (mut tally) "empty arms" mapped 11 [x 5] (add x 5)))
+                (t/unmap! (mut mapped))))))
+    (g/release! (mut graph))))
+
+;;; for (i = 0; i < n; i++) { if (i == stop) return i * 2; sum += i; }
+;;; return sum;  -- an early exit from the loop body.
+(defn early-exit! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        n (t/param! (mut graph) start 11 0)
+        stop (t/param! (mut graph) start 11 1)
+        zero (t/constant! (mut graph) 11 0)
+        header (t/loop-begin! (mut graph) (t/end! (mut graph) start))
+        i (t/loop-phi! (mut graph) header zero)
+        sum (t/loop-phi! (mut graph) header zero)
+        branch (t/if! (mut graph) header (t/compare! (mut graph) 16 i n))
+        body (t/if-true! (mut graph) branch)
+        exit (t/if-false! (mut graph) branch)
+        early (t/if! (mut graph) body (t/compare! (mut graph) 14 i stop))
+        leave (t/if-true! (mut graph) early)
+        stay (t/if-false! (mut graph) early)
+        next-sum (t/binary! (mut graph) 26 11 sum i)
+        next-i (t/binary! (mut graph) 26 11 i (t/constant! (mut graph) 11 1))
+        back (t/loop-end! (mut graph) stay)
+        r1 (t/return! (mut graph) leave 11
+                      (t/binary! (mut graph) 28 11 i (t/constant! (mut graph) 11 2)))
+        r2 (t/return! (mut graph) exit 11 sum)]
+    (t/patch! (mut graph) header 2 back)
+    (t/patch! (mut graph) i 3 next-i)
+    (t/patch! (mut graph) sum 3 next-sum)
+    (match (t/generated (mut tally) "early exit" graph start [r1 r2] a)
+      (None [] 0)
+      (Some [made]
+            (let [(mut mapped) (.mapped made)]
+              ; Guard, bottom test and early exit. An iteration is the
+              ; bottom test falling through and the exit test jumping back;
+              ; the one `jmp` is the guard's zero-trip case.
+              (shape! (mut tally) "early exit" made
+                      (Shape :conditional 3 :unconditional 1 :size 64 :loops 1))
+              (for n [(: 0 u64) 1 5 50]
+                (for stop [(: 0 u64) 3 49 1000]
+                  (t/expect! (mut tally) "early exit" mapped 11 [n stop]
+                             (if (< stop n) (* stop 2) (/ (* n (primitive/isub n 1)) 2)))))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+;;; if (x == 0) unreachable; return x + 1;  -- the trap has nothing behind
+;;; it, and the live path needs one conditional jump at most.
+(defn trap-path! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        x (t/param! (mut graph) start 11 0)
+        branch (t/if! (mut graph) start
+                      (t/compare! (mut graph) 14 x (t/constant! (mut graph) 11 0)))
+        dead (t/if-true! (mut graph) branch)
+        live (t/if-false! (mut graph) branch)
+        stop (t/unreachable! (mut graph) dead)
+        ret (t/return! (mut graph) live 11
+                       (t/binary! (mut graph) 26 11 x (t/constant! (mut graph) 11 1)))]
+    (match (t/generated (mut tally) "trap path" graph start [ret stop] a)
+      (None [] 0)
+      (Some [made]
+            (let [(mut mapped) (.mapped made)]
+              (shape! (mut tally) "trap path" made
+                      (Shape :conditional 1 :unconditional 0 :size 16 :loops 0))
+              (for x [(: 1 u64) 2 0xFFFFFFFFFFFFFFFF]
+                (t/expect! (mut tally) "trap path" mapped 11 [x] (add x 1)))
+              (t/check! (mut tally) (= (traps mapped 0) 0) "trap path traps" 1 0)
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+;;; A loop behind `lead` 32-bit additions of straight-line code (three
+;;; bytes each), so that its top falls on every offset modulo 16:
+;;;   x = (i32) p; repeat lead times: x += k + 1;  v = (i64) x
+;;;   do { v = v * 3 + i; i -= 1 } while (i != 0); return v
+(defn padded-loop! [(tally (mut t/Tally)) (lead i64) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        p (t/param! (mut graph) start 11 0)
+        n (t/param! (mut graph) start 11 1)
+        (mut x) p]
+    (for [k 0 lead]
+      (set! x (t/binary! (mut graph) 26 10
+                         (if (= k 0) (t/unary! (mut graph) 35 10 x) x)
+                         (t/constant! (mut graph) 10 (cast u64 (+ k 1))))))
+    (let [seed (if (= lead 0) p (t/unary! (mut graph) 33 11 x))
+          header (t/loop-begin! (mut graph) (t/end! (mut graph) start))
+          i (t/loop-phi! (mut graph) header n)
+          value (t/loop-phi! (mut graph) header seed)
+          next-value (t/binary! (mut graph) 26 11
+                                (t/binary! (mut graph) 28 11 value
+                                           (t/constant! (mut graph) 11 3))
+                                i)
+          next-i (t/binary! (mut graph) 27 11 i (t/constant! (mut graph) 11 1))
+          branch (t/if! (mut graph) header
+                        (t/compare! (mut graph) 15 next-i (t/constant! (mut graph) 11 0)))
+          again (t/if-true! (mut graph) branch)
+          exit (t/if-false! (mut graph) branch)
+          back (t/loop-end! (mut graph) again)
+          ret (t/return! (mut graph) exit 11 next-value)]
+      (t/patch! (mut graph) header 2 back)
+      (t/patch! (mut graph) i 3 next-i)
+      (t/patch! (mut graph) value 3 next-value)
+      (match (t/generated (mut tally) "padded loop" graph start [ret] a)
+        (None [] 0)
+        (Some [made]
+              (let [(mut mapped) (.mapped made)
+                    summary (.summary made)]
+                (shape! (mut tally) "padded loop" made
+                        (Shape :conditional 1 :unconditional 0 :size -1 :loops 1))
+                ; Aligned, or left alone because that needed over ten bytes.
+                (t/check! (mut tally)
+                          (or (= (.aligned-loops summary) 1) (= (.padding summary) 0))
+                          "padded loop: padding that does not align"
+                          (.padding summary) 0)
+                (t/check! (mut tally) (<= (.padding summary) 10)
+                          "padded loop: padding over the limit" (.padding summary) 10)
+                (for n [(: 1 u64) 2 9]
+                  (let [(mut model) (: 5 u64)
+                        (mut k) n]
+                    (for [j 0 lead]
+                      (set! model (& (add model (cast u64 (+ j 1))) 0xFFFFFFFF)))
+                    (when (> lead 0)
+                      (set! model (cast u64 (cast i64 (t/signed 10 model)))))
+                    (while (> k 0)
+                      (set! model (add (mul model 3) k))
+                      (set! k (- k 1)))
+                    (t/expect! (mut tally) "padded loop" mapped 11 [5 n] model)))
+                (t/unmap! (mut mapped))))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 layout shapes: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (header-loop! (mut tally) a)
+        (bottom-loop! (mut tally) a)
+        (nested-loops! (mut tally) a)
+        (returning-diamond! (mut tally) a)
+        (joined-diamond! (mut tally) a)
+        (for chain [(: 1 i64) 2 5]
+          (empty-arms! (mut tally) chain a))
+        (early-exit! (mut tally) a)
+        (trap-path! (mut tally) a)
+        (for [lead 0 40]
+          (padded-loop! (mut tally) lead a))
+        (println "x64 layout shapes: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))

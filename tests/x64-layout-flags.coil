@@ -1,0 +1,349 @@
+(module stogir.tests.x64-layout-flags)
+(import "stogir.graph" :as g)
+(import "stogir.types" :as types)
+(import "stogir.x64.testing" :as t)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; Compares with zero that read the flags of the instruction before them
+;;; (stogir.x64.emit/zero-flags!), and every case in which they must not.
+;;;
+;;; Each function is `t = a OP b; if (t CMP 0) return 111; else return 222;`
+;;; or a variation, compiled as given, run on values that separate the
+;;; right answer from every wrong reading of the flags (results that
+;;; overflow, that carry, that are zero only in their low bits), and its
+;;; emission summary says whether the compare was dropped.
+;;;
+;;; Dropped
+;;;   * AND, OR, XOR before any condition (they leave `test`'s own flags)
+;;;   * ADD, SUB, NEG and shifts by a nonzero constant before ==, !=, signed
+;;;     < and >= (sign flag), unsigned <= and > (which are == and != here)
+;;;   * a countdown's SUB before its loop jump
+;;;   * SUB proven not to overflow before signed > and <=
+;;; Kept
+;;;   * ADD/SUB before signed > and <= without that proof (they read OF)
+;;;   * ADD/SUB before unsigned < and >= (they read CF)
+;;;   * MUL (its ZF and SF are undefined), a shift by a variable count
+;;;     (a zero count leaves the flags of something else), rotates
+;;;   * 8- and 16-bit values (the instruction ran at 32 bits)
+;;;   * a 32-bit result tested as a 64-bit value
+;;;   * another instruction in between
+;;; A test in a join block is emitted at each block end that enters it (a
+;;; test block run in place), where it follows that path's own instruction:
+;;; dropping it there is right, and checked by value.
+
+(defn add [(x u64) (y u64)] (-> u64) (primitive/iadd x y))
+
+(defn values [(ty i32)] (-> (array u64 12))
+  (let [width (cast u64 (t/bits ty))
+        top (<< (: 1 u64) (- width 1))]
+    [(: 0 u64) 1 2 3 top (- top 1) (+ top 1)
+     0xFFFFFFFFFFFFFFFF 0xFFFFFFFFFFFFFFFE 0x100000000 0x80000000 0x7FFFFFFF]))
+
+;;; Opcodes of the operations under test, and how the test builds them.
+(const OP-NEG 31)
+(const OP-SHIFT-ZERO 1000)
+(const OP-VARIABLE-SHIFT 1001)
+
+;;; The value `t` of the function for arguments x and y.
+(defn computed [(operation i32) (ty i32) (x u64) (y u64)] (-> u64)
+  (cond (= operation OP-NEG) (t/unary 31 ty x)
+        ; Constant shifts use a count of 3, or 0.
+        (or (= operation 49) (= operation 50) (= operation 51) (= operation 52)
+            (= operation 53))
+          (t/binary operation ty x 3)
+        (= operation OP-SHIFT-ZERO) (& x (t/mask ty))
+        (= operation OP-VARIABLE-SHIFT) (t/binary 49 ty x y)
+        :else (t/binary operation ty x y)))
+
+;;; if ((a OP b) CMP 0) return 111; else return 222;  and check that the
+;;; compare was dropped exactly when `fused`.
+(defn zero-test! [(tally (mut t/Tally)) (label (slice u8)) (operation i32)
+                  (comparison i32) (ty i32) (fused bool) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        p (t/param! (mut graph) start ty 0)
+        q (t/param! (mut graph) start ty 1)
+        value (cond (= operation OP-NEG) (t/unary! (mut graph) 31 ty p)
+                    (or (= operation 49) (= operation 50) (= operation 51) (= operation 52)
+                        (= operation 53))
+                      (t/binary! (mut graph) operation ty p (t/constant! (mut graph) ty 3))
+                    (= operation OP-SHIFT-ZERO)
+                      (t/binary! (mut graph) 49 ty p (t/constant! (mut graph) ty 0))
+                    (= operation OP-VARIABLE-SHIFT) (t/binary! (mut graph) 49 ty p q)
+                    :else (t/binary! (mut graph) operation ty p q))
+        compare (t/compare! (mut graph) comparison value (t/constant! (mut graph) ty 0))
+        branch (t/if! (mut graph) start compare)
+        r1 (t/return! (mut graph) (t/if-true! (mut graph) branch) 11
+                      (t/constant! (mut graph) 11 111))
+        r2 (t/return! (mut graph) (t/if-false! (mut graph) branch) 11
+                      (t/constant! (mut graph) 11 222))]
+    (match (t/generated (mut tally) label graph start [r1 r2] a)
+      (None [] 0)
+      (Some [made]
+            (let [(mut mapped) (.mapped made)
+                  dropped (.fused-tests (.summary made))]
+              (t/check! (mut tally) (= dropped (if fused 1 0)) label dropped (if fused 1 0))
+              (for x (values ty)
+                (for y (values ty)
+                  (let [result (computed operation ty x y)]
+                    (t/expect! (mut tally) label mapped 11 [(t/dirty ty x) (t/dirty ty y)]
+                               (if (= (t/binary comparison ty result 0) 1) 111 222)))))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+;;; Which comparisons with zero may read the flags of `operation`'s
+;;; instruction: all of them after AND/OR/XOR; after ADD/SUB/NEG/shifts
+;;; only those that need no carry and no overflow flag.
+(defn readable? [(operation i32) (comparison i32)] (-> bool)
+  (cond (or (= operation 46) (= operation 47) (= operation 48)) true
+        (or (= operation 26) (= operation 27) (= operation OP-NEG)
+            (= operation 49) (= operation 50) (= operation 51))
+          ; EQ NE LT GE ULE UGT
+          (or (= comparison 14) (= comparison 15) (= comparison 16) (= comparison 17)
+              (= comparison 22) (= comparison 23))
+        :else false))
+
+(defn matrix! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (for ty [(: 11 i32) 5 10 4 9 3 8 2]
+    (for operation [(: 26 i32) 27 28 46 47 48 49 50 51 52 53 OP-NEG OP-SHIFT-ZERO
+                    OP-VARIABLE-SHIFT]
+      (for comparison [(: 14 i32) 15 16 17 18 19 20 21 22 23]
+        ; SHL of a narrow value runs at 32 bits like the arithmetic; the
+        ; other shifts run at the value's own width, where an 8- or 16-bit
+        ; instruction does describe an 8- or 16-bit value.
+        (let [wide (>= (t/bits ty) 32)
+              own-width (or (= operation 50) (= operation 51))]
+          (zero-test! (mut tally) "zero test" operation comparison ty
+                      (and (or wide own-width) (readable? operation comparison))
+                      a))))))
+
+;;; t = a & b; u = t + c; if (t != 0) return u; else return u + 1;  -- the
+;;; ADD sits between the AND and the test of the AND's value.
+(defn intervening! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        p (t/param! (mut graph) start 11 0)
+        q (t/param! (mut graph) start 11 1)
+        c (t/param! (mut graph) start 11 2)
+        masked (t/binary! (mut graph) 47 11 p q)
+        sum (t/binary! (mut graph) 26 11 masked c)
+        branch (t/if! (mut graph) start
+                      (t/compare! (mut graph) 15 masked (t/constant! (mut graph) 11 0)))
+        r1 (t/return! (mut graph) (t/if-true! (mut graph) branch) 11 sum)
+        r2 (t/return! (mut graph) (t/if-false! (mut graph) branch) 11
+                      (t/binary! (mut graph) 26 11 sum (t/constant! (mut graph) 11 1)))]
+    (match (t/generated (mut tally) "intervening" graph start [r1 r2] a)
+      (None [] 0)
+      (Some [made]
+            (let [(mut mapped) (.mapped made)]
+              (t/check! (mut tally) (= (.fused-tests (.summary made)) 0) "intervening"
+                        (.fused-tests (.summary made)) 0)
+              (for x (values 11)
+                (for y (values 11)
+                  ; c chosen so that the sum is zero exactly when x & y is
+                  ; not: reading the ADD's flags would invert the answer.
+                  (for c [(primitive/isub (: 0 u64) (& x y)) 5]
+                    (t/expect! (mut tally) "intervening" mapped 11 [x y c]
+                               (if (!= (& x y) 0) (add (& x y) c) (add c 1))))))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+;;; t = (u32) a + (u32) b; if ((u64) t == 0) ...  -- the ADD ran at 32 bits
+;;; and the tested value is 64 bits wide.
+(defn widened! [(tally (mut t/Tally)) (extension i32) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        p (t/param! (mut graph) start 10 0)
+        q (t/param! (mut graph) start 10 1)
+        sum (t/binary! (mut graph) 26 10 p q)
+        wide (t/unary! (mut graph) extension 11 sum)
+        branch (t/if! (mut graph) start
+                      (t/compare! (mut graph) 16 wide (t/constant! (mut graph) 11 0)))
+        r1 (t/return! (mut graph) (t/if-true! (mut graph) branch) 11
+                      (t/constant! (mut graph) 11 111))
+        r2 (t/return! (mut graph) (t/if-false! (mut graph) branch) 11
+                      (t/constant! (mut graph) 11 222))]
+    (match (t/generated (mut tally) "widened" graph start [r1 r2] a)
+      (None [] 0)
+      (Some [made]
+            (let [(mut mapped) (.mapped made)]
+              (t/check! (mut tally) (= (.fused-tests (.summary made)) 0) "widened"
+                        (.fused-tests (.summary made)) 0)
+              (for x (values 10)
+                (for y (values 10)
+                  (let [sum (t/binary 26 10 x y)
+                        wide (t/convert extension 10 11 sum)]
+                    (t/expect! (mut tally) "widened" mapped 11
+                               [(t/dirty 10 x) (t/dirty 10 y)]
+                               (if (= (t/binary 16 11 wide 0) 1) 111 222)))))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+;;; if (c) t = a & b; else t = a | b;  if (t != 0) ...  -- the test is in
+;;; the join block, which two paths enter: each path gets its own copy.
+(defn joined! [(tally (mut t/Tally)) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        p (t/param! (mut graph) start 11 0)
+        q (t/param! (mut graph) start 11 1)
+        c (t/param! (mut graph) start 11 2)
+        first (t/if! (mut graph) start c)
+        yes (t/if-true! (mut graph) first)
+        no (t/if-false! (mut graph) first)
+        both (t/binary! (mut graph) 47 11 p q)
+        either (t/binary! (mut graph) 46 11 p q)
+        merge (t/merge! (mut graph) (t/end! (mut graph) yes) (t/end! (mut graph) no))
+        phi (t/phi! (mut graph) 11 merge both either)
+        branch (t/if! (mut graph) merge
+                      (t/compare! (mut graph) 15 phi (t/constant! (mut graph) 11 0)))
+        r1 (t/return! (mut graph) (t/if-true! (mut graph) branch) 11
+                      (t/constant! (mut graph) 11 111))
+        r2 (t/return! (mut graph) (t/if-false! (mut graph) branch) 11
+                      (t/constant! (mut graph) 11 222))]
+    (match (t/generated (mut tally) "joined" graph start [r1 r2] a)
+      (None [] 0)
+      (Some [made]
+            (let [(mut mapped) (.mapped made)]
+              (for x (values 11)
+                (for y (values 11)
+                  (for c [(: 0 u64) 1]
+                    (t/expect! (mut tally) "joined" mapped 11 [x y c]
+                               (if (!= (if (!= c 0) (& x y) (| x y)) 0) 111 222)))))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+;;; A countdown: do { acc = acc * 3 + i; i -= step; } while (i CMP 0);
+;;; `guard` puts the loop under `if (i > 0)`, which proves that the first
+;;; decrement cannot overflow.
+(defn countdown! [(tally (mut t/Tally)) (label (slice u8)) (ty i32) (comparison i32)
+                  (step u64) (fused bool) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        n (t/param! (mut graph) start ty 0)
+        header (t/loop-begin! (mut graph) (t/end! (mut graph) start))
+        i (t/loop-phi! (mut graph) header n)
+        acc (t/loop-phi! (mut graph) header (t/constant! (mut graph) 11 0))
+        wide (if (= (t/bits ty) 64)
+                 (if (= ty 11) i (t/unary! (mut graph) 36 11 i))
+                 (t/unary! (mut graph) (if (types/signed? ty) 33 34) 11 i))
+        next-acc (t/binary! (mut graph) 26 11
+                            (t/binary! (mut graph) 28 11 acc (t/constant! (mut graph) 11 3))
+                            wide)
+        next-i (t/binary! (mut graph) 27 ty i (t/constant! (mut graph) ty step))
+        branch (t/if! (mut graph) header
+                      (t/compare! (mut graph) comparison next-i (t/constant! (mut graph) ty 0)))
+        again (t/if-true! (mut graph) branch)
+        exit (t/if-false! (mut graph) branch)
+        back (t/loop-end! (mut graph) again)
+        ret (t/return! (mut graph) exit 11 next-acc)]
+    (t/patch! (mut graph) header 2 back)
+    (t/patch! (mut graph) i 3 next-i)
+    (t/patch! (mut graph) acc 3 next-acc)
+    (match (t/generated (mut tally) label graph start [ret] a)
+      (None [] 0)
+      (Some [made]
+            (let [(mut mapped) (.mapped made)
+                  dropped (.fused-tests (.summary made))]
+              (t/check! (mut tally) (= dropped (if fused 1 0)) label dropped (if fused 1 0))
+              ; One conditional jump per iteration and nothing else.
+              (t/check! (mut tally) (= (.conditional (.summary made)) 1) label
+                        (.conditional (.summary made)) 1)
+              (t/check! (mut tally) (= (.unconditional (.summary made)) 0) label
+                        (.unconditional (.summary made)) 0)
+              (for start-value [(: 1 u64) 2 3 4 9 12 60 240]
+                ; Only starts the loop leaves after a few iterations.
+                (when (= (% start-value step) 0)
+                  (let [(mut model) (: 0 u64)
+                        (mut k) (& start-value (t/mask ty))
+                        (mut running) true]
+                    (while running
+                      (set! model
+                            (add (primitive/imul model 3)
+                                 (if (types/signed? ty)
+                                     (cast u64 (cast i64 (t/signed ty k)))
+                                     k)))
+                      (set! k (t/binary 27 ty k step))
+                      (set! running (= (t/binary comparison ty k 0) 1)))
+                    (t/expect! (mut tally) label mapped 11 [(t/dirty ty start-value)] model))))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+;;; if (i >= lower) { j = i - step; if (j > 0) return 111; return 222; }
+;;; return 333;  -- with lower >= 0 the guard proves the SUB exact, and the
+;;; signed > may read its flags; otherwise it may not, and for i near the
+;;; minimum the wrapped difference is positive although `sub` says less.
+(defn guarded-decrement! [(tally (mut t/Tally)) (label (slice u8)) (ty i32) (guarded bool)
+                          (comparison i32) (fused bool) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        i (t/param! (mut graph) start ty 0)
+        (mut control) start
+        (mut outside) (: 0 i32)]
+    (when guarded
+      (let [guard (t/if! (mut graph) start
+                         (t/compare! (mut graph) 17 i (t/constant! (mut graph) ty 0)))]
+        (set! control (t/if-true! (mut graph) guard))
+        (set! outside (t/return! (mut graph) (t/if-false! (mut graph) guard) 11
+                                 (t/constant! (mut graph) 11 333)))))
+    (let [j (t/binary! (mut graph) 27 ty i (t/constant! (mut graph) ty 5))
+          branch (t/if! (mut graph) control
+                        (t/compare! (mut graph) comparison j (t/constant! (mut graph) ty 0)))
+          r1 (t/return! (mut graph) (t/if-true! (mut graph) branch) 11
+                        (t/constant! (mut graph) 11 111))
+          r2 (t/return! (mut graph) (t/if-false! (mut graph) branch) 11
+                        (t/constant! (mut graph) 11 222))
+          (mut roots) (ArrayList::new [i32] a)]
+      (push! (mut roots) r1)
+      (push! (mut roots) r2)
+      (when guarded (push! (mut roots) outside))
+      (match (t/generated (mut tally) label graph start (slice roots) a)
+        (None [] 0)
+        (Some [made]
+              (let [(mut mapped) (.mapped made)
+                    dropped (.fused-tests (.summary made))
+                    top (<< (: 1 u64) (cast u64 (- (t/bits ty) 1)))]
+                (t/check! (mut tally) (= dropped (if fused 1 0)) label dropped (if fused 1 0))
+                (for x [(: 0 u64) 1 4 5 6 100 top (+ top 1) (+ top 4) (+ top 5) (+ top 6)
+                        (- top 1) 0xFFFFFFFFFFFFFFFF]
+                  (t/expect! (mut tally) label mapped 11 [(t/dirty ty x)]
+                             (if (and guarded (= (t/binary 17 ty x 0) 0))
+                                 333
+                                 (if (= (t/binary comparison ty (t/binary 27 ty x 5) 0) 1)
+                                     111
+                                     222))))
+                (t/unmap! (mut mapped)))))
+      (free! (mut roots)))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 layout flags: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (matrix! (mut tally) a)
+        (intervening! (mut tally) a)
+        (widened! (mut tally) 33 a)
+        (widened! (mut tally) 34 a)
+        (joined! (mut tally) a)
+        ; Countdowns: != reads the SUB's zero flag at 32 and 64 bits; a
+        ; narrow counter is decremented at 32 bits and tested at its own.
+        (for ty [(: 11 i32) 5 10 4]
+          (countdown! (mut tally) "countdown !=" ty 15 1 true a)
+          (countdown! (mut tally) "countdown by three" ty 15 3 true a))
+        (for ty [(: 9 i32) 3 8 2]
+          (countdown! (mut tally) "narrow countdown" ty 15 1 false a))
+        ; `> 0` reads the overflow flag: only a decrement proven exact may
+        ; supply it. Unproven here: the counter is any value.
+        (for ty [(: 11 i32) 10]
+          (countdown! (mut tally) "countdown > 0" ty 19 1 false a)
+          (guarded-decrement! (mut tally) "unguarded decrement >" ty false 19 false a)
+          (guarded-decrement! (mut tally) "unguarded decrement <=" ty false 18 false a)
+          (guarded-decrement! (mut tally) "unguarded decrement <" ty false 16 true a)
+          (guarded-decrement! (mut tally) "guarded decrement >" ty true 19 true a)
+          (guarded-decrement! (mut tally) "guarded decrement <=" ty true 18 true a))
+        (println "x64 layout flags: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))
