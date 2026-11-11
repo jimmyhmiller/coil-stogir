@@ -1,0 +1,96 @@
+(module stogir.tests.x64-compose-leaf)
+(import "stogir.graph" :as g)
+(import "stogir.image" :as image)
+(import "stogir.link" :as link)
+(import "stogir.options" :as options)
+(import "stogir.native.private-types" :as private)
+(import "stogir.x64.compile" :as compile)
+(import "stogir.x64.testing" :as t)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+;;; Library defect 002: link/compose of one image must keep what the x86-64
+;;; emitter recorded about that image's single function
+;;; (`Image.leaf-effects`): an embedder moves a finished leaf image out of
+;;; scratch memory by composing it alone, and stogir.x64.private-leaf refuses
+;;; an image without the record. Composing several images is no longer one
+;;; function and clears it.
+;;;
+;;; Nothing here is executed, so the test runs on any host.
+
+;;; leaf(x, y) = x * factor + y, a call-free function.
+(defn leaf [(symbol (slice u8)) (factor u64) (a (dyn Allocator))] (-> image/Image)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        x (t/param! (mut graph) start 11 0)
+        y (t/param! (mut graph) start 11 1)
+        value (t/binary! (mut graph) 26 11
+                         (t/binary! (mut graph) 28 11 x (t/constant! (mut graph) 11 factor))
+                         y)
+        ret (t/return! (mut graph) start 11 value)
+        compiled (match (compile/image-with-private graph start [ret] symbol
+                                                    (options/Options :level 2) a
+                                                    (private/no-context))
+                   (Err [message] (panic "leaf {} does not compile: {}" symbol message))
+                   (Ok [compiled] compiled))]
+    (g/release! (mut graph))
+    compiled))
+
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut first) (leaf "leaf_one" 3 a)
+        (mut second) (leaf "leaf_two" 5 a)
+        (mut failures) 0]
+    (when (or (= (& (.leaf-effects first) image/LEAF-RECORDED) 0)
+              (= (& (.leaf-effects second) image/LEAF-RECORDED) 0))
+      (println "a compiled leaf carries no leaf record")
+      (set! failures (+ failures 1)))
+    ; One image alone: the record, and the text, survive.
+    (match (link/compose [first] a)
+      (Err [message] (println "compose of one: {}" message) (set! failures (+ failures 1)))
+      (Ok [module]
+          (let [(mut module) module
+                (mut same) (= (len (.text (.image module))) (len (.text first)))]
+            (when same
+              (for [i 0 (len (.text first))]
+                (when (!= (get (.text (.image module)) i) (get (.text first) i))
+                  (set! same false))))
+            (unless same
+              (println "compose of one image changed its text")
+              (set! failures (+ failures 1)))
+            (when (!= (.leaf-effects (.image module)) (.leaf-effects first))
+              (println "compose of one image: leaf record {:x} became {:x}"
+                       (.leaf-effects first) (.leaf-effects (.image module)))
+              (set! failures (+ failures 1)))
+            ; Composing the copy again still keeps it.
+            (match (let [copy (.image module)] (link/compose [copy] a))
+              (Err [message] (println "compose of the copy: {}" message)
+                   (set! failures (+ failures 1)))
+              (Ok [again]
+                  (let [(mut again) again]
+                    (when (!= (.leaf-effects (.image again)) (.leaf-effects first))
+                      (println "composing the copy lost the leaf record")
+                      (set! failures (+ failures 1)))
+                    (link/release! (mut again)))))
+            (link/release! (mut module)))))
+    ; Several images: not one function, no record.
+    (match (link/compose [first second] a)
+      (Err [message] (println "compose of two: {}" message) (set! failures (+ failures 1)))
+      (Ok [module]
+          (let [(mut module) module]
+            (when (!= (.leaf-effects (.image module)) 0)
+              (println "compose of two images kept a leaf record {:x}"
+                       (.leaf-effects (.image module)))
+              (set! failures (+ failures 1)))
+            (link/release! (mut module)))))
+    ; No image: an empty module without a record.
+    (match (link/compose [] a)
+      (Err [message] (println "compose of none: {}" message) (set! failures (+ failures 1)))
+      (Ok [module]
+          (let [(mut module) module]
+            (when (!= (.leaf-effects (.image module)) 0) (set! failures (+ failures 1)))
+            (link/release! (mut module)))))
+    (image/release! (mut first))
+    (image/release! (mut second))
+    (println "compose leaf record checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

@@ -1,0 +1,152 @@
+(module stogir.tests.compile-reads-graph)
+(import "stogir.graph" :as g)
+(import "stogir.graph-seal" :as seal)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.symbols" :as symbols)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.native.compile" :as compile)
+(import "stogir.native.private-types" :as private)
+(import "coil.scratch" :as scratch)
+(import "coil.primitive" :as p)
+(import "coil.alloc" :use [malloc-allocator Allocator allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; The contract of the compile entry points (docs/ARCHITECTURE.md, "A compile
+;;; call only reads its graph"): embedders compile many graphs concurrently,
+;;; and those graphs may share one arena. Each graph here lives in a scratch
+;;; arena of its own; compiling it through every public entry point, at every
+;;; optimization level, with another allocator must leave the arena's
+;;; allocation total and the graph's seal (stogir.graph-seal: every container
+;;; by address, length, capacity and contents) exactly as they were.
+;;;
+;;; The graphs: a counted loop with PHIs; a SWITCH (switch/verify keeps
+;;; scratch lists); a call to a named function whose result feeds arithmetic
+;;; (calls/verify, the terminal chain). The System V ARGVAL case of library
+;;; defect 003 is tests/x64-verify-borrowed-graph.coil.
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn loop-graph [(graph (mut g/Graph)) (roots (mut (array i32 2)))] (-> i32)
+  (let [start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        limit (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        entry (require (b/emit! (mut graph) 114 0 [start]))
+        loop (require (b/loop-begin! (mut graph) entry))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        index (require (b/loop-phi! (mut graph) loop zero))
+        sum (require (b/loop-phi! (mut graph) loop zero))
+        condition (require (b/emit! (mut graph) 16 1 [index limit]))
+        split (require (b/emit! (mut graph) 116 0 [loop condition]))
+        body (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        exit (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        next-index (require (b/emit! (mut graph) 26 11 [index one]))
+        next-sum (require (b/emit! (mut graph) 26 11 [sum index]))
+        back (require (b/emit! (mut graph) 115 0 [body]))
+        ret (require (b/emit! (mut graph) 120 11 [exit sum (: 0 i32)]))]
+    (require (b/patch! (mut graph) loop 2 back))
+    (require (b/patch! (mut graph) index 3 next-index))
+    (require (b/patch! (mut graph) sum 3 next-sum))
+    (set! (mut roots) 0 ret)
+    (set! (mut roots) 1 0)
+    start))
+
+(defn switch-graph [(graph (mut g/Graph)) (roots (mut (array i32 2)))] (-> i32)
+  (let [start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        switch (require (b/switch! (mut graph) start x))
+        seven (require (b/scalar-constant! (mut graph) 11 7 8))
+        first (require (b/case-value! (mut graph) switch seven))
+        default (require (b/case-default! (mut graph) switch))
+        r1 (require (b/emit! (mut graph) 120 11 [first x (: 0 i32)]))
+        zero (require (b/scalar-constant! (mut graph) 11 0 8))
+        r2 (require (b/emit! (mut graph) 120 11 [default zero r1]))]
+    (set! (mut roots) 0 r1)
+    (set! (mut roots) 1 r2)
+    start))
+
+(defn call-graph [(graph (mut g/Graph)) (roots (mut (array i32 2))) (a (dyn Allocator))] (-> i32)
+  (let [start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 11 [start (: 0 i32) 0]))
+        function (require (symbols/function! (mut graph) "_compile_reads_graph_callee" 0))
+        callee (match (calls/create 0 11 [(: 11 u8)] a)
+                 (Err [message] (panic "prototype: {}" message))
+                 (Ok [owned] owned))
+        call (require (calls/emit! (mut graph) callee start function [x] a))
+        one (require (b/scalar-constant! (mut graph) 11 1 8))
+        sum (require (b/emit! (mut graph) 26 11 [call one]))
+        ret (require (b/emit! (mut graph) 120 11 [call sum (: 0 i32)]))]
+    (set! (mut roots) 0 ret)
+    (set! (mut roots) 1 0)
+    start))
+
+(defn settle [(label (slice u8)) (entry (slice u8)) (result (Result image/Image (slice u8)))]
+  (-> i64)
+  (match result
+    (Err [message] (println "{} {}: does not compile: {}" label entry message) 1)
+    (Ok [compiled] (let [(mut compiled) compiled] (image/release! (mut compiled)) 0))))
+
+;;; Compile `graph` through every entry point and report what changed.
+(defn check [(label (slice u8)) (graph g/Graph) (start i32) (roots (slice i32))
+             (arena (ptr scratch/ScratchArena))] (-> i64)
+  (let [a (malloc-allocator)
+        total (.total arena)
+        sealed (seal/seal graph)
+        (mut failures) 0]
+    (match (compile/validate graph)
+      (Err [message] (println "{}: validate: {}" label message) (set! failures (+ failures 1)))
+      (Ok [_] 0))
+    (set! failures (+ failures (settle label "image" (compile/image graph start roots "entry" a))))
+    (set! failures (+ failures (settle label "vector-image"
+                                       (compile/vector-image graph start roots "entry" a))))
+    (for level [(: 1 i32) 2 3]
+      (set! failures (+ failures (settle label "image-with-options"
+                                         (compile/image-with-options
+                                           graph start roots "entry"
+                                           (options/Options :level level) a))))
+      (set! failures (+ failures (settle label "image-with-private"
+                                         (compile/image-with-private
+                                           graph start roots "entry"
+                                           (options/Options :level level) a
+                                           (private/no-context)))))
+      (set! failures (+ failures (settle label "image-with-options-optimized"
+                                         (compile/image-with-options-optimized
+                                           graph start roots "entry"
+                                           (options/Options :level level) a))))
+      (set! failures (+ failures (settle label "image-with-options-proven"
+                                         (compile/image-with-options-proven
+                                           graph start roots "entry"
+                                           (options/Options :level level) a 0)))))
+    (match (compile/object graph start roots "entry" a)
+      (Err [message] (println "{}: object: {}" label message) (set! failures (+ failures 1)))
+      (Ok [bytes] (let [(mut bytes) bytes] (free! (mut bytes)) 0)))
+    (when (!= (.total arena) total)
+      (println "{}: compiling allocated {} bytes from the graph's own allocator"
+               label (- (.total arena) total))
+      (set! failures (+ failures 1)))
+    (when (!= (seal/seal graph) sealed)
+      (println "{}: compiling wrote to the graph" label)
+      (set! failures (+ failures 1)))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for kind [(: 0 i32) 1 2]
+      (let [arena (p/alloc-stack scratch/ScratchArena)
+            _ (scratch/ScratchArena::init-with-capacity arena (malloc-allocator) 65536)
+            a (allocator arena)
+            (mut graph) (g/create a)
+            (mut roots) [(: 0 i32) 0]
+            start (cond (= kind 0) (loop-graph (mut graph) (mut roots))
+                        (= kind 1) (switch-graph (mut graph) (mut roots))
+                        :else (call-graph (mut graph) (mut roots) a))
+            label (cond (= kind 0) "loop" (= kind 1) "switch" :else "call")]
+        (set! failures
+              (+ failures
+                 (if (= (get roots 1) 0)
+                     (check label graph start [(get roots 0)] arena)
+                     (check label graph start [(get roots 0) (get roots 1)] arena))))))
+    (println "compile reads its graph: {} failures" failures)
+    (if (= failures 0) 0 1)))

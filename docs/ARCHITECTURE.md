@@ -41,6 +41,32 @@ must pass compiler delivery gates before being described as installed.
 - Keep a working graph alive until pending graph references have been resolved
   into the owned image. Compilation must preserve the caller's graph when the
   API promises immutable input.
+- **A compile call only reads its graph.** Every compile entry point
+  (`stogir.native.compile`, `stogir.a64.compile`, `stogir.x64.compile`:
+  `validate`, `text`, `image*`, `object*`, the private-module forms) takes
+  its graph by value and may be called concurrently with other compiles of
+  other graphs, including graphs whose storage shares one allocator (an
+  embedder's module arena). A compile therefore
+  - never writes a graph cell, constant, string or interning table of its
+    input, and never appends to or reallocates any of its containers;
+  - never allocates from the graph's allocator: all scratch and all results
+    come from the allocator passed to the call (`validate`, which takes
+    none, uses the process allocator). No code a compile reaches may read
+    the `alc` of a graph container; verification
+    (`verify/native-input*`, `calls/verify*`, `switch/verify*`,
+    `terminal/verify-chains*`, `argval/verify`) takes the allocator as a
+    parameter;
+  - mutates only copies it made itself with that allocator (`g/duplicate`,
+    `compact/compact`; an `instruction-overlay` borrows the input's constants
+    and strings and may only append instructions and write operands);
+  - keeps no state outside the call: the library has no mutable globals and
+    no caches on the graph, and a private-leaf context is read-only once
+    frozen (registration, freezing, confirmation and sealing are the
+    embedder's single-threaded setup).
+  `stogir.graph-seal` fingerprints everything a graph owns;
+  `tests/compile-reads-graph.coil` and `tests/x64-verify-borrowed-graph.coil`
+  hold the entry points to this with graphs that live in an arena, and the
+  x86-64 test support checks the seal around every compile it makes.
 - JIT and AOT consume the same relocatable image. There is no alternate optimizer
   or LLVM/TPDE fallback behind either path.
 - Keep all optimization, matching, allocation and image generation inside the
