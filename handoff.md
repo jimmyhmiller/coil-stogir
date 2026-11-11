@@ -1,8 +1,155 @@
 # Coil Stogir performance handoff
 
-Updated November 8, 2026. **The generation goal is met (5.09×, 5.25×, 5.31× in whole bootstraps); the runtime goal is not (~1.31×).** This document describes where things stand and the plan for meeting them. Earlier session logs are in git history (this file at `171fa16` and before) and in the `coil-stogir` pad.
+Updated November 8, 2026 (night). **The generation goal is met at the default settings (5.09–5.31×); the runtime goal is not: ~1.31× at default, ~1.29× with the best options, which cost generation (~4.3–4.5×).** The section below is self-contained and supersedes the earlier ones for runtime work; older sections are kept for history. Earlier session logs are in git history and in the `coil-stogir` pad.
 
-## November 8 early morning (latest)
+## November 8 night: exact instruction comparison and the 10% push (latest)
+
+This session had one directive: reach runtime ≤ 1.10× LLVM at any generation cost. It did not get there. What it did produce is an **exact, per-instruction comparison of the two hosts**. That turns "where is the gap" from guesswork into measurement, plus three new options and a ranked plan. Start here.
+
+### Status against the goals
+
+Matched hosts emit the Coil compiler at `coil/.worktrees/stogir-branch-fusion` (the workload root, "R" below) with Stogir O3. The LLVM host is `R/build/n8-full8/host-llvm/bin/coil`, at about 42.2–42.5B cycles min; the goal is ≤ ~46.5–48B.
+
+| Configuration | Runtime cycles vs LLVM | Generation vs LLVM |
+|---|---:|---:|
+| Default | ~1.31× | 5.09–5.31× (met) |
+| `BASE` = `COIL_STOGIR_INLINE=small=80,small-scope=any,hoist=1 COIL_STOGIR_LOOP_EVICT=1 COIL_STOGIR_LOOP_RELOAD=1` | ~1.29–1.30× | ~4.3–4.5× (+18%, measured in hp12/hp15) |
+| `BASE` + `COIL_STOGIR_PREDICT=1` | ~1.28–1.29× | +0.5% more |
+| Profile-guided layout (diagnostic bound only, see below) | ~1.25× | — |
+
+Runtime numbers moved by about 1% between rounds; host load was often 10–30. Always compare within one alternating round.
+
+### Where everything is
+
+Paths are under `/Users/jimmyhmiller/Documents/Code/projects`. Nothing is installed or pushed.
+
+| Item | Location |
+|---|---|
+| Stogir library | `coil-stogir/.worktrees/inline-policy`, branch `feature/inline-policy`. This session: `f6d21fa` call holes, `c08cd47` static branch prediction, `015b4a1` loop rotation (on top of `9ff761d` loop evict/reload, `b8766f8` prune default, `261c3cd` hoist frames, shrink-wrap and inline-policy commits). |
+| Coil integration | `coil/.worktrees/stogir-inline-policy`, branch `stogir/inline-policy`, `0ef1e351` vendors the library unchanged into `src/compiler/stogir/stogir/` and adds the env flags. |
+| Option flags (adapter `codegen_stogir.coil`) | `COIL_STOGIR_INLINE=...` (policy: `budget`, `template`, `small`, `small-scope=any\|loop`, `leaf`, `hoist`, `always`, `pair`, `indirect`), `COIL_STOGIR_SHRINK_WRAP`, `COIL_STOGIR_PRUNE_DEFAULT`, `COIL_STOGIR_LOOP_RELOAD`, `COIL_STOGIR_LOOP_EVICT`, `COIL_STOGIR_CALL_HOLES`, `COIL_STOGIR_PREDICT`, `COIL_STOGIR_ROTATE`. All are off by default, and the default object is unchanged (`9d775276…`). |
+| Results and README | Coil `docs/benchmarks/inline-policy/README.md` (all rounds, against the goals) and `results/ab-*.log` |
+| Host builders and A/B | Coil `docs/benchmarks/inline-policy/tools/`: `mkhost-env.sh ROOT CANDIDATE OUTDIR [COIL_STOGIR_*=…]` (prints generation seconds); `ab.sh ROUNDS OUTDIR name=host …` (alternates hosts, prints min/median cycles relative to the first host, checks that all outputs are identical); `genenv.py` (generation) |
+| Exact-count tooling | Coil `docs/benchmarks/inline-policy/tools/bbcount/` (copied from the scratch worktree, see below) |
+| Scratch instrumentation worktree | `coil/.worktrees/stogir-ra-audit`, branch `scratch/stogir-ra-audit` (not for merging). Holds the block-counter emitter, frame-audit dumps, `COIL_STOGIR_DUMP=fn` graph dumps and the profile-layout hack. **Its latest changes are uncommitted**; a copy is in `tools/bbcount/ra-audit-uncommitted.patch`. Its `build/` holds the counted hosts (`bb-base`, `bb-default`, `bb-big3`, `bbp-pred2`, `bbp-pgo`, …) and `build/llbb/` (the counted LLVM host). |
+| Tests added | Library `tests/branch-predict.coil`, `tests/loop-rotate.coil`; `tests/loop-entry-split.coil` gained `hole-check`. These and `block-layout`, `switch-prune-default`, `shrink-wrap`, `module-execution`, `pressure-index`, `a64-allocate`, `private-call-allocation` pass. **The full library suite and FAST have not been run** for this session's commits. |
+
+### How the exact counts work (reuse this)
+
+**Stogir host.** In the scratch worktree, `COIL_STOGIR_BBCOUNT=1` makes `a64/block-count.coil` emit `movz/movk x16 = 0x500000000000 + 8*i; ldr x17,[x16]; add x17,#1; str x17,[x16]` at every block label. It also prints `bbmap FUNCTION BLOCKREF INDEX` to stdout, which `mkhost-env.sh` captures in `emit.out`. `bbcount.dylib` (`cc -dynamiclib bbcount.c -o bbcount.dylib`) maps the counter array at that fixed address and writes `$BBCOUNT_OUT` at exit.
+```
+cd coil/.worktrees/stogir-ra-audit
+env $(env | grep ^COIL_ | sed 's/=.*//;s/^/-u /') PATH="$PWD/build/seed-bin:$PATH" COIL_LIBRARY_STATE=0 python3 scripts/dev.py build candidate
+zsh $INLINE_POLICY/docs/benchmarks/inline-policy/tools/mkhost-env.sh $R build/bin/coil-candidate build/bb-X COIL_STOGIR_BBCOUNT=1 <settings>
+(cd $R; COIL_LIBRARY_STATE=0 COIL_TPDE_SERIAL=1 DYLD_INSERT_LIBRARIES=$A/build/bbcount/bbcount.dylib BBCOUNT_OUT=$A/build/bb-X/counts.bin \
+   $A/build/bb-X/bin/coil emit-obj src/compiler/main.coil --backend stogir -O3 --no-debug -o $A/build/bb-X/self.o)
+objdump -d --no-show-raw-insn build/bb-X/bin/coil > build/bb-X/coil.dis
+python3 tools/bbcount/mixdump.py build/bb-X/coil.dis build/bb-X/counts.bin build/bb-X/mix.json
+```
+Check that `self.o` hashes to the same object as an uninstrumented host. Do not wrap the run in `/usr/bin/time`, which strips `DYLD_INSERT_LIBRARIES` under SIP.
+
+**LLVM host.** Rebuild it from IR with the same counter:
+```
+cd $R; build/bin/coil-candidate emit-ir src/compiler/main.coil -O3 --no-debug > main.ll
+opt -passes='default<O3>' main.ll -o opt.bc && llvm-dis opt.bc -o opt.ll
+python3 tools/bbcount/llvm-instr.py opt.ll inst.ll   # side-effecting inline asm, clobbers x16/x17
+llc -O3 -mcpu=generic -relocation-model=pic -filetype=obj inst.ll -o inst.o
+# link exactly like R/build/n8-full8/llvm-link-command.json
+```
+The uninstrumented rebuild (`llc` on `opt.bc`) reproduces the real LLVM host: 139.8B vs 139.9B instructions, same output object. Caveats:
+- llc duplicates some counter blocks (tail duplication). `mixdump.py` splits those counts across the copies.
+- Machine blocks llc creates itself (switch trees, edge splits) carry no counter. `mixdump.py` does not charge code after an unconditional `b`/`br`/`ret`, so LLVM is slightly undercounted, and both sides lose about 20B against the hardware totals.
+- `udf` words are inline jump tables, never charged.
+
+**Analysis scripts** (`tools/bbcount/`; all take `DIS COUNTS`, see each docstring):
+
+| Script | What it gives |
+|---|---|
+| `mixdump.py` → `cmpmix.py`, `fncmp.py` | Per-function, per-opcode mix |
+| `fold.py`, `foldrole.py` | Folds Stogir-only functions (callees LLVM inlined) into their callers by dynamic call-site counts, for a per-function gap |
+| `annot.py DIS COUNTS FN MIN` | One function's disassembly with exact counts; the best way to compare a hot loop side by side |
+| `taken.py`, `takenfn.py` | Taken-branch lower bounds |
+| `checks.py` | Branches that lead only to a trap |
+| `bigram.py`, `ngram.py`, `ngcmp.py` | Instruction-shape n-grams |
+| `stackcls.py`, `stackcls2.py` | Stack loads and stores by frame-slot kind; needs the scratch build's `FRAME`/`SLOT` dump lines in `emit.out` |
+| `redload.py`, `redstore.py`, `chains.py`, `swchain.py` | Redundancy and compare-chain counts |
+| `mkprofile.py`, `predeval.py`, `scratch-layout.py` | Profile-layout experiment and static-prediction evaluation |
+
+### What the comparison shows
+
+Counted code, `BASE` vs LLVM O3:
+
+| | Stogir | LLVM |
+|---|---:|---:|
+| Instructions | 191.0B | 118.1B |
+| Basic blocks executed | 43.2B | 25.0B |
+| Taken branches (lower bound) | 20.0B | 8.8B |
+| All loads, incl. stack (accesses) | 41.7B | 28.5B |
+| Stack loads: spill reloads / callee-saved restores / locals | 8.3 / 5.2 / 3.4B | ~7B total |
+| Spill stores | 3.2B | — |
+| Conditional branches that only reach a trap | 3.19B | 0.10B |
+| Register moves | 12.5B | 5.0B |
+| Extensions (`sxtw`/`uxtw`/`ubfx`/…) | 4.6B | 0.5B |
+
+What these numbers mean:
+- **Where the gap lives.** In functions both binaries define, Stogir executes 119.5B vs LLVM's 114.8B, and LLVM's figure includes what it inlined. The rest, 71.5B, is Stogir executing callees that LLVM inlined away.
+- **It is spread out.** Folded per function, everything is 1.3–2.9× (top: `primitive-bind-one!`/`primitive-providers-in` +4.8B, `exports-check` +2.6B, `verify.structure` +2.1B, `src-mod-lookup-at` +2.0B, `sccp.optimize-proven-compacting` +2.0B). The top 60 functions hold 55B of the 73B gap. There is no single hot spot.
+- **Higher IPC doesn't save Stogir.** Stogir runs at IPC ~3.8 vs ~3.3, because its extra instructions are cheap ones. Cycles track memory round trips and taken branches far more than instruction count.
+
+**The single biggest item: `coil.compiler.resolve.primitive-providers-in`.** It runs 300M outer iterations with an inner `for k` loop that is almost never entered (306M header tests, 6.6M bodies).
+- Stogir runs about 49 instructions per iteration, LLVM about 28. Stogir's version accounts for **2.4B of the 8.3B spill reloads**.
+- Why: linear scan's "evict the farthest next use" rule evicts the outer values, at the point where the inner-loop values begin, for registers the inner body needs across its calls. It then reloads them in the inner loop's exit block, on every outer iteration (4 reloads at default, 9 with `LOOP_EVICT`).
+- LLVM instead keeps the outer values in callee-saved registers, stores the inner values at their definition, and reloads them only inside the rare body.
+- The same loop also has an AVec walk with redundant bounds checks (`i<0`, `i>=len`, and `idx&31 < 32`), `sub/asr/lsl` instead of `and`, `mov #240; mul; add` instead of `umaddl`, and a duplicated spill store.
+
+Other measured classes:
+- **Checks.** 3.2B trap-check branches plus their compares (~6.4B instructions). LLVM removes them with range facts (IV ≥ 0, dominating `i < len` after load CSE, known bits of masks).
+- **Loops.** LLVM hoists invariant loads (`len`, `.data`) and strength-reduces `i*stride`, mostly after loop rotation. Example: `src-mod-lookup-at`, 283M iterations, 11 instructions and 3 loads in Stogir vs ~6 instructions and 1 load in LLVM. Its hot path has no stores.
+- **Peepholes.** `cmp x,#0; b.eq/b.lt/b.ge` (3B) could be `cbz`/`tbnz`, but compare+branch fuse, so the cycle value is small. Others: `mov #imm; mul` (1.7B), `(x asr k) lsl k` (0.9B), `ldr x; uxtb`, `mov w; sxtw`, i32 loop counters sign-extended every iteration, and chained `ubfx`.
+- **Control flow.** Same-target compare chains a `ccmp` could merge: 1.6B blocks. Linear compare chains on one register (`match` dispatch): 0.76B blocks. LLVM emits 1.55B `csel`-type instructions, Stogir 0.12B.
+- **Inlining.** More inlining today makes things worse. The big3 config removes ~4B of call overhead but adds ~9B of spill, frame and branch code. With `primitive-providers-in` inlined into `primitive-bind-one!`, the pair costs 22.2B vs 15.0B out of line; LLVM's inlined version is 10.2B. **Inlining only pays once the allocator handles large functions.**
+
+### What was tried this session (min cycles vs that round's base)
+
+| Change | Result |
+|---|---|
+| `COIL_STOGIR_CALL_HOLES=1`: a value stays in a caller-saved register and is stored only across a call's clobber (`allocation.call-hole!`) | `primitive-providers-in` 13.7 → 12.5B instructions, but +0.7B (default) / +1.3B (`BASE`) overall. Net loss; leave off. |
+| `COIL_STOGIR_PREDICT=1`: Ball-Larus heuristics combined Dempster-Shafer (loop branch, opcode/pointer, loop header, call, return, backward cold propagation to `UNREACHABLE`) feed `IF` arm percentages to the existing Pettis-Hansen layout | −0.5% to −0.9% cycles, +0.5% generation. Taken branches 20.0B → 17.9B. Keep. |
+| Profile-guided layout (scratch; measured counts fed into layout) | −3.5% to −3.9% cycles; taken 14.1B. **This is the ceiling for layout work.** Not shippable (LLVM is not PGO). |
+| `COIL_STOGIR_ROTATE=1`: `stogir.loop-rotate`, LoopRotate-style header duplication into a guard and the latch, with exact SSA repair, root remapping and no re-rotation | Correct (identical self-compiled object) but neutral (−0.7% min / +0.9% median, +1B instructions), +31% generation from one full re-preparation per rotated loop. Does not fix the `primitive-providers-in` reloads, because the inner values' live ranges still start before the new guard. |
+| Rotate + call holes, with or without evict | +2% to +4%. Worse. |
+
+### Ranked plan to reach 1.10× (≈ 11% of cycles still to find)
+
+1. **A frequency-aware allocator, estimated 3–6%.** This is the largest lever and it gates inlining. Linear scan with next-use eviction (pinned `ir_ra.c`) cannot express LLVM greedy's decisions:
+   - region splitting at block boundaries chosen by edge frequency;
+   - spill weights from use frequency;
+   - spilling the short hot value rather than the long cold one.
+   It needs block frequencies before allocation (the static predictor in `block-layout.coil`, `predict!`, can be reused) plus a split-around-the-conflict-region eviction (spill the evicted value only for the conflict, not until its next use). Validate on `primitive-providers-in` with `annot.py`: the target is no stack traffic on the zero-trip path.
+2. **Loop optimizations on rotated loops, estimated 3–5%.**
+   - Hoist invariant loads out of loops with no aliasing writes on paths to the back edge; the rotated guard makes this safe.
+   - Forward redundant loads across blocks.
+   - Eliminate checks with range facts: IV ranges, dominating conditions, known bits.
+   - Strength-reduce `i*stride` addressing.
+   - Make rotation cheap (one analysis, innermost-first) before relying on it; the current +31% comes from re-running `pipeline/prepare` per loop.
+3. **Inlining, after 1 and 2.** 71.5B of the gap is in callees LLVM inlined. Re-run the big configs (`budget=4096,template=2048,small=256,…`) once spills in large functions are fixed.
+4. **Layout and if-conversion, up to ~3%.** Better static heuristics (the profile bound is −3.5%), `csel` if-conversion, `ccmp` chains, switch lowering.
+5. **Peepholes, ~1%.** `madd`/`umaddl`, mask `and`, `cbz`/`tbnz`, `ldrb`, deduplicated spill stores, IV widening.
+
+Expect generation to land well below 5× (perhaps ~3×) if all of this is done naively; budget each item with `genenv.py`.
+
+### Pitfalls hit this session
+
+- **Root lists contain control nodes.** The adapter's observed roots include `END`/`LOOP_END` nodes. A graph pass that deletes control must remap roots, or scheduling fails with "live node lacks placement".
+- **Dead PHIs are not scheduled** but still reference their merge. When replacing a merge, retarget them, or `register-live` fails with "phi region must be MERGE or LOOP_BEGIN".
+- **Re-rotating a rotated loop peels an iteration.** A pass that rewrites loop headers must not revisit headers it created.
+- **Coil `at` returns a reference.** `(p/cast i64 (at s 0))` reads the byte; use `(data s)` for a slice's pointer.
+- **A Coil helper named `set!` shadows the built-in.**
+- **Shell removals.** `rm -rf $VAR/...` is blocked by the session's safety check; use `"${VAR:?}"` or literal paths.
+- **IR dumps.** In the scratch worktree, `COIL_STOGIR_DUMP=<function name>` prints `stogir.dump/graph` before native compile. Module functions are named with their module prefix (e.g. `t5.count-hits`).
+
+
+## November 8 early morning
 
 Library `feature/branch-fusion` at `4589058`; Coil `stogir/branch-fusion` at `892641a2` vendors it (quick FAST passes at every vendoring; every bootstrap host reproduces the seed object; full library suite at `b7d5d00` shows only the two pre-existing failures plus link-flag tests). Nothing installed or pushed. Full FAST has not been run.
 
@@ -32,7 +179,7 @@ Library `feature/branch-fusion` at `4589058`; Coil `stogir/branch-fusion` at `89
 4. Tail calls for register-pair (Option/Result) results: 3,428 call+epilogue sequences in tail position, ~1.1% of samples.
 5. Spill/reload placement in high-pressure loops (`resolve-use` reloads values it does not use inside its inner loop).
 
-## November 7 evening (latest)
+## November 7 evening
 
 Library `feature/branch-fusion` at `4b4eda0`; Coil `stogir/branch-fusion` at `1c8c3100` vendors it (quick FAST passes; Stogir-only bootstrap reproduces the seed object). Nothing installed or pushed.
 
