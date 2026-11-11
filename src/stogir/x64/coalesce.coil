@@ -1,21 +1,66 @@
-;;; Virtual-register joining before allocation on x86-64: non-overlapping PHI
-;;; inputs and results share one allocation identity, so most PHI edge copies
-;;; disappear (the neutral stogir.phi-coalesce).
+;;; Virtual-register joining before allocation on x86-64.
 ;;;
-;;; The a64 module of this name also joins COPY, BITCAST and TRUNC "views"
-;;; with their sources. That part is written against AArch64 conversion
-;;; knowledge (stogir.a64.convert) and is not ported yet: on x86-64 those
-;;; nodes are hinted to their source's register instead
-;;; (stogir.x64.constraints), which removes the move in the common case.
+;;;   * Non-overlapping PHI inputs and results share one allocation identity,
+;;;     so most PHI edge copies disappear (the neutral stogir.phi-coalesce).
+;;;   * Integer register views share their source's identity (the neutral
+;;;     stogir.view-coalesce): COPY, a same-size BITCAST and every TRUNC.
+;;;
+;;; Why those are views here. A value occupies the low bits of its register
+;;; and every higher bit is unspecified (stogir.x64.value), so the low part
+;;; of a wider value is already a valid narrower one: TRUNC, like COPY and a
+;;; BITCAST between integer types of one size, is emitted as a plain move,
+;;; and as nothing when source and result have one register. A conversion
+;;; to BOOL is not a view: it canonicalizes to 0 or 1. The source of a view
+;;; owns the joined group, so moves and spills of the group have the
+;;; source's width; the emitter of TRUNC likewise moves at the source's
+;;; width when the registers differ, because the source may live on in the
+;;; result's register (stogir.x64.convert).
+;;;
+;;; Extensions are never views: SEXT and ZEXT define bits their source
+;;; leaves unspecified. COPY and BITCAST of floating and vector values
+;;; belong to their families and are not joined here.
 (module stogir.x64.coalesce)
 (import "stogir.graph" :as g)
 (import "stogir.cfg" :as cfg)
+(import "stogir.node" :as n)
+(import "stogir.types" :as types)
+(import "stogir.live-ranges" :as ranges)
 (import "stogir.phi-coalesce" :as phi)
+(import "stogir.view-coalesce" :as views)
 (import "stogir.allocation" :as allocation)
 (import "stogir.locations" :as locations)
 (import "stogir.schedule" :as schedule)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [Allocator])
+(import "coil.result" :use [Some None])
+
+;;; Whether scheduled node `reference` is an integer view of its operand.
+(defn reusable? [(graph g/Graph) (reference i32)] (-> bool)
+  (let [node (get (.instructions graph) (cast i64 reference))
+        opcode (n/opcode node)
+        ty (cast i32 (n/type-id node))]
+    (and (or (= opcode 68) (= opcode 36) (= opcode 35))
+         (> (.op1 node) 0)
+         (types/integer? ty)
+         (or (= opcode 68) (!= ty 1))
+         (match (g/lookup graph (.op1 node))
+           (None [] false)
+           (Some [source]
+                 (let [input (cast i32 (n/type-id source))]
+                   (and (types/integer? input)
+                        (if (= opcode 35)
+                            (< (types/size ty 8) (types/size input 8))
+                            (= (types/size ty 8) (types/size input 8))))))))))
+
+;;; The view kinds of every scheduled node (stogir.view-coalesce).
+(defn kinds [(graph g/Graph) (scheduled schedule/Schedule) (a (dyn Allocator))]
+  (-> (ArrayList u8))
+  (let [(mut result) (ArrayList::new [u8] a)]
+    (extend-zeroed! (mut result) (len (.instructions graph)))
+    (for reference (.nodes scheduled)
+      (when (reusable? graph reference)
+        (set! (mut result) (cast i64 reference) views/REUSABLE)))
+    result))
 
 ;;; The allocation owner of graph value `reference`. `parents` is empty when
 ;;; nothing was joined.
@@ -27,14 +72,19 @@
           (set! result (get parents (cast i64 result))))
         result)))
 
-;;; Join PHI groups in `parts` (unsplit, unassigned, sorted by parent). The
-;;; result maps each graph reference to its owner, or is empty.
+;;; Join PHI groups and views in `parts` (unsplit, unassigned, sorted by
+;;; parent). `originals[r]` is value r's own lifetime before any joining.
+;;; The result maps each graph reference to its owner, or is empty.
 (defn run-prepared! [(parts (mut (ArrayList allocation/Part)))
                      (graph g/Graph) (scheduled schedule/Schedule)
                      (blocks cfg/Blocks) (depths (ArrayList i32))
+                     (originals (slice ranges/Value))
                      (a (dyn Allocator))] (-> (ArrayList i32))
   (let [(mut parents) (ArrayList::new [i32] a)
-        (mut groups) (phi/run! (mut parts) (mut parents) graph scheduled blocks depths a)]
+        (mut groups) (phi/run! (mut parts) (mut parents) graph scheduled blocks depths a)
+        (mut marked) (kinds graph scheduled a)]
+    (views/extend! (mut parents) groups (mut parts) graph scheduled originals (slice marked) a)
+    (free! (mut marked))
     (free! (mut groups))
     parents))
 
