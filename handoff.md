@@ -1,6 +1,33 @@
 # Coil Stogir performance handoff
 
-Updated November 8, 2026 (night). **The generation goal is met at the default settings (5.09–5.31×); the runtime goal is not: ~1.31× at default, ~1.29× with the best options, which cost generation (~4.3–4.5×).** The section below is self-contained and supersedes the earlier ones for runtime work; older sections are kept for history. Earlier session logs are in git history and in the `coil-stogir` pad.
+Updated November 11, 2026: an x86-64 Linux backend was added (first section below). AArch64 status, from November 8, 2026 (night): **The generation goal is met at the default settings (5.09–5.31×); the runtime goal is not: ~1.31× at default, ~1.29× with the best options, which cost generation (~4.3–4.5×).** The section below is self-contained and supersedes the earlier ones for runtime work; older sections are kept for history. Earlier session logs are in git history and in the `coil-stogir` pad.
+
+## November 10-11: x86-64 Linux backend (latest for x86)
+
+Stogir now has an x86-64 backend (`src/stogir/x64`, System V, ELF, Linux JIT), and the Coil compiler builds itself with it on x86-64 Linux. The AArch64 numbers and sections below are unchanged by this work: AArch64 objects are byte-identical before and after.
+
+### Status against the goals on x86-64 Linux (Ryzen AI Max+ 395, LLVM 21)
+
+| Goal | Stogir | LLVM | Ratio | Bar |
+|---|---:|---:|---:|---|
+| Generation wall | 1.097 s | 9.50 s | 8.7x faster | >= 5x, met |
+| Runtime, cycles | 106.74B | 92.35B | 1.156x | <= 1.10x, not met |
+
+Runtime instructions are 1.48x. The profile points at the x64 register allocator: spill stores and reloads around loop back edges, with only 12 general registers allocatable (r10, r11 and rbp are reserved). The list of known tuning gaps and the rounds so far are in Coil `docs/benchmarks/x86/tuning.md`.
+
+### What is verified
+
+- Linux: `-O3` self-build, bootstrap reproduces the seed object, identical objects across thread settings, 2400 of 2400 parallel compiles identical, ThreadSanitizer self-emit clean, correctness sweep against LLVM output (demos 138/138, stdlib 24/24, examples 30/30, library tests 1053/1056).
+- Library: 426 tests pass on the Mac (the three that fail, `x64-host`, `x64-jit-image`, `x64-jit-text`, execute x86-64 code and need that host); on Linux all `tests/x64-*.coil` pass (`x64-call-*` through `tools/x86/call-tests.sh`).
+- Known Linux failures: `jit-hva-incoming`, `jit-hva-outgoing` (Coil compiler SSEUP limitation), `jit-hva-abi` (AArch64 convention), `jit-floating-extension` (FMA needs an image under bare text). No x86-64 SHIMCALL program has run end to end through the compiler.
+
+### Where everything is
+
+- Design and decisions: `docs/X86_PORT.md`, `docs/X86_FAMILIES.md`, `docs/ABI.md`, `docs/ARCHITECTURE.md` ("A compile call only reads its graph"), `tests/X64_STATUS.md`.
+- Linux test runners: `tools/x86/remote-test.sh`, `tools/x86/call-tests.sh`, `tools/x86/family-tests.sh`.
+- Coil integration: branch `stogir/x86` in the coil repository (vendors this library at ded7635; measurement tools and the defect reports 001-004, all fixed, under `docs/benchmarks/x86/`).
+- Parked: branch `x86/tune-wip` (one unbuilt, unmeasured allocator-option change; not for merging as is).
+- Large table-shaped tests are written as data with `src/stogir/test-data.coil` (`table`, `link-entries`).
 
 ## November 8 night: exact instruction comparison and the 10% push (latest)
 
