@@ -227,3 +227,152 @@
             (if (and (= (.kind location) 0) (registers/gpr? (cast i32 (.value location))))
                 (cast i32 (.value location))
                 -1)))))
+
+;;; ---- Floating values (f32, f64) in XMM registers --------------------------
+;;;
+;;; A FLOAT or DOUBLE lives in the low 4 or 8 bytes of an XMM register; the
+;;; rest of the register is unspecified. Register copies are `movaps`, loads
+;;; and stores `movss`/`movsd`. None of these, and no SSE logic instruction
+;;; (`xorps`, `andps`, `pcmpeqd`, ...), writes EFLAGS, so every helper below
+;;; may sit between a flag producer and its consumer.
+;;;
+;;; Constants: +0.0 is `xorps x, x`. Any other value is loaded from the
+;;; function's constant pool with `movss/movsd x, [rip + disp32]`, as
+;;; compilers do: the instruction is emitted with a zero displacement and a
+;;; pending stogir.x64.code/Reference (kind PC32, addend -4, target the
+;;; constant's graph reference), which stogir.x64.pool resolves when the
+;;; function's text is complete. No image relocation is involved.
+
+;;; Whether the scalar floating type is DOUBLE (FLOAT otherwise).
+(defn double? [(ty i32)] (-> bool)
+  (= ty 12))
+
+;;; The scalar load/store move of a floating type.
+(defn float-move [(ty i32)] (-> i32)
+  (if (double? ty) encode/MOVSD encode/MOVSS))
+
+;;; The bits of a numeric floating constant (the low 32 for a FLOAT), None
+;;; for anything else.
+(defn float-constant-bits [(graph g/Graph) (reference i32)] (-> (Option u64))
+  (if (>= reference 0)
+      (None)
+      (match (g/lookup graph reference)
+        (None [] (None))
+        (Some [node]
+              (let [ty (cast i32 (n/type-id node))]
+                (if (and (symbols/numeric? node) (types/floating? ty))
+                    (Some (if (double? ty)
+                              (n/constant-bits node)
+                              (& (n/constant-bits node) 0xFFFFFFFF)))
+                    (None)))))))
+
+;;; Build the floating constant `reference` in XMM register `destination`.
+;;; Flags are untouched.
+(defn float-constant! [(out (mut code/Buffer)) (graph g/Graph) (reference i32)
+                       (destination i32)] (-> (Result i32 (slice u8)))
+  (let [begin (len (.text out))]
+    (if (not (registers/simd? destination))
+        (Err "floating constant requires an XMM register")
+        (match (float-constant-bits graph reference)
+          (None [] (Err "floating constant operand is not a numeric floating constant"))
+          (Some [raw]
+                (match (if (= raw 0)
+                           (encode/sse-rr (mut (.text out)) encode/XORPS destination destination)
+                           (encode/sse-mov-rm (mut (.text out))
+                                              (float-move (type-of graph reference))
+                                              destination (encode/mem-rip 0)))
+                  (Err [message] (Err message))
+                  (Ok [field]
+                      (when (!= raw 0)
+                        (push! (mut (.references out))
+                               (code/Reference :offset field :kind 5 :target reference
+                                               :addend -4)))
+                      (Ok (cast i32 (- (len (.text out)) begin))))))))))
+
+;;; Where the floating value `reference` is at `position`: its XMM register,
+;;; or `scratch` (xmm14 or xmm15) after loading a spilled value or building a
+;;; constant there. Flags are untouched.
+(defn float-register! [(out (mut code/Buffer))
+                       (graph g/Graph)
+                       (parts loc/View)
+                       (base frame/Base)
+                       (reference i32)
+                       (position i64)
+                       (scratch i32)] (-> (Result i32 (slice u8)))
+  (let [ty (type-of graph reference)]
+    (cond (not (types/floating? ty)) (Err "floating operand has no scalar floating type")
+          (< reference 0)
+            (match (float-constant! (mut out) graph reference scratch)
+              (Err [message] (Err message))
+              (Ok [_] (Ok scratch)))
+          :else
+            (match (loc/resolve parts reference position)
+              (Err [message] (Err message))
+              (Ok [location]
+                  (cond (loc/constant? location)
+                          (match (float-constant! (mut out) graph (cast i32 (.value location))
+                                                  scratch)
+                            (Err [message] (Err message))
+                            (Ok [_] (Ok scratch)))
+                        (= (.kind location) 1)
+                          (match (spill location base)
+                            (Err [message] (Err message))
+                            (Ok [m]
+                                (match (encode/sse-mov-rm (mut (.text out)) (float-move ty)
+                                                          scratch m)
+                                  (Err [message] (Err message))
+                                  (Ok [_] (Ok scratch)))))
+                        (and (= (.kind location) 0)
+                             (registers/simd? (cast i32 (.value location)))
+                             (registers/allocatable? ty (cast i32 (.value location))))
+                          (Ok (cast i32 (.value location)))
+                        :else (Err "floating operand requires an XMM register")))))))
+
+;;; The XMM register that holds the floating result of `reference`, defined
+;;; at `position + 1`.
+(defn float-destination [(graph g/Graph) (parts loc/View) (reference i32) (position i64)]
+  (-> (Result i32 (slice u8)))
+  (match (loc/resolve parts reference (+ position 1))
+    (Err [message] (Err message))
+    (Ok [location]
+        (if (and (= (.kind location) 0)
+                 (types/floating? (type-of graph reference))
+                 (registers/simd? (cast i32 (.value location)))
+                 (registers/allocatable? (type-of graph reference) (cast i32 (.value location))))
+            (Ok (cast i32 (.value location)))
+            (Err "floating result requires an XMM register")))))
+
+;;; `movaps destination, source`, nothing when they are one register.
+(defn float-move! [(out (mut code/Buffer)) (destination i32) (source i32)]
+  (-> (Result i32 (slice u8)))
+  (if (= destination source)
+      (Ok 0)
+      (match (encode/sse-mov-rr (mut (.text out)) encode/MOVAPS destination source)
+        (Err [message] (Err message))
+        (Ok [_] (Ok 0)))))
+
+;;; Copy the floating value `reference` (register, spill slot or constant)
+;;; into XMM register `destination`. Flags are untouched.
+(defn float-into! [(out (mut code/Buffer))
+                   (graph g/Graph)
+                   (parts loc/View)
+                   (base frame/Base)
+                   (reference i32)
+                   (position i64)
+                   (destination i32)] (-> (Result i32 (slice u8)))
+  (match (float-register! (mut out) graph parts base reference position destination)
+    (Err [message] (Err message))
+    (Ok [source] (float-move! (mut out) destination source))))
+
+;;; The XMM register holding floating value `reference` at `position`, or -1
+;;; when it is a constant, spilled or otherwise not in a register.
+(defn float-register-of [(graph g/Graph) (parts loc/View) (reference i32) (position i64)]
+  (-> i32)
+  (if (<= reference 0)
+      -1
+      (match (loc/resolve parts reference position)
+        (Err [_] -1)
+        (Ok [location]
+            (if (and (= (.kind location) 0) (registers/simd? (cast i32 (.value location))))
+                (cast i32 (.value location))
+                -1)))))
