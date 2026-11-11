@@ -1,0 +1,284 @@
+(module stogir.tests.x64-core-entry)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.options" :as options)
+(import "stogir.image" :as image)
+(import "stogir.jit.native" :as jit)
+(import "stogir.a64.private-leaf" :as private)
+(import "stogir.x64.compile" :as compile)
+(import "stogir.x64.testing" :as t)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; The public entry points of stogir.x64.compile: validate, text, image and
+;;; the image-with-* family at every optimization level, executed through
+;;; both the raw text mapping and the image loader; and the clear errors for
+;;; level zero, private-leaf modules and every operation family that is not
+;;; implemented yet.
+
+(defn contains? [(text (slice u8)) (part (slice u8))] (-> bool)
+  (let [(mut found) false]
+    (when (<= (len part) (len text))
+      (for [i 0 (+ (- (len text) (len part)) 1)]
+        (let [(mut same) true]
+          (for [j 0 (len part)]
+            (when (!= (get text (+ i j)) (get part j)) (set! same false)))
+          (when same (set! found true)))))
+    found))
+
+;;; f(x, y) = (x + (3 + 4) * y) loop-free, and with a constant branch that
+;;; SCCP removes at level two: if (1 < 2) r = f else r = 99.
+(defn build! [(graph (mut g/Graph)) (roots (mut (ArrayList i32)))] (-> i32)
+  (let [start (t/start! (mut graph))
+        x (t/param! (mut graph) start 11 0)
+        y (t/param! (mut graph) start 11 1)
+        seven (t/binary! (mut graph) 26 11 (t/constant! (mut graph) 11 3)
+                         (t/constant! (mut graph) 11 4))
+        value (t/binary! (mut graph) 26 11 x (t/binary! (mut graph) 28 11 seven y))
+        compare (t/compare! (mut graph) 16 (t/constant! (mut graph) 11 1)
+                            (t/constant! (mut graph) 11 2))
+        branch (t/if! (mut graph) start compare)
+        yes (t/if-true! (mut graph) branch)
+        no (t/if-false! (mut graph) branch)
+        merge (t/merge! (mut graph) (t/end! (mut graph) yes) (t/end! (mut graph) no))
+        phi (t/phi! (mut graph) 11 merge value (t/constant! (mut graph) 11 99))
+        ret (t/return! (mut graph) merge 11 phi)]
+    (push! (mut roots) ret)
+    start))
+
+(defn check-image! [(tally (mut t/Tally)) (label (slice u8))
+                    (result (Result image/Image (slice u8))) (a (dyn Allocator))] (-> i64)
+  (set! (.functions tally) (+ (.functions tally) 1))
+  (match result
+    (Err [message]
+         (println "{}: {}" label message)
+         (t/fail! (mut tally))
+         0)
+    (Ok [compiled]
+        (let [(mut compiled) compiled
+              size (len (.text compiled))]
+          (when (or (!= (.machine compiled) image/X86-64)
+                    (< (.text-alignment compiled) 16)
+                    (> (len (.relocations compiled)) 0))
+            (println "{}: unexpected image machine, alignment or relocations" label)
+            (t/fail! (mut tally)))
+          (match (image/find-symbol compiled "entry_symbol")
+            (None []
+                  (println "{}: entry symbol missing" label)
+                  (t/fail! (mut tally)))
+            (Some [symbol]
+                  (match (jit/map-image compiled a)
+                    (Err [message]
+                         (println "{}: image load failed: {}" label message)
+                         (t/fail! (mut tally)))
+                    (Ok [loaded]
+                        (let [(mut loaded) loaded
+                              f (primitive/cast (fnptr (cc/C) [i64 i64] i64)
+                                                (primitive/cast (ptr u8)
+                                                                (get (.addresses loaded)
+                                                                     (cast i64 symbol))))]
+                          (for [x -4 5]
+                            (for [y -4 5]
+                              (set! (.checks tally) (+ (.checks tally) 1))
+                              (when (!= (call-ptr f x y) (+ x (* 7 y)))
+                                (when (< (.failures tally) 10)
+                                  (println "{}: wrong result for {} {}" label x y))
+                                (t/fail! (mut tally)))))
+                          (jit/release-image! (mut loaded)))))))
+          (image/release! (mut compiled))
+          size))))
+
+;;; `result` must be an error whose text contains every one of `parts`.
+(defn check-error! [(tally (mut t/Tally)) (label (slice u8)) (failed bool)
+                    (message (slice u8)) (parts (slice (slice u8)))] (-> void)
+  (set! (.checks tally) (+ (.checks tally) 1))
+  (if (not failed)
+      (do (println "{}: expected an error, compiled instead" label) (t/fail! (mut tally)))
+      (for part parts
+        (unless (contains? message part)
+          (println "{}: error \"{}\" does not mention \"{}\"" label message part)
+          (t/fail! (mut tally))))))
+
+(defn text-error! [(tally (mut t/Tally)) (label (slice u8)) (graph g/Graph) (start i32)
+                   (roots (slice i32)) (parts (slice (slice u8))) (a (dyn Allocator))] (-> void)
+  (match (compile/text graph start roots a)
+    (Ok [text]
+        (let [(mut bytes) text]
+          (free! (mut bytes))
+          (check-error! (mut tally) label false "" parts)))
+    (Err [message] (check-error! (mut tally) label true message parts))))
+
+(defn image-error! [(tally (mut t/Tally)) (label (slice u8))
+                    (result (Result image/Image (slice u8))) (parts (slice (slice u8)))] (-> void)
+  (match result
+    (Ok [compiled]
+        (let [(mut compiled) compiled]
+          (image/release! (mut compiled))
+          (check-error! (mut tally) label false "" parts)))
+    (Err [message] (check-error! (mut tally) label true message parts))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 core entry: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)
+            (mut graph) (g/create a)
+            (mut roots) (ArrayList::new [i32] a)
+            start (build! (mut graph) (mut roots))
+            pending ["x86-64 backend" "not implemented"]]
+        (match (compile/validate graph)
+          (Err [message] (println "validate: {}" message) (t/fail! (mut tally)))
+          (Ok [_] 0))
+        ; text and image carry the same bytes.
+        (match (compile/text graph start (slice roots) a)
+          (Err [message] (println "text: {}" message) (t/fail! (mut tally)))
+          (Ok [text]
+              (let [(mut bytes) text]
+                (match (compile/image graph start (slice roots) "entry_symbol" a)
+                  (Err [message] (println "image: {}" message) (t/fail! (mut tally)))
+                  (Ok [compiled]
+                      (let [(mut compiled) compiled
+                            (mut same) (= (len (.text compiled)) (len bytes))]
+                        (when same
+                          (for [i 0 (len bytes)]
+                            (when (!= (get bytes i) (get (.text compiled) i)) (set! same false))))
+                        (set! (.checks tally) (+ (.checks tally) 1))
+                        (unless same
+                          (println "text and image text differ")
+                          (t/fail! (mut tally)))
+                        (image/release! (mut compiled)))))
+                (free! (mut bytes)))))
+        (let [plain (check-image! (mut tally) "image"
+                                  (compile/image graph start (slice roots) "entry_symbol" a) a)
+              one (check-image! (mut tally) "level 1"
+                                (compile/image-with-options graph start (slice roots) "entry_symbol"
+                                                            (options/Options :level 1) a) a)
+              two (check-image! (mut tally) "level 2"
+                                (compile/image-with-options graph start (slice roots) "entry_symbol"
+                                                            (options/Options :level 2) a) a)
+              three (check-image! (mut tally) "level 3"
+                                  (compile/image-with-options graph start (slice roots)
+                                                              "entry_symbol"
+                                                              (options/Options :level 3) a) a)]
+          (check-image! (mut tally) "vector-image"
+                        (compile/vector-image graph start (slice roots) "entry_symbol" a) a)
+          (check-image! (mut tally) "image-with-private"
+                        (compile/image-with-private graph start (slice roots) "entry_symbol"
+                                                    (options/Options :level 2) a
+                                                    (private/no-context)) a)
+          (check-image! (mut tally) "image-with-options-optimized"
+                        (compile/image-with-options-optimized graph start (slice roots)
+                                                              "entry_symbol"
+                                                              (options/Options :level 2) a) a)
+          (check-image! (mut tally) "image-with-options-proven"
+                        (compile/image-with-options-proven graph start (slice roots)
+                                                           "entry_symbol"
+                                                           (options/Options :level 3) a 0) a)
+          ; Level one keeps the constant branch; SCCP removes it.
+          (set! (.checks tally) (+ (.checks tally) 1))
+          (unless (and (= plain one) (< two one) (= three two))
+            (println "unexpected code sizes: image {} level1 {} level2 {} level3 {}"
+                     plain one two three)
+            (t/fail! (mut tally))))
+        (image-error! (mut tally) "level 0"
+                      (compile/image-with-options graph start (slice roots) "entry_symbol"
+                                                  (options/Options :level 0) a)
+                      ["O0 pipeline is not implemented"])
+        (image-error! (mut tally) "level 4"
+                      (compile/image-with-options graph start (slice roots) "entry_symbol"
+                                                  (options/Options :level 4) a)
+                      ["optimization level"])
+        (image-error! (mut tally) "private module"
+                      (compile/image-for-private-module graph start (slice roots) "entry_symbol"
+                                                        (options/Options :level 2) a
+                                                        (private/no-context)
+                                                        (private/no-publication) 0)
+                      pending)
+        (image-error! (mut tally) "private module optimized"
+                      (compile/image-for-private-module-optimized
+                        graph start (slice roots) "entry_symbol" (options/Options :level 2) a
+                        (private/no-context) (private/no-publication) 0)
+                      pending)
+        (image-error! (mut tally) "private module proven"
+                      (compile/image-for-private-module-proven
+                        graph start (slice roots) "entry_symbol" (options/Options :level 2) a
+                        (private/no-context) (private/no-publication) 0 0)
+                      pending)
+        (free! (mut roots))
+        (g/release! (mut graph))
+        ; One graph per operation family that is not implemented yet.
+        (let [(mut graph) (g/create a)
+              start (t/start! (mut graph))
+              p (t/param! (mut graph) start 6 0)
+              load (t/require (b/emit! (mut graph) 91 11 [start p]))
+              ret (t/return! (mut graph) load 11 load)]
+          (text-error! (mut tally) "LOAD" graph start [ret] ["x86-64 backend" "memory family"] a)
+          (g/release! (mut graph)))
+        (let [(mut graph) (g/create a)
+              start (t/start! (mut graph))
+              x (t/param! (mut graph) start 12 0)
+              y (t/param! (mut graph) start 12 1)
+              sum (t/require (b/floating! (mut graph) 26 12 x y 0))
+              ret (t/return! (mut graph) start 12 sum)]
+          (text-error! (mut tally) "floating ADD" graph start [ret]
+                       ["x86-64 backend" "floating"] a)
+          (g/release! (mut graph)))
+        (let [(mut graph) (g/create a)
+              start (t/start! (mut graph))
+              x (t/param! (mut graph) start 11 0)
+              switch (t/require (b/switch! (mut graph) start x))
+              first (t/require (b/case-value! (mut graph) switch (t/constant! (mut graph) 11 1)))
+              default (t/require (b/case-default! (mut graph) switch))
+              r1 (t/return! (mut graph) first 11 x)
+              r2 (t/return! (mut graph) default 11 (t/constant! (mut graph) 11 0))]
+          (text-error! (mut tally) "SWITCH" graph start [r1 r2]
+                       ["x86-64 backend" "switch family"] a)
+          (g/release! (mut graph)))
+        (let [(mut graph) (g/create a)
+              start (t/start! (mut graph))
+              x (t/param! (mut graph) start 11 0)
+              variable (t/require (b/variable! (mut graph) 11 start "local" 8))
+              store (t/require (b/emit! (mut graph) 87 0 [start variable x]))
+              load (t/require (b/emit! (mut graph) 85 11 [store variable]))
+              ret (t/return! (mut graph) load 11 load)]
+          (text-error! (mut tally) "VAR" graph start [ret] ["x86-64 backend" "locals family"] a)
+          (g/release! (mut graph)))
+        (let [(mut graph) (g/create a)
+              start (t/start! (mut graph))
+              x (t/param! (mut graph) start 11 0)
+              y (t/param! (mut graph) start 11 1)
+              checked (t/require (b/checked! (mut graph) 41 11 8 x y))
+              ret (t/return! (mut graph) start 11 checked)]
+          (text-error! (mut tally) "ADD_OV" graph start [ret]
+                       ["x86-64 backend" "checked-arithmetic family"] a)
+          (g/release! (mut graph)))
+        (let [(mut graph) (g/create a)
+              start (t/start! (mut graph))
+              x (t/param! (mut graph) start 11 0)
+              absolute (t/unary! (mut graph) 32 11 x)
+              ret (t/return! (mut graph) start 11 absolute)]
+          (text-error! (mut tally) "ABS" graph start [ret] ["x86-64 backend" "ABS"] a)
+          (g/release! (mut graph)))
+        (let [(mut graph) (g/create a)
+              start (t/start! (mut graph))
+              x (t/param! (mut graph) start 11 0)
+              y (t/param! (mut graph) start 11 1)
+              least (t/binary! (mut graph) 58 11 x y)
+              ret (t/return! (mut graph) start 11 least)]
+          (text-error! (mut tally) "MIN" graph start [ret] ["x86-64 backend" "MIN"] a)
+          (g/release! (mut graph)))
+        (let [(mut graph) (g/create a)
+              start (t/start! (mut graph))
+              count (t/param! (mut graph) start 11 0)
+              allocation (t/require (b/stack-allocate! (mut graph) start count 16))
+              address (t/unary! (mut graph) 36 11 allocation)
+              ret (t/return! (mut graph) allocation 11 address)]
+          (text-error! (mut tally) "ALLOCA" graph start [ret]
+                       ["x86-64 backend" "stack family"] a)
+          (g/release! (mut graph)))
+        (println "x64 core entry: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))
