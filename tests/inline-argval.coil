@@ -1,0 +1,453 @@
+;;; Inlining a call that passes an aggregate by value (ARGVAL).
+;;;
+;;; The callee owns a private copy of the aggregate. stogir.call-inline keeps
+;;; that meaning in one of two ways:
+;;;   * the callee provably only reads the aggregate (loads through the
+;;;     parameter and through addresses computed from it, and no store or call
+;;;     anywhere in the callee): the PARAM maps to the ARGVAL's source address
+;;;     and nothing is copied;
+;;;   * otherwise the clone gets a frame object in the caller, filled from the
+;;;     source where the call was, and the PARAM maps to it.
+;;; Either way the ARGVAL node, which is only valid as a call argument, is
+;;; removed once no call passes it. Each case is expanded, validated, compiled
+;;; and executed, and its shape (copy or no copy) is checked.
+(module stogir.tests.inline-argval)
+(import "stogir.graph" :as g)
+(import "stogir.node" :as n)
+(import "stogir.builder" :as b)
+(import "stogir.calls" :as calls)
+(import "stogir.symbols" :as symbols)
+(import "stogir.stack" :as stack)
+(import "stogir.call-inline" :as inlining)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.image" :as image)
+(import "stogir.native.compile" :as compile)
+(import "stogir.jit.native" :as jit)
+(import "coil.alloc" :use [malloc-allocator Allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.primitive" :as primitive)
+(import "coil.cc" :as cc)
+(import "coil.result" :use [Result Ok Err Some None])
+
+(defn need [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+(defn prototype [(result u8) (parameters (slice u8)) (a (dyn Allocator))] (-> calls/Prototype)
+  (match (calls/create 0 result parameters a)
+    (Ok [owned] owned)
+    (Err [message] (panic "prototype: {}" message))))
+
+(defn declare! [(graph (mut g/Graph)) (result u8) (parameters (slice u8)) (a (dyn Allocator))]
+  (-> i32)
+  (let [(mut own) (prototype result parameters a)
+        id (need (calls/function! (mut graph) own a))]
+    (calls/release! (mut own))
+    id))
+
+(defn word! [(graph (mut g/Graph)) (value u64)] (-> i32)
+  (need (b/scalar-constant! (mut graph) 11 value 8)))
+
+(defn at! [(graph (mut g/Graph)) (base i32) (offset u64)] (-> i32)
+  (if (= offset 0)
+      base
+      (need (b/emit! (mut graph) 26 6 [base (need (b/scalar-constant! (mut graph) 5 offset 8))]))))
+
+(defn read! [(graph (mut g/Graph)) (control i32) (address i32)] (-> i32)
+  (need (b/emit! (mut graph) 91 11 [control address])))
+
+(defn write! [(graph (mut g/Graph)) (control i32) (address i32) (value i32)] (-> i32)
+  (need (b/emit! (mut graph) 93 0 [control address value])))
+
+(defn add! [(graph (mut g/Graph)) (left i32) (right i32)] (-> i32)
+  (need (b/emit! (mut graph) 26 11 [left right])))
+
+(defn times! [(graph (mut g/Graph)) (value i32) (factor u64)] (-> i32)
+  (need (b/emit! (mut graph) 28 11 [value (word! (mut graph) factor)])))
+
+;;; A callee graph with its single RETURN as an owned root list (the inliner
+;;; borrows the slice).
+(defstruct Function [(graph g/Graph) (entry i32) (roots (ArrayList i32))])
+
+(defn function-of [(graph g/Graph) (entry i32) (ret i32) (a (dyn Allocator))] (-> Function)
+  (let [(mut roots) (ArrayList::new [i32] a)]
+    (push! (mut roots) ret)
+    (Function :graph graph :entry entry :roots roots)))
+
+(defn callee-of [(name (slice u8)) (function Function)] (-> inlining/Callee)
+  (inlining/Callee :name name :graph (.graph function) :entry (.entry function)
+                   :roots (slice (.roots function)) :observed (slice (.roots function))
+                   :never false :always false :sparse false))
+
+;;; How many cells of `graph` are ARGVALs and how many are frame objects.
+(defstruct Shape [(argument-values i64) (frame-objects i64) (calls i64)])
+
+(defn shape [(graph g/Graph)] (-> Shape)
+  (let [(mut result) (Shape :argument-values 0 :frame-objects 0 :calls 0)
+        (mut r) (: 1 i64)]
+    (while (< r (len (.instructions graph)))
+      (let [node (get (.instructions graph) r)]
+        (when (= (n/opcode node) 70)
+          (set! (.argument-values result) (+ (.argument-values result) 1)))
+        (when (stack/frame-object? node)
+          (set! (.frame-objects result) (+ (.frame-objects result) 1)))
+        (when (or (= (n/opcode node) 79) (= (n/opcode node) 80))
+          (set! (.calls result) (+ (.calls result) 1)))
+        (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4)))))
+    result))
+
+;;; Inline `sites` into `caller`; the expansion must happen and validate.
+(defn expand [(label (slice u8)) (caller g/Graph) (roots (slice i32))
+              (sites (slice inlining/Site)) (a (dyn Allocator))] (-> rewrite/Rewritten)
+  (match (inlining/optimize-sites-if-changed caller roots sites 8 4096 a)
+    (Err [message] (panic "{}: expansion error: {}" label message))
+    (Ok [maybe]
+        (match maybe
+          (None [] (panic "{}: the site was declined" label))
+          (Some [expanded]
+                (match (rewrite/validate (.graph expanded) 8 a)
+                  (Err [message] (panic "{}: the expanded graph is invalid: {}" label message))
+                  (Ok [_] expanded)))))))
+
+;;; Compile and map; the undefined symbol `external` (when the image has
+;;; one) resolves to `address`.
+(defn loaded-with [(label (slice u8)) (graph g/Graph) (entry i32) (roots (slice i32))
+                   (external (slice u8)) (address u64) (a (dyn Allocator))] (-> jit/Loaded)
+  (match (compile/image graph entry roots "inline_argval_case" a)
+    (Err [message] (panic "{}: compile failed: {}" label message))
+    (Ok [code]
+        (let [(mut code) code
+              (mut values) (ArrayList::new [u64] a)
+              (mut found) (ArrayList::new [bool] a)]
+          (for symbol (.symbols code)
+            (let [named (image/same-name? code symbol external)]
+              (push! (mut values) (if named address 0))
+              (push! (mut found) named)))
+          (let [result (jit/map-image-resolved code (slice values) (slice found) a)]
+            (free! (mut values))
+            (free! (mut found))
+            (image/release! (mut code))
+            (match result
+              (Ok [mapped] mapped)
+              (Err [message] (panic "{}: load failed: {}" label message))))))))
+
+(defn loaded [(label (slice u8)) (graph g/Graph) (entry i32) (roots (slice i32))
+              (a (dyn Allocator))] (-> jit/Loaded)
+  (loaded-with label graph entry roots "" 0 a))
+
+(defn check! [(failures (mut i64)) (label (slice u8)) (good bool)] (-> void)
+  (unless good
+    (println "{}: failed" label)
+    (set! failures (+ failures 1))))
+
+;;; sum(p, i) = p[0] + 3 * p[2] + 5 * p[i]: constant-offset and indexed loads.
+(defn reader [(a (dyn Allocator))] (-> Function)
+  (let [(mut graph) (g/create a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        p (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        i (need (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        first (read! (mut graph) start p)
+        third (read! (mut graph) first (at! (mut graph) p 16))
+        scaled (need (b/emit! (mut graph) 49 11 [i (word! (mut graph) 3)]))
+        indexed (read! (mut graph) third (need (b/emit! (mut graph) 26 6 [p scaled])))
+        value (add! (mut graph) first
+                    (add! (mut graph) (times! (mut graph) third 3) (times! (mut graph) indexed 5)))]
+    (declare! (mut graph) 11 [(: 6 u8) 11] a)
+    (function-of graph start (need (b/emit! (mut graph) 120 11 [indexed value (: 0 i32)])) a)))
+
+;;; A read-only callee: no copy, the caller's object is read in place.
+(defn read-only! [(failures (mut i64)) (a (dyn Allocator))] (-> void)
+  (let [sum (reader a)
+        (mut graph) (g/create a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        object (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        index (need (b/emit! (mut graph) 71 11 [start (: 0 i32) 1]))
+        (mut signature) (prototype 11 [(: 6 u8) 11] a)
+        call (need (calls/emit! (mut graph) signature start
+                                (need (symbols/function! (mut graph) "argval_reader" 0))
+                                [(need (b/argument-value! (mut graph) object 32 8)) index] a))
+        ret (need (b/emit! (mut graph) 120 11 [call call (: 0 i32)]))]
+    (declare! (mut graph) 11 [(: 6 u8) 11] a)
+    (let [(mut expanded) (expand "read only" graph [ret]
+                                 [(inlining/Site :reference call
+                                                 :target (callee-of "argval_reader" sum))] a)
+          form (shape (.graph expanded))
+          (mut code) (loaded "read only" (.graph expanded) start (slice (.roots expanded)) a)
+          f (primitive/cast (fnptr (cc/C) [(ptr i64) i64] i64) (.base (.memory code)))
+          (mut cells) [(: 7 i64) 11 13 17]]
+      (check! (mut failures) "read only: no ARGVAL, no copy, no call"
+              (and (= (.argument-values form) 0) (= (.frame-objects form) 0) (= (.calls form) 0)))
+      (for [i 0 4]
+        (check! (mut failures) "read only value"
+                (= (call-ptr f (primitive/cast (ptr i64) (mut cells)) i)
+                   (+ 7 (* 3 13) (* 5 (get cells i))))))
+      (jit/release-image! (mut code))
+      (rewrite/release! (mut expanded)))
+    (calls/release! (mut signature))
+    (g/release! (mut graph))))
+
+;;; bump(p) = { v = p[0]; p[0] = v + 1; return p[0] + p[1] }: the callee writes
+;;; its copy. The caller's object must not change.
+(defn writer! [(failures (mut i64)) (a (dyn Allocator))] (-> void)
+  (let [(mut bump) (g/create a)
+        bs (need (b/emit! (mut bump) 104 0 [(: 0 i32)]))
+        p (need (b/emit! (mut bump) 71 6 [bs (: 0 i32) 0]))
+        v (read! (mut bump) bs p)
+        stored (write! (mut bump) v p (add! (mut bump) v (word! (mut bump) 1)))
+        again (read! (mut bump) stored p)
+        second (read! (mut bump) again (at! (mut bump) p 8))
+        _ (declare! (mut bump) 11 [(: 6 u8)] a)
+        bret (need (b/emit! (mut bump) 120 11 [second (add! (mut bump) again second) (: 0 i32)]))
+        (mut graph) (g/create a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        object (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        (mut signature) (prototype 11 [(: 6 u8)] a)
+        call (need (calls/emit! (mut graph) signature start
+                                (need (symbols/function! (mut graph) "argval_bump" 0))
+                                [(need (b/argument-value! (mut graph) object 16 8))] a))
+        after (read! (mut graph) call object)
+        value (add! (mut graph) (times! (mut graph) call 1000) after)
+        ret (need (b/emit! (mut graph) 120 11 [after value (: 0 i32)]))]
+    (declare! (mut graph) 11 [(: 6 u8)] a)
+    (let [(mut expanded)
+            (expand "writer" graph [ret]
+                    [(inlining/Site :reference call
+                                    :target (callee-of "argval_bump"
+                                                       (function-of bump bs bret a)))]
+                    a)
+          form (shape (.graph expanded))
+          (mut code) (loaded "writer" (.graph expanded) start (slice (.roots expanded)) a)
+          f (primitive/cast (fnptr (cc/C) [(ptr i64)] i64) (.base (.memory code)))
+          (mut cells) [(: 41 i64) 5]]
+      (check! (mut failures) "writer: no ARGVAL, one private copy"
+              (and (= (.argument-values form) 0) (= (.frame-objects form) 1) (= (.calls form) 0)))
+      (check! (mut failures) "writer value"
+              (= (call-ptr f (primitive/cast (ptr i64) (mut cells))) (+ (* (+ 42 5) 1000) 41)))
+      (check! (mut failures) "writer leaves the caller's object"
+              (and (= (get cells 0) 41) (= (get cells 1) 5)))
+      (jit/release-image! (mut code))
+      (rewrite/release! (mut expanded)))
+    (calls/release! (mut signature))
+    (g/release! (mut bump))
+    (g/release! (mut graph))))
+
+;;; The host function a forwarding callee hands its aggregate to: it changes
+;;; what it is given and returns the old sum.
+(defn scribble :cc (cc/C) [(p (ptr i64))] (-> i64)
+  (let [first (primitive/load p)
+        second (primitive/load (primitive/index p 1))]
+    (primitive/store! p 999)
+    (primitive/store! (primitive/index p 1) 999)
+    (+ first second)))
+
+;;; forward(p) = argval_scribble(p): the parameter's address leaves the
+;;; callee, so the clone gets a copy and the host function scribbles on that
+;;; copy.
+(defn forwarder! [(failures (mut i64)) (a (dyn Allocator))] (-> void)
+  (let [(mut forward) (g/create a)
+        fs (need (b/emit! (mut forward) 104 0 [(: 0 i32)]))
+        p (need (b/emit! (mut forward) 71 6 [fs (: 0 i32) 0]))
+        (mut inner) (prototype 11 [(: 6 u8)] a)
+        handed (need (calls/emit! (mut forward) inner fs
+                                  (need (symbols/function! (mut forward) "argval_scribble" 0))
+                                  [p] a))
+        _ (declare! (mut forward) 11 [(: 6 u8)] a)
+        fret (need (b/emit! (mut forward) 120 11 [handed handed (: 0 i32)]))
+        (mut graph) (g/create a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        object (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        (mut signature) (prototype 11 [(: 6 u8)] a)
+        call (need (calls/emit! (mut graph) signature start
+                                (need (symbols/function! (mut graph) "argval_forward" 0))
+                                [(need (b/argument-value! (mut graph) object 16 8))] a))
+        after (read! (mut graph) call object)
+        value (add! (mut graph) (times! (mut graph) call 1000) after)
+        ret (need (b/emit! (mut graph) 120 11 [after value (: 0 i32)]))]
+    (declare! (mut graph) 11 [(: 6 u8)] a)
+    (let [(mut expanded)
+            (expand "forwarder" graph [ret]
+                    [(inlining/Site :reference call
+                                    :target (callee-of "argval_forward"
+                                                       (function-of forward fs fret a)))]
+                    a)
+          form (shape (.graph expanded))
+          (mut code) (loaded-with "forwarder" (.graph expanded) start (slice (.roots expanded))
+                                  "argval_scribble"
+                                  (primitive/cast u64 (primitive/cast (ptr u8)
+                                                                      (fnptr-of scribble)))
+                                  a)
+          f (primitive/cast (fnptr (cc/C) [(ptr i64)] i64) (.base (.memory code)))
+          (mut cells) [(: 30 i64) 4]]
+      (check! (mut failures) "forwarder: no ARGVAL, one private copy, the inner call stays"
+              (and (= (.argument-values form) 0) (= (.frame-objects form) 1) (= (.calls form) 1)))
+      (check! (mut failures) "forwarder value"
+              (= (call-ptr f (primitive/cast (ptr i64) (mut cells))) (+ (* 34 1000) 30)))
+      (check! (mut failures) "forwarder leaves the caller's object"
+              (and (= (get cells 0) 30) (= (get cells 1) 4)))
+      (jit/release-image! (mut code))
+      (rewrite/release! (mut expanded)))
+    (calls/release! (mut inner))
+    (calls/release! (mut signature))
+    (g/release! (mut forward))
+    (g/release! (mut graph))))
+
+;;; two(p, q) = p[1] + 3 * q[0], and with `write` also q[0] = 0 first seen
+;;; through q[1]: two aggregates, both read in place, or both copied because
+;;; the callee stores (a store could reach p's object through q).
+(defn pair! [(failures (mut i64)) (write bool) (a (dyn Allocator))] (-> void)
+  (let [(mut two) (g/create a)
+        ts (need (b/emit! (mut two) 104 0 [(: 0 i32)]))
+        p (need (b/emit! (mut two) 71 6 [ts (: 0 i32) 0]))
+        q (need (b/emit! (mut two) 71 6 [ts (: 0 i32) 1]))
+        first (read! (mut two) ts (at! (mut two) p 8))
+        second (read! (mut two) first q)
+        last (if write (write! (mut two) second q (word! (mut two) 0)) second)
+        _ (declare! (mut two) 11 [(: 6 u8) 6] a)
+        tret (need (b/emit! (mut two) 120 11
+                            [last (add! (mut two) first (times! (mut two) second 3)) (: 0 i32)]))
+        (mut graph) (g/create a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        left (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        right (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 1]))
+        (mut signature) (prototype 11 [(: 6 u8) 6] a)
+        call (need (calls/emit! (mut graph) signature start
+                                (need (symbols/function! (mut graph) "argval_two" 0))
+                                [(need (b/argument-value! (mut graph) left 16 8))
+                                 (need (b/argument-value! (mut graph) right 24 8))] a))
+        after (read! (mut graph) call right)
+        value (add! (mut graph) (times! (mut graph) call 1000) after)
+        ret (need (b/emit! (mut graph) 120 11 [after value (: 0 i32)]))]
+    (declare! (mut graph) 11 [(: 6 u8) 6] a)
+    (let [(mut expanded)
+            (expand "pair" graph [ret]
+                    [(inlining/Site :reference call
+                                    :target (callee-of "argval_two"
+                                                       (function-of two ts tret a)))]
+                    a)
+          form (shape (.graph expanded))
+          (mut code) (loaded "pair" (.graph expanded) start (slice (.roots expanded)) a)
+          f (primitive/cast (fnptr (cc/C) [(ptr i64) (ptr i64)] i64) (.base (.memory code)))
+          (mut one) [(: 2 i64) 9]
+          (mut other) [(: 6 i64) 1 1]]
+      (check! (mut failures) "pair shape"
+              (and (= (.argument-values form) 0) (= (.calls form) 0)
+                   (= (.frame-objects form) (if write 2 0))))
+      (check! (mut failures) "pair value"
+              (= (call-ptr f (primitive/cast (ptr i64) (mut one))
+                           (primitive/cast (ptr i64) (mut other)))
+                 (+ (* (+ 9 18) 1000) 6)))
+      (check! (mut failures) "pair leaves the caller's objects" (= (get other 0) 6))
+      (jit/release-image! (mut code))
+      (rewrite/release! (mut expanded)))
+    (calls/release! (mut signature))
+    (g/release! (mut two))
+    (g/release! (mut graph))))
+
+;;; outer(p) = sum(ARGVAL(p), 1) + p[3]; the caller passes ARGVAL(object) to
+;;; outer. Inlining sum into outer leaves outer read-only, and inlining that
+;;; into the caller leaves no ARGVAL, no copy and no call anywhere.
+(defn nested! [(failures (mut i64)) (a (dyn Allocator))] (-> void)
+  (let [sum (reader a)
+        (mut outer) (g/create a)
+        os (need (b/emit! (mut outer) 104 0 [(: 0 i32)]))
+        p (need (b/emit! (mut outer) 71 6 [os (: 0 i32) 0]))
+        (mut inner-signature) (prototype 11 [(: 6 u8) 11] a)
+        inner (need (calls/emit! (mut outer) inner-signature os
+                                 (need (symbols/function! (mut outer) "argval_reader" 0))
+                                 [(need (b/argument-value! (mut outer) p 32 8))
+                                  (word! (mut outer) 1)] a))
+        fourth (read! (mut outer) inner (at! (mut outer) p 24))
+        _ (declare! (mut outer) 11 [(: 6 u8)] a)
+        oret (need (b/emit! (mut outer) 120 11 [fourth (add! (mut outer) inner fourth) (: 0 i32)]))
+        (mut flat) (expand "nested inner" outer [oret]
+                           [(inlining/Site :reference inner
+                                           :target (callee-of "argval_reader" sum))] a)
+        (mut graph) (g/create a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        object (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        (mut signature) (prototype 11 [(: 6 u8)] a)
+        call (need (calls/emit! (mut graph) signature start
+                                (need (symbols/function! (mut graph) "argval_outer" 0))
+                                [(need (b/argument-value! (mut graph) object 32 8))] a))
+        ret (need (b/emit! (mut graph) 120 11 [call call (: 0 i32)]))]
+    (declare! (mut graph) 11 [(: 6 u8)] a)
+    (let [(mut expanded)
+            (expand "nested outer" graph [ret]
+                    [(inlining/Site
+                       :reference call
+                       :target (inlining/Callee :name "argval_outer" :graph (.graph flat)
+                                                :entry os :roots (slice (.roots flat))
+                                                :observed (slice (.roots flat))
+                                                :never false :always false :sparse false))]
+                    a)
+          form (shape (.graph expanded))
+          (mut code) (loaded "nested" (.graph expanded) start (slice (.roots expanded)) a)
+          f (primitive/cast (fnptr (cc/C) [(ptr i64)] i64) (.base (.memory code)))
+          (mut cells) [(: 7 i64) 11 13 17]]
+      (check! (mut failures) "nested: no ARGVAL, no copy, no call"
+              (and (= (.argument-values form) 0) (= (.frame-objects form) 0) (= (.calls form) 0)))
+      (check! (mut failures) "nested value"
+              (= (call-ptr f (primitive/cast (ptr i64) (mut cells)))
+                 (+ 7 (* 3 13) (* 5 11) 17)))
+      (jit/release-image! (mut code))
+      (rewrite/release! (mut expanded)))
+    (rewrite/release! (mut flat))
+    (calls/release! (mut inner-signature))
+    (calls/release! (mut signature))
+    (g/release! (mut outer))
+    (g/release! (mut graph))))
+
+;;; One ARGVAL passed to two calls: it stays while a call still passes it and
+;;; goes with the last one.
+(defn shared! [(failures (mut i64)) (a (dyn Allocator))] (-> void)
+  (let [sum (reader a)
+        (mut graph) (g/create a)
+        start (need (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        object (need (b/emit! (mut graph) 71 6 [start (: 0 i32) 0]))
+        (mut signature) (prototype 11 [(: 6 u8) 11] a)
+        copy (need (b/argument-value! (mut graph) object 32 8))
+        function (need (symbols/function! (mut graph) "argval_reader" 0))
+        first (need (calls/emit! (mut graph) signature start function
+                                 [copy (word! (mut graph) 0)] a))
+        second (need (calls/emit! (mut graph) signature first function
+                                  [copy (word! (mut graph) 3)] a))
+        ret (need (b/emit! (mut graph) 120 11
+                           [second (add! (mut graph) first second) (: 0 i32)]))]
+    (declare! (mut graph) 11 [(: 6 u8)] a)
+    (let [(mut one) (expand "shared first" graph [ret]
+                            [(inlining/Site :reference first
+                                            :target (callee-of "argval_reader" sum))] a)
+          kept (shape (.graph one))
+          (mut both) (expand "shared both" graph [ret]
+                             [(inlining/Site :reference first
+                                             :target (callee-of "argval_reader" sum))
+                              (inlining/Site :reference second
+                                             :target (callee-of "argval_reader" sum))] a)
+          gone (shape (.graph both))
+          (mut code) (loaded "shared" (.graph both) start (slice (.roots both)) a)
+          f (primitive/cast (fnptr (cc/C) [(ptr i64)] i64) (.base (.memory code)))
+          (mut cells) [(: 7 i64) 11 13 17]]
+      (check! (mut failures) "shared: the ARGVAL stays for the remaining call"
+              (and (= (.argument-values kept) 1) (= (.calls kept) 1)))
+      (check! (mut failures) "shared: the ARGVAL goes with the last call"
+              (and (= (.argument-values gone) 0) (= (.calls gone) 0) (= (.frame-objects gone) 0)))
+      (check! (mut failures) "shared value"
+              (= (call-ptr f (primitive/cast (ptr i64) (mut cells)))
+                 (+ (+ 7 39 35) (+ 7 39 85))))
+      (jit/release-image! (mut code))
+      (rewrite/release! (mut one))
+      (rewrite/release! (mut both)))
+    (calls/release! (mut signature))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (let [a (malloc-allocator)
+        (mut failures) (: 0 i64)]
+    (read-only! (mut failures) a)
+    (writer! (mut failures) a)
+    (forwarder! (mut failures) a)
+    (pair! (mut failures) false a)
+    (pair! (mut failures) true a)
+    (nested! (mut failures) a)
+    (shared! (mut failures) a)
+    (println "inlined ARGVAL arguments, read in place or copied: {} failures" failures)
+    (if (= failures 0) 0 1)))
