@@ -1,0 +1,158 @@
+(module stogir.tests.x64-core-arithmetic)
+(import "stogir.graph" :as g)
+(import "stogir.types" :as types)
+(import "stogir.integer-binary" :as binary)
+(import "stogir.integer-unary" :as unary)
+(import "stogir.x64.compile" :as compile)
+(import "stogir.x64.testing" :as t)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+;;; Every integer binary operation, comparison and unary operation of the
+;;; x86-64 core at every integer width, in each operand form (register and
+;;; register, register and constant, constant and register, one value twice),
+;;; over edge values. Arguments carry garbage above their type's width, which
+;;; generated code must never read, and narrow results must come back
+;;; extended to 32 bits.
+
+(defstruct Tally [(checks i64) (failures i64) (functions i64)])
+
+;;; Garbage for the bits above a narrow argument.
+(defn dirty [(ty i32) (value u64)] (-> u64)
+  (| (& value (t/mask ty)) (& (: 0xA5C3F00DDEADBE00 u64) (^ (t/mask ty) 0xFFFFFFFFFFFFFFFF))))
+
+;;; Edge values of `ty`: zero, small numbers, all ones, the signed extremes,
+;;; the 32-bit immediate boundaries, counts around the width and bit patterns.
+(defn values [(ty i32) (a (dyn Allocator))] (-> (ArrayList u64))
+  (let [(mut result) (ArrayList::new [u64] a)
+        width (cast u64 (t/bits ty))
+        m (t/mask ty)]
+    (if (= ty 1)
+        (do (push! (mut result) 0) (push! (mut result) 1))
+        (for raw [(: 0 u64) 1 2 3 7 100
+                  (- width 1) width (+ width 1)
+                  m (- m 1)
+                  (<< (: 1 u64) (- width 1))
+                  (- (<< (: 1 u64) (- width 1)) 1)
+                  (+ (<< (: 1 u64) (- width 1)) 1)
+                  0x7FFFFFFF 0x80000000 0xFFFFFFFF 0x100000000
+                  0xFFFFFFFF7FFFFFFF 0xFFFFFFFF80000000
+                  0x5555555555555555 0xAAAAAAAAAAAAAAAA 0x0123456789ABCDEF]
+          (let [value (& raw m)
+                (mut seen) false]
+            (for existing result (when (= existing value) (set! seen true)))
+            (unless seen (push! (mut result) value)))))
+    result))
+
+(defn comparison? [(opcode i32)] (-> bool)
+  (and (>= opcode 14) (<= opcode 23)))
+
+(defn division? [(opcode i32)] (-> bool)
+  (or (= opcode 29) (= opcode 30)))
+
+;;; Compile one function and check it on every (a, b) pair. `form`: 0 = both
+;;; operands are parameters, 1 = the right operand is the constant `fixed`,
+;;; 2 = the left operand is the constant `fixed`, 3 = both are parameter 0.
+(defn check-binary! [(tally (mut Tally)) (opcode i32) (ty i32) (form i32) (fixed u64)
+                     (inputs (ArrayList u64)) (allocator (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create allocator)
+        result-type (if (comparison? opcode) (: 1 i32) ty)
+        start (t/start! (mut graph))
+        p0 (t/param! (mut graph) start ty 0)
+        p1 (if (= form 0) (t/param! (mut graph) start ty 1) 0)
+        constant (if (or (= form 1) (= form 2)) (t/constant! (mut graph) ty fixed) 0)
+        left (if (= form 2) constant p0)
+        right (cond (= form 0) p1 (= form 1) constant :else p0)
+        value (t/binary! (mut graph) opcode result-type left right)
+        ret (t/return! (mut graph) start result-type value)]
+    (set! (.functions tally) (+ (.functions tally) 1))
+    (match (compile/text graph start [ret] allocator)
+      (Err [message]
+           (println "compile failed: opcode {} type {} form {} constant {:x}: {}"
+                    opcode ty form fixed message)
+           (set! (.failures tally) (+ (.failures tally) 1)))
+      (Ok [text]
+          (let [(mut bytes) text]
+            (match (t/map (slice bytes))
+              (Err [message]
+                   (println "map failed: {}" message)
+                   (set! (.failures tally) (+ (.failures tally) 1)))
+              (Ok [mapped]
+                  (let [(mut code) mapped]
+                    (for x inputs
+                      (for [j 0 (if (= form 0) (len inputs) 1)]
+                        (let [y (get inputs j)
+                              a (cond (= form 2) fixed :else x)
+                              c (cond (= form 0) y (= form 1) fixed (= form 2) x :else x)]
+                          (when (or (not (division? opcode)) (t/divisible? ty a c))
+                            (let [expected (t/returned result-type (t/binary opcode ty a c))
+                                  actual (& (t/invoke code [(dirty ty x) (dirty ty y)])
+                                            (t/returned-mask result-type))]
+                              (set! (.checks tally) (+ (.checks tally) 1))
+                              (when (!= actual expected)
+                                (when (< (.failures tally) 20)
+                                  (println "opcode {} type {} form {} a {:x} b {:x}: got {:x} expected {:x}"
+                                           opcode ty form a c actual expected))
+                                (set! (.failures tally) (+ (.failures tally) 1))))))))
+                    (t/unmap! (mut code)))))
+            (free! (mut bytes)))))
+    (g/release! (mut graph))))
+
+(defn check-unary! [(tally (mut Tally)) (opcode i32) (ty i32) (inputs (ArrayList u64))
+                    (allocator (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create allocator)
+        start (t/start! (mut graph))
+        p0 (t/param! (mut graph) start ty 0)
+        value (t/unary! (mut graph) opcode ty p0)
+        ret (t/return! (mut graph) start ty value)]
+    (set! (.functions tally) (+ (.functions tally) 1))
+    (match (compile/text graph start [ret] allocator)
+      (Err [message]
+           (println "compile failed: unary {} type {}: {}" opcode ty message)
+           (set! (.failures tally) (+ (.failures tally) 1)))
+      (Ok [text]
+          (let [(mut bytes) text]
+            (match (t/map (slice bytes))
+              (Err [message]
+                   (println "map failed: {}" message)
+                   (set! (.failures tally) (+ (.failures tally) 1)))
+              (Ok [mapped]
+                  (let [(mut code) mapped]
+                    (for x inputs
+                      (let [expected (t/returned ty (t/unary opcode ty x))
+                            actual (& (t/invoke code [(dirty ty x)]) (t/returned-mask ty))]
+                        (set! (.checks tally) (+ (.checks tally) 1))
+                        (when (!= actual expected)
+                          (when (< (.failures tally) 20)
+                            (println "unary {} type {} a {:x}: got {:x} expected {:x}"
+                                     opcode ty x actual expected))
+                          (set! (.failures tally) (+ (.failures tally) 1)))))
+                    (t/unmap! (mut code)))))
+            (free! (mut bytes)))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 core arithmetic: skipped, not an x86-64 host") 0)
+      (let [allocator (malloc-allocator)
+            (mut tally) (Tally :checks 0 :failures 0 :functions 0)]
+        (for ty [(: 1 i32) 2 3 4 5 6 7 8 9 10 11]
+          (let [(mut inputs) (values ty allocator)]
+            (for opcode [(: 14 i32) 15 16 17 18 19 20 21 22 23
+                         26 27 28 29 30 46 47 48 49 50 51 52 53]
+              (when (or (comparison? opcode) (binary/valid-type? opcode ty))
+                (check-binary! (mut tally) opcode ty 0 0 inputs allocator)
+                (unless (division? opcode)
+                  (check-binary! (mut tally) opcode ty 3 0 inputs allocator))
+                (for fixed inputs
+                  (unless (and (division? opcode) (= fixed 0))
+                    (check-binary! (mut tally) opcode ty 1 fixed inputs allocator))
+                  (check-binary! (mut tally) opcode ty 2 fixed inputs allocator))))
+            (for opcode [(: 31 i32) 45]
+              (when (unary/valid-type? opcode ty)
+                (check-unary! (mut tally) opcode ty inputs allocator)))
+            (free! (mut inputs))))
+        (println "x64 core arithmetic: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))
