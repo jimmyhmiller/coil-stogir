@@ -36,6 +36,7 @@ EXCLUDED = {
     "global-alignment": "fixtures are hand-encoded AArch64 words (RET, ADRP/ADD patches) and decode ADRP",
     "jit-hva-varargs": "calls a hand-encoded AArch64 probe function",
     "private-leaf": "registers hand-encoded AArch64 leaves and checks their register masks",
+    "x64-core-entry": "x86-64 backend test; borrows the private-leaf context types",
 }
 
 # A probe function written as AArch64 bytes does not compile for another machine.
@@ -61,6 +62,7 @@ GUARDS = {
     "jit-loop": [("(when (!= (% (+ (* i 4) displacement) 8) 0)", None, "(do)"),
                  ("(when (or (!= backwards 1) (!= unconditional 0))", None, "(do)")],
     "jit-multiply-literal": [("(when (and (not simple)", None, "(do)")],
+    "jit-reciprocal-division": [("(while (< (+ at 3) (len code))", None, "(do)")],
     "jit-return-tail": [("(let [(mut at) (: 0 i64)]", None, "(do)")],
     "jit-select-diamond": [("(when (and (or (<= variant 4) (= variant 8)) (or (!= jumps 0)", None, "(do)"),
                            ("(when (and (>= variant 5) (<= variant 7) (= jumps 0))", None, "(do)")],

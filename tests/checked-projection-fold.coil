@@ -1,0 +1,110 @@
+(module stogir.tests.checked-projection-fold)
+;;; OVERFLOW of a checked producer that folds to one of its operands.
+;;;
+;;; ADD_OV(v, 0) and SUB_OV(v, 0) are v, and cannot overflow. When v is
+;;; itself a checked operation the folded producer's OVERFLOW must become
+;;; false; redirecting it to v would make it read v's flag instead. Checked
+;;; structurally after SCCP and by native execution at optimization level
+;;; two. (Found by tests/x64-integer-stress.coil.)
+(import "stogir.graph" :as g)
+(import "stogir.builder" :as b)
+(import "stogir.node" :as n)
+(import "stogir.options" :as options)
+(import "stogir.sccp" :as sccp)
+(import "stogir.sccp-rewrite" :as rewrite)
+(import "stogir.native.compile" :as compile)
+(import "stogir.image" :as image)
+(import "stogir.jit.native" :as jit)
+(import "coil.alloc" :use [malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+(import "coil.primitive" :as p)
+(import "coil.cc" :as cc)
+
+(defn require [(value (Result i32 (slice u8)))] (-> i32)
+  (match value (Ok [r] r) (Err [message] (panic "{}" message))))
+
+;;; The value RETURN gives back in `graph`: a reference, 0 when none is found.
+(defn returned [(graph g/Graph)] (-> i32)
+  (let [(mut found) (: 0 i32) (mut r) 1]
+    (while (< r (len (.instructions graph)))
+      (let [node (get (.instructions graph) r)]
+        (when (= (n/opcode node) 120) (set! found (.op2 node)))
+        (set! r (+ r (/ (+ (cast i64 (get (.arities graph) r)) 4) 4)))))
+    found))
+
+;;; f(x, y) = OVERFLOW(OP_OV(MUL_OV(x, y), z)) on U8, where z is the PHI of
+;;; `if (true) 0 else y`: SCCP proves it zero, the producer folds to the
+;;; multiplication, and the result is false for every x and y although the
+;;; multiplication often overflows. `opcode` is ADD_OV (41) or SUB_OV (42).
+;;; `direct`: return OVERFLOW(MUL_OV(x, y)) instead, which must stay a real
+;;; projection.
+(defn check [(opcode i32) (direct bool)] (-> i64)
+  (let [a (malloc-allocator)
+        (mut graph) (g/create a)
+        (mut failures) 0
+        start (require (b/emit! (mut graph) 104 0 [(: 0 i32)]))
+        x (require (b/emit! (mut graph) 71 2 [start (: 0 i32) 0]))
+        y (require (b/emit! (mut graph) 71 2 [start (: 0 i32) 1]))
+        zero (require (b/scalar-constant! (mut graph) 2 0 8))
+        yes (require (b/scalar-constant! (mut graph) 1 1 8))
+        product (require (b/emit! (mut graph) 43 2 [x y]))
+        split (require (b/emit! (mut graph) 116 0 [start yes]))
+        taken (require (b/emit! (mut graph) 107 0 [split (: 0 i32)]))
+        other (require (b/emit! (mut graph) 108 0 [split (: 0 i32)]))
+        end1 (require (b/emit! (mut graph) 114 0 [taken]))
+        end2 (require (b/emit! (mut graph) 114 0 [other]))
+        merge (require (b/emit! (mut graph) 112 0 [end1 end2]))
+        nothing (require (b/emit! (mut graph) 67 2 [merge zero y]))
+        same (require (b/emit! (mut graph) opcode 2 [product nothing]))
+        flag (require (b/emit! (mut graph) 44 1 [(if direct product same)]))
+        ret (require (b/emit! (mut graph) 120 1 [merge flag (: 0 i32)]))]
+    (match (sccp/optimize-memory graph 8 [ret] true a)
+      (Err [message] (panic "{}" message))
+      (Ok [result]
+          (let [(mut out) result
+                value (returned (.graph out))]
+            (if direct
+                (when (or (<= value 0)
+                          (!= (n/opcode (get (.instructions (.graph out)) (cast i64 value))) 44))
+                  (println "opcode {}: the direct projection did not survive" opcode)
+                  (set! failures (+ failures 1)))
+                (when (or (>= value 0)
+                          (match (g/lookup (.graph out) value)
+                            (None [] true)
+                            (Some [node] (!= (n/constant-bits node) 0))))
+                  (println "opcode {}: OVERFLOW of a folded producer is not false" opcode)
+                  (set! failures (+ failures 1))))
+            (rewrite/release! (mut out)))))
+    (match (compile/image-with-options graph start [ret] "checked_fold"
+                                       (options/Options :level 2) a)
+      (Err [message]
+           (println "opcode {} direct {}: compile failed: {}" opcode direct message)
+           (set! failures (+ failures 1)))
+      (Ok [compiled]
+          (let [(mut code) compiled]
+            (match (jit/map-image code a)
+              (Err [message] (panic "{}" message))
+              (Ok [value]
+                  (let [(mut loaded) value
+                        f (p/cast (fnptr (cc/C) [u64 u64] u64) (.base (.memory loaded)))]
+                    (for v [(: 0 u64) 1 2 15 16 17 200 255]
+                      (for w [(: 0 u64) 1 2 15 16 17 200 255]
+                        (let [wanted (if (and direct (> (* v w) 255)) (: 1 u64) 0)
+                              actual (& (f v w) 255)]
+                          (when (!= actual wanted)
+                            (when (= failures 0)
+                              (println "opcode {} direct {}: f({}, {}) = {}, expected {}"
+                                       opcode direct v w actual wanted))
+                            (set! failures (+ failures 1))))))
+                    (jit/release-image! (mut loaded)))))
+            (image/release! (mut code)))))
+    (g/release! (mut graph))
+    failures))
+
+(defn main [] (-> i64)
+  (let [(mut failures) 0]
+    (for opcode [(: 41 i32) 42]
+      (for direct [false true]
+        (set! failures (+ failures (check opcode direct)))))
+    (println "checked projection fold checks: {} failures" failures)
+    (if (= failures 0) 0 1)))

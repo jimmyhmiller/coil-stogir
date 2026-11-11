@@ -11,7 +11,10 @@ constants, COPY, ADD SUB MUL DIV MOD, AND OR XOR NOT NEG, shifts and rotates,
 integer comparisons, IF, COND, SEXT ZEXT TRUNC and integer BITCAST, PHI, loops,
 MERGE, RETURN, TRAP and UNREACHABLE, with spilling, preserved registers and a
 fixed frame. Everything else belongs to a family, and each family is a module
-whose entry points currently return a clear `Err`.
+whose entry points return a clear `Err` until it is implemented. Implemented
+so far: `CHECKED`, `BITS`, the reciprocal rule hook, and on the core's side
+address-form arithmetic (`x64/lea.coil`) and view coalescing
+(`x64/coalesce.coil`).
 
 | Family constant | Module(s) | Operations |
 |---|---|---|
@@ -26,6 +29,7 @@ whose entry points currently return a clear `Err`.
 | `SWITCH` | `x64/switch.coil` | SWITCH (the CASE_* projections are block starts); implemented |
 | `BITS` | `x64/bits.coil` | integer ABS, BSWAP, CTPOP, CTLZ, CTTZ, MIN, MAX |
 | (rule hook) | `x64/reciprocal.coil` | DIV/MOD by a constant without `div` |
+| (rule hook) | `x64/lea.coil` | sums and small multiplications as `lea` (RULE-LEA), with fusion of single-use producers |
 
 Each placeholder module's header lists its operations, the interface it must
 implement and the notes specific to it. The floating family is implemented
@@ -207,8 +211,19 @@ the location view, the frame base, the plan, the frame and the frame size.
   table is pushed on `(.tables control)` for the driver to place.
 - **Reciprocal division** (`x64/reciprocal.coil`): not a node family but a
   rule hook. `reciprocal/select` may replace the `RULE-DIVIDE` tile of a DIV
-  or MOD; its rules are then constrained and emitted by
-  `reciprocal/constrain!` and `reciprocal/emit!`.
+  or MOD, by one of its own rules (100..119, constrained and emitted by
+  `reciprocal/constrain!` and `reciprocal/emit!`) or by a core rule (an
+  unsigned division by a power of two is `RULE-SHIFT-RI`).
+- **Address forms** (`x64/lea.coil`): the same kind of hook for the other
+  arithmetic tiles. `lea/strength` rewrites a tile when it is selected,
+  `lea/fuse!` runs in the matcher's fusion pass and marks absorbed producers
+  `omitted`, the matcher rebuilds a RULE-LEA node's machine inputs from its
+  tile, and the driver calls `lea/emit!`. The core's constraints already fit
+  the tile (`left` and `right` are its register operands, 0 when absent).
+- **Checked arithmetic** (`x64/checked.coil`) is the one place where a flag
+  value crosses a node boundary: from a producer to the OVERFLOW scheduled
+  directly behind it. Do not emit flag-writing code for a node of another
+  family between the two; allocator transfers are moves.
 - **Calls** (`x64/call.coil`, implemented): placement is
   `x64/abi-arguments.coil` (shared with `x64/incoming.coil`) and
   `x64/call-abi.coil` (one call's layout). The matcher asks

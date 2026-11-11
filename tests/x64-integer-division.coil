@@ -1,0 +1,135 @@
+(module stogir.tests.x64-integer-division)
+(import "stogir.graph" :as g)
+(import "stogir.types" :as types)
+(import "stogir.x64.testing" :as t)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.result" :use [Some None])
+
+;;; DIV and MOD by a constant on x86-64 (stogir.x64.reciprocal): powers of
+;;; two of either sign, and every other divisor by multiply-high, signed and
+;;; unsigned at 8, 16, 32 and 64 bits, compiled end to end and compared with
+;;; the reference evaluator of stogir.x64.testing.
+;;;
+;;; 8-bit types: every divisor with every dividend. 16-bit types: every
+;;; dividend with a set of divisors. Wider types: boundary dividends, the
+;;; neighbours of multiples of the divisor and random dividends.
+;;;
+;;; Forms: 0 = x OP d; 1 = (x OP d) XOR x, which keeps the dividend live so
+;;; the result cannot take its register; 2 = (x / d) + (x % d).
+;;; Pairs that the IR leaves undefined (the minimum divided by -1) are not
+;;; called: they trap on x86-64 (docs/X86_PORT.md).
+
+(defn push-unique! [(list (mut (ArrayList u64))) (value u64)] (-> void)
+  (let [(mut seen) false]
+    (for existing list (when (= existing value) (set! seen true)))
+    (unless seen (push! (mut list) value))))
+
+;;; Divisors of `ty`: never zero.
+(defn divisors [(ty i32) (a (dyn Allocator))] (-> (ArrayList u64))
+  (let [(mut result) (ArrayList::new [u64] a)
+        width (cast i64 (t/bits ty))
+        m (t/mask ty)
+        (mut state) (+ (: 0x0DD5EED5 u64) (cast u64 ty))]
+    (if (= width 8)
+        (for [d 1 256] (push! (mut result) (cast u64 d)))
+        (do
+          (for [k 0 width]
+            (push-unique! (mut result) (<< (: 1 u64) (cast u64 k)))
+            (push-unique! (mut result) (& (- 0 (<< (: 1 u64) (cast u64 k))) m)))
+          (for [d 1 131]
+            (push-unique! (mut result) (cast u64 d))
+            (push-unique! (mut result) (& (- 0 (cast u64 d)) m)))
+          (for special [(: 641 u64) 1000 10000 100000 1000000007 0x55555555 0xAAAAAAAB
+                        0x7FFFFFFF 0x80000001 0xFFFFFFFD 0xFFFFFFFF 0x100000001
+                        0x5555555555555555 0xAAAAAAAAAAAAAAAB 0x7FFFFFFFFFFFFFFF
+                        0x8000000000000001 0xFFFFFFFFFFFFFFFD 0xFFFFFFFFFFFFFFFE
+                        0xCCCCCCCCCCCCCCCD 0x6666666666666667 6700417 274177
+                        0x7FFFFFFE 0x7FFFFFFFFFFFFFFE 0x80000003 0x8000000000000003
+                        0x7FFF 0x8001 0xFFFD 0x5555 0xAAAB 0x7FFD 0x8003]
+            (when (!= (& special m) 0) (push-unique! (mut result) (& special m))))
+          (for [i 0 40]
+            (let [raw (t/random! (mut state))
+                  ; Random divisors of every magnitude.
+                  value (& (>> raw (& (>> raw 58) (cast u64 (- width 1)))) m)]
+              (when (!= value 0) (push-unique! (mut result) value))))))
+    result))
+
+(defn dividends [(ty i32) (d u64) (a (dyn Allocator))] (-> (ArrayList u64))
+  (let [(mut result) (ArrayList::new [u64] a)
+        width (cast i64 (t/bits ty))
+        m (t/mask ty)
+        half (>> m 1)
+        (mut state) (+ (* d 0x9E3779B97F4A7C15) (cast u64 ty))]
+    (if (<= width 16)
+        (for [x 0 (<< (: 1 i64) width)] (push! (mut result) (cast u64 x)))
+        (do
+          (for raw [(: 0 u64) 1 2 m (- m 1) half (+ half 1) (+ half 2) (- half 1)
+                    0x7FFFFFFF 0x80000000 0xFFFFFFFF 0x100000000
+                    (- d 1) d (+ d 1) (- 0 d) (- 1 d) (- m d) (* d 2) (- (* d 2) 1)]
+            (push! (mut result) (& raw m)))
+          ; Neighbours of the largest multiples below the unsigned and signed
+          ; maxima, and of their negations.
+          (for [k 0 7]
+            (push! (mut result) (& (+ (- (* (/ m d) d) 3) (cast u64 k)) m))
+            (push! (mut result) (& (+ (- (* (/ half d) d) 3) (cast u64 k)) m))
+            (push! (mut result) (& (- 0 (+ (- (* (/ half d) d) 3) (cast u64 k))) m)))
+          (for [i 0 90]
+            (let [raw (t/random! (mut state))]
+              (push! (mut result)
+                     (& (if (= (% i 3) 0) (>> raw (& (>> raw 58) 63)) raw) m))))))
+    result))
+
+(defn check! [(tally (mut t/Tally)) (opcode i32) (ty i32) (form i32) (d u64)
+              (allocator (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create allocator)
+        start (t/start! (mut graph))
+        x (t/param! (mut graph) start ty 0)
+        divisor (t/constant! (mut graph) ty d)
+        value (t/binary! (mut graph) opcode ty x divisor)
+        result (cond (= form 1) (t/binary! (mut graph) 48 ty value x)
+                     (= form 2)
+                       (t/binary! (mut graph) 26 ty value
+                                  (t/binary! (mut graph) (if (= opcode 29) 30 29) ty x divisor))
+                     :else value)
+        ret (t/return! (mut graph) start ty result)
+        (mut inputs) (dividends ty d allocator)]
+    (match (t/compiled (mut tally) "constant division" graph start [ret] allocator)
+      (None [] (println "  opcode {} type {} form {} divisor {:x}" opcode ty form d))
+      (Some [mapped]
+            (let [(mut code) mapped]
+              (for a inputs
+                (when (t/divisible? ty a d)
+                  (let [plain (t/binary opcode ty a d)
+                        expected (cond (= form 1) (^ plain a)
+                                       (= form 2)
+                                         (& (+ plain (t/binary (if (= opcode 29) 30 29) ty a d))
+                                            (t/mask ty))
+                                       :else plain)
+                        before (.failures tally)]
+                    (t/expect! (mut tally) "constant division" code ty [(t/dirty ty a)] expected)
+                    (when (and (!= (.failures tally) before) (< before 25))
+                      (println "  opcode {} type {} form {} divisor {:x} dividend {:x}"
+                               opcode ty form d a)))))
+              (t/unmap! (mut code)))))
+    (free! (mut inputs))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 integer division: skipped, not an x86-64 host") 0)
+      (let [allocator (malloc-allocator)
+            (mut tally) (t/tally)]
+        (for ty [(: 2 i32) 3 4 5 7 8 9 10 11]
+          (let [(mut list) (divisors ty allocator)]
+            (for d list
+              (for opcode [(: 29 i32) 30]
+                (check! (mut tally) opcode ty 0 d allocator)
+                ; The 16-bit types run every dividend once per divisor.
+                (when (!= (t/bits ty) 16)
+                  (check! (mut tally) opcode ty 1 d allocator)
+                  (when (= opcode 29) (check! (mut tally) opcode ty 2 d allocator)))))
+            (free! (mut list))))
+        (println "x64 integer division: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))

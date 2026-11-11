@@ -13,6 +13,8 @@
 ;;;     other user needs the Boolean.
 ;;;   * A floating comparison (stogir.x64.fcompare, selected by the floating
 ;;;     family) fuses the same way, into IF, integer COND and floating COND.
+;;;   * Sums and small multiplications take the address form, and an address
+;;;     form absorbs single-use producers that fit it (stogir.x64.lea).
 ;;;   * Every other node goes to its operation family
 ;;;     (stogir.x64.families/select!).
 ;;;   * Afterwards the memory family selects address modes, folds single-use
@@ -36,6 +38,7 @@
 (import "stogir.x64.call" :as call)
 (import "stogir.a64.result-projections" :as result-projections)
 (import "stogir.x64.families" :as families)
+(import "stogir.x64.lea" :as lea)
 (import "stogir.x64.plan" :as plan)
 (import "stogir.x64.reciprocal" :as reciprocal)
 (import "stogir.x64.select" :as select)
@@ -168,7 +171,7 @@
                         (set! (mut (.tiles state)) index
                               (if (= (.rule tile) select/RULE-DIVIDE)
                                   (reciprocal/select graph reference tile)
-                                  tile))))
+                                  (lea/strength tile)))))
                 :else 0))))
     ; Fusion, in schedule order.
     (when (and fuse (= error ""))
@@ -192,6 +195,10 @@
       (match (families/fuse! (mut state) graph scheduled a)
         (Err [message] (set! error message))
         (Ok [_] 0)))
+    ; Address forms, over what is still a register sum after that.
+    (when (= error "")
+      (for reference (.nodes scheduled)
+        (lea/fuse! (mut state) graph reference fuse)))
     (if (!= error "")
         (do (release-matching! (mut state)) (Err error))
         (let [(mut operands) (machine/build graph scheduled (.omitted state)
@@ -214,6 +221,18 @@
                   (push! (mut (.inputs operands)) (.op3 node))
                   (set! (mut (.ranges operands)) index
                         (machine/Range :offset offset :count (+ (.count range) 2)))))))
+          ; An address-form node reads the terms of its tile: its own
+          ; operands, or those of the producers it absorbed.
+          (for reference (.nodes scheduled)
+            (let [index (cast i64 reference)
+                  tile (get (.tiles state) index)]
+              (when (and (= (.rule tile) select/RULE-LEA) (not (get (.omitted state) index)))
+                (let [offset (len (.inputs operands))]
+                  (when (> (.left tile) 0) (push! (mut (.inputs operands)) (.left tile)))
+                  (when (> (.right tile) 0) (push! (mut (.inputs operands)) (.right tile)))
+                  (set! (mut (.ranges operands)) index
+                        (machine/Range :offset offset
+                                       :count (- (len (.inputs operands)) offset)))))))
           ; A CALL whose integer result pieces are only loaded back from a
           ; private frame object defines those loads itself, in rax and rdx
           ; (the target-neutral proof of stogir.a64.result-projections).

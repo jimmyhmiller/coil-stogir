@@ -1,0 +1,191 @@
+(module stogir.tests.x64-integer-flags)
+(import "stogir.graph" :as g)
+(import "stogir.x64.testing" :as t)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.result" :use [Some None])
+
+;;; Compares with zero behind the integer family's address and shift forms.
+;;;
+;;; The driver drops a `test r, r` when the instruction before it produced r
+;;; and left flags that answer the condition (stogir.x64.code/Flags). The
+;;; address forms of stogir.x64.lea replace instructions that did leave such
+;;; flags by ones that may not:
+;;;   * `lea` (a sum whose result is not in an operand's register, a scaled
+;;;     sum, x * 3 | 5 | 9) and `mov` write no flags at all, so the compare
+;;;     must stay, whatever the instruction before the `lea` left;
+;;;   * SUB(x, c) may be emitted as `add rd, -c`: zero and sign are those of
+;;;     the result, but the overflow flag is the addition's, so `x - c > 0`
+;;;     and `<= 0` may read the flags only for a subtraction proven not to
+;;;     overflow, and never for a wrapping one;
+;;;   * x * 2^k is a shift, whose zero and sign flags are the result's.
+;;; Every function computes v with one of those forms from an AND (whose
+;;; flags are the most permissive record) and returns (v CMP 0) ? 1 : 2,
+;;; through COND or through a branch, over inputs where v, the AND and a
+;;; non-wrapping reading of the arithmetic disagree about the answer. The
+;;; loops count down with `i = i - step; while (i CMP 0)`, in place and with
+;;; the old counter still live.
+
+(defn inputs [(ty i32)] (-> (array u64 16))
+  (let [top (<< (: 1 u64) (cast u64 (- (t/bits ty) 1)))]
+    [(: 0 u64) 1 2 3 5 7 8 100 (- top 1) top (+ top 1) (+ top 5) (- 0 (: 1 u64)) (- 0 (: 5 u64))
+     (- 0 (: 100 u64)) 0x5555555555555555]))
+
+;;; v for `shape`, as a graph node and as a value. w = x & y.
+;;;   0  w + z * 8 + 16     1  w * 2      2  w * 8      3  w + 5, w live after
+;;;   4  w - 5              5  w + (-5)   6  w - 5, w live after
+;;;   7  w * 5              8  w + z      9  w - (the type's minimum)
+(defn form! [(graph (mut g/Graph)) (shape i32) (ty i32) (w i32) (z i32)] (-> i32)
+  (let [k (cond (= shape 0) (: 16 u64) (= shape 1) 2 (= shape 2) 8 (= shape 5) (- 0 (: 5 u64))
+                (= shape 9) (<< (: 1 u64) (cast u64 (- (t/bits ty) 1)))
+                :else 5)
+        c (t/constant! (mut graph) ty k)]
+    (cond (= shape 0)
+            (t/binary! (mut graph) 26 ty
+                       (t/binary! (mut graph) 26 ty w
+                                  (t/binary! (mut graph) 49 ty z (t/constant! (mut graph) ty 3)))
+                       c)
+          (or (= shape 1) (= shape 2) (= shape 7)) (t/binary! (mut graph) 28 ty w c)
+          (or (= shape 3) (= shape 5)) (t/binary! (mut graph) 26 ty w c)
+          (= shape 8) (t/binary! (mut graph) 26 ty w z)
+          :else (t/binary! (mut graph) 27 ty w c))))
+
+(defn form [(shape i32) (ty i32) (w u64) (z u64)] (-> u64)
+  (let [m (t/mask ty)
+        top (<< (: 1 u64) (cast u64 (- (t/bits ty) 1)))]
+    (& (cond (= shape 0) (+ w (<< z 3) 16)
+             (= shape 1) (* w 2)
+             (= shape 2) (* w 8)
+             (= shape 3) (+ w 5)
+             (= shape 7) (* w 5)
+             (= shape 8) (+ w z)
+             (= shape 9) (- w top)
+             :else (- w 5))
+       m)))
+
+;;; f(x, y, z) = (v CMP 0) ? 1 : 2, plus w when `keep` holds it live.
+(defn check! [(tally (mut t/Tally)) (shape i32) (ty i32) (compare i32) (branch bool)
+              (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        x (t/param! (mut graph) start ty 0)
+        y (t/param! (mut graph) start ty 1)
+        z (t/param! (mut graph) start ty 2)
+        w (t/binary! (mut graph) 47 ty x y)
+        v (form! (mut graph) shape ty w z)
+        keep (or (= shape 3) (= shape 6))
+        test (t/compare! (mut graph) compare v (t/constant! (mut graph) ty 0))
+        one (t/constant! (mut graph) ty 1)
+        two (t/constant! (mut graph) ty 2)
+        (mut roots) (ArrayList::new [i32] a)]
+    (if branch
+        (let [split (t/if! (mut graph) start test)
+              yes (t/if-true! (mut graph) split)
+              no (t/if-false! (mut graph) split)]
+          (push! (mut roots)
+                 (t/return! (mut graph) yes ty (if keep (t/binary! (mut graph) 26 ty one w) one)))
+          (push! (mut roots)
+                 (t/return! (mut graph) no ty (if keep (t/binary! (mut graph) 26 ty two w) two))))
+        (let [chosen (t/select! (mut graph) ty test one two)]
+          (push! (mut roots)
+                 (t/return! (mut graph) start ty
+                            (if keep (t/binary! (mut graph) 26 ty chosen w) chosen)))))
+    (match (t/compiled (mut tally) "zero compare" graph start (slice roots) a)
+      (None [] (println "  shape {} type {} compare {} branch {}" shape ty compare branch))
+      (Some [mapped]
+            (let [(mut code) mapped
+                  m (t/mask ty)]
+              (for vx (inputs ty)
+                (for vy [(: 0xFFFFFFFFFFFFFFFF u64) 0 0x5555555555555555]
+                  (for vz [(: 0 u64) 1 0x1FFFFFFFFFFFFFFE]
+                    (let [wv (& vx vy m)
+                          value (form shape ty wv (& vz m))
+                          answer (if (= (t/binary compare ty value 0) 1) (: 1 u64) 2)
+                          expected (& (if keep (+ answer wv) answer) m)
+                          before (.failures tally)]
+                      (t/expect! (mut tally) "zero compare" code ty
+                                 [(t/dirty ty vx) (t/dirty ty vy) (t/dirty ty vz)] expected)
+                      (when (and (!= (.failures tally) before) (< before 25))
+                        (println "  shape {} type {} compare {} branch {} w {:x} z {:x}"
+                                 shape ty compare branch wv (& vz m)))))))
+              (t/unmap! (mut code)))))
+    (free! (mut roots))
+    (g/release! (mut graph))))
+
+;;; total = 0; i = n & 63; while (i CMP 0) { total += i [old i when `after`];
+;;; i = i - step }; return total. The decrement is SUB(i, step) or
+;;; ADD(i, -step).
+(defn reference-loop [(ty i32) (compare i32) (step u64) (after bool) (n u64)] (-> u64)
+  (let [m (t/mask ty)
+        (mut i) (& n 63)
+        (mut total) (: 0 u64)
+        (mut rounds) 0]
+    (while (and (= (t/binary compare ty i 0) 1) (< rounds 200))
+      (let [next (& (- i step) m)]
+        (set! total (& (+ total (if after i next)) m))
+        (set! i next)
+        (set! rounds (+ rounds 1))))
+    total))
+
+(defn loop-check! [(tally (mut t/Tally)) (ty i32) (compare i32) (step u64) (adding bool)
+                   (after bool) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        n (t/param! (mut graph) start ty 0)
+        first (t/binary! (mut graph) 47 ty n (t/constant! (mut graph) ty 63))
+        zero (t/constant! (mut graph) ty 0)
+        entry (t/end! (mut graph) start)
+        header (t/loop-begin! (mut graph) entry)
+        i (t/loop-phi! (mut graph) header first)
+        total (t/loop-phi! (mut graph) header zero)
+        test (t/compare! (mut graph) compare i zero)
+        split (t/if! (mut graph) header test)
+        body (t/if-true! (mut graph) split)
+        exit (t/if-false! (mut graph) split)
+        next (if adding
+                 (t/binary! (mut graph) 26 ty i (t/constant! (mut graph) ty (- 0 step)))
+                 (t/binary! (mut graph) 27 ty i (t/constant! (mut graph) ty step)))
+        sum (t/binary! (mut graph) 26 ty total (if after i next))
+        back (t/loop-end! (mut graph) body)
+        ret (t/return! (mut graph) exit ty total)]
+    (t/patch! (mut graph) header 2 back)
+    (t/patch! (mut graph) i 3 next)
+    (t/patch! (mut graph) total 3 sum)
+    (match (t/compiled (mut tally) "countdown" graph start [ret] a)
+      (None [] (println "  type {} compare {} step {} adding {} after {}" ty compare step adding
+                        after))
+      (Some [mapped]
+            (let [(mut code) mapped]
+              (for [n 0 70]
+                (let [before (.failures tally)]
+                  (t/expect! (mut tally) "countdown" code ty [(t/dirty ty (cast u64 n))]
+                             (reference-loop ty compare step after (cast u64 n)))
+                  (when (and (!= (.failures tally) before) (< before 25))
+                    (println "  type {} compare {} step {} adding {} after {} n {}"
+                             ty compare step adding after n))))
+              (t/unmap! (mut code)))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 integer flags: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (for ty [(: 11 i32) 10 5 4 9 8]
+          (for [shape 0 10]
+            (for compare [(: 14 i32) 15 16 17 18 19 22 23]
+              (for branch [false true]
+                (check! (mut tally) (cast i32 shape) ty compare branch a)))))
+        ; `i > 0` and `i != 0` end; a step of 1 reaches zero exactly, a
+        ; step of 3 passes it (the reference stops a runaway `!=` loop, and
+        ; those counts are not called).
+        (for ty [(: 11 i32) 10 5 4]
+          (for compare [(: 19 i32) 15 23]
+            (for step [(: 1 u64) 3]
+              (when (or (= step 1) (= compare 19))
+                (for adding [false true]
+                  (for after [false true]
+                    (loop-check! (mut tally) ty compare step adding after a)))))))
+        (println "x64 integer flags: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))

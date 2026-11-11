@@ -1,0 +1,293 @@
+(module stogir.tests.x64-integer-emit)
+(import "stogir.graph" :as g)
+(import "stogir.fill" :as fill)
+(import "stogir.types" :as types)
+(import "stogir.allocation" :as allocation)
+(import "stogir.interval" :as interval)
+(import "stogir.locations" :as locations)
+(import "stogir.frame" :as frame)
+(import "stogir.integer-binary" :as binary)
+(import "stogir.integer-unary" :as unary)
+(import "stogir.matched-uses" :as machine)
+(import "stogir.x64.bits" :as bits)
+(import "stogir.x64.checked" :as checked)
+(import "stogir.x64.code" :as code)
+(import "stogir.x64.context" :as context)
+(import "stogir.x64.emit" :as emit)
+(import "stogir.x64.encode" :as encode)
+(import "stogir.x64.frame-address" :as address)
+(import "stogir.x64.lea" :as lea)
+(import "stogir.x64.plan" :as plan)
+(import "stogir.x64.reciprocal" :as reciprocal)
+(import "stogir.x64.select" :as select)
+(import "stogir.x64.testing" :as t)
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.result" :use [Result Ok Err])
+
+;;; The emitters of the x86-64 integer family under hand-made register
+;;; assignments: every way the result register can coincide with an operand
+;;; register, and every placement around the fixed registers rax and rdx
+;;; that the constraints allow. The allocator reaches some of these only by
+;;; chance; here each is constructed.
+;;;
+;;; A function under test is: copy the two arguments into the chosen operand
+;;; registers, the emitter's code, copy the chosen result register to rax.
+;;;
+;;; Kinds
+;;;   UNARY      ABS BSWAP CTPOP CTLZ CTTZ of p0
+;;;   EXTREMUM   MIN, MAX of p0 and p1
+;;;   VALUE      ADD_OV SUB_OV MUL_OV of p0 and p1, followed by its OVERFLOW
+;;;              in a fourth register; the value is returned
+;;;   FLAG       the same, the OVERFLOW is returned
+;;;   DIVISION   DIV, MOD of p0 by a constant (stogir.x64.reciprocal); the
+;;;              selected rule must not be the hardware division
+;;;   ADDRESS    a RULE-LEA tile over p0 and p1 (stogir.x64.lea)
+
+(const UNARY 0)
+(const EXTREMUM 1)
+(const VALUE 2)
+(const FLAG 3)
+(const DIVISION 4)
+(const ADDRESS 5)
+
+(const RAX 0)
+(const RDX 2)
+(const RSI 6)
+(const RDI 7)
+
+;;; Caller-saved registers that are not the two argument registers.
+(defn pool [] (-> (array i32 5))
+  [(: 0 i32) 1 2 8 9])
+
+;;; A part that holds graph value `reference` in `register` everywhere.
+(defn hold! [(parts (mut (ArrayList allocation/Part))) (reference i32) (register i32)
+             (a (dyn Allocator))] (-> void)
+  (let [(mut part) (allocation/create reference a)]
+    (interval/add! (mut (.ranges part)) 0 100)
+    (set! (.register part) register)
+    (push! (mut parts) part)))
+
+(defn release-parts! [(parts (mut (ArrayList allocation/Part)))] (-> void)
+  (for [i 0 (len parts)] (allocation/release! (elem (mut parts) i)))
+  (free! (mut parts)))
+
+;;; A plan with every table zeroed for `cells` graph cells.
+(defn blank-plan [(cells i64) (a (dyn Allocator))] (-> plan/Plan)
+  (let [(mut result)
+          (plan/Plan
+            :operands (machine/Plan
+                        :ranges (ArrayList::new [machine/Range] a)
+                        :inputs (ArrayList::new [i32] a)
+                        :definitions (ArrayList::new [bool] a)
+                        :omitted (ArrayList::new [bool] a)
+                        :rematerialized (ArrayList::new [bool] a)
+                        :output-ranges (ArrayList::new [machine/Range] a)
+                        :outputs (ArrayList::new [i32] a)
+                        :definers (ArrayList::new [i32] a))
+            :tiles (ArrayList::new [select/Tile] a)
+            :families (ArrayList::new [i32] a)
+            :comparisons (ArrayList::new [i32] a)
+            :addresses (ArrayList::new [i32] a)
+            :offsets (ArrayList::new [i64] a)
+            :indices (ArrayList::new [i32] a)
+            :index-shifts (ArrayList::new [i32] a))]
+    (extend-zeroed! (mut (.omitted (.operands result))) cells)
+    (fill/append! (mut (.tiles result)) cells (select/none))
+    (extend-zeroed! (mut (.comparisons result)) cells)
+    result))
+
+(defn accept! [(tally (mut t/Tally)) (result (Result i64 (slice u8)))] (-> void)
+  (match result
+    (Err [message]
+         (println "encode failed: {}" message)
+         (t/fail! (mut tally)))
+    (Ok [_] 0)))
+
+;;; The address-form shapes: base, index, shift and displacement of shape k.
+(defstruct Shape [(base bool) (index bool) (shift i32) (offset i64)])
+
+(defn shape [(k i32)] (-> Shape)
+  (case k
+    0 (Shape :base true :index true :shift 0 :offset 0)
+    1 (Shape :base true :index true :shift 2 :offset 0)
+    2 (Shape :base true :index true :shift 3 :offset -129)
+    3 (Shape :base true :index false :shift 0 :offset 0x7FFFFFFF)
+    4 (Shape :base true :index false :shift 0 :offset -1)
+    5 (Shape :base true :index false :shift 0 :offset 0)
+    6 (Shape :base false :index true :shift 1 :offset 4096)
+    7 (Shape :base true :index true :shift 0 :offset 100)
+    (Shape :base false :index true :shift 3 :offset 0)))
+
+(const SHAPES 9)
+
+;;; What the function of this case returns for arguments x and y.
+(defn expected [(kind i32) (opcode i32) (ty i32) (fixed u64) (x u64) (y u64)] (-> u64)
+  (cond (= kind UNARY) (t/unary opcode ty x)
+        (= kind EXTREMUM) (t/binary opcode ty x y)
+        (= kind VALUE) (t/binary opcode ty x y)
+        (= kind FLAG) (t/overflow opcode ty x y)
+        (= kind DIVISION) (t/binary opcode ty x fixed)
+        :else
+          (let [form (shape opcode)]
+            (& (+ (if (.base form) x 0)
+                  (if (.index form) (<< y (cast u64 (.shift form))) 0)
+                  (cast u64 (.offset form)))
+               (t/mask ty)))))
+
+;;; Whether the register assignment respects what the family's constraints
+;;; guarantee its emitter. p0 is in `ra`, p1 in `rb`, the result in `rd` and
+;;; the OVERFLOW in `ro`.
+(defn usable? [(kind i32) (opcode i32) (ty i32) (long-magic bool) (ra i32) (rb i32) (rd i32)
+               (ro i32)] (-> bool)
+  (cond (= ra rb) false
+        ; The value is read after the OVERFLOW was written.
+        (and (= kind VALUE) (= ro rd)) false
+        ; Unsigned 64-bit MUL_OV has rax and rdx reserved while it reads.
+        (and (or (= kind VALUE) (= kind FLAG)) (checked/wide-unsigned-product? opcode ty))
+          (and (!= ra RAX) (!= ra RDX) (!= rb RAX) (!= rb RDX))
+        ; So has the 64-bit multiply-high.
+        (and (= kind DIVISION) long-magic) (and (!= ra RAX) (!= ra RDX))
+        :else true))
+
+(defn case! [(tally (mut t/Tally)) (kind i32) (opcode i32) (ty i32) (fixed u64)
+             (ra i32) (rb i32) (rd i32) (ro i32) (inputs (slice u64)) (a (dyn Allocator))]
+  (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        p0 (t/param! (mut graph) start ty 0)
+        p1 (t/param! (mut graph) start ty 1)
+        constant (t/constant! (mut graph) ty fixed)
+        node (cond (= kind UNARY) (t/unary! (mut graph) opcode ty p0)
+                   (= kind DIVISION) (t/binary! (mut graph) opcode ty p0 constant)
+                   (= kind ADDRESS) (t/binary! (mut graph) 26 ty p0 p1)
+                   :else (t/binary! (mut graph) opcode ty p0 p1))
+        flag (if (or (= kind VALUE) (= kind FLAG)) (t/unary! (mut graph) 44 1 node) 0)
+        result-type (if (= kind FLAG) (: 1 i32) ty)
+        (mut parts) (ArrayList::new [allocation/Part] a)
+        (mut matched) (blank-plan (len (.instructions graph)) a)
+        (mut layout) (frame/create a)
+        (mut out) (code/create a)
+        (mut error) ""
+        (mut long-magic) false
+        (mut tile) (select/none)]
+    (when (= kind DIVISION)
+      (match (select/arithmetic graph node)
+        (Err [message] (set! error message))
+        (Ok [hardware]
+            (set! tile (reciprocal/select graph node hardware))
+            (when (= (.rule tile) select/RULE-DIVIDE)
+              (set! error "hardware division selected for a constant divisor"))
+            (set! long-magic (and (= (.rule tile) reciprocal/RULE-MAGIC)
+                                  (= (.bits tile) 64))))))
+    (when (= kind ADDRESS)
+      (let [form (shape opcode)]
+        (set! tile (lea/tile (if (>= (t/bits ty) 64) 64 32)
+                             (if (.base form) p0 0)
+                             (if (.index form) p1 0)
+                             (.shift form)
+                             (if (>= (t/bits ty) 64)
+                                 (.offset form)
+                                 (encode/sign-extend 32 (.offset form)))))))
+    (when (and (= error "") (usable? kind opcode ty long-magic ra rb rd ro))
+      (hold! (mut parts) p0 ra a)
+      (hold! (mut parts) p1 rb a)
+      (hold! (mut parts) node rd a)
+      (when (> flag 0) (hold! (mut parts) flag ro a))
+      ; Parameter 0 arrives in rdi and parameter 1 in rsi; neither is in the pool.
+      (accept! (mut tally) (encode/mov-rr (mut (.text out)) 64 ra RDI))
+      (accept! (mut tally) (encode/mov-rr (mut (.text out)) 64 rb RSI))
+      (let [cx (context/Context
+                 :graph graph
+                 :parts (locations/linear-view parts)
+                 :base (address/stack-base)
+                 :matched matched
+                 :frame layout
+                 :frame-size 0
+                 :outgoing-size 0
+                 :alignment 16)]
+        (match (cond (or (= kind UNARY) (= kind EXTREMUM)) (bits/emit! (mut out) cx node 10)
+                     (or (= kind VALUE) (= kind FLAG))
+                       (match (checked/emit! (mut out) cx node 10)
+                         (Err [message] (Err [i32 (slice u8)] message))
+                         (Ok [_] (checked/emit! (mut out) cx flag 12)))
+                     (= kind ADDRESS) (lea/emit! (mut out) cx node 10 tile)
+                     (select/reciprocal-rule? (.rule tile))
+                       (reciprocal/emit! (mut out) cx node 10 tile)
+                     :else (emit/tile! (mut out) cx node 10 tile))
+          (Err [message] (set! error message))
+          (Ok [_] 0)))
+      (accept! (mut tally) (encode/mov-rr (mut (.text out)) 64 RAX (if (= kind FLAG) ro rd)))
+      (accept! (mut tally) (encode/ret (mut (.text out))))
+      (set! (.functions tally) (+ (.functions tally) 1))
+      (when (= error "")
+        (match (t/map (slice (.text out)))
+          (Err [message] (set! error message))
+          (Ok [mapped]
+              (let [(mut mapped) mapped
+                    pairs (not (or (= kind UNARY) (= kind DIVISION)))]
+                (for x inputs
+                  (for [j 0 (if pairs (len inputs) 1)]
+                    (let [y (get inputs j)]
+                      (when (or (!= kind DIVISION) (t/divisible? ty x fixed))
+                        (let [wanted (& (expected kind opcode ty fixed x y) (t/mask result-type))
+                              actual (& (t/invoke mapped [(t/dirty ty x) (t/dirty ty y)])
+                                        (t/mask result-type))]
+                          (set! (.checks tally) (+ (.checks tally) 1))
+                          (when (!= actual wanted)
+                            (when (< (.failures tally) 20)
+                              (println "kind {} opcode {} type {} constant {:x} ra {} rb {} rd {} ro {} x {:x} y {:x}: got {:x} expected {:x}"
+                                       kind opcode ty fixed ra rb rd ro x y actual wanted))
+                            (t/fail! (mut tally))))))))
+                (t/unmap! (mut mapped)))))))
+    (when (!= error "")
+      (when (< (.failures tally) 20)
+        (println "kind {} opcode {} type {} constant {:x} ra {} rb {} rd {} ro {}: {}"
+                 kind opcode ty fixed ra rb rd ro error))
+      (t/fail! (mut tally)))
+    (code/release! (mut out))
+    (frame/release! (mut layout))
+    (plan/release! (mut matched))
+    (release-parts! (mut parts))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 integer emit: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)
+            registers (pool)]
+        (for ty [(: 11 i32) 5 10 4 9 3 8 2]
+          (let [width (cast u64 (t/bits ty))
+                (mut inputs) (ArrayList::new [u64] a)]
+            (for value [(: 0 u64) 1 2 5 100 0xFFFFFFFFFFFFFFFF 0xFFFFFFFFFFFFFFF9
+                        (<< (: 1 u64) (- width 1)) (- (<< (: 1 u64) (- width 1)) 1)
+                        (<< (: 1 u64) (/ width 2)) 0x123456789ABCDEF1]
+              (push! (mut inputs) value))
+            (for ra registers
+              (for rb registers
+                (for rd registers
+                  (for opcode [(: 32 i32) 54 55 56 57]
+                    (when (unary/valid-type? opcode ty)
+                      (case! (mut tally) UNARY opcode ty 0 ra rb rd 0 (slice inputs) a)))
+                  (for opcode [(: 58 i32) 59]
+                    (case! (mut tally) EXTREMUM opcode ty 0 ra rb rd 0 (slice inputs) a))
+                  (for opcode [(: 41 i32) 42 43]
+                    (for ro registers
+                      (case! (mut tally) VALUE opcode ty 0 ra rb rd ro (slice inputs) a)
+                      (case! (mut tally) FLAG opcode ty 0 ra rb rd ro (slice inputs) a)))
+                  (for opcode [(: 29 i32) 30]
+                    (for fixed [(: 2 u64) 16 3 7 10 641 0xFFFFFFFFFFFFFFFD 0xFFFFFFFFFFFFFFF0
+                                0x8000000000000000 0x5555555555555555 0xAAAAAAAAAAAAAAAB]
+                      ; Minus one and the divisors that are it, zero or one
+                      ; in this type keep the hardware division.
+                      (let [d (& fixed (t/mask ty))]
+                        (when (and (> d 1) (or (not (types/signed? ty)) (!= d (t/mask ty))))
+                          (case! (mut tally) DIVISION opcode ty d ra rb rd 0 (slice inputs)
+                                 a)))))
+                  (for [k 0 SHAPES]
+                    (case! (mut tally) ADDRESS (cast i32 k) ty 0 ra rb rd 0 (slice inputs) a)))))
+            (free! (mut inputs))))
+        (println "x64 integer emit: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))

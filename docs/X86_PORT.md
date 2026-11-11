@@ -47,6 +47,9 @@ decision changes.
   publication functions of `stogir.a64.private-leaf` as they are (its neutral
   state types are exported for that); only leaf creation, the clobber mask,
   reference validation and binding are x86-64's own.
+  Also moved: `stogir.reciprocal` (the magic-number recipes of `stogir.a64.reciprocal`)
+  and `stogir.view-coalesce` (the view joining of `stogir.a64.coalesce`;
+  each backend's `coalesce` module says which nodes are views).
   The x64 driver, transfers and fixups are written again rather than shared,
   each with its reason at the top of the file (4-byte words, AArch64
   scratches, shrink-wrapping interleaved with the node walk).
@@ -94,6 +97,20 @@ instruction forms at the type's own width; DIV and MOD extend narrow operands
 to 32 bits. A returned value is extended to 32 bits by its signedness. The
 rule is written out at the top of `x64/value.coil`.
 
+Views. Because the bits above a value's width are unspecified, the low part
+of a wider value is already a valid narrower one: COPY, a same-size integer
+BITCAST and every integer TRUNC are *views*. They are emitted as nothing when
+source and result share a register and otherwise as a move of the whole
+64-bit register, and `x64/coalesce.coil` joins each with its source into one
+allocation group (`stogir.view-coalesce`). The whole-register move matters:
+a narrow view can share its group with a 64-bit value that lives on, so a
+move at the view's own width would cut that value. A conversion to BOOL is
+not a view (it canonicalizes to 0 or 1), nor is SEXT or ZEXT.
+
+Results the IR leaves undefined, chosen to match the AArch64 backend:
+CTLZ(0) is the type's width; CTTZ(0) is 64 for 64-bit types and 32 for
+every narrower type; ABS of the minimum is the minimum.
+
 ## What x86 needs that a64 did not
 
 1. **Two-address instructions.** `op rd, rm` overwrites rd. The emitter
@@ -122,13 +139,16 @@ rule is written out at the top of `x64/value.coil`.
      Division by zero and the overflowing signed quotient trap (#DE); the IR
      leaves both undefined and nothing is checked. AArch64 hardware returns
      0 / the dividend / the minimum for those inputs, and
-     `tests/jit-division.coil` checks exactly those results, so that test
-     dies with SIGFPE on x86-64 until its zero-divisor and overflow inputs
-     are made target-specific or this backend emits a guarded sequence.
-     Trapping matches what an LLVM-built program does on x86-64. Division by a constant is
-     a plain `div` until `x64/reciprocal.coil` selects better rules.
-   - One-operand `mul`/`imul` and `cmpxchg` (families not written yet) follow
-     the same pattern: clobber, copy in, prefer.
+     `tests/jit-division.coil` checks exactly those results on AArch64 and,
+     on x86-64, that the same inputs die with SIGFPE. Trapping matches what
+     an LLVM-built program does on x86-64. Division by a constant other
+     than 0, 1 and -1 uses no `div` (`x64/reciprocal.coil`: shifts for
+     powers of two of either sign, multiply-high otherwise); 0, 1 and -1
+     keep the hardware division and with it the trap.
+   - One-operand `mul`/`imul` follow the same pattern (clobber, copy in,
+     prefer): unsigned 64-bit MUL_OV (`x64/checked.coil`) and the 64-bit
+     multiply-high of division by a constant (`x64/reciprocal.coil`).
+     `cmpxchg` (atomics, not written yet) will too.
 3. **Flags.** Almost every ALU instruction writes flags. Rules:
    - Moves emitted between any two nodes (spills, reloads, phi moves, constant
      and address materialization) never write flags: `mov`, `lea`, `movaps`,
@@ -140,7 +160,11 @@ rule is written out at the top of `x64/value.coil`.
      edge moves, `movzx` after `setcc`) is emitted.
    - No flag value is live between two nodes, so a node's own code may use
      any instruction once its last flag consumer is emitted (DIV zeroes edx
-     with `xor`).
+     with `xor`). The one exception: a checked producer (ADD_OV, SUB_OV,
+     MUL_OV) leaves its overflow condition in the flags for the OVERFLOW
+     projection, which the schedule keeps directly behind it
+     (`stogir.checked-schedule`); only allocator transfers, which are moves,
+     can sit between the two (`x64/checked.coil`, as NZCV on AArch64).
    - Floating compares use `ucomiss/ucomisd` and handle the parity flag for
      unordered operands exactly as upstream's `ir_emit_cmp_fp` does
      (`x64/fcompare.coil`): each predicate picks the operand order whose one
@@ -153,7 +177,6 @@ rule is written out at the top of `x64/value.coil`.
      zeroing, `movaps`/`movss`/`movsd`, `andps`, `pcmpeqd` and the like may
      sit between a flag producer and its consumer, unlike `xor r, r`.
 4. **Variable-length code.** Offsets are bytes. A branch is emitted as rel32
-<<<<<<< HEAD
    with a fixup record (`x64/fixups.coil`: the instruction's first byte, its
    displacement field, its label, its condition, and whether it is short);
    labels are a table of byte offsets. There are no veneers in text. Once a
@@ -181,17 +204,6 @@ rule is written out at the top of `x64/value.coil`.
      that ends in a flag-setting instruction for its result calls
      `code/note-flags!`; nothing else is needed to stay correct, since any
      byte emitted afterwards and every block start invalidate the record.
-5. **Memory operands and LEA.** Loads fold into ALU and compare operands, and
-   `lea` covers add-with-shift and three-operand adds, following upstream's
-   fusion rules. This is selection work on top of a correct register-only
-   version, not a prerequisite for it.
-=======
-   with a fixup record; shrinking to rel8 and loop alignment are a separate
-   pass over records, not word arithmetic. There are no veneers in text.
-   A record (`x64/fixups.coil`) holds the instruction's first byte, its
-   displacement field, its label and its condition; labels are a table of
-   byte offsets. Neither the relaxation pass nor alignment padding exists
-   yet: the block layout's alignment requests are ignored.
 5. **Memory operands and LEA.** Done by the memory family
    (`x64/memory.coil`, `fuse!`), after the core's own tiles and comparison
    fusion:
@@ -210,9 +222,12 @@ rule is written out at the top of `x64/value.coil`.
      `op [a], x` (ADD SUB AND OR XOR with a register or immediate; NOT, NEG).
    - The scratch contract: a memory operand names allocated registers, rsp,
      rbp and at most r10, so r11 is free for the instruction's other operand.
-   `lea` for add-with-shift and three-operand adds of values (not addresses)
-   is still to do.
->>>>>>> feature/x86
+   - Sums of values (not addresses) take the address form afterwards
+     (`x64/lea.coil`, RULE-LEA): what is still a register ADD, or ADD/SUB of
+     an immediate, once the memory family chose its operands becomes a base,
+     a scaled index and a displacement, absorbing single-use producers of
+     its block; multiplication by 2, 3, 5 and 9 is a `lea` and by other
+     powers of two a shift.
 
 ## Floating point
 

@@ -73,6 +73,7 @@
 (import "stogir.x64.call-abi" :as abi)
 (import "stogir.call-results" :as results)
 (import "stogir.x64.callee-saved" :as callee)
+(import "stogir.x64.coalesce" :as coalesce)
 (import "stogir.x64.floating" :as floating)
 (import "stogir.floating" :as floating-ops)
 (import "stogir.x64.code" :as code)
@@ -89,6 +90,7 @@
 (import "stogir.native.private-types" :as private)
 (import "stogir.x64.return-values" :as return-values)
 (import "stogir.x64.incoming" :as incoming)
+(import "stogir.x64.lea" :as lea)
 (import "stogir.x64.plan" :as plan)
 (import "stogir.x64.pool" :as pool)
 (import "stogir.x64.reciprocal" :as reciprocal)
@@ -106,7 +108,9 @@
 
 ;;; The allocator's transfers at split boundaries. Adjacent ranges of a
 ;;; joined PHI group may belong to different SSA definitions: a split at the
-;;; birth of a new value has no old value to carry and is dropped.
+;;; birth of a new value has no old value to carry and is dropped. So is a
+;;; split at the definition of a COPY or BITCAST in the group: its emitter
+;;; moves the value from where the source is to where the result is.
 (defn split-moves [(graph g/Graph) (scheduled schedule/Schedule)
                    (assigned allocate/Assigned) (matched plan/Plan)
                    (allocator (dyn Allocator))] (-> (ArrayList locations/Transfer))
@@ -116,9 +120,12 @@
     (when (.coalesced (.locations assigned))
       (for [i 0 (len moves)]
         (let [move (get moves i)]
-          (unless (allocation-transfers/redefined? graph scheduled (.parts assigned)
-                                                   (.locations assigned) (.operands matched)
-                                                   (.parent move) (.position move))
+          (unless (or (allocation-transfers/redefined? graph scheduled (.parts assigned)
+                                                       (.locations assigned) (.operands matched)
+                                                       (.parent move) (.position move))
+                      (coalesce/view-defined? graph scheduled (.parts assigned)
+                                              (.locations assigned) (.parent move)
+                                              (.position move)))
             (set! (mut moves) kept move)
             (set! kept (+ kept 1)))))
       (while (> (len moves) kept) (pop! (mut moves))))
@@ -804,9 +811,11 @@
                         (unary/emit! (mut output) cx reference position)
                       :else
                         (let [tile (get (.tiles matched) (cast i64 reference))]
-                          (if (select/reciprocal-rule? (.rule tile))
-                              (reciprocal/emit! (mut output) cx reference position tile)
-                              (emit/tile! (mut output) cx reference position tile))))
+                          (cond (select/reciprocal-rule? (.rule tile))
+                                  (reciprocal/emit! (mut output) cx reference position tile)
+                                (= (.rule tile) select/RULE-LEA)
+                                  (lea/emit! (mut output) cx reference position tile)
+                                :else (emit/tile! (mut output) cx reference position tile))))
                 (Err [message] (set! error message))
                 (Ok [_] 0))
               ; The `add`/`sub` this node just emitted cannot overflow.
