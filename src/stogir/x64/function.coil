@@ -56,10 +56,12 @@
 (import "stogir.x64.emit" :as emit)
 (import "stogir.x64.encode" :as encode)
 (import "stogir.x64.families" :as families)
+(import "stogir.x64.fcompare" :as fcompare)
 (import "stogir.x64.fixups" :as fixups)
 (import "stogir.x64.incoming" :as incoming)
 (import "stogir.x64.lea" :as lea)
 (import "stogir.x64.plan" :as plan)
+(import "stogir.x64.pool" :as pool)
 (import "stogir.x64.reciprocal" :as reciprocal)
 (import "stogir.x64.registers" :as registers)
 (import "stogir.x64.select" :as select)
@@ -68,6 +70,7 @@
 (import "stogir.x64.unary" :as unary)
 (import "stogir.x64.uses" :as uses)
 (import "stogir.x64.value" :as value)
+(import "stogir.types" :as types)
 (import "coil.arraylist" :use [ArrayList])
 (import "coil.alloc" :use [Allocator])
 (import "coil.result" :use [Result Ok Err Some None])
@@ -124,16 +127,23 @@
     (if (= error "") (Ok 0) (Err error))))
 
 ;;; RETURN: the integer value (register, spill slot or constant) goes to rax,
-;;; extended to 32 bits by its type's signedness; then the epilogue.
+;;; extended to 32 bits by its type's signedness; a FLOAT or DOUBLE goes to
+;;; xmm0. Then the epilogue.
 (defn return! [(out (mut code/Buffer)) (cx context/Context) (assigned allocate/Assigned)
                (reference i32) (position i64)] (-> (Result i32 (slice u8)))
   (let [node (get (.instructions (.graph cx)) (cast i64 reference))
         ty (cast i32 (n/type-id node))
         (mut error) ""]
-    (when (!= ty 0)
-      (code/accept-count! (mut error)
-                          (emit/into! (mut out) cx (.op2 node) position registers/RAX))
-      (code/accept-count! (mut error) (abi/normalize! (mut out) ty registers/RAX)))
+    (cond (= ty 0) 0
+          (types/floating? ty)
+            (code/accept-count! (mut error)
+                                (value/float-into! (mut out) (.graph cx) (.parts cx) (.base cx)
+                                                   (.op2 node) position registers/XMM0))
+          :else
+            (do
+              (code/accept-count! (mut error)
+                                  (emit/into! (mut out) cx (.op2 node) position registers/RAX))
+              (code/accept-count! (mut error) (abi/normalize! (mut out) ty registers/RAX))))
     (code/accept-count! (mut error) (epilogue! (mut out) assigned (.frame-size cx)))
     (if (= error "") (Ok 0) (Err error))))
 
@@ -155,7 +165,9 @@
 
 ;;; IF: the flags of its fused comparison or of its condition value, a
 ;;; conditional branch on the edge that does not fall through, the
-;;; fall-through edge's moves, and a jump when that block is not next.
+;;; fall-through edge's moves, and a jump when that block is not next. A
+;;; floating comparison or condition value gives an extended condition
+;;; (stogir.x64.fcompare), which may take two branches.
 (defn conditional-branch! [(out (mut code/Buffer)) (cx context/Context) (flow edges/Flow)
                            (control (mut edges/Control)) (reference i32) (position i64)
                            (next i32) (allocator (dyn Allocator))]
@@ -172,9 +184,9 @@
           (Ok [cc]
               (let [fallthrough (if (= next (.yes sides)) (.yes sides) (.no sides))
                     taken (if (= next (.yes sides)) (.no sides) (.yes sides))
-                    condition (if (= next (.yes sides)) (encode/invert cc) cc)]
-                (match (edges/branch-edge! (mut out) flow (mut control) taken (+ position 1)
-                                           condition allocator)
+                    condition (if (= next (.yes sides)) (fcompare/invert cc) cc)]
+                (match (edges/branch-edge-parity! (mut out) flow (mut control) taken
+                                                  (+ position 1) condition allocator)
                   (Err [message] (Err message))
                   (Ok [_]
                       (match (edges/edge! (mut out) flow fallthrough (+ position 1) allocator)
@@ -364,7 +376,12 @@
                     (= opcode 117)
                       (switch/emit! (mut output) cx flow (mut control) reference position
                                     (edges/next-successor flow reference next) allocator)
-                    (!= (plan/family matched reference) families/CORE)
+                    ; A family's node, except the floating forms of PARAM,
+                    ; RETURN and IF, which need the driver's state and are
+                    ; emitted by the cases below.
+                    (and (!= (plan/family matched reference) families/CORE)
+                         (not (and (= (plan/family matched reference) families/FLOATING)
+                                   (or (= opcode 71) (= opcode 116) (= opcode 120)))))
                       (families/emit! (mut output) cx reference position
                                       (plan/family matched reference))
                     (= opcode 71)
@@ -414,6 +431,12 @@
     (when (= error "")
       (match (fixups/apply-relative! (mut (.text output)) (.labels control)
                                      (.relatives control))
+        (Err [message] (set! error message))
+        (Ok [_] 0)))
+    ; The floating constant pool follows the code; its loads are patched
+    ; once nothing before it can move any more.
+    (when (= error "")
+      (match (pool/finish! (mut output) graph allocator)
         (Err [message] (set! error message))
         (Ok [_] 0)))
     (edges/release-control! (mut control))

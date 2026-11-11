@@ -1,0 +1,289 @@
+(module stogir.tests.x64-float-pressure)
+(import "stogir.graph" :as g)
+(import "stogir.x64.testing" :as t)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.arraylist" :use [ArrayList])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; The XMM register class under pressure on x86-64, both widths, checked
+;;; bit for bit against the reference evaluator of stogir.x64.testing:
+;;;
+;;;   live      up to 40 floating values live at once (there are 14
+;;;             allocatable XMM registers), built from twelve floating
+;;;             parameters, eight in registers and four on the stack, and
+;;;             distinct constants (a constant pool of dozens of entries),
+;;;             folded together twice so every value is spilled and reloaded
+;;;             or read from its slot, with integer values live alongside;
+;;;   incoming  twelve floating and twelve integer parameters, all used:
+;;;             floating and integer stack parameters interleaved with
+;;;             register ones;
+;;;   loops     counted loops whose floating PHIs rotate (a three-cycle, a
+;;;             swap: parallel moves through xmm15), start from constants
+;;;             (+0.0 by xorps and a pool constant on the entry edge) and
+;;;             stay live with 0, 10 or 24 other values across the loop, so
+;;;             the PHIs live in registers or in spill slots.
+
+(defn exact [(ty i32) (value i64)] (-> u64)
+  (if (= ty 12) (t/f64-bits (cast f64 value)) (t/f32-bits (cast f32 value))))
+
+;;; A finite value of `ty` from a random word: a small integer scaled by a
+;;; power of two, of either sign.
+(defn finite [(ty i32) (state (mut u64))] (-> u64)
+  (let [raw (t/random! (mut state))
+        whole (- (cast i64 (& raw 0xFFFFF)) 0x80000)
+        scale (get [(: 1.0 f64) 0.5 0.125 4.0 1024.0 0.0009765625] (cast i64 (% (>> raw 32) 6)))
+        value (* (cast f64 whole) scale)]
+    (if (= ty 12) (t/f64-bits value) (t/f32-bits (cast f32 value)))))
+
+(defn fold-opcode [(k i64)] (-> i32)
+  (get [(: 26 i32) 27 28 26 59 27 58 26] (% k 8)))
+
+(defn mismatch! [(tally (mut t/Tally)) (label (slice u8)) (ty i32) (count i64) (run i64)
+                 (actual u64) (expected u64)] (-> void)
+  (set! (.checks tally) (+ (.checks tally) 1))
+  (when (!= actual expected)
+    (when (< (.failures tally) 30)
+      (println "{} type {} size {} run {}: got {:x} expected {:x}" label ty count run actual
+               expected))
+    (t/fail! (mut tally))))
+
+;;; `count` values v[k] = parameter[k mod 12] + (k + 1), all live while they
+;;; are folded into one accumulator forward and then backward; the integer
+;;; parameters are converted and added in between.
+(defn live! [(tally (mut t/Tally)) (ty i32) (count i64) (direct bool) (a (dyn Allocator))]
+  (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        (mut floats) (ArrayList::new [i32] a)
+        (mut integers) (ArrayList::new [i32] a)
+        (mut values) (ArrayList::new [i32] a)]
+    (for [k 0 12] (push! (mut floats) (t/param! (mut graph) start ty (cast i32 k))))
+    (for [k 0 6] (push! (mut integers) (t/param! (mut graph) start 11 (cast i32 (+ 12 k)))))
+    (for [k 0 count]
+      (push! (mut values)
+             (t/binary! (mut graph) 26 ty (get floats (% k 12))
+                        (t/constant! (mut graph) ty (exact ty (+ k 1))))))
+    (let [(mut total) (get values 0)]
+      (for [k 1 count]
+        (set! total (t/binary! (mut graph) (fold-opcode k) ty total (get values k))))
+      (for [k 0 6]
+        (set! total (t/binary! (mut graph) 26 ty total
+                               (t/unary! (mut graph) 37 ty (get integers k)))))
+      (for [k 0 count]
+        (set! total (t/binary! (mut graph) (fold-opcode (+ k 3)) ty total
+                               (get values (- (- count 1) k)))))
+      (let [ret (if direct
+                    (t/return! (mut graph) start ty total)
+                    (t/return! (mut graph) start 5 (t/float-bits! (mut graph) ty total)))]
+        (match (t/compiled (mut tally) "x64 float pressure: live" graph start [ret] a)
+          (None [] 0)
+          (Some [mapped]
+                (let [(mut mapped) mapped
+                      (mut state) (+ (cast u64 count) 0x5EED)
+                      (mut arguments) (ArrayList::new [u64] a)
+                      (mut whole) (ArrayList::new [u64] a)
+                      (mut model) (ArrayList::new [u64] a)]
+                  (for [run 0 12]
+                    (clear! (mut arguments))
+                    (clear! (mut whole))
+                    (clear! (mut model))
+                    (for [k 0 12]
+                      (push! (mut arguments)
+                             (cond (= run 0) (exact ty (+ k 1))
+                                   (= run 1) (exact ty (- 0 k))
+                                   (= run 2) (t/float-specials ty (+ k 8))
+                                   :else (finite ty (mut state)))))
+                    (for [k 0 6]
+                      (push! (mut whole)
+                             (if (< run 2) (cast u64 (+ k run)) (t/random! (mut state)))))
+                    (for [k 0 count]
+                      (push! (mut model)
+                             (t/float-binary 26 ty (get arguments (% k 12))
+                                             (exact ty (+ k 1)))))
+                    (let [(mut expected) (get model 0)
+                          (mut unsure) false]
+                      (for [k 1 count]
+                        (when (t/float-ambiguous? ty expected (get model k)) (set! unsure true))
+                        (set! expected (t/float-binary (fold-opcode k) ty expected (get model k))))
+                      (for [k 0 6]
+                        (let [converted (t/float-from-integer 11 ty (get whole k))]
+                          (when (t/float-ambiguous? ty expected converted) (set! unsure true))
+                          (set! expected (t/float-binary 26 ty expected converted))))
+                      (for [k 0 count]
+                        (let [other (get model (- (- count 1) k))]
+                          (when (t/float-ambiguous? ty expected other) (set! unsure true))
+                          (set! expected
+                                (t/float-binary (fold-opcode (+ k 3)) ty expected other))))
+                      (let [raw (if direct
+                                    (t/invoke-floating mapped (slice arguments) (slice whole))
+                                    (t/invoke-mixed mapped (slice arguments) (slice whole)))
+                            actual (if (= ty 12) raw (& raw 0xFFFFFFFF))]
+                        (unless unsure
+                          (mismatch! (mut tally) "live" ty count run actual expected)))))
+                  (free! (mut arguments))
+                  (free! (mut whole))
+                  (free! (mut model))
+                  (t/unmap! (mut mapped)))))))
+    (free! (mut floats))
+    (free! (mut integers))
+    (free! (mut values))
+    (g/release! (mut graph))))
+
+;;; Twelve floating and twelve integer parameters, each used once:
+;;; sum of float[k] * (k + 1) plus the integers converted.
+(defn incoming! [(tally (mut t/Tally)) (ty i32) (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        (mut total) (t/constant! (mut graph) ty 0)]
+    (for [k 0 12]
+      (set! total
+            (t/binary! (mut graph) 26 ty total
+                       (t/binary! (mut graph) 28 ty (t/param! (mut graph) start ty (cast i32 k))
+                                  (t/constant! (mut graph) ty (exact ty (+ k 1)))))))
+    (for [k 0 12]
+      (set! total
+            (t/binary! (mut graph) 26 ty total
+                       (t/unary! (mut graph) 37 ty
+                                 (t/param! (mut graph) start 10 (cast i32 (+ 12 k)))))))
+    (let [ret (t/return! (mut graph) start ty total)]
+      (match (t/compiled (mut tally) "x64 float pressure: incoming" graph start [ret] a)
+        (None [] 0)
+        (Some [mapped]
+              (let [(mut mapped) mapped
+                    (mut state) (: 0xABCDEF u64)
+                    (mut arguments) (ArrayList::new [u64] a)
+                    (mut whole) (ArrayList::new [u64] a)]
+                (for [run 0 8]
+                  (clear! (mut arguments))
+                  (clear! (mut whole))
+                  (for [k 0 12]
+                    (push! (mut arguments)
+                           (if (= run 0) (exact ty (+ (* k 3) 1)) (finite ty (mut state))))
+                    (push! (mut whole)
+                           (if (= run 0) (cast u64 (+ 100 k)) (t/random! (mut state)))))
+                  (let [(mut expected) (: 0 u64)]
+                    (for [k 0 12]
+                      (set! expected
+                            (t/float-binary 26 ty expected
+                                            (t/float-binary 28 ty (get arguments k)
+                                                            (exact ty (+ k 1))))))
+                    (for [k 0 12]
+                      (set! expected
+                            (t/float-binary 26 ty expected
+                                            (t/float-from-integer 10 ty (get whole k)))))
+                    (let [raw (t/invoke-floating mapped (slice arguments) (slice whole))]
+                      (mismatch! (mut tally) "incoming" ty 12 run
+                                 (if (= ty 12) raw (& raw 0xFFFFFFFF)) expected))))
+                (free! (mut arguments))
+                (free! (mut whole))
+                (t/unmap! (mut mapped))))))
+    (g/release! (mut graph))))
+
+;;; for (i = 0; i < n; i++) { (x, y, z) = rotated; acc += x * step; step += 1 }
+;;; with `extra` other values live across the loop. `swap` rotates only x
+;;; and y. Returns ((acc + x) - y) * z + the extra values.
+(defn loop! [(tally (mut t/Tally)) (ty i32) (extra i64) (swap bool) (a (dyn Allocator))]
+  (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        pa (t/param! (mut graph) start ty 0)
+        pb (t/param! (mut graph) start ty 1)
+        pc (t/param! (mut graph) start ty 2)
+        n (t/param! (mut graph) start 11 3)
+        zero (t/constant! (mut graph) ty 0)
+        first-step (t/constant! (mut graph) ty (exact ty 3))
+        one (t/constant! (mut graph) ty (exact ty 1))
+        (mut others) (ArrayList::new [i32] a)]
+    (for [k 0 extra]
+      (push! (mut others)
+             (t/binary! (mut graph) 28 ty (if (= (% k 2) 0) pa pb)
+                        (t/constant! (mut graph) ty (exact ty (+ k 2))))))
+    (let [loop (t/loop-begin! (mut graph) (t/end! (mut graph) start))
+          i (t/loop-phi! (mut graph) loop (t/constant! (mut graph) 11 0))
+          x (t/loop-phi! (mut graph) loop pa)
+          y (t/loop-phi! (mut graph) loop pb)
+          z (t/loop-phi! (mut graph) loop pc)
+          acc (t/loop-phi! (mut graph) loop zero)
+          step (t/loop-phi! (mut graph) loop first-step)
+          branch (t/if! (mut graph) loop (t/compare! (mut graph) 16 i n))
+          body (t/if-true! (mut graph) branch)
+          exit (t/if-false! (mut graph) branch)
+          next-i (t/binary! (mut graph) 26 11 i (t/constant! (mut graph) 11 1))
+          next-acc (t/binary! (mut graph) 26 ty acc (t/binary! (mut graph) 28 ty x step))
+          next-step (t/binary! (mut graph) 26 ty step one)
+          back (t/loop-end! (mut graph) body)]
+      (t/patch! (mut graph) loop 2 back)
+      (t/patch! (mut graph) i 3 next-i)
+      (t/patch! (mut graph) x 3 y)
+      (t/patch! (mut graph) y 3 (if swap x z))
+      (t/patch! (mut graph) z 3 (if swap z x))
+      (t/patch! (mut graph) acc 3 next-acc)
+      (t/patch! (mut graph) step 3 next-step)
+      (let [(mut total)
+              (t/binary! (mut graph) 28 ty
+                         (t/binary! (mut graph) 27 ty (t/binary! (mut graph) 26 ty acc x) y)
+                         z)]
+        (for [k 0 extra]
+          (set! total (t/binary! (mut graph) 26 ty total (get others k))))
+        (let [ret (t/return! (mut graph) exit ty total)]
+          (match (t/compiled (mut tally) "x64 float pressure: loop" graph start [ret] a)
+            (None [] 0)
+            (Some [mapped]
+                  (let [(mut mapped) mapped
+                        (mut state) (: 0x100F u64)]
+                    (for [trips 0 8]
+                      (for [run 0 3]
+                        (let [va (if (= run 0) (exact ty 2) (finite ty (mut state)))
+                              vb (if (= run 0) (exact ty -5) (finite ty (mut state)))
+                              vc (if (= run 0) (exact ty 7) (finite ty (mut state)))
+                              (mut mx) va
+                              (mut my) vb
+                              (mut mz) vc
+                              (mut macc) (: 0 u64)
+                              (mut mstep) (exact ty 3)]
+                          (for [k 0 trips]
+                            (let [ox mx
+                                  oy my
+                                  oz mz]
+                              (set! macc (t/float-binary 26 ty macc
+                                                         (t/float-binary 28 ty ox mstep)))
+                              (set! mstep (t/float-binary 26 ty mstep (exact ty 1)))
+                              (set! mx oy)
+                              (set! my (if swap ox oz))
+                              (set! mz (if swap oz ox))))
+                          (let [(mut expected)
+                                  (t/float-binary
+                                    28 ty
+                                    (t/float-binary 27 ty (t/float-binary 26 ty macc mx) my)
+                                    mz)]
+                            (for [k 0 extra]
+                              (set! expected
+                                    (t/float-binary 26 ty expected
+                                                    (t/float-binary 28 ty
+                                                                    (if (= (% k 2) 0) va vb)
+                                                                    (exact ty (+ k 2))))))
+                            (let [raw (t/invoke-floating mapped [va vb vc]
+                                                         [(cast u64 trips)])]
+                              (mismatch! (mut tally) (if swap "swap loop" "rotation loop") ty
+                                         extra (+ (* trips 10) run)
+                                         (if (= ty 12) raw (& raw 0xFFFFFFFF)) expected))))))
+                    (t/unmap! (mut mapped))))))))
+    (free! (mut others))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 float pressure: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (for ty [(: 12 i32) 13]
+          (for count [(: 3 i64) 13 14 15 16 24 40]
+            (live! (mut tally) ty count false a)
+            (live! (mut tally) ty count true a))
+          (incoming! (mut tally) ty a)
+          (for extra [(: 0 i64) 10 24]
+            (loop! (mut tally) ty extra false a)
+            (loop! (mut tally) ty extra true a)))
+        (println "x64 float pressure: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))

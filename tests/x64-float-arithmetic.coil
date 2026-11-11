@@ -1,0 +1,140 @@
+(module stogir.tests.x64-float-arithmetic)
+(import "stogir.graph" :as g)
+(import "stogir.floating" :as floating)
+(import "stogir.x64.testing" :as t)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; Every scalar floating operation of the x86-64 backend except FMA, at both
+;;; widths, against the reference evaluator of stogir.x64.testing, bit for
+;;; bit, over every pair of the special values there (zeros, subnormals,
+;;; ties, 2^52, infinities, quiet and signalling NaNs of both signs):
+;;;
+;;;   binary   ADD SUB MUL DIV, the selecting MIN MAX, FMIN FMAX FMINNM FMAXNM
+;;;   compare  EQ .. UGT, ORDERED, UNORDERED producing a BOOL (not fused)
+;;;   unary    NEG ABS SQRT ROUND_EVEN UP DOWN ZERO AWAY
+;;;
+;;; Operand forms: 0 both XMM parameters, 1 one parameter used twice, 2 both
+;;; built from integer parameters with BITCAST, 3 the left operand a
+;;; constant, 4 the right operand a constant (each over a set of constants
+;;; that includes +0.0, which is built with xorps, and NaNs), 5 as 0 with
+;;; the result returned in xmm0 instead of rax.
+;;;
+;;; Where stogir.floating/evaluate folds an operation, its result must be
+;;; the same bits (constant folding and generated code never disagree); the
+;;; only exception is the payload of a NaN produced from two different NaNs.
+
+(defn binary? [(opcode i32)] (-> bool)
+  (not (floating/unary? opcode)))
+
+(defn reference [(opcode i32) (ty i32) (a u64) (b u64)] (-> u64)
+  (cond (floating/comparison? opcode) (t/float-compare opcode ty a b)
+        (floating/unary? opcode) (t/float-unary opcode ty a)
+        :else (t/float-binary opcode ty a b)))
+
+(defn constant-at [(ty i32) (index i64)] (-> u64)
+  ; +0.0, -0.0, 1.5, the largest subnormal, +infinity, a negative quiet NaN
+  ; with a payload, a signalling NaN.
+  (t/float-specials ty (get [(: 0 i64) 1 12 4 20 23 24] index)))
+
+(const CONSTANTS 7)
+
+(defn check! [(tally (mut t/Tally)) (opcode i32) (ty i32) (form i32) (a u64) (b u64)
+              (actual u64)] (-> void)
+  (let [expected (reference opcode ty a b)]
+    (set! (.checks tally) (+ (.checks tally) 1))
+    ; ADD and MUL of two different NaNs may return either one, quieted.
+    (when (and (!= actual expected)
+               (not (and (or (= opcode 26) (= opcode 28))
+                         (t/float-ambiguous? ty a b)
+                         (= actual (t/float-quiet ty b)))))
+      (when (< (.failures tally) 30)
+        (println "op {} type {} form {}: {:x} , {:x} gave {:x}, expected {:x}"
+                 opcode ty form a b actual expected))
+      (t/fail! (mut tally)))
+    ; Constant folding agrees wherever it is defined.
+    (match (floating/evaluate opcode ty a b)
+      (None [] 0)
+      (Some [folded]
+            (set! (.checks tally) (+ (.checks tally) 1))
+            (when (and (!= folded expected)
+                       (not (and (binary? opcode) (t/float-ambiguous? ty a b)))
+                       ; The host's own NaN choice for one NaN operand is the
+                       ; hardware's, checked above; folding may also keep a
+                       ; signalling NaN's payload unquieted in a selection.
+                       (not (and (t/float-nan? ty folded) (t/float-nan? ty expected)
+                                 (>= opcode 26) (<= opcode 29))))
+              (when (< (.failures tally) 30)
+                (println "op {} type {}: folding {:x} , {:x} gives {:x}, the backend {:x}"
+                         opcode ty a b folded expected))
+              (t/fail! (mut tally)))))))
+
+;;; One function computing `opcode` in operand form `form`; `fixed` is the
+;;; constant of forms 3 and 4.
+(defn run! [(tally (mut t/Tally)) (opcode i32) (ty i32) (form i32) (fixed u64)
+            (a (dyn Allocator))] (-> void)
+  (let [(mut graph) (g/create a)
+        start (t/start! (mut graph))
+        integers (= form 2)
+        p0 (t/param! (mut graph) start (if integers 5 ty) 0)
+        p1 (t/param! (mut graph) start (if integers 5 ty) 1)
+        x (if integers (t/float-value! (mut graph) ty p0) p0)
+        y (if integers (t/float-value! (mut graph) ty p1) p1)
+        literal (t/constant! (mut graph) ty fixed)
+        left (if (= form 3) literal x)
+        right (cond (= form 4) literal
+                    (= form 1) x
+                    (= form 3) x
+                    :else y)
+        comparison (floating/comparison? opcode)
+        value (cond (floating/unary? opcode) (t/unary! (mut graph) opcode ty left)
+                    comparison (t/compare! (mut graph) opcode left right)
+                    :else (t/binary! (mut graph) opcode ty left right))
+        direct (and (= form 5) (not comparison))
+        ret (cond direct (t/return! (mut graph) start ty value)
+                  comparison (t/return! (mut graph) start 1 value)
+                  :else (t/return! (mut graph) start 5 (t/float-bits! (mut graph) ty value)))
+        mask (if (= ty 12) (: 0xFFFFFFFFFFFFFFFF u64) 0xFFFFFFFF)]
+    (match (t/compiled (mut tally) "x64 float arithmetic" graph start [ret] a)
+      (None []
+            (println "  (op {} type {} form {})" opcode ty form))
+      (Some [mapped]
+            (let [(mut mapped) mapped]
+              (for [i 0 t/FLOAT-SPECIALS]
+                (for [j 0 (if (or (floating/unary? opcode) (= form 1) (= form 3) (= form 4))
+                              1
+                              t/FLOAT-SPECIALS)]
+                  (let [u (t/float-specials ty i)
+                        v (t/float-specials ty j)
+                        ; The operands the operation sees.
+                        l (if (= form 3) fixed u)
+                        r (cond (= form 4) fixed
+                                (or (= form 1) (= form 3)) u
+                                :else v)
+                        raw (cond direct (t/invoke-floating mapped [u v] [])
+                                  integers (t/invoke-mixed mapped [] [u v])
+                                  :else (t/invoke-mixed mapped [u v] []))
+                        actual (if comparison (& raw 0xFF) (& raw mask))]
+                    (check! (mut tally) opcode ty form l r actual))))
+              (t/unmap! (mut mapped)))))
+    (g/release! (mut graph))))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 float arithmetic: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (for ty [(: 12 i32) 13]
+          (for opcode [(: 26 i32) 27 28 29 58 59 133 134 135 136
+                       14 15 16 17 18 19 20 21 22 23 24 25
+                       31 32 131 137 138 139 140 141]
+            (for form [(: 0 i32) 1 2 5]
+              (unless (and (floating/unary? opcode) (= form 1))
+                (run! (mut tally) opcode ty form 0 a)))
+            (for form [(: 3 i32) 4]
+              (unless (and (floating/unary? opcode) (= form 4))
+                (for [k 0 CONSTANTS]
+                  (run! (mut tally) opcode ty form (constant-at ty k) a))))))
+        (println "x64 float arithmetic: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))
