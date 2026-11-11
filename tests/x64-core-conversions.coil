@@ -1,0 +1,118 @@
+(module stogir.tests.x64-core-conversions)
+(import "stogir.graph" :as g)
+(import "stogir.conversion" :as conversion)
+(import "stogir.x64.testing" :as t)
+(import "coil.alloc" :use [Allocator malloc-allocator])
+(import "coil.result" :use [Result Ok Err Some None])
+
+;;; SEXT, ZEXT, TRUNC and integer BITCAST between every pair of integer types
+;;; the IR allows, from a parameter (with garbage above its width) and from a
+;;; constant, plus COPY of every integer type. BOOL results must be 0 or 1.
+
+(defn inputs [(ty i32)] (-> (array u64 12))
+  (let [width (cast u64 (t/bits ty))]
+    (if (= ty 1)
+        [(: 0 u64) 1 0 1 0 1 0 1 0 1 0 1]
+        [(: 0 u64) 1 2 0x7F 0x80 0xFF 0x100
+         (<< (: 1 u64) (- width 1))
+         (- (<< (: 1 u64) (- width 1)) 1)
+         0xFFFFFFFFFFFFFFFF 0x8000000080008080 0x0123456789ABCD00])))
+
+(defn main [] (-> i64)
+  (if (not (t/host?))
+      (do (println "x64 core conversions: skipped, not an x86-64 host") 0)
+      (let [a (malloc-allocator)
+            (mut tally) (t/tally)]
+        (for source [(: 1 i32) 2 3 4 5 6 7 8 9 10 11]
+          (for target [(: 1 i32) 2 3 4 5 6 7 8 9 10 11]
+            (for opcode [(: 33 i32) 34 35 36]
+              (match (conversion/policy opcode source target 8)
+                (Err [_] 0)
+                (Ok [_]
+                    ; From a parameter.
+                    (let [(mut graph) (g/create a)
+                          start (t/start! (mut graph))
+                          p (t/param! (mut graph) start source 0)
+                          value (t/unary! (mut graph) opcode target p)
+                          ret (t/return! (mut graph) start target value)]
+                      (match (t/compiled (mut tally) "conversion" graph start [ret] a)
+                        (None [] 0)
+                        (Some [mapped]
+                              (let [(mut mapped) mapped]
+                                (for x (inputs source)
+                                  (t/expect! (mut tally) "conversion" mapped target
+                                             [(t/dirty source x)]
+                                             (t/convert opcode source target x)))
+                                (t/unmap! (mut mapped)))))
+                      (g/release! (mut graph)))
+                    ; From each constant.
+                    (for x (inputs source)
+                      (let [(mut graph) (g/create a)
+                            start (t/start! (mut graph))
+                            c (t/constant! (mut graph) source x)
+                            value (t/unary! (mut graph) opcode target c)
+                            ret (t/return! (mut graph) start target value)]
+                        (match (t/compiled (mut tally) "constant conversion" graph start [ret] a)
+                          (None [] 0)
+                          (Some [mapped]
+                                (let [(mut mapped) mapped]
+                                  (t/expect! (mut tally) "constant conversion" mapped target []
+                                             (t/convert opcode source target x))
+                                  (t/unmap! (mut mapped)))))
+                        (g/release! (mut graph)))))))))
+        ; COPY of a parameter and of a constant; chains of conversions.
+        (for ty [(: 1 i32) 2 3 4 5 6 7 8 9 10 11]
+          (let [(mut graph) (g/create a)
+                start (t/start! (mut graph))
+                p (t/param! (mut graph) start ty 0)
+                copy (t/copy! (mut graph) ty p)
+                again (t/copy! (mut graph) ty copy)
+                ret (t/return! (mut graph) start ty again)]
+            (match (t/compiled (mut tally) "copy" graph start [ret] a)
+              (None [] 0)
+              (Some [mapped]
+                    (let [(mut mapped) mapped]
+                      (for x (inputs ty)
+                        (t/expect! (mut tally) "copy" mapped ty [(t/dirty ty x)] x))
+                      (t/unmap! (mut mapped)))))
+            (g/release! (mut graph)))
+          (let [(mut graph) (g/create a)
+                start (t/start! (mut graph))
+                c (t/constant! (mut graph) ty (if (= ty 1) 1 0x80C3A5F012345681))
+                copy (t/copy! (mut graph) ty c)
+                ret (t/return! (mut graph) start ty copy)]
+            (match (t/compiled (mut tally) "constant copy" graph start [ret] a)
+              (None [] 0)
+              (Some [mapped]
+                    (let [(mut mapped) mapped]
+                      (t/expect! (mut tally) "constant copy" mapped ty []
+                                 (if (= ty 1) 1 0x80C3A5F012345681))
+                      (t/unmap! (mut mapped)))))
+            (g/release! (mut graph))))
+        ; i8 -> SEXT i32 -> TRUNC i16 -> ZEXT u64 -> TRUNC bool, all in one.
+        (let [(mut graph) (g/create a)
+              start (t/start! (mut graph))
+              p (t/param! (mut graph) start 8 0)
+              wide (t/unary! (mut graph) 33 10 p)
+              half (t/unary! (mut graph) 35 9 wide)
+              unsigned (t/unary! (mut graph) 36 3 half)
+              long (t/unary! (mut graph) 34 5 unsigned)
+              truth (t/unary! (mut graph) 35 1 long)
+              back (t/unary! (mut graph) 34 5 truth)
+              sum (t/binary! (mut graph) 26 5 long back)
+              ret (t/return! (mut graph) start 5 sum)]
+          (match (t/compiled (mut tally) "chain" graph start [ret] a)
+            (None [] 0)
+            (Some [mapped]
+                  (let [(mut mapped) mapped]
+                    (for x (inputs 8)
+                      (let [w (t/convert 33 8 10 x)
+                            h (t/convert 35 10 9 w)
+                            l (t/convert 34 3 5 h)
+                            tr (t/convert 35 5 1 l)]
+                        (t/expect! (mut tally) "chain" mapped 5 [(t/dirty 8 x)] (+ l tr))))
+                    (t/unmap! (mut mapped)))))
+          (g/release! (mut graph)))
+        (println "x64 core conversions: {} functions, {} checks, {} failures"
+                 (.functions tally) (.checks tally) (.failures tally))
+        (if (= (.failures tally) 0) 0 1))))

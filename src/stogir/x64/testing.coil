@@ -6,6 +6,7 @@
 ;;;   * an independent reference evaluator for the integer operations, written
 ;;;     with wide arithmetic and sharing nothing with the backend or with
 ;;;     stogir.fold;
+;;;   * a failure tally with compile-and-map and check helpers;
 ;;;   * mapping and calling generated code on an x86-64 host. Every function
 ;;;     is called through one twelve-argument System V signature: the first
 ;;;     six arguments arrive in registers, the rest on the stack, and a
@@ -16,9 +17,11 @@
 (import "stogir.types" :as types)
 (import "stogir.target" :as target)
 (import "stogir.jit.native" :as jit)
+(import "stogir.x64.compile" :as compile)
+(import "coil.alloc" :use [Allocator])
 (import "coil.primitive" :as primitive)
 (import "coil.cc" :as cc)
-(import "coil.result" :use [Result Ok Err])
+(import "coil.result" :use [Result Ok Err Option Some None])
 
 ;;; Whether generated x86-64 code can run in this process.
 (defn host? [] (-> bool)
@@ -59,6 +62,18 @@
 ;;; RETURN of `value` (`ty` 0 and `value` 0 for a void return).
 (defn return! [(graph (mut g/Graph)) (control i32) (ty i32) (value i32)] (-> i32)
   (require (b/emit! (mut graph) 120 ty [control value (: 0 i32)])))
+
+;;; COPY of `value`.
+(defn copy! [(graph (mut g/Graph)) (ty i32) (value i32)] (-> i32)
+  (require (b/emit! (mut graph) 68 ty [value (: 0 i32)])))
+
+;;; UNREACHABLE ending block `control`; it is an exit root of the function.
+(defn unreachable! [(graph (mut g/Graph)) (control i32)] (-> i32)
+  (require (b/unreachable! (mut graph) control 0)))
+
+;;; TRAP in block `control`.
+(defn trap! [(graph (mut g/Graph)) (control i32)] (-> i32)
+  (require (b/trap! (mut graph) control)))
 
 (defn end! [(graph (mut g/Graph)) (control i32)] (-> i32)
   (require (b/emit! (mut graph) 114 0 [control])))
@@ -241,3 +256,55 @@
     (for [i 0 (len arguments)] (set! (mut a) i (get arguments i)))
     (call-ptr f (get a 0) (get a 1) (get a 2) (get a 3) (get a 4) (get a 5)
               (get a 6) (get a 7) (get a 8) (get a 9) (get a 10) (get a 11))))
+
+;;; Counts of one test program.
+(defstruct Tally [(checks i64) (failures i64) (functions i64)])
+
+(defn tally [] (-> Tally)
+  (Tally :checks 0 :failures 0 :functions 0))
+
+(defn fail! [(counts (mut Tally))] (-> void)
+  (set! (.failures counts) (+ (.failures counts) 1)))
+
+;;; Compile `graph` as given (stogir.x64.compile/text) and map it. A compile
+;;; or mapping failure is printed with `label` and counted.
+(defn compiled [(counts (mut Tally)) (label (slice u8)) (graph g/Graph) (start i32)
+                (roots (slice i32)) (allocator (dyn Allocator))] (-> (Option Mapped))
+  (set! (.functions counts) (+ (.functions counts) 1))
+  (match (compile/text graph start roots allocator)
+    (Err [message]
+         (println "{}: compile failed: {}" label message)
+         (fail! (mut counts))
+         (None))
+    (Ok [text]
+        (let [(mut bytes) text
+              result (match (map (slice bytes))
+                       (Err [message]
+                            (println "{}: map failed: {}" label message)
+                            (fail! (mut counts))
+                            (None [Mapped]))
+                       (Ok [mapped] (Some mapped)))]
+          (free! (mut bytes))
+          result))))
+
+;;; Call `mapped` and compare the bits a result of `ty` defines in rax with
+;;; `expected` (a value of `ty`; narrow types are checked in their 32-bit
+;;; extended form).
+(defn expect! [(counts (mut Tally)) (label (slice u8)) (mapped Mapped) (ty i32)
+               (arguments (slice u64)) (expected u64)] (-> void)
+  (let [wanted (returned ty expected)
+        actual (& (invoke mapped arguments) (returned-mask ty))]
+    (set! (.checks counts) (+ (.checks counts) 1))
+    (when (!= actual wanted)
+      (when (< (.failures counts) 25)
+        (println "{}: got {:x} expected {:x} (type {}, first arguments {:x} {:x})"
+                 label actual wanted ty
+                 (if (> (len arguments) 0) (get arguments 0) 0)
+                 (if (> (len arguments) 1) (get arguments 1) 0)))
+      (fail! (mut counts)))))
+
+;;; Garbage above the low `bits ty` bits of `value`: what a caller may leave
+;;; in the unused part of a narrow argument.
+(defn dirty [(ty i32) (value u64)] (-> u64)
+  (| (& value (mask ty))
+     (& (: 0xA5C3F00DDEADBE00 u64) (^ (mask ty) 0xFFFFFFFFFFFFFFFF))))
