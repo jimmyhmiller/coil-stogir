@@ -195,3 +195,83 @@ typedef int64_t (*raw6_fn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uin
 int64_t c_drive_dirty(void *f, uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
   return ((raw6_fn)f)(a, b, c, d, 0, 0);
 }
+
+/* Raw argument images for tests/x64-call-stress.coil: six general argument
+ * registers, eight vector registers (low 64 bits) and 32 stack words.
+ * c_inject(f) calls f with every argument location loaded from c_seed;
+ * c_capture, called with any signature, stores every argument location in
+ * c_frame and returns 12345. */
+/* Hidden, so the assembly below may address them PC-relatively even when
+ * this object is linked into a shared object. */
+__attribute__((visibility("hidden"))) uint64_t c_seed[46];
+__attribute__((visibility("hidden"))) uint64_t c_frame[46];
+__attribute__((visibility("hidden"))) uint64_t c_frame_rax;
+int64_t c_capture(void);
+int64_t c_inject(void *f);
+
+__asm__(
+    "    .text\n"
+    "    .globl c_capture\n"
+    "    .type c_capture, @function\n"
+    "c_capture:\n"
+    "    movq %rax, c_frame_rax(%rip)\n"
+    "    movq %rdi, c_frame+0(%rip)\n"
+    "    movq %rsi, c_frame+8(%rip)\n"
+    "    movq %rdx, c_frame+16(%rip)\n"
+    "    movq %rcx, c_frame+24(%rip)\n"
+    "    movq %r8, c_frame+32(%rip)\n"
+    "    movq %r9, c_frame+40(%rip)\n"
+    "    movq %xmm0, c_frame+48(%rip)\n"
+    "    movq %xmm1, c_frame+56(%rip)\n"
+    "    movq %xmm2, c_frame+64(%rip)\n"
+    "    movq %xmm3, c_frame+72(%rip)\n"
+    "    movq %xmm4, c_frame+80(%rip)\n"
+    "    movq %xmm5, c_frame+88(%rip)\n"
+    "    movq %xmm6, c_frame+96(%rip)\n"
+    "    movq %xmm7, c_frame+104(%rip)\n"
+    "    xorl %ecx, %ecx\n"
+    "    leaq c_frame+112(%rip), %rdx\n"
+    "1:  movq 8(%rsp,%rcx,8), %rax\n"
+    "    movq %rax, (%rdx,%rcx,8)\n"
+    "    incq %rcx\n"
+    "    cmpq $32, %rcx\n"
+    "    jne 1b\n"
+    "    movl $12345, %eax\n"
+    "    ret\n"
+    "    .size c_capture, .-c_capture\n"
+    "    .globl c_inject\n"
+    "    .type c_inject, @function\n"
+    "c_inject:\n"
+    "    pushq %rbx\n"
+    "    subq $256, %rsp\n"
+    "    movq %rdi, %r11\n"
+    "    xorl %ecx, %ecx\n"
+    "    leaq c_seed+112(%rip), %rdx\n"
+    "1:  movq (%rdx,%rcx,8), %rax\n"
+    "    movq %rax, (%rsp,%rcx,8)\n"
+    "    incq %rcx\n"
+    "    cmpq $32, %rcx\n"
+    "    jne 1b\n"
+    "    movq c_seed+48(%rip), %xmm0\n"
+    "    movq c_seed+56(%rip), %xmm1\n"
+    "    movq c_seed+64(%rip), %xmm2\n"
+    "    movq c_seed+72(%rip), %xmm3\n"
+    "    movq c_seed+80(%rip), %xmm4\n"
+    "    movq c_seed+88(%rip), %xmm5\n"
+    "    movq c_seed+96(%rip), %xmm6\n"
+    "    movq c_seed+104(%rip), %xmm7\n"
+    "    movq c_seed+0(%rip), %rdi\n"
+    "    movq c_seed+8(%rip), %rsi\n"
+    "    movq c_seed+16(%rip), %rdx\n"
+    "    movq c_seed+24(%rip), %rcx\n"
+    "    movq c_seed+32(%rip), %r8\n"
+    "    movq c_seed+40(%rip), %r9\n"
+    "    call *%r11\n"
+    "    addq $256, %rsp\n"
+    "    popq %rbx\n"
+    "    ret\n"
+    "    .size c_inject, .-c_inject\n");
+
+uint64_t *c_seed_words(void) { return c_seed; }
+uint64_t *c_frame_words(void) { return c_frame; }
+uint64_t c_captured_rax(void) { return c_frame_rax; }

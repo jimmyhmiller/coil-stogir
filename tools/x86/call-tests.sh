@@ -17,6 +17,6 @@ cd $ROOT
 if [ $# -eq 0 ]; then set -- tests/x64-call-*.coil; fi
 ssh -o BatchMode=yes "$HOST" "mkdir -p $DEST/build $DEST/tests" || exit 2
 rsync -a tests/x64-call-helpers.c "${HOST}:$DEST/tests/" || exit 2
-ssh -o BatchMode=yes "$HOST" "cd $DEST && cc -O2 -fno-omit-frame-pointer -Wall -c tests/x64-call-helpers.c -o build/x64-call-helpers.o" || exit 2
+ssh -o BatchMode=yes "$HOST" "cd $DEST && cc -O2 -fPIC -fno-omit-frame-pointer -Wall -c tests/x64-call-helpers.c -o build/x64-call-helpers.o" || exit 2
 OBJECT=$(ssh -o BatchMode=yes "$HOST" "cd $DEST && pwd")/build/x64-call-helpers.o
 COIL_FLAGS="${COIL_FLAGS:--O1 --no-debug} --link-flag $OBJECT" exec tools/x86/remote-test.sh "$@"
