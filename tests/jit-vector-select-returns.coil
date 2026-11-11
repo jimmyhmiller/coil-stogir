@@ -101,86 +101,138 @@
       (set! i (+ i 1)))
     result))
 
-(defn returned-call [(ty i32)
-                     (cty i32)
-                     (mode i32)
-                     (address (ptr u8))
-                     (yes (slice u8))
-                     (no (slice u8))
-                     (bits u64)
-                     (output (ptr u64))] (-> void)
-  (let [(mut scalar32) (: 0.0 f32)
-        (mut scalar64) (: 0.0 f64)
-        yes-d (Select8 :bits (v/vsplat [u64 1] (read-word yes 0 8)))
-        no-d (Select8 :bits (v/vsplat [u64 1] (read-word no 0 8)))
-        yes-q
-          (Select16
-            :bits
-              (v/vinsert (v/vsplat [u64 2] (read-word yes 0 8))
-                         1
-                         (read-word yes 8 8)))
-        no-q
-          (Select16
-            :bits
-              (v/vinsert (v/vsplat [u64 2] (read-word no 0 8))
-                         1
-                         (read-word no 8 8)))]
-    (p/store! (p/cast (ptr u32) (mut scalar32)) (cast u32 bits))
-    (p/store! (p/cast (ptr u64) (mut scalar64)) bits)
-    (when (and (= cty 5) (= (types/size ty 8) 8) (= mode 0))
-      (let [f (p/cast (fnptr (cc/C) [u64 Select8 Select8] Select8) address)
-            result (call-ptr f bits yes-d no-d)]
-        (p/store! output (v/vextract (.bits result) 0))))
-    (when (and (= cty 5) (= (types/size ty 8) 8) (= mode 3))
-      (let [f (p/cast (fnptr (cc/C) [u64] Select8) address)
-            result (call-ptr f bits)]
-        (p/store! output (v/vextract (.bits result) 0))))
-    (when (and (= cty 5) (= (types/size ty 8) 16) (= mode 0))
-      (let [f (p/cast (fnptr (cc/C) [u64 Select16 Select16] Select16) address)
-            result (call-ptr f bits yes-q no-q)]
-        (p/store! output (v/vextract (.bits result) 0))
-        (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
-    (when (and (= cty 5) (= (types/size ty 8) 16) (= mode 3))
-      (let [f (p/cast (fnptr (cc/C) [u64] Select16) address)
-            result (call-ptr f bits)]
-        (p/store! output (v/vextract (.bits result) 0))
-        (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
-    (when (and (= cty 12) (= (types/size ty 8) 8) (= mode 0))
-      (let [f (p/cast (fnptr (cc/C) [f64 Select8 Select8] Select8) address)
-            result (call-ptr f scalar64 yes-d no-d)]
-        (p/store! output (v/vextract (.bits result) 0))))
-    (when (and (= cty 12) (= (types/size ty 8) 8) (= mode 3))
-      (let [f (p/cast (fnptr (cc/C) [f64] Select8) address)
-            result (call-ptr f scalar64)]
-        (p/store! output (v/vextract (.bits result) 0))))
-    (when (and (= cty 12) (= (types/size ty 8) 16) (= mode 0))
-      (let [f (p/cast (fnptr (cc/C) [f64 Select16 Select16] Select16) address)
-            result (call-ptr f scalar64 yes-q no-q)]
-        (p/store! output (v/vextract (.bits result) 0))
-        (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
-    (when (and (= cty 12) (= (types/size ty 8) 16) (= mode 3))
-      (let [f (p/cast (fnptr (cc/C) [f64] Select16) address)
-            result (call-ptr f scalar64)]
-        (p/store! output (v/vextract (.bits result) 0))
-        (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
-    (when (and (= cty 13) (= (types/size ty 8) 8) (= mode 0))
-      (let [f (p/cast (fnptr (cc/C) [f32 Select8 Select8] Select8) address)
-            result (call-ptr f scalar32 yes-d no-d)]
-        (p/store! output (v/vextract (.bits result) 0))))
-    (when (and (= cty 13) (= (types/size ty 8) 8) (= mode 3))
-      (let [f (p/cast (fnptr (cc/C) [f32] Select8) address)
-            result (call-ptr f scalar32)]
-        (p/store! output (v/vextract (.bits result) 0))))
-    (when (and (= cty 13) (= (types/size ty 8) 16) (= mode 0))
-      (let [f (p/cast (fnptr (cc/C) [f32 Select16 Select16] Select16) address)
-            result (call-ptr f scalar32 yes-q no-q)]
-        (p/store! output (v/vextract (.bits result) 0))
-        (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
-    (when (and (= cty 13) (= (types/size ty 8) 16) (= mode 3))
-      (let [f (p/cast (fnptr (cc/C) [f32] Select16) address)
-            result (call-ptr f scalar32)]
-        (p/store! output (v/vextract (.bits result) 0))
-        (p/store! (p/index output 1) (v/vextract (.bits result) 1))))))
+;;; x86-64 only. vector-call(f, block, integer, out): xmm0, xmm1, xmm2 = the
+;;; three 16-byte halves of `block`, rdi = integer; f(); out[0..16) = xmm0.
+;;; The Linux Coil compiler cannot pass a 16-byte vector across a C function
+;;; pointer (coil-bugs: "SysV ABI ... SSEUP"), so on x86-64 the vector and
+;;; floating arguments travel through memory and this probe; what is checked
+;;; of the result is unchanged. The placement is the backend's minimal one:
+;;; floating and vector parameters take xmm0.. in order, integers rdi...
+;;; Bytes from tools/x86/asm-bytes.sh:
+;;;   push rbx; mov rbx, rcx; mov rax, rdi; movups xmm0, [rsi];
+;;;   movups xmm1, [rsi+16]; movups xmm2, [rsi+32]; mov rdi, rdx; call rax;
+;;;   movups [rbx], xmm0; pop rbx
+(target/arch-pick
+  (defn vector-call :cc (cc/C) [(f u64) (block u64) (integer u64) (out u64)] (-> void)
+    (p/machine-code (Aarch64) 0xc0 0x03 0x5f 0xd6))
+  (defn vector-call :cc (cc/C) [(f u64) (block u64) (integer u64) (out u64)] (-> void)
+    (p/machine-code (X86_64)
+                    0x53 0x48 0x89 0xcb 0x48 0x89 0xf8 0x0f 0x10 0x06 0x0f 0x10
+                    0x4e 0x10 0x0f 0x10 0x56 0x20 0x48 0x89 0xd7 0xff 0xd0 0x0f
+                    0x11 0x03 0x5b)))
+
+(target/arch-pick
+  (defn returned-call [(ty i32)
+                       (cty i32)
+                       (mode i32)
+                       (address (ptr u8))
+                       (yes (slice u8))
+                       (no (slice u8))
+                       (bits u64)
+                       (output (ptr u64))] (-> void)
+    (let [(mut scalar32) (: 0.0 f32)
+          (mut scalar64) (: 0.0 f64)
+          yes-d (Select8 :bits (v/vsplat [u64 1] (read-word yes 0 8)))
+          no-d (Select8 :bits (v/vsplat [u64 1] (read-word no 0 8)))
+          yes-q
+            (Select16
+              :bits
+                (v/vinsert (v/vsplat [u64 2] (read-word yes 0 8))
+                           1
+                           (read-word yes 8 8)))
+          no-q
+            (Select16
+              :bits
+                (v/vinsert (v/vsplat [u64 2] (read-word no 0 8))
+                           1
+                           (read-word no 8 8)))]
+      (p/store! (p/cast (ptr u32) (mut scalar32)) (cast u32 bits))
+      (p/store! (p/cast (ptr u64) (mut scalar64)) bits)
+      (when (and (= cty 5) (= (types/size ty 8) 8) (= mode 0))
+        (let [f (p/cast (fnptr (cc/C) [u64 Select8 Select8] Select8) address)
+              result (call-ptr f bits yes-d no-d)]
+          (p/store! output (v/vextract (.bits result) 0))))
+      (when (and (= cty 5) (= (types/size ty 8) 8) (= mode 3))
+        (let [f (p/cast (fnptr (cc/C) [u64] Select8) address)
+              result (call-ptr f bits)]
+          (p/store! output (v/vextract (.bits result) 0))))
+      (when (and (= cty 5) (= (types/size ty 8) 16) (= mode 0))
+        (let [f (p/cast (fnptr (cc/C) [u64 Select16 Select16] Select16) address)
+              result (call-ptr f bits yes-q no-q)]
+          (p/store! output (v/vextract (.bits result) 0))
+          (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
+      (when (and (= cty 5) (= (types/size ty 8) 16) (= mode 3))
+        (let [f (p/cast (fnptr (cc/C) [u64] Select16) address)
+              result (call-ptr f bits)]
+          (p/store! output (v/vextract (.bits result) 0))
+          (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
+      (when (and (= cty 12) (= (types/size ty 8) 8) (= mode 0))
+        (let [f (p/cast (fnptr (cc/C) [f64 Select8 Select8] Select8) address)
+              result (call-ptr f scalar64 yes-d no-d)]
+          (p/store! output (v/vextract (.bits result) 0))))
+      (when (and (= cty 12) (= (types/size ty 8) 8) (= mode 3))
+        (let [f (p/cast (fnptr (cc/C) [f64] Select8) address)
+              result (call-ptr f scalar64)]
+          (p/store! output (v/vextract (.bits result) 0))))
+      (when (and (= cty 12) (= (types/size ty 8) 16) (= mode 0))
+        (let [f (p/cast (fnptr (cc/C) [f64 Select16 Select16] Select16) address)
+              result (call-ptr f scalar64 yes-q no-q)]
+          (p/store! output (v/vextract (.bits result) 0))
+          (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
+      (when (and (= cty 12) (= (types/size ty 8) 16) (= mode 3))
+        (let [f (p/cast (fnptr (cc/C) [f64] Select16) address)
+              result (call-ptr f scalar64)]
+          (p/store! output (v/vextract (.bits result) 0))
+          (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
+      (when (and (= cty 13) (= (types/size ty 8) 8) (= mode 0))
+        (let [f (p/cast (fnptr (cc/C) [f32 Select8 Select8] Select8) address)
+              result (call-ptr f scalar32 yes-d no-d)]
+          (p/store! output (v/vextract (.bits result) 0))))
+      (when (and (= cty 13) (= (types/size ty 8) 8) (= mode 3))
+        (let [f (p/cast (fnptr (cc/C) [f32] Select8) address)
+              result (call-ptr f scalar32)]
+          (p/store! output (v/vextract (.bits result) 0))))
+      (when (and (= cty 13) (= (types/size ty 8) 16) (= mode 0))
+        (let [f (p/cast (fnptr (cc/C) [f32 Select16 Select16] Select16) address)
+              result (call-ptr f scalar32 yes-q no-q)]
+          (p/store! output (v/vextract (.bits result) 0))
+          (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
+      (when (and (= cty 13) (= (types/size ty 8) 16) (= mode 3))
+        (let [f (p/cast (fnptr (cc/C) [f32] Select16) address)
+              result (call-ptr f scalar32)]
+          (p/store! output (v/vextract (.bits result) 0))
+          (p/store! (p/index output 1) (v/vextract (.bits result) 1))))))
+  (defn returned-call [(ty i32)
+                       (cty i32)
+                       (mode i32)
+                       (address (ptr u8))
+                       (yes (slice u8))
+                       (no (slice u8))
+                       (bits u64)
+                       (output (ptr u64))] (-> void)
+    ; A floating condition is the first XMM argument and the arms follow it;
+    ; an integer condition is in rdi and the arms are the first two XMM
+    ; arguments. Mode 3 takes the condition alone. Only the result's own
+    ; bytes are defined in xmm0.
+    (let [(mut block) [(: 0 u64) 0 0 0 0 0]
+          (mut result) [(: 0 u64) 0]
+          slot (if (= cty 5) (: 0 i64) 2)
+          bytes (cast i64 (types/size ty 8))
+          (mut i) (: 0 i64)]
+      (when (!= cty 5) (set! (mut block) 0 bits))
+      (when (= mode 0)
+        (set! (mut block) slot (read-word yes 0 8))
+        (set! (mut block) (+ slot 1) (read-word yes 8 8))
+        (set! (mut block) (+ slot 2) (read-word no 0 8))
+        (set! (mut block) (+ slot 3) (read-word no 8 8)))
+      (vector-call (p/cast u64 address)
+                   (p/cast u64 (data block))
+                   bits
+                   (p/cast u64 (data result)))
+      (while (< i bytes)
+        (p/store! (p/index (p/cast (ptr u8) output) i)
+                  (p/load (p/index (p/cast (ptr u8) (data result)) i)))
+        (set! i (+ i 1))))))
 
 (defn exercise [(ty i32) (cty i32) (mode i32) (address (ptr u8))] (-> i64)
   (let [width (types/size ty 8)
@@ -334,7 +386,7 @@
                 (require (b/vector-constant! (mut graph) ty 8 (slice yes-bytes))))
           (set! no
                 (require (b/vector-constant! (mut graph) ty 8 (slice no-bytes))))))
-    (match (calls/create 9 (cast u8 ty) (slice parameters) alc)
+    (match (calls/create (target/arch-pick 9 8) (cast u8 ty) (slice parameters) alc)
       (Err [message] (println "{}" message) (set! failures (+ failures 1)))
       (Ok [prototype]
           (let [(mut prototype) prototype]

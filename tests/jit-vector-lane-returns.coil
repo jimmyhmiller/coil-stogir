@@ -102,80 +102,131 @@
             (_ 0x123456789ABCDEF0))]
     (& raw (mask-width ty))))
 
-(defn returned-call [(ty i32)
-                     (op i32)
-                     (address (ptr u8))
-                     (input (slice u8))
-                     (fresh u64)
-                     (index u64)
-                     (output (ptr u64))] (-> void)
-  (let [(mut scalar32) (: 0.0 f32)
-        (mut scalar64) (: 0.0 f64)
-        d (Lane8 :bits (v/vsplat [u64 1] (read-word input 0 8)))
-        q
-          (Lane16
-            :bits
-              (v/vinsert (v/vsplat [u64 2] (read-word input 0 8))
-                         1
-                         (read-word input 8 8)))]
-    (p/store! (p/cast (ptr u32) (mut scalar32)) (cast u32 fresh))
-    (p/store! (p/cast (ptr u64) (mut scalar64)) fresh)
-    (when (= ty 45)
-      (when (= op 61)
-        (let [f (p/cast (fnptr (cc/C) [Lane8 u64] f32) address)
-              result (call-ptr f d index)]
-          (p/store! (p/cast (ptr f32) output) result)))
-      (when (= op 62)
-        (let [f (p/cast (fnptr (cc/C) [f32 Lane8 u64] Lane8) address)
-              result (call-ptr f scalar32 d index)]
-          (p/store! output (v/vextract (.bits result) 0))))
-      (when (= op 63)
-        (let [f (p/cast (fnptr (cc/C) [f32] Lane8) address)
-              result (call-ptr f scalar32)]
-          (p/store! output (v/vextract (.bits result) 0)))))
-    (when (= ty 61)
-      (when (= op 61)
-        (let [f (p/cast (fnptr (cc/C) [Lane16 u64] f32) address)
-              result (call-ptr f q index)]
-          (p/store! (p/cast (ptr f32) output) result)))
-      (when (= op 62)
-        (let [f (p/cast (fnptr (cc/C) [f32 Lane16 u64] Lane16) address)
-              result (call-ptr f scalar32 q index)]
-          (p/store! output (v/vextract (.bits result) 0))
-          (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
-      (when (= op 63)
-        (let [f (p/cast (fnptr (cc/C) [f32] Lane16) address)
-              result (call-ptr f scalar32)]
-          (p/store! output (v/vextract (.bits result) 0))
-          (p/store! (p/index output 1) (v/vextract (.bits result) 1)))))
-    (when (= ty 28)
-      (when (= op 61)
-        (let [f (p/cast (fnptr (cc/C) [Lane8 u64] f64) address)
-              result (call-ptr f d index)]
-          (p/store! (p/cast (ptr f64) output) result)))
-      (when (= op 62)
-        (let [f (p/cast (fnptr (cc/C) [f64 Lane8 u64] Lane8) address)
-              result (call-ptr f scalar64 d index)]
-          (p/store! output (v/vextract (.bits result) 0))))
-      (when (= op 63)
-        (let [f (p/cast (fnptr (cc/C) [f64] Lane8) address)
-              result (call-ptr f scalar64)]
-          (p/store! output (v/vextract (.bits result) 0)))))
-    (when (= ty 44)
-      (when (= op 61)
-        (let [f (p/cast (fnptr (cc/C) [Lane16 u64] f64) address)
-              result (call-ptr f q index)]
-          (p/store! (p/cast (ptr f64) output) result)))
-      (when (= op 62)
-        (let [f (p/cast (fnptr (cc/C) [f64 Lane16 u64] Lane16) address)
-              result (call-ptr f scalar64 q index)]
-          (p/store! output (v/vextract (.bits result) 0))
-          (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
-      (when (= op 63)
-        (let [f (p/cast (fnptr (cc/C) [f64] Lane16) address)
-              result (call-ptr f scalar64)]
-          (p/store! output (v/vextract (.bits result) 0))
-          (p/store! (p/index output 1) (v/vextract (.bits result) 1)))))))
+;;; x86-64 only. vector-call(f, block, integer, out): xmm0, xmm1, xmm2 = the
+;;; three 16-byte halves of `block`, rdi = integer; f(); out[0..16) = xmm0.
+;;; The Linux Coil compiler cannot pass a 16-byte vector across a C function
+;;; pointer (coil-bugs: "SysV ABI ... SSEUP"), so on x86-64 the vector and
+;;; floating arguments travel through memory and this probe; what is checked
+;;; of the result is unchanged. The placement is the backend's minimal one:
+;;; floating and vector parameters take xmm0.. in order, integers rdi...
+;;; Bytes from tools/x86/asm-bytes.sh:
+;;;   push rbx; mov rbx, rcx; mov rax, rdi; movups xmm0, [rsi];
+;;;   movups xmm1, [rsi+16]; movups xmm2, [rsi+32]; mov rdi, rdx; call rax;
+;;;   movups [rbx], xmm0; pop rbx
+(target/arch-pick
+  (defn vector-call :cc (cc/C) [(f u64) (block u64) (integer u64) (out u64)] (-> void)
+    (p/machine-code (Aarch64) 0xc0 0x03 0x5f 0xd6))
+  (defn vector-call :cc (cc/C) [(f u64) (block u64) (integer u64) (out u64)] (-> void)
+    (p/machine-code (X86_64)
+                    0x53 0x48 0x89 0xcb 0x48 0x89 0xf8 0x0f 0x10 0x06 0x0f 0x10
+                    0x4e 0x10 0x0f 0x10 0x56 0x20 0x48 0x89 0xd7 0xff 0xd0 0x0f
+                    0x11 0x03 0x5b)))
+
+(target/arch-pick
+  (defn returned-call [(ty i32)
+                       (op i32)
+                       (address (ptr u8))
+                       (input (slice u8))
+                       (fresh u64)
+                       (index u64)
+                       (output (ptr u64))] (-> void)
+    (let [(mut scalar32) (: 0.0 f32)
+          (mut scalar64) (: 0.0 f64)
+          d (Lane8 :bits (v/vsplat [u64 1] (read-word input 0 8)))
+          q
+            (Lane16
+              :bits
+                (v/vinsert (v/vsplat [u64 2] (read-word input 0 8))
+                           1
+                           (read-word input 8 8)))]
+      (p/store! (p/cast (ptr u32) (mut scalar32)) (cast u32 fresh))
+      (p/store! (p/cast (ptr u64) (mut scalar64)) fresh)
+      (when (= ty 45)
+        (when (= op 61)
+          (let [f (p/cast (fnptr (cc/C) [Lane8 u64] f32) address)
+                result (call-ptr f d index)]
+            (p/store! (p/cast (ptr f32) output) result)))
+        (when (= op 62)
+          (let [f (p/cast (fnptr (cc/C) [f32 Lane8 u64] Lane8) address)
+                result (call-ptr f scalar32 d index)]
+            (p/store! output (v/vextract (.bits result) 0))))
+        (when (= op 63)
+          (let [f (p/cast (fnptr (cc/C) [f32] Lane8) address)
+                result (call-ptr f scalar32)]
+            (p/store! output (v/vextract (.bits result) 0)))))
+      (when (= ty 61)
+        (when (= op 61)
+          (let [f (p/cast (fnptr (cc/C) [Lane16 u64] f32) address)
+                result (call-ptr f q index)]
+            (p/store! (p/cast (ptr f32) output) result)))
+        (when (= op 62)
+          (let [f (p/cast (fnptr (cc/C) [f32 Lane16 u64] Lane16) address)
+                result (call-ptr f scalar32 q index)]
+            (p/store! output (v/vextract (.bits result) 0))
+            (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
+        (when (= op 63)
+          (let [f (p/cast (fnptr (cc/C) [f32] Lane16) address)
+                result (call-ptr f scalar32)]
+            (p/store! output (v/vextract (.bits result) 0))
+            (p/store! (p/index output 1) (v/vextract (.bits result) 1)))))
+      (when (= ty 28)
+        (when (= op 61)
+          (let [f (p/cast (fnptr (cc/C) [Lane8 u64] f64) address)
+                result (call-ptr f d index)]
+            (p/store! (p/cast (ptr f64) output) result)))
+        (when (= op 62)
+          (let [f (p/cast (fnptr (cc/C) [f64 Lane8 u64] Lane8) address)
+                result (call-ptr f scalar64 d index)]
+            (p/store! output (v/vextract (.bits result) 0))))
+        (when (= op 63)
+          (let [f (p/cast (fnptr (cc/C) [f64] Lane8) address)
+                result (call-ptr f scalar64)]
+            (p/store! output (v/vextract (.bits result) 0)))))
+      (when (= ty 44)
+        (when (= op 61)
+          (let [f (p/cast (fnptr (cc/C) [Lane16 u64] f64) address)
+                result (call-ptr f q index)]
+            (p/store! (p/cast (ptr f64) output) result)))
+        (when (= op 62)
+          (let [f (p/cast (fnptr (cc/C) [f64 Lane16 u64] Lane16) address)
+                result (call-ptr f scalar64 q index)]
+            (p/store! output (v/vextract (.bits result) 0))
+            (p/store! (p/index output 1) (v/vextract (.bits result) 1))))
+        (when (= op 63)
+          (let [f (p/cast (fnptr (cc/C) [f64] Lane16) address)
+                result (call-ptr f scalar64)]
+            (p/store! output (v/vextract (.bits result) 0))
+            (p/store! (p/index output 1) (v/vextract (.bits result) 1)))))))
+  (defn returned-call [(ty i32)
+                       (op i32)
+                       (address (ptr u8))
+                       (input (slice u8))
+                       (fresh u64)
+                       (index u64)
+                       (output (ptr u64))] (-> void)
+    ; Arguments in order: the scalar (not for EXTRACT), then the vector (not
+    ; for SPLAT). Only the result's own bytes are defined in xmm0.
+    (let [(mut block) [(: 0 u64) 0 0 0 0 0]
+          (mut result) [(: 0 u64) 0]
+          slot (if (= op 62) (: 2 i64) 0)
+          bytes
+            (cast i64
+                  (if (= op 61)
+                      (types/scalar-size (types/base-type ty) 8)
+                      (types/size ty 8)))
+          (mut i) (: 0 i64)]
+      (when (!= op 61) (set! (mut block) 0 fresh))
+      (when (!= op 63)
+        (set! (mut block) slot (read-word input 0 8))
+        (set! (mut block) (+ slot 1) (read-word input 8 8)))
+      (vector-call (p/cast u64 address)
+                   (p/cast u64 (data block))
+                   index
+                   (p/cast u64 (data result)))
+      (while (< i bytes)
+        (p/store! (p/index (p/cast (ptr u8) output) i)
+                  (p/load (p/index (p/cast (ptr u8) (data result)) i)))
+        (set! i (+ i 1))))))
 
 (defn exercise [(ty i32) (op i32) (lane i32) (address (ptr u8))] (-> i64)
   (let [width (types/size ty 8)
@@ -327,7 +378,7 @@
       (when (>= lane 0)
         (set! index
               (require (b/scalar-constant! (mut graph) 5 (cast u64 lane) 8)))))
-    (match (calls/create 9 (cast u8 result-type) (slice parameters) alc)
+    (match (calls/create (target/arch-pick 9 8) (cast u8 result-type) (slice parameters) alc)
       (Err [message] (println "{}" message) (set! failures (+ failures 1)))
       (Ok [prototype]
           (let [(mut prototype) prototype]
